@@ -15,7 +15,7 @@
 //!   only; AWS CLI docs show {vectorBucket}/{index}; spike double-emits (SDKs
 //!   ignore unknown members).
 
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::State;
@@ -29,7 +29,7 @@ use crate::store::{self, BucketMeta, IndexMeta, StoreError, VectorRow};
 /// Shared server state (cloned into handlers).
 #[derive(Clone)]
 pub struct AppState {
-    pub data_dir: PathBuf,
+    pub storage: Arc<store::Storage>,
     pub creds: Option<crate::sigv4::Credentials>,
     pub region: String,
     pub account: String,
@@ -295,7 +295,7 @@ async fn resolve_index(
     vb: &str,
     ix: &str,
 ) -> Result<IndexMeta, ApiError> {
-    match store::load_bucket(&state.data_dir, vb).await? {
+    match state.storage.load_bucket(vb).await? {
         None => {
             return Err(ApiError::not_found(format!(
                 "vector bucket {vb} does not exist"
@@ -303,7 +303,7 @@ async fn resolve_index(
         }
         Some(_) => {}
     }
-    match store::load_index(&state.data_dir, vb, ix).await? {
+    match state.storage.load_index(vb, ix).await? {
         None => Err(ApiError::not_found(format!(
             "index {ix} does not exist in vector bucket {vb}"
         ))),
@@ -328,7 +328,7 @@ pub async fn create_vector_bucket(
         creation_time_rfc3339: rfc3339,
         creation_time_epoch: epoch,
     };
-    store::create_bucket(&state.data_dir, &meta).await?;
+    state.storage.create_bucket(&meta).await?;
 
     // Model (botocore 2025-07-15): required member `vectorBucketArn` only.
     // AWS CLI reference documents `vectorBucket` — double-emit, SDKs ignore extras.
@@ -383,7 +383,9 @@ pub async fn create_index(
         }
     }
 
-    if store::load_bucket(&state.data_dir, &input.vector_bucket_name)
+    if state
+        .storage
+        .load_bucket(&input.vector_bucket_name)
         .await?
         .is_none()
     {
@@ -407,7 +409,7 @@ pub async fn create_index(
             .metadata_configuration
             .map(|c| c.non_filterable_metadata_keys),
     };
-    store::create_index(&state.data_dir, &meta).await?;
+    state.storage.create_index(&meta).await?;
 
     let mut index_json = serde_json::json!({
         "vectorBucketName": meta.vector_bucket_name,
@@ -472,14 +474,15 @@ pub async fn put_vectors(
         });
     }
 
-    store::upsert_vectors(
-        &state.data_dir,
-        &input.vector_bucket_name,
-        &input.index_name,
-        meta.dimension,
-        rows,
-    )
-    .await?;
+    state
+        .storage
+        .upsert_vectors(
+            &input.vector_bucket_name,
+            &input.index_name,
+            meta.dimension,
+            rows,
+        )
+        .await?;
     Ok(empty_ok())
 }
 
@@ -515,17 +518,18 @@ pub async fn query_vectors(
     };
     let filter_fn = compiled_filter.as_ref().map(|f| eval_filter_closure(f.clone()));
 
-    let hits = store::query_vectors(
-        &state.data_dir,
-        &input.vector_bucket_name,
-        &input.index_name,
-        meta.dimension,
-        &meta.distance_metric,
-        &q,
-        top_k as usize,
-        filter_fn.as_deref(),
-    )
-    .await?;
+    let hits = state
+        .storage
+        .query_vectors(
+            &input.vector_bucket_name,
+            &input.index_name,
+            meta.dimension,
+            &meta.distance_metric,
+            &q,
+            top_k as usize,
+            filter_fn.as_deref(),
+        )
+        .await?;
 
     let return_distance = input.return_distance.unwrap_or(false);
     let return_metadata = input.return_metadata.unwrap_or(false);
@@ -669,7 +673,7 @@ mod tests {
 
     fn state(dir: &std::path::Path) -> AppState {
         AppState {
-            data_dir: dir.to_path_buf(),
+            storage: std::sync::Arc::new(store::Storage::file(dir)),
             creds: None, // --no-auth
             region: "us-east-1".into(),
             account: "000000000000".into(),

@@ -6,8 +6,12 @@
 //! `POST /<OperationName>`, JSON bodies; PutVectors success = 200 empty body.
 
 mod ops;
+mod s3;
 mod sigv4;
 mod store;
+
+#[cfg(test)]
+mod taskd_tests;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -33,6 +37,23 @@ struct Args {
     /// Data directory for the file backend
     #[arg(long, default_value = "./spike-data")]
     data_dir: String,
+
+    /// Backend URI: `file:<dir>` (default, --data-dir shorthand) or
+    /// `s3+http://host:port/bucket[/prefix]` (S3-compatible, Task D).
+    #[arg(long)]
+    backend: Option<String>,
+
+    /// S3 region (default us-east-1; MinIO/seaweedfs convention)
+    #[arg(long, default_value = "us-east-1")]
+    s3_region: String,
+
+    /// S3 static access key (env override: VF_S3_ACCESS_KEY / AWS_ACCESS_KEY_ID)
+    #[arg(long, env = "VF_S3_ACCESS_KEY")]
+    s3_access_key: Option<String>,
+
+    /// S3 static secret key (env override: VF_S3_SECRET_KEY / AWS_SECRET_ACCESS_KEY)
+    #[arg(long, env = "VF_S3_SECRET_KEY")]
+    s3_secret_key: Option<String>,
 
     /// Disable SigV4 verification entirely (CI mode)
     #[arg(long)]
@@ -64,6 +85,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/QueryVectors", post(ops::query_vectors))
         .fallback(fallback_404);
     authed
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             gate_middleware,
@@ -102,9 +124,34 @@ async fn main() {
         format!("sigv4(access_key={})", args.access_key.as_deref().unwrap_or(""))
     };
 
-    let data_dir = std::path::PathBuf::from(&args.data_dir);
+    let backend_spec = args.backend.clone().unwrap_or_else(|| format!("file:{}", args.data_dir));
+    let storage = if let Some(dir) = backend_spec.strip_prefix("file:") {
+        store::Storage::file(std::path::PathBuf::from(dir))
+    } else if let Some(mut cfg) = s3::S3BackendConfig::parse(&backend_spec) {
+        cfg.region = args.s3_region.clone();
+        cfg.access_key = args
+            .s3_access_key
+            .clone()
+            .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok());
+        cfg.secret_key = args
+            .s3_secret_key
+            .clone()
+            .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok());
+        match store::Storage::s3(cfg) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("vf-spike: S3 backend init failed: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        eprintln!(
+            "vf-spike: cannot parse --backend {backend_spec:?} (expected file:<dir> or s3+http://host:port/bucket[/prefix])"
+        );
+        std::process::exit(2);
+    };
     let state = AppState {
-        data_dir: data_dir.clone(),
+        storage: std::sync::Arc::new(storage),
         creds: if args.no_auth { None } else { creds },
         region: args.region.clone(),
         account: "000000000000".to_string(),
@@ -112,9 +159,9 @@ async fn main() {
     };
 
     eprintln!(
-        "vf-spike: starting on 127.0.0.1:{} data_dir={} auth={} region={} account={} trace={}",
+        "vf-spike: starting on 127.0.0.1:{} backend={:?} auth={} region={} account={} trace={}",
         args.port,
-        data_dir.display(),
+        state.storage,
         auth_desc,
         args.region,
         state.account,
@@ -288,7 +335,7 @@ mod tests {
 
     fn test_state(dir: &std::path::Path, creds: Option<sigv4::Credentials>) -> AppState {
         AppState {
-            data_dir: dir.to_path_buf(),
+            storage: std::sync::Arc::new(store::Storage::file(dir)),
             creds,
             region: "us-east-1".into(),
             account: "000000000000".into(),

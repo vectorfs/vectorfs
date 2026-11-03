@@ -36,8 +36,25 @@ clap = { version = "4", features = ["derive", "env"] }
 # AWS SDK. Task D (MinIO) options + evidence: see NOTES.md 依赖核查.
 lancedb = "0.41"
 
-# Hard rule: no aws-* SDK crates as direct dependencies of this server.
-# (SigV4 verification is hand-rolled in src/sigv4.rs.)
+# Task D: S3 backend WITHOUT the AWS SDK. object_store ships its own SigV4 + HTTP S3 client
+# (reqwest + aws-lc-rs crypto only; no aws-config chain). Version unified with the object_store
+# lance already locks (0.14.2) -> no duplicate. NOTE: "aws" feature hard-depends on aws-lc-rs
+# (cmake needed to build); size cost recorded in NOTES/REPORT.
+object_store = { version = "0.14", features = ["aws"] }
+
+# Injection seam: lancedb 0.41 re-exports Session + ObjectStoreRegistry but NOT the
+# ObjectStoreProvider trait -> direct dep on lance-io, same version lancedb already locks.
+lance-io = "14.0.2"
+
+# Direct lance dep only to name NewColumnTransform (Q10 schema-evolution experiment);
+# same version already in tree via lancedb -> zero new crates compiled.
+lance = "14.0.2"
+
+url = "2"
+async-trait = "0.1"
+
+# Hard rule: no aws-config / aws-sdk-* crates as dependencies of this server.
+# (SigV4 verification is hand-rolled in src/sigv4.rs; S3 client = object_store self-signed.)
 
 [dev-dependencies]
 # tower::oneshot for in-process integration tests (no network port).
@@ -48,3 +65,10 @@ tempfile = "3"
 [profile.release]
 # spike: keep cargo defaults; recorded in NOTES.md for size-budget comparison.
 # (product later: lto=fat / codegen-units=1 / strip — design.md §5.7)
+
+# Task D size adjudication: product-grade profile per design §5.7 (NOT used by cargo test).
+[profile.release-prod]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = true

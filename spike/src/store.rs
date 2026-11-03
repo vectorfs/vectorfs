@@ -1,8 +1,10 @@
-//! Storage backend (M0 Task B): file-backend only.
-//! - catalog: `<root>/buckets/<name>/bucket.json`, `<root>/buckets/<vb>/indexes/<ix>/index.json`
-//!   (create via O_EXCL so existence checks are race-free within one process);
+//! Storage backend (M0 Task B: file; Task D: + S3-compatible via object_store).
+//! - catalog: `buckets/<name>/bucket.json`, `buckets/<vb>/indexes/<ix>/index.json`
+//!   (file: O_EXCL create; S3: `PutMode::Create` conditional put — both are
+//!   race-free create-if-not-exists);
 //! - engine: lancedb (the ONLY module that touches lancedb API, design.md §5.7).
-//!   One Lance table per index at `<index>/data/vectors.lance`, opened via a
+//!   One Lance table per index at `<index>/data/vectors.lance` (file) or
+//!   `s3://<bucket>[/<prefix>]/buckets/<vb>/indexes/<ix>/data` (S3), opened via a
 //!   fresh `Connection` per operation (spike simplification — no connection cache).
 //!
 //! Lance schema: `key: utf8 not null`, `vector: fixed_size_list<f32, dim>` (not null),
@@ -18,9 +20,13 @@ use lancedb::arrow::arrow_array::{
 use lancedb::arrow::arrow_array::types::Float32Type;
 use lancedb::arrow::arrow_schema::{ArrowError, DataType, Field, Schema};
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::{connect, DistanceType};
+use lancedb::{connect, DistanceType, Table};
 
-const TABLE_NAME: &str = "vectors";
+use crate::s3::S3BackendConfig;
+
+use object_store::ObjectStoreExt as _; // get/delete/put_opts on Arc<dyn ObjectStore>
+
+pub(crate) const TABLE_NAME: &str = "vectors";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct BucketMeta {
@@ -68,7 +74,158 @@ fn internal(e: impl std::fmt::Display) -> StoreError {
 }
 
 // ---------------------------------------------------------------------------
-// paths
+// backend selection (Task D)
+// ---------------------------------------------------------------------------
+
+/// A configured storage backend. All catalog + engine operations go through
+/// here; the S3 variant carries the object_store client (catalog) and the
+/// custom-registry lancedb Session (engine).
+pub enum Storage {
+    File(PathBuf),
+    S3 {
+        cfg: S3BackendConfig,
+        session: Arc<lancedb::Session>,
+        catalog: Arc<dyn object_store::ObjectStore>,
+    },
+}
+
+impl std::fmt::Debug for Storage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Storage::File(p) => write!(f, "file:{}", p.display()),
+            Storage::S3 { cfg, .. } => write!(f, "s3:{}/{}{}", cfg.bucket, cfg.prefix, cfg.endpoint),
+        }
+    }
+}
+
+impl Storage {
+    pub fn file(root: impl Into<PathBuf>) -> Self {
+        Storage::File(root.into())
+    }
+
+    pub fn s3(cfg: S3BackendConfig) -> Result<Self, String> {
+        let catalog = cfg.build_catalog_store().map_err(|e| e.to_string())?;
+        Ok(Storage::S3 {
+            cfg,
+            session: S3BackendConfig::build_session(),
+            catalog,
+        })
+    }
+
+    // ---- catalog ----
+
+    pub async fn load_bucket(&self, name: &str) -> Result<Option<BucketMeta>, StoreError> {
+        match self {
+            Storage::File(root) => load_bucket_file(root, name).await,
+            Storage::S3 { cfg, catalog, .. } => {
+                let key = cfg.catalog_key(&format!("buckets/{name}/bucket.json"));
+                read_json_s3(catalog, &key).await
+            }
+        }
+    }
+
+    pub async fn load_index(&self, vb: &str, ix: &str) -> Result<Option<IndexMeta>, StoreError> {
+        match self {
+            Storage::File(root) => load_index_file(root, vb, ix).await,
+            Storage::S3 { cfg, catalog, .. } => {
+                let key = cfg.catalog_key(&format!("buckets/{vb}/indexes/{ix}/index.json"));
+                read_json_s3(catalog, &key).await
+            }
+        }
+    }
+
+    pub async fn create_bucket(&self, meta: &BucketMeta) -> Result<(), StoreError> {
+        match self {
+            Storage::File(root) => create_bucket_file(root, meta).await,
+            Storage::S3 { cfg, catalog, .. } => {
+                let key = cfg.catalog_key(&format!(
+                    "buckets/{}/bucket.json",
+                    meta.vector_bucket_name
+                ));
+                put_json_create_s3(catalog, &key, &serde_json::to_vec_pretty(meta).map_err(internal)?)
+                    .await
+            }
+        }
+    }
+
+    pub async fn create_index(&self, meta: &IndexMeta) -> Result<(), StoreError> {
+        match self {
+            Storage::File(root) => create_index_file(root, meta).await,
+            Storage::S3 { cfg, catalog, .. } => {
+                let key = cfg.catalog_key(&format!(
+                    "buckets/{}/indexes/{}/index.json",
+                    meta.vector_bucket_name, meta.index_name
+                ));
+                put_json_create_s3(catalog, &key, &serde_json::to_vec_pretty(meta).map_err(internal)?)
+                    .await?;
+                if let Err(e) = self.create_lance_table(meta).await {
+                    let _ = catalog.delete(&key).await; // best-effort rollback
+                    return Err(e);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // ---- engine ----
+
+    async fn open_table(&self, vb: &str, ix: &str) -> Result<Table, StoreError> {
+        match self {
+            Storage::File(root) => open_table_file(root, vb, ix).await,
+            Storage::S3 { cfg, session, .. } => {
+                crate::s3::open_table(cfg, session, vb, ix)
+                    .await
+                    .map_err(internal)
+            }
+        }
+    }
+
+    async fn create_lance_table(&self, meta: &IndexMeta) -> Result<(), StoreError> {
+        match self {
+            Storage::File(root) => create_lance_table_file(root, meta).await,
+            Storage::S3 { cfg, session, .. } => {
+                let conn = cfg
+                    .connect(session, &meta.vector_bucket_name, &meta.index_name)
+                    .await
+                    .map_err(internal)?;
+                conn.create_empty_table(TABLE_NAME, arrow_schema(meta.dimension))
+                    .execute()
+                    .await
+                    .map_err(internal)?;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn upsert_vectors(
+        &self,
+        vb: &str,
+        ix: &str,
+        dim: i32,
+        rows: Vec<VectorRow>,
+    ) -> Result<(), StoreError> {
+        let table = self.open_table(vb, ix).await?;
+        upsert_table(&table, dim, rows).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_vectors(
+        &self,
+        vb: &str,
+        ix: &str,
+        dim: i32,
+        metric: &str,
+        query: &[f32],
+        top_k: usize,
+        filter: Option<&(dyn Fn(&serde_json::Value) -> bool + Send + Sync)>,
+    ) -> Result<Vec<QueryHit>, StoreError> {
+        let table = self.open_table(vb, ix).await?;
+        query_table(&table, dim, metric, query, top_k, filter).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// paths (file backend)
 // ---------------------------------------------------------------------------
 
 pub fn bucket_dir(root: &Path, name: &str) -> PathBuf {
@@ -84,7 +241,7 @@ fn lance_root(root: &Path, vb: &str, ix: &str) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// catalog JSON
+// catalog JSON — file backend
 // ---------------------------------------------------------------------------
 
 async fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, StoreError> {
@@ -97,16 +254,16 @@ async fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option
     }
 }
 
-pub async fn load_bucket(root: &Path, name: &str) -> Result<Option<BucketMeta>, StoreError> {
+async fn load_bucket_file(root: &Path, name: &str) -> Result<Option<BucketMeta>, StoreError> {
     read_json(&bucket_dir(root, name).join("bucket.json")).await
 }
 
-pub async fn load_index(root: &Path, vb: &str, ix: &str) -> Result<Option<IndexMeta>, StoreError> {
+async fn load_index_file(root: &Path, vb: &str, ix: &str) -> Result<Option<IndexMeta>, StoreError> {
     read_json(&index_dir(root, vb, ix).join("index.json")).await
 }
 
 /// Create bucket.json exclusively. Existing file -> Conflict.
-pub async fn create_bucket(root: &Path, meta: &BucketMeta) -> Result<(), StoreError> {
+async fn create_bucket_file(root: &Path, meta: &BucketMeta) -> Result<(), StoreError> {
     let dir = bucket_dir(root, &meta.vector_bucket_name);
     tokio::fs::create_dir_all(&dir).await.map_err(internal)?;
     let path = dir.join("bucket.json");
@@ -132,7 +289,7 @@ pub async fn create_bucket(root: &Path, meta: &BucketMeta) -> Result<(), StoreEr
 /// Create index.json exclusively + the empty Lance table.
 /// On Lance failure the index.json is removed again (best effort) so the
 /// catalog never advertises an index without a dataset.
-pub async fn create_index(root: &Path, meta: &IndexMeta) -> Result<(), StoreError> {
+async fn create_index_file(root: &Path, meta: &IndexMeta) -> Result<(), StoreError> {
     let dir = index_dir(root, &meta.vector_bucket_name, &meta.index_name);
     tokio::fs::create_dir_all(&dir).await.map_err(internal)?;
     let json = serde_json::to_vec_pretty(meta).map_err(internal)?;
@@ -155,11 +312,50 @@ pub async fn create_index(root: &Path, meta: &IndexMeta) -> Result<(), StoreErro
         }
         Err(e) => return Err(internal(e)),
     }
-    if let Err(e) = create_lance_table(root, meta).await {
+    if let Err(e) = create_lance_table_file(root, meta).await {
         let _ = tokio::fs::remove_file(&path).await;
         return Err(e);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// catalog JSON — S3 backend (object_store, conditional put)
+// ---------------------------------------------------------------------------
+
+async fn read_json_s3<T: serde::de::DeserializeOwned>(
+    store: &Arc<dyn object_store::ObjectStore>,
+    key: &object_store::path::Path,
+) -> Result<Option<T>, StoreError> {
+    match store.get(key).await {
+        Ok(res) => {
+            let bytes = res.bytes().await.map_err(internal)?;
+            serde_json::from_slice(&bytes).map(Some).map_err(internal)
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(internal(e)),
+    }
+}
+
+/// Conditional create via `PutMode::Create` (If-None-Match:* on S3-compatible
+/// stores). Existing object -> Conflict.
+async fn put_json_create_s3(
+    store: &Arc<dyn object_store::ObjectStore>,
+    key: &object_store::path::Path,
+    json: &[u8],
+) -> Result<(), StoreError> {
+    use object_store::{PutMode, PutOptions};
+    store
+        .put_opts(key, json.to_vec().into(), PutOptions { mode: PutMode::Create, ..Default::default() })
+        .await
+        .map(|_| ())
+        .map_err(|e| match e {
+            object_store::Error::AlreadyExists { .. } => StoreError::Conflict(format!(
+                "object {} already exists",
+                key.as_ref()
+            )),
+            other => internal(other),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -185,7 +381,7 @@ fn distance_type(metric: &str) -> DistanceType {
     }
 }
 
-async fn open_table(root: &Path, vb: &str, ix: &str) -> Result<lancedb::Table, StoreError> {
+async fn open_table_file(root: &Path, vb: &str, ix: &str) -> Result<Table, StoreError> {
     let conn = connect(lance_root(root, vb, ix).to_str().expect("utf8 path"))
         .execute()
         .await
@@ -193,7 +389,7 @@ async fn open_table(root: &Path, vb: &str, ix: &str) -> Result<lancedb::Table, S
     conn.open_table(TABLE_NAME).execute().await.map_err(internal)
 }
 
-async fn create_lance_table(root: &Path, meta: &IndexMeta) -> Result<(), StoreError> {
+async fn create_lance_table_file(root: &Path, meta: &IndexMeta) -> Result<(), StoreError> {
     let conn = connect(lance_root(root, &meta.vector_bucket_name, &meta.index_name).to_str().expect("utf8 path"))
         .execute()
         .await
@@ -216,14 +412,11 @@ pub struct VectorRow {
 /// lancedb 0.41 API actually used: `Table::merge_insert(&["key"])`
 /// `.when_matched_update_all(None)` + `.when_not_matched_insert_all()`
 /// `.execute(Box<dyn RecordBatchReader + Send>)`.
-pub async fn upsert_vectors(
-    root: &Path,
-    vb: &str,
-    ix: &str,
+async fn upsert_table(
+    table: &Table,
     dim: i32,
     rows: Vec<VectorRow>,
 ) -> Result<(), StoreError> {
-    let table = open_table(root, vb, ix).await?;
     let schema = arrow_schema(dim);
 
     let keys: StringArray = rows.iter().map(|r| Some(r.key.as_str())).collect();
@@ -276,17 +469,14 @@ pub struct QueryHit {
 ///   (pre-filter semantics, ENHANCED-always per design.md §4.4), then sort/truncate.
 /// Both paths end sorted by (distance asc, key asc).
 #[allow(clippy::too_many_arguments)]
-pub async fn query_vectors(
-    root: &Path,
-    vb: &str,
-    ix: &str,
+async fn query_table(
+    table: &Table,
     dim: i32,
     metric: &str,
     query: &[f32],
     top_k: usize,
     filter: Option<&(dyn Fn(&serde_json::Value) -> bool + Send + Sync)>,
 ) -> Result<Vec<QueryHit>, StoreError> {
-    let table = open_table(root, vb, ix).await?;
     let mut hits: Vec<QueryHit> = Vec::new();
 
     match filter {

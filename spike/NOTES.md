@@ -242,13 +242,75 @@ Task A 的 3.5MB 是链接器丢弃引擎的下界；**真实引擎体积 312MiB
 - 类型化路径本轮**无法直接实证**：两 SDK 的 Create* 输出模型都只有 ARN 成员（模型漂移，见 Task B 备注），creationTime 只存在于我们双发的嵌套对象里 → 作为未知成员被忽略（忽略本身即一种"接受"：不因 epoch float 报解析错）。
 - 解析器直测（补证据）：botocore `parse_timestamp(1793712491.7435482)` → `datetime`（微秒保留）；smithy-go v1.28.7 json `ShapeDeserializer.ReadTime` 默认 `epoch-seconds` → `smithytime.ParseEpochSeconds` → `time.Time` UTC（毫秒截断），实测 `1793712491.7435482 → 2026-11-03T13:28:11.743Z`。即 **epoch float 是 rest-json Timestamp 的两 SDK 原生默认格式**，未来 Get* 类操作回读无风险。
 
-## 延迟矩阵
+## Task D 工程备注（S3 后端接入 + 三张矩阵 + 体积）
 
-（Task C/D 填）
+日期：2026-11-03。产物：`vf-spike --backend s3+http://host:port/bucket[/prefix]`（零 AWS SDK）；`spike/src/s3.rs`（provider）、`store.rs` Storage 抽象、`taskd_tests.rs`（条件写矩阵 + Q10 实验）。`cargo test` 19 passed + 1 ignored（ignored 项 = 需活 S3 服务的条件写测试，对 SeaweedFS 实跑 PASS）。
 
-## 条件写矩阵
+### 环境翻车实录：MinIO 二进制已不可得（重要）
 
-（Task C/D 填）
+任务书首选「docker 起 minio 容器」，本机四条路全部失败，如实记录：
+
+1. **docker daemon 死**：Docker Desktop WSL2 集成，`/var/run/docker.sock` 残留但无监听，`dockerd` 二进制不存在（CLI-only 安装），无法从 WSL 内拉起 Windows 侧 Docker Desktop。
+2. **dl.min.io 410 Gone**：MinIO 社区版已归档（"The open-source MinIO Server... are archived and no longer maintained... no longer served from this site"），`/server/minio/release/*` 与 `/archive/` 均返回 410 页面。**2026 年起 MinIO 无社区二进制可下**。
+3. **Docker Hub 匿名拉取已死**：手写 registry API 拉镜像（token → manifest → layer）：auth.docker.io 发放的匿名 token `access: []`（不授 pull scope），manifest 请求 401 insufficient_scope——2026 年匿名 pull 已实质关闭；mirror.gcr.io token 跳转 GCP 控制台要凭证；docker.m.daocloud.io 同样 401。
+4. **处置**：换 **SeaweedFS 4.52**（GitHub release `linux_amd64.tar.gz`，149MB `weed` 单二进制，`weed server -s3 -s3.port=9000`；embedded filer 无 IAM 时匿名 Admin）。设计 §5.2 本就列 SeaweedFS 为 v0.2 验证后端，此处提前验证。**注意：本任务"minio"实测行全部为 SeaweedFS 4.52 实测**；MinIO 对 If-None-Match:* 的支持以 object_store 文档声明为准（"minio supports conditional put using standard If-Match/If-None-Match headers"），标注"文档核实未实测"。
+
+### S3 注入路线（零 AWS SDK）——已走通
+
+路线（对照本地 registry 源码逐一核实后实现，~40 分钟研究 + 半天工程）：
+
+1. 直接依赖 `object_store 0.14`（features=["aws"]，版本与 lance 锁定的 0.14.2 统一，无重复）。其 S3 客户端为 object_store 自研（reqwest + **aws-lc-rs**——注意：aws feature 硬依赖 aws-lc-rs，编译需 cmake，已 `apt install cmake`；ring 替代 feature 在 0.14 被 `#[cfg(all(feature="ring", not(feature="aws-lc-rs")))]` 排除）。
+2. `src/s3.rs::StaticS3Provider` 实现 `lance_io::object_store::ObjectStoreProvider::new_store(base_path, params)`：从 `params.storage_options()`（endpoint/access_key_id/secret_access_key/region/allow_http/skip_signature）构造 `AmazonS3Builder`，经**公开构造器** `ObjectStore::new(...)` 返回（结构体字面量构造不可行——`local_dir_operations`/`paginated_lister` 字段 crate 私有；`ObjectStore::new` 会因默认 registry 无 s3 provider 打一条 guess 警告，prefix 值一致，无害）。
+3. `ObjectStoreRegistry::default()`（file+memory 常驻）+ `registry.insert("s3", provider)` → `lancedb::Session::new(6GiB, 1GiB, registry)`（cache 尺寸对齐 `Session::default()`）→ `lancedb::connect(uri).session(session).storage_options(opts)`。lancedb re-export 了 `Session`/`ObjectStoreRegistry` 但**没 re-export `ObjectStoreProvider` trait**——需直接依赖 `lance-io = "14.0.2"`（树内已有版本，零新 crate）。
+4. 每操作新开 Connection（沿袭 Task B 简化），Session（含 registry 与 cache）跨操作复用。
+5. **manifest 提交安全性**：`lance-table::commit_handler_from_url("s3://…")` 无条件返回 `ConditionalPutCommitHandler`，其 commit = `put_opts(PutMode::Create)` → object_store 发 `If-None-Match:*`，412/Precondition 映射 AlreadyExists → lance `CommitConflict`。**即条件写矩阵直接决定 Lance 提交在该后端是否原子**。
+6. catalog（bucket.json/index.json）在 S3 后端同走 `PutMode::Create`（§5.0 语义），首写竞态=AlreadyExists→ConflictException。已在 wire 层验证（boto3 9/9 步骤 2 的 409 即来自 S3 条件写路径）。
+
+### 验收：S3 后端双 SDK 9/9
+
+- boto3 1.43.123：`boto3_check.py --endpoint http://127.0.0.1:18901 --prefix minio` → **9/9 PASS**（首轮通过，零兼容问题）。
+- aws-sdk-go-v2 s3vectors v1.17.1：`vf-conformance --prefix s3go` → **9/9 PASS**（与 boto3 同 prefix 复跑会因桶已存在 409，换 prefix 即绿——两套脚本按干净前缀设计）。
+- 数据落位核验：boto3 直查 SeaweedFS 桶 `vf-spike`，`buckets/<vb>/bucket.json`、`indexes/<ix>/data/vectors.lance/_versions/*.manifest`、`_transactions/*.txn`、`_deletions/*.arrow`、数据文件全在——Lance dataset 完整躺在对象存储上。
+
+### 过程中修的真 bug
+
+- **axum 默认 body 限额 2MB**：`to_bytes(body, 21MB)` 之前先被 router 的 `DefaultBodyLimit`（默认 2MB）拦下 → 500×768 float JSON（约 8MB）413。修复：`.layer(DefaultBodyLimit::max(MAX_BODY))`（main.rs）。Task C 向量只有 dim4 没踩到；bench 首轮抓到。**产品期同类坑：任何"我们上限 20MiB"的声明必须配 body-limit 集成测试。**
+
+### 延迟矩阵
+
+（数据见 REPORT.md；测量细节）
+
+- 脚本：`/root/tmp-d/bench.py`（不进仓库）——boto3 直打 API，500/批 PutVectors（每批一次 merge_insert 提交），查询 200 次 topK=10 无过滤 + 50 次 `{"i":{"$eq":随机存在值}}`（spike 过滤路径=全表扫+Rust 内存过滤，如实计入），客户端计时，P50/P99。
+- server：**release profile**（Task B 记过 debug 严重低估引擎：同 10k 规模 debug 查询 P50 24.5ms vs release 8.5ms）。
+- s3 后端 = SeaweedFS 同机（localhost http），非"容器网络"——与任务书"minio 同机"同口径；R2/远端延迟未测（无凭证）。
+
+### 条件写矩阵
+
+- 实测行：LocalFileSystem（O_EXCL 语义，`conditional_put_local` 测试）与 SeaweedFS 4.52（`conditional_put_s3` 测试，`cargo test -- --ignored` + `VF_S3CP_URI` 实跑）。
+- 文档行：AWS S3（2024-08 起 PutObject/CompleteMultipartUpload 支持 If-None-Match:*，已存在=412 PreconditionFailed，并发冲突=409 ConditionalRequestConflict）；R2（If-None-Match:* 原子评估，412）；MinIO（object_store 文档声明支持标准 precondition 头）。
+- object_store→lance 错误链（源码核实）：412/Precondition → `Error::AlreadyExists` → lance `CommitError::CommitConflict`。
+
+### 体积（Task B 遗留裁决）
+
+```
+Task B release(默认 profile, file-only):   326,366,168 B (312 MiB)
+Task D release(默认 profile, +S3 客户端):  397,246,352 B (379 MiB)   ← object_store aws + aws-lc-rs + reqwest 链 (+67.7 MiB)
+Task D release-prod(§5.7 产品 profile):    172,523,448 B (164.5 MiB)  ← lto=fat + codegen-units=1 + strip（-57%，编译 ~25 min）
+```
+
+- 依赖裁剪查证：**datafusion 54 在 lancedb 0.41 与 lance 14.0.2 均为非可选依赖**（lancedb Cargo.toml 无任何 datafusion feature；lance 虽有大量 feature 但 datafusion 不在其中）——「关 feature 去 datafusion」在此依赖代际不可达，引擎成本不可避（Task A 已定性 datafusion=全树最大子图）。
+- 体积参照（真实可查）：SeaweedFS `weed` 单二进制 = 149MB（本任务实测下载物）；MinIO 二进制（历史版本量级 ~100MB，2026 起不可下载无法复测，不引用具体数）。
+
+### Q10 实验（merge_insert × 动态 schema 演化，附录B-Q10 / 必答 4）
+
+`taskd_tests::merge_insert_with_schema_evolution`（file 后端，lancedb 0.41 + lance 14.0.2）：
+
+1. 建表 schema `metadata: struct{i:int64}`；批 1（{i}）merge_insert 正常。
+2. 批 2 出现新 metadata 键 tag（struct{i,tag}）**直接 merge_insert → 干净拒绝**：`Append with different schema: metadata had mismatched children: missing=[], unexpected=[metadata.tag]`（fail-closed，无静默丢弃/损坏）。
+3. 演化姿势摸索（两步排雷，如实记录）：AllNulls 字段名写 `"metadata.tag"` → 被拒（"Top level field cannot contain `.`"）；AllNulls 传含已有子字段 i 的完整 struct → 被拒（"Column i already exists"）。**正确姿势：`table.add_columns().transform(NewColumnTransform::AllNulls(schema{metadata: struct{仅新子字段}}))`** → OK。
+4. 演化后批 2 merge_insert 正常提交；读回：旧行 tag=NULL、新行带值，无数据丢失。
+5. 结论：**演化不破坏 merge_insert，前提是"新键 → 先演化后提交"的服务端流程**；产品写路径按 §5.3 实现时即：检测批内新键 → AllNulls 演化 → merge_insert。风险#7 的"并发批新键"由单写者天然规避（§5.1）。
+
 
 ## 附录B对拍（Task C：B1/B2/B3(部分)/B7/B8；「客户端实证」= 可由 boto3/Go SDK 行为直接回答，「待AWS实测」= 需真实端点）
 
