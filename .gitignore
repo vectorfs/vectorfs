@@ -1,0 +1,28 @@
+# --- Rust / cargo ---
+target/
+**/*.rs.bk
+
+# --- spike runtime data (latency-matrix datasets etc.) ---
+spike-data/
+
+# --- logs & env ---
+*.log
+.env
+
+# --- Python (boto3 conformance client) ---
+__pycache__/
+.venv/
+*.pyc
+
+# --- Go (aws-sdk-go-v2 conformance client): binaries by name ---
+# (module dir spike/conformance/go/ itself stays tracked; only build outputs ignored)
+conformance
+vf-conformance
+conformance-*
+vf-conformance-*
+*.test
+*.out
+
+# --- editor / OS noise ---
+.DS_Store
+*.swp

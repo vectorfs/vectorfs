@@ -1,0 +1,37 @@
+[package]
+name = "vf-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+# M0 throwaway spike crate. Quality bar: builds & is measurable. Not product code.
+
+[[bin]]
+name = "vf-spike"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP: converged features (no default catch-all). http1 + json + tokio runtime glue only.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+
+# Runtime: deliberately narrow.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+
+# CLI args (env override needs clap "env" feature).
+clap = { version = "4", features = ["derive", "env"] }
+
+# Engine. Minor locked to 0.41. Default features of lancedb are empty (fs object_store only).
+# DELIBERATELY NOT enabling lancedb "aws" feature: lance-io/aws pulls the full AWS SDK chain
+# (aws-config -> aws-sdk-sso/sts/ssooidc -> ~22 aws-* crates + opendal). Server target is zero
+# AWS SDK. Task D (MinIO) options + evidence: see NOTES.md 依赖核查.
+lancedb = "0.41"
+
+# Hard rule: no aws-* SDK crates as direct dependencies of this server.
+# (SigV4 verification is hand-rolled in src/sigv4.rs.)
+
+[profile.release]
+# spike: keep cargo defaults; recorded in NOTES.md for size-budget comparison.
+# (product later: lto=fat / codegen-units=1 / strip — design.md §5.7)
