@@ -171,9 +171,76 @@ Task A 的 3.5MB 是链接器丢弃引擎的下界；**真实引擎体积 312MiB
 
 ---
 
-## 线格式观察
+## Task C 工程备注（官方 AWS SDK 直连验收 + 线格式抓包对拍）
 
-（Task C 填；Task B 的 --trace 事件格式与样例见上方「Task B 工程备注」）
+日期：2026-11-03。**M0 正式验收门达成**：boto3 1.43.123（Python 3.13.5）与 aws-sdk-go-v2 `service/s3vectors` v1.17.1（go 1.24.4）**未经修改直连**，4 操作 + 错误路径 9 步全 PASS，**验签开启**（`--access-key test --secret-key testsecret`，未用 `--no-auth`）。
+
+### 交付物
+
+- `spike/conformance/boto3_check.py`：9 步符合性检查（--endpoint/--access-key/--secret-key/--region/--prefix，prefix 默认随机），每步 PASS/FAIL，任一 FAIL 退出码 1。不绑定 server 生命周期；改 --endpoint 即可打真实 AWS（无 delete 操作故不清理）。
+- `spike/conformance/go/`（module `vf-conformance`）：`s3vectors@v1.17.1` + `config` + `credentials`，flag 同上，步骤 1–9 与 boto3 对齐，错误断言 `errors.As(&types.XxxException{})`；二进制 `vf-conformance` 不提交（.gitignore 已忽略）。
+- 抓包：`--trace` 全程开启，trace 存 `/tmp/vf-trace.log`（1 启动行 + 23 req + 23 resp：curl healthz×1、boto3×11、go×11）。
+
+### spike/src 改动清单
+
+**零改动。** 两 SDK 首轮全绿，未出现需要动 `spike/src/*.rs` 的兼容问题。`cargo test` 17/17 绿（0.17s，与 Task B 相同）。
+
+### Go SDK v1.17.1 API 形态备注（schema-serde 新路径，B8 相关）
+
+- `types.VectorData` 是 union 接口，float32 分支为 `&types.VectorDataMemberFloat32{Value: []float32}`。
+- `PutInputVector.Metadata` / `QueryVectorsInput.Filter` 是 `document.Interface`：发送用 `s3vectors/document.NewLazyDocument(goValue)`；回读用 `UnmarshalSmithyDocument(&map[string]any)`，数字回读为 `smithy-go/document.Number`（字符串形态，需自行 ParseFloat 比较）。
+- 与传统 codegen 的差异：`ReturnDistance`/`ReturnMetadata` 是裸 `bool`（非 `*bool`），`QueryOutputVector.Distance` 是 `*float32`（非 `*float64`）。
+
+
+---
+
+## 线格式观察（Task C，--trace 抓包 + 独立复算对拍）
+
+抓包环境：server `--trace`（验签开启）；boto3 1.43.123 与 Go SDK s3vectors v1.17.1 各跑 9 步脚本。签名验证方法：用 trace 里的 Authorization/SignedHeaders/body **独立重算**整套 SigV4（Python），对每条请求比对 Signature —— 这是判定 payload 形态的硬证据（UNSIGNED-PAYLOAD / aws-chunked 假设下重算不可能匹配）。
+
+### 1. SigV4 实际形态（两 SDK 对比）
+
+| 项 | boto3 1.43.123 | aws-sdk-go-v2（core v1.47.5 / s3vectors v1.17.1） |
+|---|---|---|
+| `x-amz-content-sha256` 头 | **不发**（非 S3 服务；全 11 请求均无） | **不发**（全 11 请求均无） |
+| payload hash 形态 | hex sha256(body) 进 canonical request（**signed payload**）——复算 10/10 正确 SK 请求全匹配 + 错 SK 请求用错 SK 复算匹配 | 同左，signed payload |
+| UNSIGNED-PAYLOAD / aws-chunked | **均未出现** | **均未出现** |
+| SignedHeaders | `content-type;host;x-amz-date`（3 个；boto3 会签 content-type；amz-sdk-* 头**发送但不签**） | `amz-sdk-invocation-id;amz-sdk-request;content-length;content-type;host;x-amz-date`（**6 个**：Go 签 content-length 和 amz-sdk-* 头） |
+| Authorization 格式 | `AWS4-HMAC-SHA256 Credential=test/20261103/us-east-1/s3vectors/aws4_request, SignedHeaders=…, Signature=…`（标准单头，两 SDK 完全同构） | 同左 |
+| X-Amz-Date | `20261103T132811Z`（ISO8601 basic，秒精度） | 同左（`20261103T132816Z`） |
+| Content-Type | `application/json`，**无 charset** | `application/json`，**无 charset** |
+| User-Agent | `Boto3/1.43.123 md/Botocore#1.43.123 ua/2.1 os/linux#6.18.54.1-… md/arch#x86_64 lang/python#3.13.5 md/pyimpl#…` | `aws-sdk-go-v2/1.47.5 ua/2.1 os/linux lang/go#1.24.4 md/GOOS#linux md/GOARCH#amd64 api/s3vectors#1.17.1 m/E,e` |
+| 其他头 | `accept-encoding: identity`、`amz-sdk-invocation-id: <uuid>`、`amz-sdk-request: attempt=1`、content-length | `accept-encoding: gzip`、`amz-sdk-invocation-id: <uuid>`、`amz-sdk-request: attempt=1; max=3`、content-length |
+| X-Amz-Security-Token | 不发（static AK/SK 无 session token） | 不发 |
+
+对 server 验签器的含义：**不能假定 SignedHeaders 恒为 host+x-amz-date** —— 必须按请求声明的 SignedHeaders 列表重建 canonical headers（Task B 的实现正是这么做的，两 SDK 11+11 全通过；Go 签 content-length/amz-sdk-* 头也正确处理）。
+
+### 2. 请求 body 序列化差异（同语义、不同字节）
+
+- boto3：`", "` / `": "` 带空格分隔，float 打成 `1.0`；Go：紧凑无空格、**成员按字母序**（`{"indexName":…,"queryVector":…,"topK":…,"vectorBucketName":…}`）、float32 `1` 打成整数。
+- server 侧 serde 按 member 名取值，顺序/空白/整数-浮点形态均无关紧要（本轮全过即证据）。
+- metadata document：boto3 dict 直出；Go `NewLazyDocument(map)`。未 set 的成员省略。
+
+### 3. 两 SDK 对我们响应的接受面
+
+- **Create* 双发（顶层 ARN + 嵌套 vectorBucket/index 对象）**：boto3 实际解析字段 = `['vectorBucketArn']` / `['indexArn']`；Go populated members = `[VectorBucketArn]` / `[IndexArn]`——两 SDK 对未知成员（含其中 epoch-float creationTime）**静默忽略、不报错**。双发策略被证实无害。
+- **QueryVectors**：`vectors[].{key,distance,metadata}` + `distanceMetric` 全被两边解析；metadata document 双向 roundtrip（string/number/bool 三类型全对；Go 数字回读为 document.Number 需转换比较）。
+- **PutVectors 成功响应**：200 + 空 body + 应用层零头（无 content-type；trace 里 response headers = `{}`）——两 SDK 均接受（空输出 shape 无解析要求）。
+- **响应头极简**（无 x-amzn-RequestId/Date 等应用层头）：两 SDK 均不要求；真实 AWS 会发 x-amzn-RequestId 等，M1 拟真可加，非兼容必需。
+
+### 4. 错误响应映射证据（头+body 双发）
+
+本轮覆盖 409 Conflict / 404 NotFound / 400 Validation / 403 AccessDenied 各两条（两 SDK 各一）：
+
+- wire 形态（server 发出）：`X-Amzn-Errortype: <裸形状名>` 头 + body `{"__type":"<裸形状名>","message":"…"}`。
+- boto3：`e.response["Error"]["Code"]` 全等于形状名；机制（botocore 1.43 源）：rest-json 解析器先取 body `__type`，再用 `x-amzn-errortype` 头**覆盖**（`RestJSONParser._inject_error_code`），`:`/`#` namespace 前缀会被剥离。
+- Go：`errors.As(&types.XxxException{})` 全命中，`ErrorCode()` = 形状名，`Message` 正确透出；机制（smithy-go v1.28.7 `transport/http/protocol/internal/json/error.go`）：`ResolveProtocolErrorType` **头优先**、body `__type` 兜底、body `code` 第三，`SanitizeErrorCode` 剥 `:`/`#`。
+- 结论：**头赢、body 兜底**，双发对两 SDK 均是冗余安全；裸形状名（无 namespace）两边原生支持。
+
+### 5. creationTime epoch float 的接受性
+
+- 类型化路径本轮**无法直接实证**：两 SDK 的 Create* 输出模型都只有 ARN 成员（模型漂移，见 Task B 备注），creationTime 只存在于我们双发的嵌套对象里 → 作为未知成员被忽略（忽略本身即一种"接受"：不因 epoch float 报解析错）。
+- 解析器直测（补证据）：botocore `parse_timestamp(1793712491.7435482)` → `datetime`（微秒保留）；smithy-go v1.28.7 json `ShapeDeserializer.ReadTime` 默认 `epoch-seconds` → `smithytime.ParseEpochSeconds` → `time.Time` UTC（毫秒截断），实测 `1793712491.7435482 → 2026-11-03T13:28:11.743Z`。即 **epoch float 是 rest-json Timestamp 的两 SDK 原生默认格式**，未来 Get* 类操作回读无风险。
 
 ## 延迟矩阵
 
@@ -183,6 +250,17 @@ Task A 的 3.5MB 是链接器丢弃引擎的下界；**真实引擎体积 312MiB
 
 （Task C/D 填）
 
-## 附录B对拍
+## 附录B对拍（Task C：B1/B2/B3(部分)/B7/B8；「客户端实证」= 可由 boto3/Go SDK 行为直接回答，「待AWS实测」= 需真实端点）
 
-（Task B/C 填）
+- **B1 错误 wire 实际形态**：
+  - 客户端实证：头（`X-Amzn-Errortype`）+ body（`__type` + `message`）双发被两 SDK 正确映射为类型化异常——409→`client.exceptions.ConflictException` / 404→`NotFoundException` / 400→`ValidationException` / 403→`AccessDeniedException` 全命中，HTTP 状态码同步；裸形状名（无 namespace）对两者原生可用（botocore `_inject_error_code` 用头覆盖并剥 `:`/`#`；smithy-go `ResolveProtocolErrorType` 头优先 + `SanitizeErrorCode`）。头/body 之一丢失也各能兜底（两边都有两级取码路径）。
+  - 待AWS实测：真实端点 `__type` 是否带 namespace（`com.aws…#Shape`）、ValidationException 线上是否恒 400、message 原文与 fieldList 形态。
+- **B2 SigV4 payload 形态**：✅ 已闭环（纯客户端行为，无需 AWS）：两 SDK 对 s3vectors **均不发 `x-amz-content-sha256` 头**（那是 S3 专属），payload hash 以 **hex sha256(body) 进 canonical request**（signed payload）——用 trace 独立复算 22/22 条签名全匹配证明；**无 UNSIGNED-PAYLOAD、无 aws-chunked**。差异在签名头集合：boto3 只签 3 头（含 content-type），Go 签 6 头（含 content-length 与 amz-sdk-*）。server 验签须按请求 SignedHeaders 逐头重建（已满足）。
+- **B3 Document 边界（部分）**：
+  - 客户端实证：顶层混合类型 `{string, number, bool}`（{"tag":"demo","n":7,"ok":true}）两 SDK marshal→server 存储→回读 unmarshal 全程无损；Go 对 nil/空 document 的线形态：成员未 set→省略、`NewLazyDocument(map{})`→`"metadata":{}`、`NewLazyDocument(nil)`→`"metadata":null`（server 三态均接受，null 按"无 metadata"存 NULL）。
+  - 待AWS实测：嵌套对象/混合数组/超大数字被拒时的错误形态（ValidationException vs Serialization 族）——需要真实端点发坏数据回读。
+- **B7（部分）cosine distance / charset / 空 body 头**：
+  - 客户端实证：① Content-Type 精确值 = `application/json` **无 charset**（两 SDK 请求一致；我们响应也不带 charset，均被接受）。② PutVectors 成功 = 200 空 body 且应用层无 content-type，两 SDK 均正常返回空输出。③ cosine distance 数值与 `1 − cos_sim` 假设一致：d(同向量)=0.0、d([1,0,0,0] vs [1,1,0,0])=0.2928932 = 1−1/√2（f32 精度）；tie 时我们按 (distance, key) 排序（本轮 topK 截断处无歧义断言）。
+  - 待AWS实测：AWS 的确切公式与 tie 次序声明、AWS 空 body 响应的真实头集合（x-amzn-RequestId 等）。
+- **B8 Go SDK v1.17.x schema-serde 与旧版差异**：✅ 已闭环（客户端实证）：s3vectors **自 v1.0.0 起就是 document.Interface + union（VectorData 接口）的新路径 API**，不存在"旧路径"版本可比；v1.0.0 与 v1.17.1 对 nil/空 document 序列化**字节级一致**（省略 / `{}` / `null` 三态同形，离线抓包对比）。结论：B8 对 s3vectors 无风险，问题关闭。
+- 范围外（本任务未触碰，M1 或对 AWS 实测再答）：B4 filter 语义、B5 PutVectors 覆盖语义（本轮仅钉死 server 自身行为 = 整行替换、无 legacy 残留；AWS 对拍待实测）、B6 nextToken、B9 tags ARN 编码、B10 merge-insert 叠加。
