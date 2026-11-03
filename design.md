@@ -13,6 +13,7 @@
 | 命名 | **保留 vectorfs** | GitHub org 已占位（今日创建）；crates.io/PyPI/npm 全空（2026-11-03 撞名审查）；"fs"语义税由 README 第一句承担 |
 | 阿里别名层 | **废弃**，只实现 AWS 面 | 理由见 §4.7 与附录C |
 | 三验证 | ①协议面 PASS（21 操作、rest-json、SigV4 已核实）②落地帖待发（稿已备）③竞争部分翻车（见附录D），触发本日方向改写 | 详细竞争快照存附录D，未来会话不必重查 |
+| M0 spike | **2026-11-03 完成，验收门 PASS**：boto3 与 Go SDK v1.17.1 直连 file:// 与 S3 后端各 9/9（SigV4 验签开启）；零 AWS SDK 的 S3 注入路线走通；数据见 `spike/REPORT.md` | 本文件已按其修订：体积预算 155/175、后端矩阵实测化、写路径三步序、optimize 升 M1 必做 |
 
 ## 1. 定位
 
@@ -26,8 +27,8 @@
 | 邻居 | 形态 | 与我们的关系 |
 |---|---|---|
 | AWS S3 Vectors / 阿里 OSS 向量 Bucket | 云托管服务 | 协议出处；我们是其自托管/离线形态 |
-| SeaweedFS 4.52+ / Ceph RGW(master) / Ozone(roadmap) | 平台**内置** s3vectors，绑定自家存储 | 名义竞争，实际**可宿主**：vectorfs 可跑在它们的 S3 面之上；差异=后端无关、单二进制、秒级启动、超集 |
-| MinIO / R2 / AWS S3 | 纯对象存储 | **宿主**。vectorfs 是它们的功能补全层 |
+| SeaweedFS 4.52+ / Ceph RGW(master) / Ozone(roadmap) | 平台**内置** s3vectors，绑定自家存储 | 名义竞争，实际**可宿主**——**已实证（M0）**：vectorfs 跑在其 S3 面上 9/9 兼容；差异=后端无关、单二进制、秒级启动、超集 |
+| MinIO / R2 / AWS S3 | 纯对象存储 | **宿主**。注：MinIO 社区版已归档（2026-02 repo archived，末版 2025-10，dl 下线）——存量部署仍可宿主，新装机流向 SeaweedFS/Garage/Silo（附录D） |
 | LocalStack | 模拟器（无 s3vectors；社区版 2026-03 转 inactive） | 我们的 file:// 与 memory:// 后端 = 其 s3vectors 空位的替代 |
 | pgvector / Qdrant 等 | 专用向量库，自有 API | 不同协议面；用户以"应用已按 s3vectors 编写"为准选择我们 |
 
@@ -153,9 +154,9 @@ AWS SDK / CLI(vf) / MCP 客户端
 
 ### 5.2 存储后端抽象
 
-- 统一经 object_store（lancedb 内建支持）。v0.1 矩阵：`file://`（默认，零配置）、`memory://`（CI/测试）、`s3://`（MinIO / AWS S3 / R2；endpoint + path-style + 静态凭证经 `vf serve --backend` 与环境变量）。
-- v0.2 验证扩展：SeaweedFS S3 面、Ceph RGW、阿里 OSS S3 网关——只做兼容性验证与文档矩阵，不做专码。
-- **条件写能力矩阵**（*spike* 必测）：S3 If-None-Match:*（AWS 2025 起 / MinIO / R2 支持情况）、其余后端降级路径 = LOCK 对象 + 单写者串行化（性能降低但正确）。
+- **接入路线定稿（M0 实证，零 AWS SDK）**：object_store 0.14（aws feature）自建客户端 → 实现 `lance_io::ObjectStoreProvider` → 自定义 lancedb `Session` 注入。例外记录：需直接依赖 lance-io（lancedb 未 re-export provider trait）。代价：aws feature 硬绑 aws-lc-rs（cmake 构建依赖），体积 +67.7MiB——接受（风险 #11）。
+- v0.1 矩阵：`file://`（默认，零配置）、`memory://`（CI/测试）、`s3://`（**SeaweedFS 4.52 已实测 9/9 + 条件写 + 延迟**；AWS S3 / R2 / MinIO 存量——If-None-Match:\* 文档核实均支持，M1 在真实云 S3 补实测 conformance）。v0.2 验证扩展：Ceph RGW、Garage/Silo。
+- **条件写矩阵（M0 结论）**：LocalFS / SeaweedFS 实测，AWS / R2 / MinIO 文档核实——全部支持 If-None-Match:\*；Lance manifest 提交即走此路径 ⇒ **提交原子性在全部目标后端成立**；LOCK 对象降级保留为防御性设计，非必需。
 
 ### 5.3 数据布局与 Lance schema
 
@@ -171,7 +172,7 @@ AWS SDK / CLI(vf) / MCP 客户端
       data/                  # Lance dataset（目录名固定，不用 "lance" 默认名避免歧义）
 ```
 - Lance schema：`key: utf8 not null`、`vector: fixed_size_list<float32, dim>`、`metadata: struct<动态字段>` + `metadata_json: utf8`（nonFilterable 键的原文）。
-- **动态 schema 演化**：新 metadata 键首次出现时 struct 加列（Lance schema evolution；*spike* 验证 merge-insert 与演化叠加行为，附录B-Q10）。值类型冲突（同键先 number 后 string）→ ValidationException。
+- **动态 schema 演化（M0 闭环，附录B-Q10）**：批内出现新 metadata 键 → `add_columns().transform(AllNulls(仅新子字段))` 演化 → merge_insert，三步在同一请求内完成。实证：跳过演化直接提交会被干净拒绝（fail-closed，无静默损坏）；演化后旧行 NULL、新行带值。值类型冲突（同键先 number 后 string）→ ValidationException。
 - 一代一表原则保留的简化版：index 创建参数即"代"；无嵌入模型版本问题（不自带嵌入）。
 
 ### 5.4 写路径
@@ -180,7 +181,7 @@ AWS SDK / CLI(vf) / MCP 客户端
 2. 单次 Lance `merge_insert("key")` 原子提交（upsert）或 delete-merge（DeleteVectors，≤500 keys）。
 3. 200 空 body。
 - 批量纪律：一请求一提交（严禁逐条 add——继承教训）；merge-insert 内部即批。
-- `optimize`（M2）：fragment > 32 且空闲时压缩——管理命令，非自动后台任务（继承教训）。
+- **M0 实测注记**：表 >50 万行后每批提交线性变慢（100k→1M：269→333ms@file、292→408ms@s3）——`optimize`（fragment > 32 且空闲时压缩，管理命令非自动后台任务）由 M2 **提前至 M1 必做**。
 
 ### 5.5 查询路径
 
@@ -188,19 +189,21 @@ AWS SDK / CLI(vf) / MCP 客户端
 - ENHANCED 语义 = 标量谓词下推预过滤 → KNN（Lance scan filter + vector search 一体）。
 - **分页 token**：opaque base64 `{manifest_version, last_key/offset, segment}`——manifest 版本入 token = **快照隔离**（翻页期间写入不改变结果集）。
 - segment：`hash(key) % segmentCount` 分片（可并行，语义与 AWS 一致：segments 划分 keyspace）。
-- 距离语义：euclidean = L2；cosine 距离定义（1−sim vs 角度）*spike* 对拍（附录B-Q7）；`returnDistance/returnMetadata` 默认 false。
+- 距离语义：cosine = 1−相似度（M0 钉死）；euclidean 注意 lancedb 原生返回**平方 L2**，查询侧须补 sqrt（M0 发现，保序）；`returnDistance/returnMetadata` 默认 false。
+- **M0 实测注记**：flat 全表扫 1M×768 = 398ms(file)/972ms(s3)——1M 规模需 IVF_PQ（M2 已规划）；spike 的 filter 走全表扫+内存过滤（1M 时 1.0–1.4s），产品实现谓词下推后过滤查询将显著下降。
 
 ### 5.6 缓存
 
 - manifest 不可变 → 数据页本地缓存以 `{manifest 版本, 文件, 偏移}` 键控，天然一致；远端后端时缓存显著加速重复查询（*spike* 量化）。
 - 缓存目录默认 `<root>/.cache/`（file 后端时退化为 OS 页缓存即够）。
+- **M0 实测注记**：S3 后端与 file 的查询延迟比随规模放大（100k≈2.6x、1M≈2.4x，每查询全量拉取所致）——manifest 键控缓存在 S3 后端是**一级优化项**，非可选。另：每操作新开 lance Connection 是已识别的优化点（连接缓存）。
 
 ### 5.7 HTTP/依赖栈（v1）
 
 | 件 | 选型 | 备注 |
 |---|---|---|
-| HTTP server | axum 或裸 hyper（*spike* 按体积定） | 21 条平铺路由，无中间件复杂度 |
-| SigV4 验签 | 自研（倾向）或 aws-sigv4 | 服务器**零 AWS SDK 依赖**是目标 |
+| HTTP server | axum（M0 定稿：底座仅 3.4MiB，hyper 对照无意义） | 21 条平铺路由，无中间件复杂度 |
+| SigV4 验签 | **自研定稿**（~350 行；双 SDK 22/22 签名验签通过；S3 出站同样经 object_store 自研签名，全链零 AWS SDK） | lancedb aws feature = 22 个 aws-\* crate + opendal，禁用 |
 | 序列化 | serde + serde_json | filter/metadata 为自由 JSON Document |
 | 引擎 | lancedb 0.41（锁 minor，API 只经一个内部 crate 出现） | 双 arrow 版本风险 M0 第一周 `cargo tree -d` 验证 |
 | object_store | 随 lancedb | s3 特性按需开 |
@@ -208,7 +211,7 @@ AWS SDK / CLI(vf) / MCP 客户端
 | ~~tantivy~~ | **推迟到 M2** | v1 过滤由 Lance 标量谓词承担；全文只在超集需要；顺带推迟 arrow 去重风险 |
 | CLI/MCP | clap + rmcp(3.x stable) | |
 | 出网 | 无（server 不发起出网请求；S3 后端除外） | |
-| 其余 | cargo-deny（拒 GPL/AGPL/CC-BY-NC）+ cargo-machete + `cargo tree -d` 进 CI；release profile lto=fat/codegen-units=1/strip；体积 ≤120MB 警戒 / 150MB 硬顶（内嵌 .so 白名单仅 v2 客户端的 ort/pdfium，v1 应远小） | CI：ubuntu x64+arm64 + macos check + size-guard；发布冒烟在 ubuntu:20.04 容器跑全链路 |
+| 其余 | cargo-deny（拒 GPL/AGPL/CC-BY-NC）+ cargo-machete + `cargo tree -d` 进 CI；release-prod profile 强制 lto=fat+cgu=1+strip（M0 实测 379→164.5MiB，datafusion 为不可裁剪的引擎固定成本）；体积 **≤155MB 警戒 / 175MB 硬顶**（S3 客户端 +67.7MiB 已含；内嵌 .so 白名单仅 v2 客户端的 ort/pdfium） | CI：ubuntu x64+arm64 + macos check + size-guard；发布冒烟在 ubuntu:20.04 容器跑全链路 |
 
 ### 5.8 客户端面（薄，v1）
 
@@ -237,7 +240,9 @@ AWS SDK / CLI(vf) / MCP 客户端
 
 ## 7. 里程碑与验证门（K0：分步执行，每步过门才进下一步）
 
-### M0 — 协议符合性 spike（≤3 周，throwaway crate `spike/`，不进产品）
+### M0 — 协议符合性 spike ✅ 完成（2026-11-03，throwaway crate `spike/`，不进产品）
+
+**结果：验收门 PASS**——双官方 SDK 直连 file:// 与 S3(SeaweedFS 4.52) 后端各 9/9（验签开启）；必答 1-6 全部回答，数据见 `spike/REPORT.md`。门槛实测：写批 P50 285–408ms（<500 PASS）、查询 P99@10万 file 49.7ms / s3 128.3ms（<300 PASS）。进 M1 的遗留 5 项：谓词下推、optimize、连接缓存、真实云 S3 conformance、aws-lc-rs/cmake 进 CI。以下为原任务书：
 
 范围：最小 server（CreateVectorBucket / CreateIndex / PutVectors / QueryVectors 四操作）+ SigV4 验签 + object_store 双后端（file + minio 容器）。
 验收：**boto3 与 aws-sdk-go-v2 未经修改直连跑通四操作 roundtrip（验签开启状态）**。
@@ -272,7 +277,8 @@ AWS SDK / CLI(vf) / MCP 客户端
 | 1 | **LanceDB 公司出官方 s3vectors 网关**（天然主人，两家竞品都用 Lance，路径现成） | 中 | 极高 | 无法防；差异化转"后端无关+模拟器+超集"或转贡献者 | 其 blog/release 官宣 → 一周内重定位裁决 |
 | 2 | SeaweedFS 天级迭代，补齐单进程简单模式/超集 | 中高 | 高 | 我们=后端无关（可跑 MinIO/R2/S3）+模拟器位+超集首发 | 其发布 simple mode 且 hybrid → 评估 niche down |
 | 3 | 协议漂移（季度级：2026-06 分页、2026-09 prefilter） | 高 | 中 | CI 每月 diff botocore 模型，21 op 兼容矩阵文档化 | 破坏性变更 → 7 天适配窗口承诺 |
-| 4 | 条件写在部分 S3 后端缺失 → Lance 提交退化/慢 | 中 | 中 | LOCK 对象单写者串行化降级路径（§5.2） | spike 矩阵发现缺口 → 文档标注该后端限单写者 |
+| 4 | 条件写在部分 S3 后端缺失 → Lance 提交退化/慢 | **低**（M0：全部目标后端支持 If-None-Match:*） | 中 | LOCK 对象单写者串行化降级（防御性保留，§5.2） | 新后端接入时先跑条件写测试 |
+| 11 | aws-lc-rs（object_store aws 硬绑）：C 供应链 + cmake 构建依赖进 CI | 低 | 低 | 锁版本；CI 预装 cmake；关注上游 ring feature 恢复后切换 | 构建链断供 → 评估 ring 路线 |
 | 5 | 远端 S3 延迟伤叙事 | 中 | 中 | file/memory 保底 dev/CI；manifest 键控缓存 | spike 延迟超标 → 叙事降级为"同机房 MinIO 位" |
 | 6 | 单人断代（生存悖论） | 高 | 高 | K0 分步门槛 + 可退出性格局（Lance 开放格式）+ M1 起每季评估寻找共维者 | 6 个月无第二贡献者 → 维护模式 + README 寻接管 |
 | 7 | merge-insert × schema 演化边角（并发批新键、类型漂移） | 中 | 中 | 写者串行天然规避并发演化；类型冲突预检 | spike Q10 失败 → metadata 全 blob + 建列惰性化 |
@@ -304,6 +310,7 @@ AWS SDK / CLI(vf) / MCP 客户端
   2. 新组件三问（进 PR 模板）：差异化必需还是"AI 让它便宜"？无用户证据是否新增持久状态？文档是否超代码量？
   3. 负面清单（§2）为宪法，改动须显式裁决记录于本文档 §0。
   4. conformance 套件先于功能实现（TDD 于协议面：测试=官方 SDK）。
+  5. 2026-11-03 M0 执行实录：子代理模式——主会话分派 5 个任务（环境/脚手架/实现/SDK 验收/S3+性能）、逐任务亲自复跑验收（不采信代理自述：测试、双 SDK roundtrip、S3 后端、体积、MinIO 归档均独立复现）、逐任务提交（b5ea181→…）。此为 K0"借助 coding agent 推进"的标准作业形态。
 
 ---
 
@@ -335,7 +342,9 @@ AWS SDK / CLI(vf) / MCP 客户端
 | PutVectorBucketDefaultIndexMode | POST /PutVectorBucketDefaultIndexMode | — | defaultIndexMode∈{CLASSIC,ENHANCED}；仅影响新建索引 |
 | UpdateIndexMode | POST /UpdateIndexMode | — | indexMode∈{CLASSIC,ENHANCED}；我们=恒 ENHANCED 行为 |
 
-## 附录B：协议模糊点（M0 spike 必答）
+## 附录B：协议模糊点（M0 对拍结果 + 原始清单）
+
+**M0 对拍结论**：B2 ✅（两 SDK 均 signed payload、无 x-amz-content-sha256 头；boto3 签 3 头、Go 签 6 头——验签须按请求声明列表重建）、B8 ✅（问题消解）、B10 ✅（三步序闭环，§5.3）；B1 部分（头+body 双发被两 SDK 类型化解析，AWS 端原文待实测）、B3/B7 部分（document 三态/无 charset/空 body/cosine=1−sim 已实证）；**B4/B5/B6/B9 需真实 AWS 端点，M1 或有凭证机会时补**。原文如下：
 
 1. 错误 wire 实际形态：真实端点头/body 组合、`__type` 是否带 namespace、ValidationException 线上恒 400？（对策：双发 + 三 SDK 回读断言。）
 2. SigV4 payload：boto3/Go SDK 对该服务实际发 signed payload 还是 UNSIGNED-PAYLOAD？aws-chunked？
@@ -368,3 +377,5 @@ AWS SDK / CLI(vf) / MCP 客户端
 | 社区情绪 | HN 高热帖抱怨 post-filter/topK/无 hybrid；明确 self-host 呼声（"cloud is someone else's computer"） | — | 超集+自托管叙事的原始证据 |
 
 （快照来源与链接见 2026-11-03 会话调研记录；下次复查按 §9 月度节奏。）
+
+**2026-11-03 增补**：MinIO 社区版归档（repo 2026-02 archived，末版 2025-10，下载通道下线；AGPL 线由 Silo 分支续命）——"简单自托管对象存储"位现真空，流向 SeaweedFS/Garage/Silo。对 vectorfs 双重含义：①宿主格局变动（README/文档的宿主列表口径随之调整）；②"向量界 MinIO"类比的心智位反而更空——名字的出处退场，位子还在。另：SeaweedFS 4.52 的 S3 面已实测作为 vectorfs 宿主（M0，9/9）——"竞争者即宿主"判断获实证。
