@@ -38,10 +38,14 @@ pub fn config_path(data_dir: &Path) -> PathBuf {
         .join(CONFIG_FILE)
 }
 
-/// Contents of `<data-dir>/.vectorfs/vectorfs.toml`. Server-side skeleton
-/// only (M2 T1); T2 grows the plugin/ingest sections on this same struct.
-/// `deny_unknown_fields`: a typo'd key must fail loudly at startup (with the
-/// TOML span), never silently fall through to defaults.
+/// Contents of `<data-dir>/.vectorfs/vectorfs.toml`. Server-side fields
+/// are M2 T1; the M2 T2 plugin sections ([extractor.*], [embedder.*],
+/// [ingest.*], design.md §5.10.4) live in the SAME file and are declared
+/// here only so `deny_unknown_fields` (which keeps guarding every OTHER
+/// key) tolerates their presence — their strict parse, with TOML line
+/// attribution, is `pipeline::config::load_pipeline_config` over the raw
+/// text (spans need the source, a span-free `Table` cannot carry them).
+/// `init` never writes them, so serialization stays byte-identical to T1.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
@@ -50,6 +54,15 @@ pub struct FileConfig {
     pub account_id: String,
     pub access_key_id: String,
     pub secret_access_key: String,
+    /// `[extractor.<name>]` sections (raw; parsed by pipeline::config).
+    #[serde(default)]
+    pub extractor: Option<toml::Table>,
+    /// `[embedder.<name>]` sections (raw; parsed by pipeline::config).
+    #[serde(default)]
+    pub embedder: Option<toml::Table>,
+    /// `[ingest.<bucket>]` sections (raw; parsed by pipeline::config).
+    #[serde(default)]
+    pub ingest: Option<toml::Table>,
 }
 
 /// Raw `vectorfs serve` flags — Option everywhere so "not given" stays
@@ -423,6 +436,11 @@ pub fn init(data_dir: &Path, force: bool) -> Result<InitOutcome, String> {
         account_id: DEFAULT_ACCOUNT.to_string(),
         access_key_id: generate_access_key(),
         secret_access_key: generate_secret_key(),
+        // init writes the pure-protocol server file; plugin sections are
+        // the operator's (or a preset's) later additions.
+        extractor: None,
+        embedder: None,
+        ingest: None,
     };
     let toml_doc = toml::to_string_pretty(&config)
         .map_err(|e| format!("serialize {}: {e}", path.display()))?;
@@ -546,6 +564,34 @@ mod tests {
 
         // unknown key -> rejected, not ignored
         std::fs::write(&path, "version = 1\nbogus_key = \"x\"\n").unwrap();
+        let err = read_config(dir.path()).unwrap_err();
+        assert!(err.contains("unknown field"), "{err}");
+    }
+
+    /// M2 T2: the plugin sections share the file — FileConfig must TOLERATE
+    /// them (their strict parse is pipeline::config's job, with line
+    /// attribution) while every other unknown key still fails.
+    #[test]
+    fn read_config_tolerates_plugin_sections_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".vectorfs")).unwrap();
+        let path = config_path(dir.path());
+
+        let base = "version = 1\nregion = \"us-east-1\"\naccount_id = \"000000000000\"\n\
+                    access_key_id = \"VFAKx\"\nsecret_access_key = \"s\"\n";
+        std::fs::write(
+            &path,
+            format!(
+                "{base}\n[extractor.pdf]\nkind = \"txt\"\ndpi = 300\n\n\
+                 [ingest.docs]\nchunk = {{ kind = \"token-window\", size = 512, overlap = 64 }}\n"
+            ),
+        )
+        .unwrap();
+        let cfg = read_config(dir.path()).unwrap().unwrap();
+        assert!(cfg.extractor.is_some() && cfg.ingest.is_some() && cfg.embedder.is_none());
+
+        // deny_unknown_fields still guards every non-plugin key
+        std::fs::write(&path, format!("{base}\n[ingsetr.d]\nx = 1\n")).unwrap();
         let err = read_config(dir.path()).unwrap_err();
         assert!(err.contains("unknown field"), "{err}");
     }

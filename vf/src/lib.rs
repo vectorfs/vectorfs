@@ -16,6 +16,7 @@ pub mod filter;
 pub mod lock;
 pub mod mcp;
 pub mod ops;
+pub mod pipeline;
 pub mod report;
 pub mod sigv4;
 pub mod status;

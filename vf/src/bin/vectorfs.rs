@@ -82,6 +82,17 @@ enum Command {
     ///
     ///   vectorfs mcp --data-dir ./vectorfs-data --tools ro
     Mcp(McpArgs),
+
+    /// Inspect / validate the file-layer pipeline configuration
+    /// (M2 T2: the [extractor.*] / [embedder.*] / [ingest.*] sections of
+    /// vectorfs.toml)
+    ///
+    /// Examples:
+    ///
+    ///   vectorfs pipelines check --data-dir ./vectorfs-data
+    ///
+    ///   vectorfs pipelines check --config ./vectorfs.toml
+    Pipelines(PipelinesArgs),
 }
 
 /// `vectorfs init` arguments.
@@ -209,6 +220,35 @@ struct McpArgs {
     tools: mcp::ToolsMode,
 }
 
+/// `vectorfs pipelines …` arguments (`check` for now; more verbs land with
+/// the T3+ runtime registry).
+#[derive(Parser, Debug)]
+struct PipelinesArgs {
+    #[command(subcommand)]
+    command: PipelinesCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum PipelinesCommand {
+    /// Validate the pipeline sections of vectorfs.toml and print a summary
+    /// (instances, ingest sections, fingerprints). Exit 0 = valid,
+    /// 1 = validation failure (line-numbered), 2 = usage/IO.
+    Check(PipelinesCheckArgs),
+}
+
+/// `vectorfs pipelines check` arguments.
+#[derive(Parser, Debug)]
+struct PipelinesCheckArgs {
+    /// Explicit config file to check (skips data-dir resolution)
+    #[arg(long, conflicts_with = "data_dir")]
+    config: Option<String>,
+
+    /// Data directory whose <dir>/.vectorfs/vectorfs.toml is checked
+    /// [env: VF_DATA_DIR] [default: ./vectorfs-data]
+    #[arg(long)]
+    data_dir: Option<String>,
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -218,6 +258,7 @@ async fn main() {
         Some(Command::Status(args)) => status_cmd(args).await,
         Some(Command::Doctor(args)) => doctor_cmd(args).await,
         Some(Command::Mcp(args)) => mcp_cmd(args).await,
+        Some(Command::Pipelines(args)) => pipelines_cmd(args),
         // Bare `vectorfs` already gets help from arg_required_else_help; this
         // arm is the explicit fallback for a None subcommand.
         None => {
@@ -325,6 +366,89 @@ async fn mcp_cmd(args: McpArgs) {
     }
 }
 
+/// `vectorfs pipelines check`: exit 0 = valid (stdout summary: parsed
+/// instances, ingest sections, fingerprints), 1 = validation failure (each
+/// error one stderr line, TOML-line attributed), 2 = usage/IO (clap usage
+/// errors already exit 2).
+fn pipelines_cmd(args: PipelinesArgs) {
+    let PipelinesCommand::Check(check) = args.command;
+    // File resolution: --config explicit; otherwise the same data-dir chain
+    // serve uses (flag > VF_DATA_DIR > default), pointing at
+    // <dir>/.vectorfs/vectorfs.toml.
+    let path = match check.config {
+        Some(f) => std::path::PathBuf::from(f),
+        None => {
+            let data_dir = check
+                .data_dir
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var("VF_DATA_DIR")
+                        .ok()
+                        .map(std::path::PathBuf::from)
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from(config::DEFAULT_DATA_DIR));
+            config::config_path(&data_dir)
+        }
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            // A missing file is a USAGE error here (the operator asked to
+            // check a specific file) — the opposite of serve, where missing
+            // means the pure-protocol face and is fine.
+            eprintln!(
+                "vectorfs pipelines check: cannot read {}: {e}",
+                path.display()
+            );
+            std::process::exit(2);
+        }
+    };
+    match vectorfs::pipeline::config::load_pipeline_config(&text) {
+        Ok(cfg) => {
+            println!("vectorfs pipelines check: {} — OK", path.display());
+            print_pipeline_summary(&cfg);
+        }
+        Err(e) => {
+            eprintln!("vectorfs pipelines check: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Deterministic (BTreeMap-ordered) stdout summary of a parsed pipeline
+/// config. stdout = results, stderr = progress/errors (report.rs contract).
+fn print_pipeline_summary(cfg: &vectorfs::pipeline::config::PipelineConfig) {
+    if cfg.extractors.is_empty() && cfg.embedders.is_empty() && cfg.ingest.is_empty() {
+        println!("no pipeline sections (pure protocol face; nothing to do)");
+        return;
+    }
+    for (name, kind) in &cfg.extractors {
+        println!("extractor {name}: kind={}", kind.describe());
+    }
+    if cfg.embedders.is_empty() {
+        println!("embedders: (none registered — ort/openai land in M2-T5)");
+    }
+    for (name, _kind) in &cfg.embedders {
+        println!("embedder {name}");
+    }
+    for (bucket, ingest) in &cfg.ingest {
+        let scope = ingest.scope.as_deref().unwrap_or("<whole root>");
+        let embedders = if ingest.embedders.is_empty() {
+            "[]".to_string()
+        } else {
+            format!("[{}]", ingest.embedders.join(", "))
+        };
+        println!(
+            "ingest {bucket}: chunker={} scope={scope} embedders={embedders} merge={} \
+             fingerprint={}",
+            ingest.chunk.describe(),
+            ingest.merge,
+            cfg.fingerprint(bucket).expect("bucket present"),
+        );
+    }
+}
+
 fn init(args: InitArgs) {
     let data_dir = args
         .data_dir
@@ -374,6 +498,35 @@ async fn serve(args: ServeArgs) {
             std::process::exit(2);
         }
     };
+
+    // ---- pipeline config fail-fast (M2 T2, design.md §5.10.3) ----
+    // The plugin sections share vectorfs.toml with the T1 server fields
+    // (resolve already parsed its FileConfig slice; the sections were
+    // tolerated there). Re-read the RAW TEXT here: line attribution needs
+    // the source, and a bad pipeline config must refuse startup BEFORE any
+    // backend/lock is touched. A MISSING file is the pure-protocol face —
+    // serve starts normally with no file layer.
+    match std::fs::read_to_string(config::config_path(&cfg.data_dir)) {
+        Ok(text) => {
+            if let Err(e) = vectorfs::pipeline::config::load_pipeline_config(&text) {
+                eprintln!("vectorfs: pipeline config invalid: {e}");
+                eprintln!(
+                    "vectorfs: hint: fix {} (or run `vectorfs pipelines check --data-dir {}`)",
+                    config::config_path(&cfg.data_dir).display(),
+                    cfg.data_dir.display()
+                );
+                std::process::exit(2);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            eprintln!(
+                "vectorfs: cannot read {}: {e}",
+                config::config_path(&cfg.data_dir).display()
+            );
+            std::process::exit(2);
+        }
+    }
 
     // ---- backend ----
     // ResolvedConfig::backend() (NOT raw Backend::parse): injects the S3
