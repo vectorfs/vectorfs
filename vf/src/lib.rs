@@ -13,6 +13,7 @@ pub mod backends;
 pub mod config;
 pub mod doctor;
 pub mod filter;
+pub mod ingest;
 pub mod lock;
 pub mod mcp;
 pub mod ops;
@@ -282,6 +283,7 @@ mod tests {
             region: "us-east-1".into(),
             account: "000000000000".into(),
             trace: false,
+            ingest: None,
         }
     }
 

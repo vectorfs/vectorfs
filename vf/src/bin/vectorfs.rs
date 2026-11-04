@@ -537,16 +537,12 @@ async fn serve(args: ServeArgs) {
     // tolerated there). Re-read the RAW TEXT here: line attribution needs
     // the source, and a bad pipeline config must refuse startup BEFORE any
     // backend/lock is touched. A MISSING file is the pure-protocol face —
-    // serve starts normally with no file layer.
+    // serve starts normally with no file layer. The PARSED config is kept:
+    // ingest sections (if any) drive the file-layer runtime below.
+    let mut pipeline_cfg = None;
     match std::fs::read_to_string(config::config_path(&cfg.data_dir)) {
-        Ok(text) => {
-            let invalid = match vectorfs::pipeline::config::load_pipeline_config(&text) {
-                Err(e) => Some(e),
-                // availability gate: a model an embedder needs at startup
-                // must exist where its config says it will be found
-                Ok(parsed) => parsed.validate_model_availability(&cfg.data_dir).err(),
-            };
-            if let Some(e) = invalid {
+        Ok(text) => match vectorfs::pipeline::config::load_pipeline_config(&text) {
+            Err(e) => {
                 eprintln!("vectorfs: pipeline config invalid: {e}");
                 eprintln!(
                     "vectorfs: hint: fix {} (or run `vectorfs pipelines check --data-dir {}`)",
@@ -555,7 +551,16 @@ async fn serve(args: ServeArgs) {
                 );
                 std::process::exit(2);
             }
-        }
+            // availability gate: a model an embedder needs at startup must
+            // exist where its config says it will be found
+            Ok(parsed) => {
+                if let Err(e) = parsed.validate_model_availability(&cfg.data_dir) {
+                    eprintln!("vectorfs: pipeline config invalid: {e}");
+                    std::process::exit(2);
+                }
+                pipeline_cfg = Some(parsed);
+            }
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             eprintln!(
@@ -592,6 +597,46 @@ async fn serve(args: ServeArgs) {
     };
     let backend = storage.backend().clone();
 
+    // ---- ingest runtime, pre-lock half (M2 T3, design.md §5.10.5) ----
+    // With ingest sections configured: (1) the FINGERPRINT gate reads every
+    // source marker and refuses startup on any config-drifted one (explicit
+    // `vf reindex` is the remedy — there is deliberately no background
+    // re-embedding engine); (2) embedders LOAD (dim probe, credentials,
+    // model prefetch — potentially slow, so it happens while nobody waits on
+    // us for the lock). No ingest config = the pure-protocol face, zero
+    // extra tasks, behavior unchanged.
+    let mut ingest_core = None;
+    if let Some(pcfg) = pipeline_cfg.as_ref().filter(|c| !c.ingest.is_empty()) {
+        if let Err(e) = vectorfs::ingest::fingerprint_gate(&storage, pcfg).await {
+            eprintln!("vectorfs: refusing to start: {e}");
+            std::process::exit(2);
+        }
+        let models_dir = pcfg
+            .models_dir
+            .clone()
+            .unwrap_or_else(|| vectorfs::pipeline::models::default_models_dir(&cfg.data_dir));
+        match vectorfs::ingest::IngestCore::load(pcfg, &models_dir).await {
+            Ok(core) => {
+                for (vb, embedders, scan) in core.describe_buckets() {
+                    eprintln!(
+                        "vectorfs: ingest {vb}: {embedders} embedder(s), scan every {scan}s \
+                         (fingerprints ok)"
+                    );
+                }
+                ingest_core = Some(core);
+            }
+            Err(e) => {
+                eprintln!("vectorfs: ingest pipeline failed to load: {e}");
+                eprintln!(
+                    "vectorfs: hint: `vectorfs pipelines check --data-dir {}` names the exact \
+                     line",
+                    cfg.data_dir.display()
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+
     // ---- single-writer lock (§5.1): acquired BEFORE the listener binds ----
     let lock_guard = match lock::acquire(&backend, storage.catalog().clone()).await {
         Ok(g) => g,
@@ -623,13 +668,34 @@ async fn serve(args: ServeArgs) {
                 .unwrap_or("")
         )
     };
+    // Ingest wiring (M2 T3): the HANDLE exists iff the runtime core was
+    // built — it goes INTO the AppState (T6's immediate-trigger surface);
+    // the scheduler + workers then spawn off that same state (single-writer
+    // LOCK held, so first-write domain creation is race-free by ownership).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let storage = Arc::new(storage);
+    let handle = ingest_core
+        .as_ref()
+        .map(|_| Arc::new(vectorfs::ingest::IngestHandle::new()));
     let state = AppState {
-        storage: Arc::new(storage),
+        storage: storage.clone(),
         creds: if cfg.no_auth { None } else { cfg.creds.clone() },
         region: cfg.region.clone(),
         account: cfg.account.clone(),
         trace: cfg.trace,
+        ingest: handle.clone(),
     };
+    let ingest_drain = handle.clone();
+    if let (Some(core), Some(handle)) = (ingest_core, handle) {
+        let runtime = vectorfs::ingest::IngestRuntime::new(
+            core,
+            Arc::new(state.clone()),
+            handle.notify(),
+            shutdown_rx.clone(),
+        );
+        runtime.spawn(&handle);
+        eprintln!("vectorfs: ingest worker running (SIGTERM drains in-flight files, ≤8s)");
+    }
     eprintln!(
         "vectorfs: starting on 127.0.0.1:{} backend={backend} auth={auth_desc} \
          region={} account={} owner={} trace={}",
@@ -652,10 +718,10 @@ async fn serve(args: ServeArgs) {
 
     // Heartbeat: TTL/3 rewrite; loss of ownership (taken over after our TTL
     // expired) must stop the daemon — wired into graceful shutdown.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let heartbeat_lock = Arc::new(tokio::sync::Mutex::new(lock_guard));
     tokio::spawn({
         let mut shutdown_rx = shutdown_rx.clone();
+        let shutdown_tx = shutdown_tx.clone();
         let lock = heartbeat_lock.clone();
         async move {
             let mut ticker = tokio::time::interval(lock::HEARTBEAT_INTERVAL);
@@ -687,8 +753,15 @@ async fn serve(args: ServeArgs) {
         .await
         .expect("server exited");
 
-    // graceful shutdown: release the LOCK (only if still ours), drop the flock.
+    // Graceful shutdown sequence: signal every background task (ingest
+    // scheduler/workers stop taking NEW files and finish the current one),
+    // drain them inside the 8s budget (Docker SIGKILLs at 10s), then release
+    // the LOCK (only if still ours) and drop the flock.
     eprintln!("vectorfs: shutting down, releasing lock…");
+    let _ = shutdown_tx.send(true);
+    if let Some(ingest) = ingest_drain.as_ref() {
+        ingest.shutdown(vectorfs::ingest::SHUTDOWN_BUDGET).await;
+    }
     heartbeat_lock.lock().await.release().await;
 }
 

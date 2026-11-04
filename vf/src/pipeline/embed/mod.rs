@@ -102,9 +102,10 @@ impl EmbedderKind {
 
     /// Human-readable kind + params (CLI summary lines). NOTE: deliberately
     /// excludes `api_key` (secrets do not belong in summaries) — the same
-    /// rule `describe()` output will follow for every future kind. When ort
-    /// runs from `path`, the model NAME is not shown: the default name would
-    /// mislead (the artifact under `path` is what embeds).
+    /// rule `describe()` output will follow for every future kind. The model
+    /// identity shown is the RESOLVED name (ort::resolve_model_name): the
+    /// artifact under `path` is what embeds, so a path-only embedder is
+    /// described by its directory, never by the default name.
     pub fn describe(&self) -> String {
         match self {
             EmbedderKind::Ort(c) => match &c.path {
@@ -112,7 +113,7 @@ impl EmbedderKind {
                 None => {
                     format!(
                         "ort(model={}{})",
-                        c.model,
+                        ort::resolve_model_name(c),
                         if c.offline { ", offline" } else { "" }
                     )
                 }
@@ -226,7 +227,7 @@ mod tests {
         let k = EmbedderKind::from_config("embedder.text", &raw, Some(7)).unwrap();
         match &k {
             EmbedderKind::Ort(c) => {
-                assert_eq!(c.model, "gte-multilingual-base");
+                assert_eq!(c.model.as_deref(), Some("gte-multilingual-base"));
                 assert!(!c.offline);
             }
             other => panic!("wrong kind: {other:?}"),

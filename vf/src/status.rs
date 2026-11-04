@@ -559,6 +559,7 @@ mod tests {
                     distance_metric: "cosine".into(),
                     non_filterable_metadata_keys: None,
                     index_mode: None,
+                    x_vf_derived: None,
                 })
                 .await
                 .unwrap();

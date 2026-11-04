@@ -621,6 +621,9 @@ pub async fn run(cfg: &crate::config::StorageConfig, mode: ToolsMode) -> McpExit
             .map(|c| c.account_id.clone())
             .unwrap_or_else(|| crate::config::DEFAULT_ACCOUNT.to_string()),
         trace: false,
+        // MCP single-agent mode does not run the ingest scheduler (M2: the
+        // file layer's writer is `vectorfs serve`).
+        ingest: None,
     });
 
     // heartbeat (TTL/3): losing ownership (taken over after our TTL expired)
@@ -710,6 +713,7 @@ mod tests {
             region: "us-east-1".into(),
             account: "000000000000".into(),
             trace: false,
+            ingest: None,
         })
     }
 

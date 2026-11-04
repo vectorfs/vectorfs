@@ -82,6 +82,39 @@ struct IngestRaw {
     /// TOML key is `index-prefix` (§5.10.4 spells it kebab-case).
     #[serde(rename = "index-prefix")]
     index_prefix: Option<String>,
+    /// Scanner period in seconds (§5.10.5 execution model). > 0.
+    #[serde(default = "default_scan_interval_secs")]
+    scan_interval_secs: usize,
+    /// Poison guard: objects larger than this are FAILED without a read
+    /// attempt (§5.10.5). > 0.
+    #[serde(default = "default_max_file_size_mb")]
+    max_file_size_mb: u64,
+    /// Per-file retry budget on top of the first attempt (§5.10.5).
+    #[serde(default = "default_retries")]
+    retries: u32,
+    /// Extractor wall-clock cap per file, wrapping the extract call.
+    #[serde(default = "default_extract_timeout_secs")]
+    extract_timeout_secs: u64,
+    /// Store chunk text as `x-vf-chunk-text` metadata (default ON, §5.10.1;
+    /// turning it off drops the key from written metadata entirely).
+    #[serde(default = "default_store_chunk_text")]
+    store_chunk_text: bool,
+}
+
+fn default_scan_interval_secs() -> usize {
+    30
+}
+fn default_max_file_size_mb() -> u64 {
+    200
+}
+fn default_retries() -> u32 {
+    3
+}
+fn default_extract_timeout_secs() -> u64 {
+    120
+}
+fn default_store_chunk_text() -> bool {
+    true
 }
 
 /// Validated pipeline configuration (the parse product consumed by T3's
@@ -166,24 +199,27 @@ impl PipelineConfig {
                     }
                 }
                 None => {
-                    let Some(builtin) = super::models::builtin(&cfg.model) else {
+                    // name-only (or default) resolution: the model MUST be a
+                    // built-in table entry (that is what can be prefetched).
+                    let name = crate::pipeline::embed::ort::resolve_model_name(cfg);
+                    let Some(builtin) = super::models::builtin(&name) else {
                         return Err(PipelineError::config(
                             format!(
                                 "[{section}]: unknown model '{}' (built-in models: {})",
-                                cfg.model,
+                                name,
                                 super::models::builtin_names().join(", ")
                             ),
                             line,
                         ));
                     };
-                    let dir = models_dir.join(&cfg.model);
+                    let dir = models_dir.join(&name);
                     if cfg.offline && !super::models::is_ready(&dir, builtin) {
                         return Err(PipelineError::config(
                             format!(
                                 "[{section}]: offline = true but model '{}' is not present under \
                                  {} — prefetch on a connected machine (vectorfs init --preset \
                                  text-rag) or set path = \"…\"; the network will not be used",
-                                cfg.model,
+                                name,
                                 dir.display()
                             ),
                             line,
@@ -213,6 +249,16 @@ pub struct IngestConfig {
     pub merge: Merge,
     /// Derived index name prefix (optional).
     pub index_prefix: Option<String>,
+    /// Scanner period in seconds (default 30).
+    pub scan_interval_secs: usize,
+    /// Poison guard, MiB (default 200).
+    pub max_file_size_mb: u64,
+    /// Retry budget per file (default 3).
+    pub retries: u32,
+    /// Extractor timeout per file, seconds (default 120).
+    pub extract_timeout_secs: u64,
+    /// Write `x-vf-chunk-text` metadata (default true).
+    pub store_chunk_text: bool,
 }
 
 impl PipelineConfig {
@@ -351,7 +397,9 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
                 "embedder '{name}' loads a self-managed model via path {p} — outside the \
                  built-in table{}; its license is your audit (built-ins are \
                  permissive-only, §5.10.5)",
-                if super::models::builtin(&cfg.model).is_some() {
+                if super::models::builtin(&crate::pipeline::embed::ort::resolve_model_name(cfg))
+                    .is_some()
+                {
                     " (the built-in pins are bypassed)"
                 } else {
                     ""
@@ -462,8 +510,81 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
                 embedders: rawi.embedders,
                 merge,
                 index_prefix: rawi.index_prefix,
+                scan_interval_secs: rawi.scan_interval_secs,
+                max_file_size_mb: rawi.max_file_size_mb,
+                retries: rawi.retries,
+                extract_timeout_secs: rawi.extract_timeout_secs,
+                store_chunk_text: rawi.store_chunk_text,
             },
         );
+    }
+
+    // ---- name-shape gates for everything the file layer AUTO-CREATES ----
+    // The ingest section key becomes a real vector bucket and every listed
+    // embedder (or the index-prefix) becomes half of a derived INDEX name
+    // (`{prefix|embedder}-{key8}`, §5.10.5). Both must satisfy the S3
+    // Vectors name rule at PARSE time — a CreateVectorBucket/CreateIndex
+    // ValidationException at 3am ingest time would be a much later, much
+    // more confusing failure. Derived names additionally lose 9 chars to
+    // the "-xxxxxxxx" suffix.
+    for (bucket, icfg) in &ingest {
+        let section = format!("ingest.{bucket}");
+        let line = section_lines.get(&section).copied();
+        if !is_aws_name(bucket) {
+            return Err(PipelineError::config(
+                format!(
+                    "[{section}]: bucket name '{bucket}' is invalid: must be 3-63 characters, \
+                     lowercase letters, digits and hyphens, starting and ending with an \
+                     alphanumeric character (the file layer auto-creates this vector bucket)"
+                ),
+                line,
+            ));
+        }
+        let base = icfg.index_prefix.as_deref().unwrap_or_else(|| {
+            // without a prefix EVERY listed embedder name goes into a derived
+            // index name; validate them all
+            ""
+        });
+        let bases: Vec<&str> = if icfg.index_prefix.is_some() {
+            vec![base]
+        } else {
+            icfg.embedders.iter().map(String::as_str).collect()
+        };
+        for b in bases {
+            if !is_derived_name_base(b) {
+                return Err(PipelineError::config(
+                    format!(
+                        "[{section}]: {} '{b}' cannot name a derived index: must be 1-54 \
+                         lowercase letters, digits and hyphens, starting and ending with an \
+                         alphanumeric character (derived names append a '-xxxxxxxx' key suffix)",
+                        if icfg.index_prefix.is_some() {
+                            "index-prefix"
+                        } else {
+                            "embedder instance name"
+                        }
+                    ),
+                    line,
+                ));
+            }
+        }
+        if icfg.scan_interval_secs == 0 {
+            return Err(PipelineError::config(
+                format!("[{section}]: scan_interval_secs must be > 0 (0 would busy-loop)"),
+                line,
+            ));
+        }
+        if icfg.max_file_size_mb == 0 {
+            return Err(PipelineError::config(
+                format!("[{section}]: max_file_size_mb must be > 0"),
+                line,
+            ));
+        }
+        if icfg.extract_timeout_secs == 0 {
+            return Err(PipelineError::config(
+                format!("[{section}]: extract_timeout_secs must be > 0"),
+                line,
+            ));
+        }
     }
 
     Ok(PipelineConfig {
@@ -508,6 +629,40 @@ fn names_or_none(names: &[&str]) -> String {
     } else {
         names.join(", ")
     }
+}
+
+/// The S3 Vectors bucket/index name rule (mirrors ops::validate_name — the
+/// pipeline layer cannot depend on the HTTP layer, and the rule is 3 lines).
+fn is_aws_name(name: &str) -> bool {
+    (3..=63).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+}
+
+/// Base part of a derived index name: the same charset, but 1..=54 — the
+/// `-{8 hex}` derived-key suffix must still fit inside the 63-char cap.
+fn is_derived_name_base(name: &str) -> bool {
+    (1..=54).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
 }
 
 /// Line of a whole-file `toml::from_str` error, from its span.
@@ -689,9 +844,97 @@ index-prefix = "docs"
         assert!(
             msg.contains(
                 "[ingest.d]: unknown field 'chunkder' (allowed: scope, extract, chunk, \
-                 embedders, merge, index-prefix)"
+                 embedders, merge, index-prefix, scan_interval_secs, max_file_size_mb, retries, \
+                 extract_timeout_secs, store_chunk_text)"
             ),
             "{msg}"
+        );
+    }
+
+    #[test]
+    fn ingest_tuning_defaults_and_overrides() {
+        // defaults apply when absent
+        let cfg =
+            parse("[ingest.docs]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n")
+                .unwrap();
+        let d = &cfg.ingest["docs"];
+        assert_eq!(d.scan_interval_secs, 30);
+        assert_eq!(d.max_file_size_mb, 200);
+        assert_eq!(d.retries, 3);
+        assert_eq!(d.extract_timeout_secs, 120);
+        assert!(d.store_chunk_text);
+        // explicit overrides parse
+        let cfg = parse(
+            "[ingest.docs]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
+             scan_interval_secs = 5\nmax_file_size_mb = 1\nretries = 0\n\
+             extract_timeout_secs = 7\nstore_chunk_text = false\n",
+        )
+        .unwrap();
+        let d = &cfg.ingest["docs"];
+        assert_eq!(d.scan_interval_secs, 5);
+        assert_eq!(d.max_file_size_mb, 1);
+        assert_eq!(d.retries, 0);
+        assert_eq!(d.extract_timeout_secs, 7);
+        assert!(!d.store_chunk_text);
+        // zero-valued periods are refused (busy-loop guard)
+        for bad in [
+            "scan_interval_secs = 0",
+            "max_file_size_mb = 0",
+            "extract_timeout_secs = 0",
+        ] {
+            let err = parse(&format!(
+                "[ingest.docs]\nchunk = {{ kind = \"token-window\", size = 8, overlap = 2 }}\n{bad}\n"
+            ))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains(bad.split_once(" =").unwrap().0),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn ingest_bucket_and_derived_name_gates() {
+        // invalid bucket name (auto-created bucket must be creatable)
+        let err = parse(
+            "[ingest.Bad_Name]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("bucket name 'Bad_Name' is invalid"),
+            "{err}"
+        );
+        // embedder instance names feed derived index names when no prefix
+        let err = parse(
+            "[embedder.Text]\nkind = \"ort\"\nmodel = \"gte-multilingual-base\"\n\
+             [ingest.docs]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
+             embedders = [\"Text\"]\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("embedder instance name 'Text' cannot name a derived index"),
+            "{err}"
+        );
+        // an index-prefix takes over the check and a matching one passes
+        let ok = parse(
+            "[embedder.Text]\nkind = \"ort\"\nmodel = \"gte-multilingual-base\"\n\
+             [ingest.docs]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
+             embedders = [\"Text\"]\nindex-prefix = \"docs\"\n",
+        )
+        .unwrap();
+        assert_eq!(ok.ingest["docs"].index_prefix.as_deref(), Some("docs"));
+        // ...but a too-long prefix cannot fit the derived suffix
+        let long = "x".repeat(55);
+        let err = parse(&format!(
+            "[ingest.docs]\nchunk = {{ kind = \"token-window\", size = 8, overlap = 2 }}\n\
+             index-prefix = \"{long}\"\n"
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot name a derived index"),
+            "{err}"
         );
     }
 
@@ -728,7 +971,7 @@ index-prefix = "docs"
         );
         assert!(msg.contains("at line 1"), "{msg}");
         // "auto" needs no instance
-        let ok = "[ingest.d]\nextract = { default = \"auto\" }\nchunk = { kind = \"token-window\", \
+        let ok = "[ingest.ddd]\nextract = { default = \"auto\" }\nchunk = { kind = \"token-window\", \
                   size = 8, overlap = 2 }\n";
         assert!(parse(ok).is_ok());
     }
@@ -938,10 +1181,10 @@ index-prefix = "docs"
         // arrives with M3 image extractors; the empty-list semantics stay
         // pure-protocol.)
         let text = "[extractor.t]\nkind = \"txt\"\n\n[embedder.e]\nkind = \"ort\"\n\
-                    [ingest.d]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
+                    [ingest.ddd]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
                     extract = { txt = \"t\" }\nembedders = [\"e\"]\n";
         let cfg = parse(text).unwrap();
-        assert_eq!(cfg.ingest["d"].embedders, ["e"]);
+        assert_eq!(cfg.ingest["ddd"].embedders, ["e"]);
         // and the negative: referencing an undeclared embedder still fails
         let bad = text.replace("embedders = [\"e\"]", "embedders = [\"nope\"]");
         assert!(parse(&bad).is_err());
@@ -960,22 +1203,23 @@ index-prefix = "docs"
             "{msg}"
         );
         // absent merge defaults to rrf
-        let cfg = parse("[ingest.d]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n")
-            .unwrap();
-        assert_eq!(cfg.ingest["d"].merge, Merge::Rrf);
+        let cfg =
+            parse("[ingest.ddd]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n")
+                .unwrap();
+        assert_eq!(cfg.ingest["ddd"].merge, Merge::Rrf);
     }
 
     // ---- fingerprint ----
 
     fn fp_of(text: &str) -> String {
         let cfg = parse(text).unwrap();
-        cfg.fingerprint("d").unwrap()
+        cfg.fingerprint("ddd").unwrap()
     }
 
     fn base_ingest() -> String {
         // 5 lines so the ingest section starts at a known line
         format!(
-            "[extractor.a]\nkind = \"txt\"\n\n[ingest.d]\nchunk = {{ kind = \"token-window\", \
+            "[extractor.a]\nkind = \"txt\"\n\n[ingest.ddd]\nchunk = {{ kind = \"token-window\", \
              size = 8, overlap = 2 }}\nextract = {{ txt = \"a\" }}\n"
         )
     }
@@ -984,7 +1228,7 @@ index-prefix = "docs"
     fn fingerprint_stable_across_key_order_and_irrelevant_fields() {
         let a = base_ingest();
         // same semantics: map key order swapped, merge/scope/index-prefix added
-        let b = "[extractor.a]\nkind = \"txt\"\n\n[ingest.d]\nchunk = { kind = \"token-window\", \
+        let b = "[extractor.a]\nkind = \"txt\"\n\n[ingest.ddd]\nchunk = { kind = \"token-window\", \
                  size = 8, overlap = 2 }\nextract = { txt = \"a\" }\nmerge = \"rrf\"\n\
                  scope = \"x/**\"\nindex-prefix = \"x\"\n";
         assert_eq!(fp_of(&a), fp_of(&b));
@@ -1003,11 +1247,11 @@ index-prefix = "docs"
         // extractor instance config (name same, section content identical
         // here — so add a DIFFERENT referenced instance instead)
         let other = "[extractor.a]\nkind = \"txt\"\n\n[extractor.b]\nkind = \"txt\"\n\n\
-                     [ingest.d]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
+                     [ingest.ddd]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
                      extract = { txt = \"b\" }\n";
         assert_ne!(fp_of(&base), fp_of(&other));
         // dropping the extractor reference entirely
-        let none = "[extractor.a]\nkind = \"txt\"\n\n[ingest.d]\nchunk = { kind = \
+        let none = "[extractor.a]\nkind = \"txt\"\n\n[ingest.ddd]\nchunk = { kind = \
                     \"token-window\", size = 8, overlap = 2 }\n";
         assert_ne!(fp_of(&base), fp_of(&none));
     }

@@ -130,6 +130,113 @@ pub struct IndexMeta {
     /// Echo-only — see BucketMeta::default_index_mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_mode: Option<String>,
+    /// File-layer derivation stamp (M2 T3, design.md §5.10.5): present iff
+    /// this index was CREATED by the ingest worker as an embedder-derived
+    /// index. The derived key (`hash(model, dim, embedder config)`) is the
+    /// index's IDENTITY — the per-batch write path re-validates it and GC
+    /// (T7) only touches indexes carrying this stamp. Serde is deliberately
+    /// tolerant in BOTH directions: pre-T3 index.json files parse without
+    /// it (`default`), and unknown future fields are ignored (module-level
+    /// forward-compat rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_vf_derived: Option<DerivedIndexInfo>,
+}
+
+/// The `x_vf_derived` payload (see `IndexMeta.x_vf_derived`).
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
+pub struct DerivedIndexInfo {
+    /// Full sha256-hex derived key `hash(model, dim, embedder config)`.
+    pub key: String,
+    /// Embedder INSTANCE name the index is fanned out from.
+    pub embedder: String,
+    /// Model identity string (ort: model name or path; openai: model).
+    pub model: String,
+    /// Declared/probed output dimensionality.
+    pub dim: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Source markers (M2 T3, design.md §5.10.1 / §5.10.5)
+// ---------------------------------------------------------------------------
+
+/// Source lifecycle state, KB-aligned naming (appendix E.2). The transition
+/// RULES live in `crate::ingest::marker` (the mechanism layer); this is the
+/// persisted data model only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SourceStatus {
+    /// Known to the scanner, not yet picked up (or re-detected as changed).
+    #[serde(rename = "PENDING")]
+    Pending,
+    /// A worker owns it right now.
+    #[serde(rename = "IN_PROGRESS")]
+    InProgress,
+    /// Fan-out completed for SOME embedders; the rest are parked with a
+    /// statusReason.
+    #[serde(rename = "PARTIALLY_INDEXED")]
+    PartiallyIndexed,
+    /// Every listed embedder's chunks are in its derived index.
+    #[serde(rename = "INDEXED")]
+    Indexed,
+    /// Attempts exhausted (poison); never auto-retried.
+    #[serde(rename = "FAILED")]
+    Failed,
+    /// The object vanished from the instance root; GC (T7) owns the rest.
+    #[serde(rename = "DELETING")]
+    Deleting,
+}
+
+impl SourceStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SourceStatus::Pending => "PENDING",
+            SourceStatus::InProgress => "IN_PROGRESS",
+            SourceStatus::PartiallyIndexed => "PARTIALLY_INDEXED",
+            SourceStatus::Indexed => "INDEXED",
+            SourceStatus::Failed => "FAILED",
+            SourceStatus::Deleting => "DELETING",
+        }
+    }
+}
+
+impl std::fmt::Display for SourceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One Source marker: the no-queue ingest bookkeeping (§5.10.5 — "待摄取 =
+/// 无标记，或签名与标记不符"). Persisted at
+/// `.vectorfs/buckets/<vb>/sources/<keyHash>.json` via the catalog store.
+///
+/// `etag_sig` is the CHEAP change signal (real etag when the backend lists
+/// one, else a size+mtime pseudo-signature — see `ingest::marker::signature_of`);
+/// `content_hash` is the DEFINITIVE sha256 of the bytes, computed inside the
+/// job and used for the metadata-only-rewrite skip.
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
+pub struct SourceMarker {
+    /// Full object key relative to the instance root (S3-semantic key).
+    pub object_key: String,
+    /// Cheap listing signature at the last observed state.
+    pub etag_sig: String,
+    /// sha256 hex of the object bytes at the last completed ingest.
+    #[serde(default)]
+    pub content_hash: String,
+    /// Pipeline fingerprint of the ingest section that owns this marker.
+    pub pipeline_fingerprint: String,
+    pub status: SourceStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
+    #[serde(default)]
+    pub retries: u32,
+    #[serde(default)]
+    pub retries_exhausted: bool,
+    /// RFC3339 (UTC) of the last marker write.
+    pub updated_at: String,
+    /// Per-modality chunk counts of the last (partial or full) completion —
+    /// the raw material for GetSource's `chunks[{index,count}]` (appendix
+    /// E.2; the wire adapter lands with T6). Absent until something lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<BTreeMap<String, u32>>,
 }
 
 #[derive(Debug)]
@@ -290,6 +397,70 @@ impl Storage {
 
     fn key(&self, rel: &str) -> object_store::path::Path {
         self.backend.object_key(rel)
+    }
+
+    // ---- Source markers (M2 T3; catalog objects like the metas above) ----
+
+    fn source_key(&self, vb: &str, key_hash: &str) -> object_store::path::Path {
+        self.key(&format!("buckets/{vb}/sources/{key_hash}.json"))
+    }
+
+    /// Load one Source marker; Ok(None) = no marker (the no-queue "pending"
+    /// signal, §5.10.5).
+    pub async fn load_source(
+        &self,
+        vb: &str,
+        key_hash: &str,
+    ) -> Result<Option<SourceMarker>, StoreError> {
+        backends::read_json(&*self.catalog, &self.source_key(vb, key_hash))
+            .await
+            .map_err(internal)
+    }
+
+    /// Unconditional marker overwrite (the single-writer LOCK serializes
+    /// writers; markers are never concurrently written by design).
+    pub async fn save_source(
+        &self,
+        vb: &str,
+        key_hash: &str,
+        marker: &SourceMarker,
+    ) -> Result<(), StoreError> {
+        let json = serde_json::to_vec_pretty(marker).map_err(internal)?;
+        backends::put_json_overwrite(&*self.catalog, &self.source_key(vb, key_hash), &json)
+            .await
+            .map_err(internal)
+    }
+
+    /// Every Source marker of one bucket. Suffix-parsed like list_buckets
+    /// (S3 keys carry the configured prefix; fixed positions would drift).
+    pub async fn list_sources(&self, vb: &str) -> Result<Vec<SourceMarker>, StoreError> {
+        let mut out = Vec::new();
+        let prefix = self.key(&format!("buckets/{vb}/sources"));
+        for key in backends::list_prefix(&*self.catalog, &prefix)
+            .await
+            .map_err(internal)?
+        {
+            // …/buckets/<vb>/sources/<keyHash>.json
+            let segs = key.as_ref().split('/').collect::<Vec<_>>();
+            if segs.len() >= 3
+                && segs[segs.len() - 2] == "sources"
+                && segs.last().is_some_and(|s| s.ends_with(".json"))
+                && let Some(m) = backends::read_json::<SourceMarker>(&*self.catalog, &key)
+                    .await
+                    .map_err(internal)?
+            {
+                out.push(m);
+            }
+        }
+        out.sort_by(|a, b| a.object_key.cmp(&b.object_key));
+        Ok(out)
+    }
+
+    /// Remove one marker (idempotent; the delete path rolls T7's GC).
+    pub async fn delete_source(&self, vb: &str, key_hash: &str) -> Result<(), StoreError> {
+        backends::delete_object(&*self.catalog, &self.source_key(vb, key_hash))
+            .await
+            .map_err(internal)
     }
 
     // ---- catalog: management-plane enumeration & removal (M1 T3, design.md §5.3) ----
@@ -1366,6 +1537,7 @@ mod tests {
                 distance_metric: "euclidean".into(),
                 non_filterable_metadata_keys: None,
                 index_mode: None,
+                x_vf_derived: None,
             })
             .await
             .unwrap();
@@ -1783,4 +1955,118 @@ mod tests {
     }
 
     use serde_json::json;
+
+    // ---- M2 T3: Source markers + derived-index meta tolerance ----
+
+    fn marker(object_key: &str, status: SourceStatus) -> SourceMarker {
+        SourceMarker {
+            object_key: object_key.to_string(),
+            etag_sig: "size=1;mtime_ns=2".into(),
+            content_hash: "ab".repeat(32),
+            pipeline_fingerprint: "fp".into(),
+            status,
+            status_reason: None,
+            retries: 0,
+            retries_exhausted: false,
+            updated_at: "2026-11-05T00:00:00.000Z".into(),
+            chunks: Some(BTreeMap::from([("text".to_string(), 3)])),
+        }
+    }
+
+    #[tokio::test]
+    async fn source_marker_round_trip_and_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::file(dir.path());
+        // absent -> None
+        assert!(s.load_source("vb", "deadbeef").await.unwrap().is_none());
+        // save two, load both back byte-equal on the fields that matter
+        let m1 = marker("docs/a.txt", SourceStatus::Pending);
+        let m2 = marker("docs/b.txt", SourceStatus::Indexed);
+        s.save_source("vb", "hash0000000000001", &m1).await.unwrap();
+        s.save_source("vb", "hash0000000000002", &m2).await.unwrap();
+        assert_eq!(
+            s.load_source("vb", "hash0000000000001").await.unwrap(),
+            Some(m1.clone())
+        );
+        let listed = s.list_sources("vb").await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].object_key, "docs/a.txt"); // sorted by object key
+        // overwrite + delete + idempotent re-delete
+        let mut m1b = m1.clone();
+        m1b.status = SourceStatus::Indexed;
+        s.save_source("vb", "hash0000000000001", &m1b)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.load_source("vb", "hash0000000000001")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SourceStatus::Indexed
+        );
+        s.delete_source("vb", "hash0000000000002").await.unwrap();
+        s.delete_source("vb", "hash0000000000002").await.unwrap();
+        assert_eq!(s.list_sources("vb").await.unwrap().len(), 1);
+        // markers live under the system prefix, never in the user namespace
+        let entries = std::fs::read_dir(dir.path()).unwrap().flatten();
+        assert_eq!(
+            entries.filter(|e| e.file_name() != ".vectorfs").count(),
+            0,
+            "marker writes must stay inside .vectorfs/"
+        );
+    }
+
+    #[test]
+    fn index_meta_tolerates_missing_and_unknown_derived_field() {
+        // pre-T3 shape: no x_vf_derived — parses with None (old index.json)
+        let old = r#"{
+            "vector_bucket_name": "vb", "index_name": "ix",
+            "index_arn": "arn", "creation_time_rfc3339": "t",
+            "creation_time_epoch": 1.0, "data_type": "float32",
+            "dimension": 8, "distance_metric": "cosine"
+        }"#;
+        let meta: IndexMeta = serde_json::from_str(old).unwrap();
+        assert!(meta.x_vf_derived.is_none());
+        // unknown FUTURE fields are ignored (forward-compat, §5.10.5):
+        // splice a new member INSIDE the object
+        let future = old.replace(
+            "\"distance_metric\": \"cosine\"",
+            "\"distance_metric\": \"cosine\", \"x_vf_next_big_thing\": {}",
+        );
+        let meta: IndexMeta = serde_json::from_str(&future).unwrap();
+        assert!(meta.x_vf_derived.is_none());
+        // derived stamp round-trips
+        let with = old.replace(
+            "\"distance_metric\": \"cosine\"",
+            &format!(
+                "\"distance_metric\": \"cosine\", \"x_vf_derived\": {{\"key\":\"{}\",\
+                 \"embedder\":\"e\",\"model\":\"m\",\"dim\":8}}",
+                "0".repeat(64)
+            ),
+        );
+        let meta: IndexMeta = serde_json::from_str(&with).unwrap();
+        let d = meta.x_vf_derived.unwrap();
+        assert_eq!(d.dim, 8);
+        assert_eq!(d.key.len(), 64);
+    }
+
+    #[test]
+    fn source_status_wire_names_are_kb_aligned() {
+        for (s, want) in [
+            (SourceStatus::Pending, "PENDING"),
+            (SourceStatus::InProgress, "IN_PROGRESS"),
+            (SourceStatus::PartiallyIndexed, "PARTIALLY_INDEXED"),
+            (SourceStatus::Indexed, "INDEXED"),
+            (SourceStatus::Failed, "FAILED"),
+            (SourceStatus::Deleting, "DELETING"),
+        ] {
+            assert_eq!(serde_json::to_value(s).unwrap(), json!(want));
+            assert_eq!(
+                serde_json::from_value::<SourceStatus>(json!(want)).unwrap(),
+                s
+            );
+            assert_eq!(s.to_string(), want);
+        }
+    }
 }

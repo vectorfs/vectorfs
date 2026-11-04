@@ -77,6 +77,11 @@ pub struct AppState {
     pub region: String,
     pub account: String,
     pub trace: bool,
+    /// Ingest runtime handle (M2 T3): present iff the config has ingest
+    /// sections AND serve wired the scheduler. The pure-protocol face (and
+    /// every pre-T3 construction site) keeps `None`; T6's `vf put` /
+    /// PutSource use `wake()` for the immediate-trigger path.
+    pub ingest: Option<Arc<crate::ingest::IngestHandle>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -978,6 +983,9 @@ pub async fn create_index(
                 .clone()
                 .unwrap_or_else(|| "ENHANCED".into()),
         ),
+        // Protocol-face indexes carry no ingest derivation stamp (that is
+        // the ingest worker's marker for ITS indexes, store.rs).
+        x_vf_derived: None,
     };
     state.storage.create_index(&meta).await?;
 
@@ -2036,6 +2044,7 @@ mod tests {
             region: "us-east-1".into(),
             account: "000000000000".into(),
             trace: false,
+            ingest: None,
         }
     }
 
@@ -2047,6 +2056,7 @@ mod tests {
             region: "us-east-1".into(),
             account: "000000000000".into(),
             trace: false,
+            ingest: None,
         }
     }
 

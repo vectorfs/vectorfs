@@ -103,17 +103,23 @@ pub fn locate_library() -> Result<LibrarySource, String> {
     Ok(LibrarySource::System)
 }
 
-/// Per-kind config struct (§5.10.4: `{ kind, model, path?, offline }`).
+/// Per-kind config struct (§5.10.4: `{ kind, model?, path?, offline }`).
 /// `path` points at a model DIRECTORY in the prefetch layout; it is the
 /// air-gapped / self-managed escape hatch and bypasses the built-in table
 /// (license then being the operator's audit, warned by `pipelines check`).
+///
+/// `model` is OPTIONAL. The four resolution cases (see [`OrtEmbedder::new`]):
+/// path+model / path only / model only / neither (→ the M2 default model).
+/// A path-only embedder must NOT inherit the default model name: the
+/// §5.10.4 air-gapped shape (`path = "/models/bge-m3"`, no `model`) would
+/// otherwise be dim-cross-checked against gte's 768 and refuse to start.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrtConfig {
     pub kind: OrtTag,
     /// Built-in model name (see `pipeline::models::BUILTIN_MODELS`).
-    #[serde(default = "default_model")]
-    pub model: String,
+    #[serde(default)]
+    pub model: Option<String>,
     /// Local model directory override (layout: model.onnx + tokenizer.json).
     #[serde(default)]
     pub path: Option<String>,
@@ -123,9 +129,41 @@ pub struct OrtConfig {
     pub offline: bool,
 }
 
-/// The M2 default model (§5.10.4 sample config).
-fn default_model() -> String {
+/// The M2 default model (§5.10.4 sample config) — used only when BOTH
+/// `model` and `path` are absent.
+pub(crate) fn default_model() -> String {
     "gte-multilingual-base".to_string()
+}
+
+/// Resolved model identity + directory (the four-case matrix of
+/// `model` × `path`). `name` feeds metadata / derivation / the built-in
+/// dim cross-check (only when it matches a table entry — path-only
+/// embedders take their name from the directory and are never
+/// cross-checked against a name they never declared).
+pub(crate) fn resolve_model(cfg: &OrtConfig, models_dir: &Path) -> (String, PathBuf) {
+    match (&cfg.model, &cfg.path) {
+        (Some(m), Some(p)) => (m.clone(), PathBuf::from(p)),
+        (None, Some(p)) => (resolve_model_name(cfg), PathBuf::from(p)),
+        (Some(m), None) => (m.clone(), models_dir.join(m)),
+        (None, None) => {
+            let m = default_model();
+            let dir = models_dir.join(&m);
+            (m, dir)
+        }
+    }
+}
+
+/// Name half of [`resolve_model`] (no filesystem needed) — the identity
+/// recorded in `x-vf-model` metadata and `x_vf_derived`.
+pub(crate) fn resolve_model_name(cfg: &OrtConfig) -> String {
+    match (&cfg.model, &cfg.path) {
+        (Some(m), _) => m.clone(),
+        (None, Some(p)) => Path::new(p)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "local-model".to_string()),
+        (None, None) => default_model(),
+    }
 }
 
 /// Literal tag: only deserializes from `"ort"`.
@@ -221,29 +259,27 @@ impl OrtEmbedder {
     /// `<data-dir>/.vectorfs/models` default — resolution is the caller's
     /// job so config parsing stays side-effect-free).
     pub async fn new(cfg: &OrtConfig, models_dir: &Path) -> Result<Self, PipelineError> {
-        // ---- model directory ----
-        let dir: PathBuf = match &cfg.path {
-            Some(p) => PathBuf::from(p),
-            None => {
-                let dir = models_dir.join(&cfg.model);
-                let ready = super::super::models::builtin(&cfg.model)
-                    .map(|m| super::super::models::is_ready(&dir, m))
-                    .unwrap_or(false);
-                if !ready {
-                    if cfg.offline {
-                        return Err(PipelineError::embed(format!(
-                            "model '{}' is not present under {} and offline = true forbids the \
-                             network — prefetch it on a connected machine (vectorfs init --preset \
-                             text-rag) or set path = \"…\" to a local copy",
-                            cfg.model,
-                            dir.display()
-                        )));
-                    }
-                    super::super::models::prefetch(&cfg.model, models_dir).await?;
+        // ---- model identity + directory (four-case matrix, resolve_model) ----
+        let (name, dir) = resolve_model(cfg, models_dir);
+        // Only a table model resolved to the cache dir can be
+        // prefetched/ready-checked; an explicit `path` must simply exist.
+        if cfg.path.is_none() {
+            let ready = super::super::models::builtin(&name)
+                .map(|m| super::super::models::is_ready(&dir, m))
+                .unwrap_or(false);
+            if !ready {
+                if cfg.offline {
+                    return Err(PipelineError::embed(format!(
+                        "model '{}' is not present under {} and offline = true forbids the \
+                         network — prefetch it on a connected machine (vectorfs init --preset \
+                         text-rag) or set path = \"…\" to a local copy",
+                        name,
+                        dir.display()
+                    )));
                 }
-                dir
+                super::super::models::prefetch(&name, models_dir).await?;
             }
-        };
+        }
         let model_path = dir.join("model.onnx");
         let tokenizer_path = dir.join("tokenizer.json");
         for p in [&model_path, &tokenizer_path] {
@@ -260,19 +296,20 @@ impl OrtEmbedder {
         }
 
         // ---- dylib + session + probe (CPU-heavy: off the reactor) ----
-        let cfg = cfg.clone();
         let model_path = model_path.display().to_string();
         let tokenizer_path = tokenizer_path.display().to_string();
         tokio::task::spawn_blocking(move || {
-            Self::load_and_probe(&cfg, &model_path, &tokenizer_path)
+            Self::load_and_probe(&name, &model_path, &tokenizer_path)
         })
         .await
         .map_err(|e| PipelineError::embed(format!("ort load task panicked: {e}")))?
     }
 
-    /// Blocking half of construction (inside `spawn_blocking`).
+    /// Blocking half of construction (inside `spawn_blocking`). `name` is the
+    /// RESOLVED model identity (see [`resolve_model`]) — the built-in dim
+    /// cross-check fires only when that name matches a table entry.
     fn load_and_probe(
-        cfg: &OrtConfig,
+        name: &str,
         model_path: &str,
         tokenizer_path: &str,
     ) -> Result<Self, PipelineError> {
@@ -307,14 +344,14 @@ impl OrtEmbedder {
 
         // ---- dim probe: static last dim of output[0] ----
         let dim = probe_dim(&session)?;
-        if let Some(declared) = super::super::models::builtin(&cfg.model)
+        if let Some(declared) = super::super::models::builtin(name)
             && declared.dim != dim
         {
             return Err(PipelineError::embed(format!(
                 "model '{}' declares dim {} but its ONNX graph outputs dim {dim} — refusing \
                  to start (mismatched vectors would silently corrupt the index; re-download \
                  the model or fix the configuration)",
-                cfg.model, declared.dim
+                name, declared.dim
             )));
         }
         let _ = &source; // resolution snapshot kept for diagnostics above
@@ -556,7 +593,7 @@ pub(crate) mod tests {
     pub(crate) fn fixture_config() -> OrtConfig {
         OrtConfig {
             kind: OrtTag::Ort,
-            model: "tiny-fixture".to_string(),
+            model: Some("tiny-fixture".to_string()),
             path: Some(fixture_dir().display().to_string()),
             offline: true,
         }
@@ -619,7 +656,7 @@ pub(crate) mod tests {
         // directory holds a different-dim graph.
         let cfg = OrtConfig {
             kind: OrtTag::Ort,
-            model: "gte-multilingual-base".to_string(),
+            model: Some("gte-multilingual-base".to_string()),
             path: Some(fixture_dir().display().to_string()),
             offline: true,
         };
@@ -648,7 +685,7 @@ pub(crate) mod tests {
         .unwrap();
         let cfg = OrtConfig {
             kind: OrtTag::Ort,
-            model: "tiny-fixture".to_string(),
+            model: Some("tiny-fixture".to_string()),
             path: Some(dir.path().display().to_string()),
             offline: true,
         };
@@ -664,7 +701,7 @@ pub(crate) mod tests {
     async fn offline_missing_model_is_an_error() {
         let cfg = OrtConfig {
             kind: OrtTag::Ort,
-            model: "gte-multilingual-base".to_string(),
+            model: Some("gte-multilingual-base".to_string()),
             path: None,
             offline: true,
         };
@@ -689,7 +726,7 @@ pub(crate) mod tests {
         .unwrap();
         let cfg = OrtConfig {
             kind: OrtTag::Ort,
-            model: "gte-multilingual-base".to_string(),
+            model: Some("gte-multilingual-base".to_string()),
             path: Some(
                 dir.path()
                     .join("gte-multilingual-base")
@@ -710,7 +747,7 @@ pub(crate) mod tests {
     fn config_roundtrip_and_guards() {
         // defaults: model = gte-multilingual-base, offline = false
         let cfg: OrtConfig = toml::from_str("kind = \"ort\"").unwrap();
-        assert_eq!(cfg.model, "gte-multilingual-base");
+        assert_eq!(cfg.model.as_deref(), None); // path-only default: no name asserted until resolution
         assert!(!cfg.offline);
         assert!(cfg.path.is_none());
         // full form round-trips flat (fingerprint-facing)
@@ -754,7 +791,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = OrtConfig {
             kind: OrtTag::Ort,
-            model: "gte-multilingual-base".to_string(),
+            model: Some("gte-multilingual-base".to_string()),
             path: None,
             offline: false,
         };
