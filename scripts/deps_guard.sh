@@ -18,10 +18,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # --workspace covers all members; spike/ is excluded from the workspace and
-# thus not checked (throwaway crate, not product). Lines are normalized:
-# `--prefix none` emits `name vX.Y.Z`, repeating instances as `name vX.Y.Z (*)`
-# — the annotation is stripped so dedup compares name+version only.
-list=$(cargo tree --workspace --prefix none | sed 's/ (.*)$//' | sort -u)
+# thus not checked (throwaway crate, not product). Lines are normalized to
+# `name vX.Y.Z` by taking the first two whitespace fields — this survives both
+# the `(*)` repeat marker and ANSI color codes (CI sets CARGO_TERM_COLOR=always,
+# which broke the old `sed 's/ (.*)$//'` strip and false-flagged same-version
+# multi-path entries as version conflicts). `--color never` belt-and-braces.
+list=$(cargo tree --workspace --prefix none --color never \
+    | awk 'NF>=2 && $2 ~ /^v[0-9]/ {print $1, $2}' | sort -u)
 total=$(grep -c ' v' <<<"$list" || true)
 
 echo "== deps_guard summary =="
