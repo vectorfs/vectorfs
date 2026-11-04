@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """boto3 conformance check against an s3vectors-compatible server (M0 Task C
-core 9 steps + M1 T3 management 10 steps = 19 steps).
+core 9 steps + M1 T3 management 9 steps + M1 T4 vector data plane 7 steps
+= 26 steps).
 
 Talks to an ALREADY-RUNNING server (default http://127.0.0.1:8787) — this script
 owns no server lifecycle. Each step prints PASS/FAIL; exit code 1 on any FAIL.
@@ -441,7 +442,186 @@ def main() -> int:
 
     step(18, "errors: 404 gets, 409 delete-non-empty", m18)
 
-    def m19():
+    # ------------------------------------------------------------------
+    # M1 T4 vector data-plane section (steps 19-25): GetVectors roundtrip +
+    # missing-key omission, ListVectors pagination + parallel segments,
+    # DeleteVectors + verification, and PutVectors over-limit negatives.
+    # Range violations that botocore itself validates client-side (keys>100
+    # / >500, maxResults range, segment pairing is NOT client-checked) cannot
+    # be driven through boto3 — those live in the tower oneshot unit tests
+    # (vf/src/ops.rs). Document-typed metadata limits (2 KB filterable,
+    # nested-object types) ARE drivable and checked server-side here.
+    # ------------------------------------------------------------------
+
+    def v20():
+        # grow the key space: v00..v09 plus a punctuation/unicode key
+        vectors = [{"key": f"{prefix}-v{i:02d}",
+                    "data": {"float32": [float(i), 1.0, 0.0, 0.0]}}
+                   for i in range(10)]
+        hostile = "sp\"ace'/🎯\u00fc"
+        vectors.append({"key": hostile, "data": {"float32": [9.0, 9.0, 0.0, 0.0]},
+                        "metadata": {"kind": "hostile"}})
+        client.put_vectors(vectorBucketName=bucket, indexName=index, vectors=vectors)
+        # every key now in the index: a, b, c (core section) + the 11 new ones
+        state["vec_keys"] = sorted(["a", "b", "c"] + [v["key"] for v in vectors])
+        # get roundtrip: found keys in request order with data+metadata, the
+        # missing key OMITTED (the model has no per-entry status member)
+        resp = client.get_vectors(
+            vectorBucketName=bucket, indexName=index,
+            keys=[hostile, f"{prefix}-ghost", "a", "b"],
+            returnData=True, returnMetadata=True,
+        )
+        OBS.append(f"get_vectors entry fields: {sorted(resp['vectors'][0])}")
+        keys = [v["key"] for v in resp["vectors"]]
+        assert keys == [hostile, "a", "b"], keys
+        a = next(v for v in resp["vectors"] if v["key"] == "a")
+        assert a["data"]["float32"] == [0.0, 1.0, 0.0, 0.0], a["data"]
+        assert a["metadata"] == {"tag": "a-new", "note": "replaced"}, a["metadata"]
+        b = next(v for v in resp["vectors"] if v["key"] == "b")
+        assert "metadata" not in b and b["data"]["float32"] == [0.0, 0.0, 0.0, 1.0], b
+        h = next(v for v in resp["vectors"] if v["key"] == hostile)
+        assert h["metadata"] == {"kind": "hostile"}, h
+        # defaults: neither member present
+        plain = client.get_vectors(vectorBucketName=bucket, indexName=index,
+                                   keys=["a"])["vectors"][0]
+        assert plain == {"key": "a"}, plain
+        return f"{len(state['vec_keys'])} keys stocked; order+omission+defaults ok"
+
+    step(19, "get_vectors: roundtrip, missing key omitted, default members absent", v20)
+
+    def v21():
+        # page 1: maxResults=2 -> 2 sorted keys + nextToken
+        resp = client.list_vectors(vectorBucketName=bucket, indexName=index, maxResults=2)
+        keys = [v["key"] for v in resp["vectors"]]
+        OBS.append(f"list_vectors entry fields: {sorted(resp['vectors'][0])}")
+        assert keys == state["vec_keys"][:2], keys
+        assert "nextToken" in resp, resp
+        state["list_token"] = resp["nextToken"]
+        assert sorted(resp["vectors"][0]) == ["key"], "default list carries only key"
+        return f"page1={keys}"
+
+    step(20, "list_vectors page 1 (maxResults=2, key-ascending)", v21)
+
+    def v22():
+        # walk to the end through nextToken; union must be every key, sorted
+        seen, token, pages = list(state["vec_keys"][:2]), state["list_token"], 1
+        while token:
+            resp = client.list_vectors(vectorBucketName=bucket, indexName=index,
+                                       maxResults=2, nextToken=token)
+            page = [v["key"] for v in resp["vectors"]]
+            assert page == sorted(page), f"page not sorted: {page}"
+            seen.extend(page)
+            token = resp.get("nextToken")
+            pages += 1
+            assert pages < 30, "pagination did not terminate"
+        assert seen == state["vec_keys"], (seen, state["vec_keys"])
+        # returnData/returnMetadata members come back when asked for
+        # (first key ascending is "a" — its current row is s6's upsert)
+        resp = client.list_vectors(vectorBucketName=bucket, indexName=index,
+                                   maxResults=1, returnData=True, returnMetadata=True)
+        v0 = resp["vectors"][0]
+        assert v0["key"] == "a", v0
+        assert v0["data"]["float32"] == [0.0, 1.0, 0.0, 0.0], v0
+        assert v0["metadata"] == {"tag": "a-new", "note": "replaced"}, v0
+        return f"{pages} pages, {len(seen)} keys, data+metadata members verified"
+
+    step(21, "list_vectors: paginate to end, order + returnData/Metadata", v22)
+
+    def v23():
+        # parallel segments: segmentCount=2, both workers paginate their own
+        # segment; union == full set, disjoint, and a repeat call is identical
+        def seg(seg_idx):
+            out, token = [], None
+            while True:
+                kw = {"vectorBucketName": bucket, "indexName": index, "segmentCount": 2,
+                      "segmentIndex": seg_idx, "maxResults": 3}
+                if token:
+                    kw["nextToken"] = token
+                resp = client.list_vectors(**kw)
+                out.extend(v["key"] for v in resp["vectors"])
+                token = resp.get("nextToken")
+                if not token:
+                    return out
+        seg0 = seg(0)
+        seg1 = seg(1)
+        assert sorted(seg0 + seg1) == state["vec_keys"], (seg0, seg1)
+        assert not set(seg0) & set(seg1), "segments overlap"
+        assert seg(0) == seg0, "segment assignment is not stable"
+        return (f"seg0={len(seg0)} seg1={len(seg1)} union={len(seg0)+len(seg1)} "
+                f"disjoint+stable")
+
+    step(22, "list_vectors segments: union=full, disjoint, stable", v23)
+
+    def v24():
+        # delete the hostile key + b; deletion is idempotent and visible
+        hostile = "sp\"ace'/🎯\u00fc"
+        client.delete_vectors(vectorBucketName=bucket, indexName=index,
+                              keys=[hostile, "b", f"{prefix}-ghost"])
+        client.delete_vectors(vectorBucketName=bucket, indexName=index,
+                              keys=[hostile])  # idempotent repeat
+        resp = client.get_vectors(vectorBucketName=bucket, indexName=index,
+                                  keys=[hostile, "b", "c"])
+        assert [v["key"] for v in resp["vectors"]] == ["c"], resp
+        keys = [v["key"] for v in client.list_vectors(
+            vectorBucketName=bucket, indexName=index, maxResults=1000)["vectors"]]
+        assert hostile not in keys and "b" not in keys, keys
+        state["vec_keys"] = keys
+        # delete -> put rebuilds the row normally
+        client.put_vectors(vectorBucketName=bucket, indexName=index,
+                           vectors=[{"key": hostile, "data": {"float32": [1.0, 2.0, 3.0, 4.0]},
+                                     "metadata": {"round": 2}}])
+        back = client.get_vectors(vectorBucketName=bucket, indexName=index,
+                                  keys=[hostile], returnData=True,
+                                  returnMetadata=True)["vectors"]
+        assert back and back[0]["metadata"] == {"round": 2}, back
+        client.delete_vectors(vectorBucketName=bucket, indexName=index, keys=[hostile])
+        return f"deleted b+hostile (ghost no-op); rebuilt+redeleted hostile"
+
+    step(23, "delete_vectors: special chars, idempotent, verified gone, rebuild", v24)
+
+    def v25():
+        # filterable metadata > 2 KB -> server-side ValidationException
+        err = expect_client_error(
+            client, client.exceptions.ValidationException,
+            lambda: client.put_vectors(
+                vectorBucketName=bucket, indexName=index,
+                vectors=[{"key": "big", "data": {"float32": [1.0, 0.0, 0.0, 0.0]},
+                          "metadata": {"s": "v" * 2100}}],
+            ),
+        )
+        assert err.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        OBS.append(f"metadata-2kb: {err.response['Error'].get('Message', '')[:90]}")
+        return "filterable 2.1 KB -> ValidationException 400"
+
+    step(24, "put_vectors metadata >2KB filterable -> ValidationException", v25)
+
+    def v26():
+        # nested object metadata value -> ValidationException naming legal types
+        err = expect_client_error(
+            client, client.exceptions.ValidationException,
+            lambda: client.put_vectors(
+                vectorBucketName=bucket, indexName=index,
+                vectors=[{"key": "nest", "data": {"float32": [1.0, 0.0, 0.0, 0.0]},
+                          "metadata": {"nested": {"deep": True}}}],
+            ),
+        )
+        assert err.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        msg = err.response["Error"].get("Message", "")
+        assert "string, number, boolean" in msg, msg
+        # flat list of primitives is legal and round-trips
+        client.put_vectors(
+            vectorBucketName=bucket, indexName=index,
+            vectors=[{"key": "listy", "data": {"float32": [0.0, 1.0, 0.0, 0.0]},
+                      "metadata": {"l": ["a", 2, True]}}],
+        )
+        got = client.get_vectors(vectorBucketName=bucket, indexName=index,
+                                 keys=["listy"], returnMetadata=True)["vectors"]
+        assert got[0]["metadata"] == {"l": ["a", 2, True]}, got
+        return f"nested rejected ({msg[:60]}…); flat list round-trips"
+
+    step(25, "put_vectors metadata type validation (nested rejected, list ok)", v26)
+
+    def m27():
         client.delete_index(vectorBucketName=bucket, indexName=index)
         client.delete_index(vectorBucketName=bucket, indexName=state["index2"])
         client.delete_vector_bucket(vectorBucketName=bucket)
@@ -456,7 +636,7 @@ def main() -> int:
         assert rest == [], f"cleanup left buckets: {[b['vectorBucketName'] for b in rest]}"
         return "index x2 + bucket x3 deleted; prefix drained"
 
-    step(19, "cleanup: delete indexes, buckets; verify prefix drained", m19)
+    step(26, "cleanup: delete indexes, buckets; verify prefix drained", m27)
 
     run_steps()
 

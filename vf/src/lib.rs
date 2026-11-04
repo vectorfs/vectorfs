@@ -29,7 +29,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
-/// Max accepted body (AWS PutVectors limit is 500 vectors / 20 MiB).
+/// Max accepted body. Deliberately ABOVE the AWS PutVectors payload limit of
+/// 20 MiB: an oversized-but-deliverable body must reach the handler so it can
+/// answer 400 ValidationException (a shape SDKs parse) instead of axum's 413
+/// (no modeled shape — typed clients surface it as an opaque transport
+/// error). Bodies beyond this hard cap are also answered 400 by the gate
+/// middleware's read, never a bare 413.
 pub const MAX_BODY: usize = 21 * 1024 * 1024;
 
 pub fn build_router(state: ops::AppState) -> Router {
@@ -39,6 +44,11 @@ pub fn build_router(state: ops::AppState) -> Router {
         .route("/CreateIndex", post(ops::create_index))
         .route("/PutVectors", post(ops::put_vectors))
         .route("/QueryVectors", post(ops::query_vectors))
+        // M1 T4 vector data plane: completes the 21-operation surface
+        // (design.md 附录A). All POST /<Op>, 200 with JSON (delete: empty).
+        .route("/GetVectors", post(ops::get_vectors))
+        .route("/ListVectors", post(ops::list_vectors))
+        .route("/DeleteVectors", post(ops::delete_vectors))
         // M1 T3 management plane (design.md §4 / 附录A): all POST /<Op> …
         .route("/GetVectorBucket", post(ops::get_vector_bucket))
         .route("/DeleteVectorBucket", post(ops::delete_vector_bucket))

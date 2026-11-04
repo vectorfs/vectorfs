@@ -1,12 +1,27 @@
-//! S3 Vectors operation handlers (wire layer). M1 T3 grows the surface from
-//! the spike's four operations to eighteen: the four originals plus the
-//! fourteen bucket/index management-plane operations (GetVectorBucket,
-//! DeleteVectorBucket, ListVectorBuckets, GetIndex, DeleteIndex, ListIndexes,
-//! policy×3, tags×3, PutVectorBucketDefaultIndexMode, UpdateIndexMode). The
-//! remaining three (GetVectors / ListVectors / DeleteVectors) land in a later
-//! M1 task. Field names are verbatim from the botocore `s3vectors/2025-07-15`
-//! model (service-2.json, develop branch, synced 2026-09-30 — NOTES.md has
-//! the extraction).
+//! S3 Vectors operation handlers (wire layer). M1 T3 grew the surface from
+//! the spike's four operations to eighteen; M1 T4 completes the full
+//! twenty-one with the vector data plane: GetVectors / ListVectors /
+//! DeleteVectors plus the full PutVectors limit set. Field names are verbatim
+//! from the botocore `s3vectors/2025-07-15` model (service-2.json, develop
+//! branch, synced 2026-09-30 — NOTES.md has the extraction).
+//!
+//! M1 T4 wire facts re-verified live against the model (local botocore
+//! 1.43.123 + develop branch curl'd 2026-11-04):
+//! - `GetOutputVector`/`ListOutputVector` members are exactly
+//!   {key (required), data?, metadata?} — there is NO `status` member
+//!   anywhere in the model (the task brief anticipated an OK/NOT_FOUND
+//!   status; the model wins). Missing GetVectors keys are therefore simply
+//!   omitted from `vectors`, never reported per-key — callers diff requested
+//!   vs returned keys (AWS user guide + API reference agree).
+//! - Both GetVectorsInput and ListVectorsInput carry `returnData` alongside
+//!   `returnMetadata` (both default false); each gates its response member.
+//! - ListVectors segment pairing (segmentCount ⇔ segmentIndex) is expressed
+//!   only in member documentation, not as a model validator — enforced here
+//!   as ValidationException, including segmentIndex < segmentCount.
+//! - Limit set per AWS "Limitations and restrictions" (user guide): payload
+//!   ≤20 MiB, metadata ≤40 KB per vector (filterable + non-filterable) with
+//!   ≤50 keys, filterable portion ≤2 KB per vector (not per value), keys
+//!   1-100 (get) / 1-500 (delete, put) of length 1-1024.
 //!
 //! Locators: every management/vector operation accepts name or ARN
 //! (model members vectorBucketName|vectorBucketArn, indexName+vectorBucketName
@@ -298,6 +313,46 @@ struct QueryVectorsInput {
     query_mode: Option<String>,
 }
 
+/// GetVectorsInput (model): keys[1-100], returnData?/returnMetadata?.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetVectorsInput {
+    vector_bucket_name: Option<String>,
+    index_name: Option<String>,
+    index_arn: Option<String>,
+    keys: Vec<String>,
+    return_data: Option<bool>,
+    return_metadata: Option<bool>,
+}
+
+/// DeleteVectorsInput (model): keys[1-500].
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteVectorsInput {
+    vector_bucket_name: Option<String>,
+    index_name: Option<String>,
+    index_arn: Option<String>,
+    keys: Vec<String>,
+}
+
+/// ListVectorsInput (model): maxResults[1-1000] (default 500), nextToken?,
+/// segmentCount[1-16] + segmentIndex[0-15] (must appear as a pair —
+/// documentation-level constraint in the model, enforced here),
+/// returnData?/returnMetadata?.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListVectorsInput {
+    vector_bucket_name: Option<String>,
+    index_name: Option<String>,
+    index_arn: Option<String>,
+    max_results: Option<i64>,
+    next_token: Option<String>,
+    segment_count: Option<i64>,
+    segment_index: Option<i64>,
+    return_data: Option<bool>,
+    return_metadata: Option<bool>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BucketLocatorInput {
@@ -422,6 +477,166 @@ fn check_vector(raw: &[f64], dim: i64, metric: &str, what: &str) -> Result<Vec<f
         )));
     }
     Ok(out)
+}
+
+/// Validate a request key list: 1..=max entries (model list min/max) and
+/// VectorKey length 1-1024 for each entry.
+fn validate_key_list(keys: &[String], what: &str, max: usize) -> Result<(), ApiError> {
+    if keys.is_empty() || keys.len() > max {
+        return Err(ApiError::validation_field(
+            what,
+            format!(
+                "{what} must contain between 1 and {max} items, got {}",
+                keys.len()
+            ),
+        ));
+    }
+    for k in keys {
+        if k.is_empty() || k.len() > 1024 {
+            return Err(ApiError::validation_field(
+                what,
+                format!("vector key {:?} must be 1-1024 characters", k),
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// PutVectors metadata limits (design.md §4.5; AWS user guide "Limitations and
+// restrictions" + "Metadata filtering", sizes as compact-JSON UTF-8 bytes)
+// ---------------------------------------------------------------------------
+
+const METADATA_MAX_BYTES: usize = 40 * 1024; // total (filterable + non-filterable) per vector
+const METADATA_MAX_KEYS: usize = 50;
+const METADATA_FILTERABLE_MAX_BYTES: usize = 2 * 1024; // filterable portion per vector
+
+/// One JSON-type name for error messages.
+fn json_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "list",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Metadata value types: string / number / boolean, or a flat list of those
+/// primitives (the exact set AWS documents as supported; nested objects and
+/// nulls are rejected with a message naming the legal types).
+fn validate_metadata_value(key: &str, v: &serde_json::Value) -> Result<(), ApiError> {
+    const LEGAL: &str = "string, number, boolean, or a list of those values";
+    match v {
+        serde_json::Value::String(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::Bool(_) => Ok(()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if !matches!(
+                    item,
+                    serde_json::Value::String(_)
+                        | serde_json::Value::Number(_)
+                        | serde_json::Value::Bool(_)
+                ) {
+                    return Err(ApiError::validation(format!(
+                        "metadata[{key:?}] list elements must be {LEGAL}, got {}",
+                        json_type(item)
+                    )));
+                }
+            }
+            Ok(())
+        }
+        other => Err(ApiError::validation(format!(
+            "metadata[{key:?}] must be {LEGAL}, got {}",
+            json_type(other)
+        ))),
+    }
+}
+
+/// Full per-vector metadata validation. `non_filterable` is the index's
+/// declared `nonFilterableMetadataKeys`: keys in that set are exempt from the
+/// 2 KB filterable cap (they ride the 40 KB total as blobs — our storage
+/// already keeps every value in `metadata_json` and reads it back whole, so
+/// "blob storage" is the natural state). AWS's 2 KB limit is documented as
+/// "Filterable metadata per vector" — the combined filterable portion, which
+/// subsumes any per-value reading.
+fn validate_metadata(
+    meta: &serde_json::Value,
+    non_filterable: Option<&[String]>,
+) -> Result<(), ApiError> {
+    let serde_json::Value::Object(map) = meta else {
+        return Err(ApiError::validation(format!(
+            "metadata must be a JSON object of key-value pairs, got {}",
+            json_type(meta)
+        )));
+    };
+    if map.len() > METADATA_MAX_KEYS {
+        return Err(ApiError::validation(format!(
+            "metadata must contain at most {METADATA_MAX_KEYS} keys, got {}",
+            map.len()
+        )));
+    }
+    let total = serde_json::to_vec(meta)
+        .map_err(|e| ApiError::internal(format!("metadata serialization: {e}")))?;
+    if total.len() > METADATA_MAX_BYTES {
+        return Err(ApiError::validation(format!(
+            "metadata is {} bytes; total metadata per vector is limited to 40 KB \
+             (filterable + non-filterable)",
+            total.len()
+        )));
+    }
+    let mut filterable = serde_json::Map::new();
+    for (k, v) in map {
+        validate_metadata_value(k, v)?;
+        if !non_filterable.is_some_and(|ks| ks.iter().any(|nf| nf == k)) {
+            filterable.insert(k.clone(), v.clone());
+        }
+    }
+    if !filterable.is_empty() {
+        let f = serde_json::to_vec(&serde_json::Value::Object(filterable))
+            .map_err(|e| ApiError::internal(format!("metadata serialization: {e}")))?;
+        if f.len() > METADATA_FILTERABLE_MAX_BYTES {
+            return Err(ApiError::validation(format!(
+                "filterable metadata is {} bytes; filterable metadata per vector is limited \
+                 to 2 KB (store larger values under keys declared in the index's \
+                 metadataConfiguration.nonFilterableMetadataKeys)",
+                f.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ListVectors segments & page budget
+// ---------------------------------------------------------------------------
+
+/// Approximate page budget for ListVectors (AWS: "If the processed dataset
+/// size exceeds 1 MB before reaching the maxResults value, the operation
+/// stops and returns the vectors that are retrieved up to that point, along
+/// with a nextToken"). Measured as the cumulative compact-JSON size of the
+/// emitted vector entries — an approximation of "processed dataset size";
+/// TODO(AWS 对拍): exact accounting AWS applies (does it count the request
+/// projection? delimiters?) is unverified.
+const LIST_PAGE_BUDGET: usize = 1024 * 1024;
+
+/// FNV-1a 64-bit over the key's UTF-8 bytes, reduced modulo segmentCount —
+/// the deterministic ListVectors segment hash. Properties we pin in tests:
+/// one key always lands in the same segment (pure function of the bytes),
+/// and the segments over 0..segmentCount partition the key space exactly
+/// (union = full set, pairwise disjoint) — so parallel workers neither
+/// duplicate nor drop keys. FNV-1a specifically: no dependencies, byte-exact
+/// specification, stable across releases/processes (unlike a randomly-seeded
+/// hash — note Rust's own DefaultHasher is NOT stable and must not be used).
+fn segment_of(key: &str, segment_count: i64) -> i64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for b in key.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    (h % segment_count as u64) as i64
 }
 
 /// Locate bucket -> index, mapping misses to 404 before any engine work.
@@ -800,6 +1015,21 @@ pub async fn put_vectors(State(state): State<AppState>, body: Bytes) -> Result<R
     )?;
     let meta = resolve_index(&state, &vb, &ix).await?;
 
+    // Payload cap (AWS: "Request payload size: Up to 20 MiB"). Checked after
+    // the body is fully buffered: the gate middleware + DefaultBodyLimit sit
+    // at 21 MiB so an oversized-but-deliverable body reaches HERE and gets a
+    // 400 ValidationException instead of axum's 413. Rationale (botocore
+    // checked 2026-11-04): rest-json error parsing keys off the
+    // X-Amzn-Errortype/__type shape, and 413 has no modeled shape here — a
+    // typed SDK surfaces it as an unparsed transport error rather than
+    // client.exceptions.ValidationException.
+    if body.len() > 20 * 1024 * 1024 {
+        return Err(ApiError::validation(format!(
+            "request body is {} bytes; the maximum request payload size is 20 MiB",
+            body.len()
+        )));
+    }
+
     if input.vectors.is_empty() || input.vectors.len() > 500 {
         return Err(ApiError::validation(format!(
             "vectors must contain between 1 and 500 items, got {}",
@@ -807,7 +1037,12 @@ pub async fn put_vectors(State(state): State<AppState>, body: Bytes) -> Result<R
         )));
     }
 
-    let mut rows = Vec::with_capacity(input.vectors.len());
+    // Same-batch duplicate keys: the LAST occurrence wins (TODO(AWS 对拍):
+    // real-service behavior for duplicate keys in one PutVectors batch is
+    // undocumented; merge_insert sources must be key-unique, so we resolve
+    // duplicates before the engine ever sees them).
+    let mut rows: Vec<VectorRow> = Vec::with_capacity(input.vectors.len());
+    let mut index_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for v in input.vectors {
         if v.key.is_empty() || v.key.len() > 1024 {
             return Err(ApiError::validation(format!(
@@ -826,13 +1061,23 @@ pub async fn put_vectors(State(state): State<AppState>, body: Bytes) -> Result<R
         // omitted metadata stores NULL — TODO: confirm against real service).
         let metadata_json = match &v.metadata {
             None | Some(serde_json::Value::Null) => None,
-            Some(m) => Some(m.to_string()),
+            Some(m) => {
+                validate_metadata(m, meta.non_filterable_metadata_keys.as_deref())?;
+                Some(m.to_string())
+            }
         };
-        rows.push(VectorRow {
-            key: v.key,
+        let row = VectorRow {
+            key: v.key.clone(),
             vector: vec,
             metadata_json,
-        });
+        };
+        match index_of.get(&v.key) {
+            Some(&i) => rows[i] = row, // later duplicate replaces the earlier row
+            None => {
+                index_of.insert(v.key, rows.len());
+                rows.push(row);
+            }
+        }
     }
 
     state
@@ -922,6 +1167,199 @@ pub async fn query_vectors(
         "vectors": vectors,
         "distanceMetric": meta.distance_metric,
     });
+    Ok(Json(resp).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// vector data plane (M1 T4): GetVectors / DeleteVectors / ListVectors
+// ---------------------------------------------------------------------------
+
+/// Serialize a stored vector for Get/List output: {key, data?{float32},
+/// metadata?} — members gated by returnData/returnMetadata, absent members
+/// omitted (model: only `key` is required on GetOutputVector/ListOutputVector).
+fn vector_entry_json(
+    v: &crate::store::FoundVector,
+    return_data: bool,
+    return_metadata: bool,
+) -> serde_json::Value {
+    let mut o = json!({ "key": v.key });
+    if return_data {
+        // f32 values widen to f64 for JSON — matches the AWS fold semantics
+        // already applied at ingest (float32 stored, float32 echoed).
+        o["data"] = json!({ "float32": v.vector });
+    }
+    if return_metadata && let Some(m) = &v.metadata {
+        o["metadata"] = m.clone();
+    }
+    o
+}
+
+/// GetVectors: batch point-lookup, keys[1-100]. Response contains one entry
+/// per FOUND key (missing keys are omitted — the model has no per-entry
+/// status member; verified 2026-11-04, see module doc), in request order,
+/// deduplicated. TODO(AWS 对拍): response ordering is undocumented; we
+/// preserve the caller's key order as the deterministic choice.
+pub async fn get_vectors(State(state): State<AppState>, body: Bytes) -> Result<Response, ApiError> {
+    let input: GetVectorsInput = parse_body(&body)?;
+    let (vb, ix) = resolve_index_locator(
+        &state,
+        input.vector_bucket_name.as_deref(),
+        input.index_name.as_deref(),
+        input.index_arn.as_deref(),
+    )?;
+    resolve_index(&state, &vb, &ix).await?;
+    validate_key_list(&input.keys, "keys", 100)?;
+
+    let found = state.storage.get_vectors(&vb, &ix, &input.keys).await?;
+    let mut by_key = std::collections::HashMap::with_capacity(found.len());
+    for f in found {
+        by_key.insert(f.key.clone(), f);
+    }
+    let return_data = input.return_data.unwrap_or(false);
+    let return_metadata = input.return_metadata.unwrap_or(false);
+    let mut seen = std::collections::HashSet::new();
+    let vectors: Vec<serde_json::Value> = input
+        .keys
+        .iter()
+        .filter(|k| seen.insert((*k).clone()))
+        .filter_map(|k| by_key.get(k))
+        .map(|v| vector_entry_json(v, return_data, return_metadata))
+        .collect();
+    Ok(Json(json!({ "vectors": vectors })).into_response())
+}
+
+/// DeleteVectors: keys[1-500] -> 200 empty. Keys are bound into an
+/// arrow/datafusion IN predicate in the store (never SQL text) — arbitrary
+/// UTF-8 keys cannot inject or escape. Absent keys are idempotent no-ops;
+/// a later PutVectors of a deleted key rebuilds the row normally (merge_insert
+/// insert path).
+pub async fn delete_vectors(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let input: DeleteVectorsInput = parse_body(&body)?;
+    let (vb, ix) = resolve_index_locator(
+        &state,
+        input.vector_bucket_name.as_deref(),
+        input.index_name.as_deref(),
+        input.index_arn.as_deref(),
+    )?;
+    resolve_index(&state, &vb, &ix).await?;
+    validate_key_list(&input.keys, "keys", 500)?;
+
+    state.storage.delete_vectors(&vb, &ix, &input.keys).await?;
+    Ok(empty_ok())
+}
+
+/// ListVectors: key-ascending pagination (maxResults 1-1000, default 500)
+/// with optional parallel segments (segmentCount 1-16 + segmentIndex 0-15,
+/// strictly paired, segmentIndex < segmentCount) and an approximate 1 MiB
+/// page budget. nextToken = base64 cursor {last_key}; the next page scans
+/// `key > last_key`, re-applies the segment filter, and continues.
+pub async fn list_vectors(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let input: ListVectorsInput = parse_body(&body)?;
+    let (vb, ix) = resolve_index_locator(
+        &state,
+        input.vector_bucket_name.as_deref(),
+        input.index_name.as_deref(),
+        input.index_arn.as_deref(),
+    )?;
+    resolve_index(&state, &vb, &ix).await?;
+
+    let max = match input.max_results {
+        None => 500,
+        Some(n) if (1..=1000).contains(&n) => n as usize,
+        Some(n) => {
+            return Err(ApiError::validation_field(
+                "maxResults",
+                format!("maxResults must be between 1 and 1000, got {n}"),
+            ));
+        }
+    };
+    let after = match input.next_token.as_deref() {
+        None | Some("") => None,
+        Some(t) => Some(decode_page_token(t)?),
+    };
+    // Pairing is documentation-level in the model ("If you specify a
+    // segmentCount value, you must also specify segmentIndex" and vice
+    // versa) — there is no validator trait, so the check lives here.
+    let segment = match (input.segment_count, input.segment_index) {
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(ApiError::validation_field(
+                "segmentIndex",
+                "segmentIndex is required when segmentCount is specified",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(ApiError::validation_field(
+                "segmentCount",
+                "segmentCount is required when segmentIndex is specified",
+            ));
+        }
+        (Some(c), Some(i)) => {
+            if !(1..=16).contains(&c) {
+                return Err(ApiError::validation_field(
+                    "segmentCount",
+                    format!("segmentCount must be between 1 and 16, got {c}"),
+                ));
+            }
+            if !(0..=15).contains(&i) || i >= c {
+                return Err(ApiError::validation_field(
+                    "segmentIndex",
+                    format!(
+                        "segmentIndex must be between 0 and segmentCount-1 ({}), got {i}",
+                        c - 1
+                    ),
+                ));
+            }
+            Some((c, i))
+        }
+    };
+
+    let return_data = input.return_data.unwrap_or(false);
+    let return_metadata = input.return_metadata.unwrap_or(false);
+
+    let scanned = state
+        .storage
+        .scan_vectors(&vb, &ix, after.as_deref())
+        .await?;
+    let candidates: Vec<&crate::store::FoundVector> = scanned
+        .iter()
+        .filter(|v| segment.is_none_or(|(c, i)| segment_of(&v.key, c) == i))
+        .collect();
+
+    // Walk in key order; stop at maxResults or when the NEXT complete entry
+    // would push the page past the 1 MiB budget (never mid-vector: the
+    // entry being cut is simply left for the next page). A token is emitted
+    // iff an item was actually left behind.
+    let mut vectors: Vec<serde_json::Value> = Vec::new();
+    let mut last_key: Option<String> = None;
+    let mut total = 0usize;
+    let mut token = None;
+    for v in &candidates {
+        if vectors.len() >= max {
+            token = last_key.clone();
+            break;
+        }
+        let entry = vector_entry_json(v, return_data, return_metadata);
+        let size = entry.to_string().len(); // compact JSON bytes — see LIST_PAGE_BUDGET note
+        if !vectors.is_empty() && total + size > LIST_PAGE_BUDGET {
+            token = last_key.clone();
+            break;
+        }
+        total += size;
+        last_key = Some(v.key.clone());
+        vectors.push(entry);
+    }
+
+    let mut resp = json!({ "vectors": vectors });
+    if let Some(t) = token {
+        resp["nextToken"] = json!(encode_page_token(&t));
+    }
     Ok(Json(resp).into_response())
 }
 
@@ -1584,6 +2022,50 @@ mod tests {
         let (st, h, _) = call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"memvb"}"#).await;
         assert_eq!(st, StatusCode::CONFLICT);
         assert_eq!(errortype(&h), Some("ConflictException"));
+
+        // M1 T4 data plane through the memory engine (expr-bound key
+        // predicates ride the same InMemory object-store session)
+        let (st, _, b) = call(
+            &r,
+            "/GetVectors",
+            r#"{"vectorBucketName":"memvb","indexName":"memix","keys":["a","zz"],
+                "returnData":true,"returnMetadata":true}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let vs = b["vectors"].as_array().unwrap();
+        assert_eq!(vs.len(), 1, "missing key omitted: {b}");
+        assert_eq!(vs[0]["key"], json!("a"));
+        assert_eq!(vs[0]["data"]["float32"], json!([1.0, 0.0]));
+        assert_eq!(vs[0]["metadata"]["t"], json!("x"));
+
+        let (st, _, b) = call(
+            &r,
+            "/ListVectors",
+            r#"{"vectorBucketName":"memvb","indexName":"memix","segmentCount":2,
+                "segmentIndex":0}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert!(b["vectors"].as_array().unwrap().len() <= 2);
+
+        let (st, _, b) = call(
+            &r,
+            "/DeleteVectors",
+            r#"{"vectorBucketName":"memvb","indexName":"memix","keys":["a"]}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let (st, _, b) = call(
+            &r,
+            "/ListVectors",
+            r#"{"vectorBucketName":"memvb","indexName":"memix"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let vs = b["vectors"].as_array().unwrap();
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0]["key"], json!("b"));
     }
 
     async fn call(
@@ -2866,5 +3348,835 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    // ------------------------------------------------------------------
+    // M1 T4: vector data plane (GetVectors / ListVectors / DeleteVectors +
+    // PutVectors full limits)
+    // ------------------------------------------------------------------
+
+    /// Request body from a JSON value (needed whenever keys contain quotes,
+    /// backslashes or non-ASCII — raw string literals get unreadable).
+    fn jbody(v: serde_json::Value) -> String {
+        v.to_string()
+    }
+
+    /// Create bucket + index helper for the T4 tests.
+    async fn mkindex(router: &axum::Router, vb: &str, ix: &str, dim: i64, metric: &str) {
+        let (st, _, b) = call(
+            router,
+            "/CreateIndex",
+            &jbody(json!({
+                "vectorBucketName": vb, "indexName": ix, "dataType": "float32",
+                "dimension": dim, "distanceMetric": metric,
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+    }
+
+    #[tokio::test]
+    async fn get_vectors_found_missing_and_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"gvb"}"#).await;
+        mkindex(&r, "gvb", "gix", 2, "euclidean").await;
+        let hostile = "sp\"'\\菊"; // quotes + backslash + non-ASCII
+        let (st, _, b) = call(
+            &r,
+            "/PutVectors",
+            &jbody(json!({
+                "vectorBucketName": "gvb", "indexName": "gix",
+                "vectors": [
+                    {"key": "a", "data": {"float32": [1, 2]},
+                     "metadata": {"tag": "one", "n": 3, "ok": true, "tags": ["x", "y"]}},
+                    {"key": "b", "data": {"float32": [3, 4]}},
+                    {"key": hostile, "data": {"float32": [5, 6]},
+                     "metadata": {"emoji": "🎯"}}
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+
+        // mixed found/missing: response holds only the FOUND keys, in request
+        // order, deduplicated; NO status member (model has none — module doc).
+        let (st, _, b) = call(
+            &r,
+            "/GetVectors",
+            &jbody(json!({
+                "vectorBucketName": "gvb", "indexName": "gix",
+                "keys": ["b", "ghost", "a", hostile, "b"],
+                "returnData": true, "returnMetadata": true,
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let vs = b["vectors"].as_array().unwrap();
+        assert_eq!(vs.len(), 3, "missing key omitted, dup key deduped: {b}");
+        assert_eq!(vs[0]["key"], json!("b")); // request order, not key order
+        assert_eq!(vs[1]["key"], json!("a"));
+        assert_eq!(vs[2]["key"], json!(hostile));
+        assert_eq!(vs[0].get("metadata"), None); // b stored without metadata
+        assert_eq!(vs[1]["metadata"]["tag"], json!("one"));
+        assert_eq!(vs[1]["metadata"]["tags"], json!(["x", "y"]));
+        assert_eq!(vs[1]["metadata"]["n"], json!(3));
+        assert_eq!(vs[1]["data"]["float32"], json!([1.0, 2.0]));
+        assert_eq!(vs[2]["metadata"]["emoji"], json!("🎯"));
+        assert!(vs.iter().all(|v| v.get("status").is_none()));
+
+        // defaults: data/metadata omitted entirely
+        let (st, _, b) = call(
+            &r,
+            "/GetVectors",
+            r#"{"vectorBucketName":"gvb","indexName":"gix","keys":["a"]}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let v0 = &b["vectors"][0];
+        assert_eq!(v0["key"], json!("a"));
+        assert!(v0.get("data").is_none(), "{v0}");
+        assert!(v0.get("metadata").is_none(), "{v0}");
+
+        // returnData=false explicit: same omission
+        let (st, _, b) = call(
+            &r,
+            "/GetVectors",
+            r#"{"vectorBucketName":"gvb","indexName":"gix","keys":["a"],
+                "returnData":false,"returnMetadata":false}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(b["vectors"][0].get("data").is_none());
+
+        // all keys missing -> 200 with empty vectors (member is required)
+        let (st, _, b) = call(
+            &r,
+            "/GetVectors",
+            r#"{"vectorBucketName":"gvb","indexName":"gix","keys":["nope1","nope2"]}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["vectors"].as_array().unwrap().len(), 0);
+
+        // exactly 100 keys (model max) -> 200; 101 -> ValidationException
+        let hundred: Vec<serde_json::Value> = (0..100)
+            .map(|i| json!({"key": format!("m{i:03}"), "data": {"float32": [0, 1]}}))
+            .collect();
+        let (st, _, b) = call(
+            &r,
+            "/PutVectors",
+            &jbody(json!({"vectorBucketName": "gvb", "indexName": "gix", "vectors": hundred})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let keys100: Vec<String> = (0..100).map(|i| format!("m{i:03}")).collect();
+        let (st, _, b) = call(
+            &r,
+            "/GetVectors",
+            &jbody(json!({"vectorBucketName": "gvb", "indexName": "gix", "keys": keys100})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["vectors"].as_array().unwrap().len(), 100);
+        let mut keys101 = keys100.clone();
+        keys101.push("one-too-many".into());
+        let (st, h, b) = call(
+            &r,
+            "/GetVectors",
+            &jbody(json!({"vectorBucketName": "gvb", "indexName": "gix", "keys": keys101})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(errortype(&h), Some("ValidationException"));
+        assert_eq!(b["fieldList"][0]["path"], json!("keys"));
+
+        // empty keys / missing keys / oversized key -> 400
+        let (st, _, _) = call(
+            &r,
+            "/GetVectors",
+            r#"{"vectorBucketName":"gvb","indexName":"gix","keys":[]}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let long_key = "k".repeat(1025);
+        let (st, _, _) = call(
+            &r,
+            "/GetVectors",
+            &jbody(json!({"vectorBucketName": "gvb", "indexName": "gix", "keys": [long_key]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // missing index -> 404 (locator resolves, catalog misses)
+        let (st, h, _) = call(
+            &r,
+            "/GetVectors",
+            r#"{"vectorBucketName":"gvb","indexName":"zz","keys":["a"]}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(errortype(&h), Some("NotFoundException"));
+    }
+
+    #[tokio::test]
+    async fn delete_vectors_special_keys_and_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"dvb"}"#).await;
+        mkindex(&r, "dvb", "dix", 2, "euclidean").await;
+        // keys chosen to break naive SQL string interpolation: quotes,
+        // backslash, unicode, emoji, and a classic injection payload. All are
+        // bound as arrow literals — none of this ever reaches SQL text.
+        let keys = [
+            "plain",
+            "it's",
+            "a\"b",
+            "back\\slash",
+            "菊🍒",
+            "'); DROP TABLE vectors;--",
+        ];
+        let vectors: Vec<serde_json::Value> = keys
+            .iter()
+            .map(|k| json!({"key": k, "data": {"float32": [1, 0]}}))
+            .collect();
+        let (st, _, b) = call(
+            &r,
+            "/PutVectors",
+            &jbody(json!({"vectorBucketName": "dvb", "indexName": "dix", "vectors": vectors})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+
+        // delete the hostile subset -> 200 empty; "plain" survives
+        let (st, _, b) = call(
+            &r,
+            "/DeleteVectors",
+            &jbody(json!({
+                "vectorBucketName": "dvb", "indexName": "dix", "keys": keys[1..]
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b, serde_json::Value::Null);
+        let (st, _, b) = call(
+            &r,
+            "/GetVectors",
+            &jbody(json!({
+                "vectorBucketName": "dvb", "indexName": "dix",
+                "keys": keys, "returnMetadata": true
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let vs = b["vectors"].as_array().unwrap();
+        assert_eq!(vs.len(), 1, "only plain survives: {b}");
+        assert_eq!(vs[0]["key"], json!("plain"));
+
+        // idempotent: deleting absent keys again is 200, not an error
+        let (st, _, _) = call(
+            &r,
+            "/DeleteVectors",
+            &jbody(json!({"vectorBucketName": "dvb", "indexName": "dix", "keys": keys[1..]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        // delete -> put same key = normal rebuild (merge_insert insert path)
+        let rebuilt = "a\"b";
+        let (st, _, b) = call(
+            &r,
+            "/PutVectors",
+            &jbody(json!({
+                "vectorBucketName": "dvb", "indexName": "dix",
+                "vectors": [{"key": rebuilt, "data": {"float32": [7, 8]},
+                             "metadata": {"round": 2}}]
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let (st, _, b) = call(
+            &r,
+            "/GetVectors",
+            &jbody(json!({
+                "vectorBucketName": "dvb", "indexName": "dix", "keys": [rebuilt],
+                "returnData": true, "returnMetadata": true
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["vectors"][0]["data"]["float32"], json!([7.0, 8.0]));
+        assert_eq!(b["vectors"][0]["metadata"]["round"], json!(2));
+
+        // boundaries: exactly 500 keys (mostly nonexistent) -> 200; 501 -> 400
+        let keys500: Vec<String> = (0..500).map(|i| format!("ghost-{i}")).collect();
+        let (st, _, b) = call(
+            &r,
+            "/DeleteVectors",
+            &jbody(json!({"vectorBucketName": "dvb", "indexName": "dix", "keys": keys500})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let mut keys501: Vec<String> = (0..500).map(|i| format!("ghost-{i}")).collect();
+        keys501.push("plain".into()); // 500 phantoms + one real = 501
+        let (st, h, b) = call(
+            &r,
+            "/DeleteVectors",
+            &jbody(json!({"vectorBucketName": "dvb", "indexName": "dix", "keys": keys501})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(errortype(&h), Some("ValidationException"));
+        assert_eq!(b["fieldList"][0]["path"], json!("keys"));
+        let (st, _, _) = call(
+            &r,
+            "/DeleteVectors",
+            r#"{"vectorBucketName":"dvb","indexName":"dix","keys":[]}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // missing index -> 404
+        let (st, h, _) = call(
+            &r,
+            "/DeleteVectors",
+            r#"{"vectorBucketName":"dvb","indexName":"zz","keys":["a"]}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(errortype(&h), Some("NotFoundException"));
+    }
+
+    /// Walk ListVectors pages to the end; returns (keys in order, pages).
+    async fn list_all(r: &axum::Router, base: serde_json::Value) -> (Vec<String>, usize) {
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut req = base.clone();
+            if let Some(t) = &token {
+                req["nextToken"] = json!(t);
+            }
+            let (st, _, b) = call(r, "/ListVectors", &jbody(req)).await;
+            assert_eq!(st, StatusCode::OK, "{b}");
+            for v in b["vectors"].as_array().unwrap() {
+                seen.push(v["key"].as_str().unwrap().to_string());
+            }
+            pages += 1;
+            match b.get("nextToken").and_then(|t| t.as_str()) {
+                Some(t) => token = Some(t.to_string()),
+                None => return (seen, pages),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_vectors_pagination_and_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"lvb"}"#).await;
+        mkindex(&r, "lvb", "lix", 2, "euclidean").await;
+        let vectors: Vec<serde_json::Value> = (0..10)
+            .map(|i| {
+                json!({"key": format!("k{i:02}"), "data": {"float32": [i, 0]},
+                       "metadata": {"n": i}})
+            })
+            .collect();
+        let (st, _, b) = call(
+            &r,
+            "/PutVectors",
+            &jbody(json!({"vectorBucketName": "lvb", "indexName": "lix", "vectors": vectors})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+
+        // default: all 10 keys ascending, no data/metadata members
+        let (st, _, b) = call(
+            &r,
+            "/ListVectors",
+            r#"{"vectorBucketName":"lvb","indexName":"lix"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let vs = b["vectors"].as_array().unwrap();
+        assert_eq!(vs.len(), 10);
+        let names: Vec<String> = vs
+            .iter()
+            .map(|v| v["key"].as_str().unwrap().to_string())
+            .collect();
+        let want: Vec<String> = (0..10).map(|i| format!("k{i:02}")).collect();
+        assert_eq!(names, want, "key-ascending order");
+        assert!(vs[0].get("data").is_none() && vs[0].get("metadata").is_none());
+        assert!(b.get("nextToken").is_none(), "single page, no token");
+
+        // returnData + returnMetadata members
+        let (st, _, b) = call(
+            &r,
+            "/ListVectors",
+            r#"{"vectorBucketName":"lvb","indexName":"lix","maxResults":1,
+                "returnData":true,"returnMetadata":true}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let v0 = &b["vectors"][0];
+        assert_eq!(v0["key"], json!("k00"));
+        assert_eq!(v0["data"]["float32"], json!([0.0, 0.0]));
+        assert_eq!(v0["metadata"]["n"], json!(0));
+        assert!(b.get("nextToken").is_some());
+
+        // multi-page walk: 3,3,3,1 — order preserved across pages
+        let (seen, pages) = list_all(
+            &r,
+            json!({"vectorBucketName": "lvb", "indexName": "lix", "maxResults": 3}),
+        )
+        .await;
+        assert_eq!(pages, 4, "pages of 3,3,3,1");
+        assert_eq!(
+            seen,
+            (0..10).map(|i| format!("k{i:02}")).collect::<Vec<_>>()
+        );
+
+        // segments: count=3 -> three pairwise-disjoint walks whose union is
+        // the full key set; repeating a segment is byte-stable. FNV-1a goldens
+        // (computed independently of the Rust impl): "k00" -> seg 0, "k05" ->
+        // seg 0 of 3 but seg 1 of 2 — the partition is hash-driven, not key order.
+        let mut union: Vec<String> = Vec::new();
+        for seg in 0..3 {
+            let (part, _) = list_all(
+                &r,
+                json!({"vectorBucketName": "lvb", "indexName": "lix", "maxResults": 2,
+                       "segmentCount": 3, "segmentIndex": seg}),
+            )
+            .await;
+            assert!(
+                part.iter().all(|k| !union.contains(k)),
+                "segment {seg} overlaps earlier segments"
+            );
+            if seg == 0 {
+                assert!(
+                    part.contains(&"k00".to_string()),
+                    "FNV-1a golden: k00 in seg0"
+                );
+                assert!(!part.contains(&"k07".to_string()));
+            }
+            union.extend(part);
+        }
+        union.sort();
+        assert_eq!(
+            union,
+            (0..10).map(|i| format!("k{i:02}")).collect::<Vec<_>>(),
+            "segment union == full key set"
+        );
+        let (again, _) = list_all(
+            &r,
+            json!({"vectorBucketName": "lvb", "indexName": "lix",
+                   "segmentCount": 3, "segmentIndex": 0}),
+        )
+        .await;
+        let (first, _) = list_all(
+            &r,
+            json!({"vectorBucketName": "lvb", "indexName": "lix",
+                   "segmentCount": 3, "segmentIndex": 0}),
+        )
+        .await;
+        assert_eq!(first, again, "same key always lands in the same segment");
+
+        // pairing: either member alone -> ValidationException
+        let (st, h, b) = call(
+            &r,
+            "/ListVectors",
+            r#"{"vectorBucketName":"lvb","indexName":"lix","segmentCount":2}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(errortype(&h), Some("ValidationException"));
+        assert_eq!(b["fieldList"][0]["path"], json!("segmentIndex"));
+        let (st, _, b) = call(
+            &r,
+            "/ListVectors",
+            r#"{"vectorBucketName":"lvb","indexName":"lix","segmentIndex":1}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["fieldList"][0]["path"], json!("segmentCount"));
+
+        // ranges: count 17 / index 16 / index >= count / count 0 -> 400
+        for (count, index) in [(17, 0), (16, 16), (2, 2), (0, 0)] {
+            let body = jbody(json!({
+                "vectorBucketName": "lvb", "indexName": "lix",
+                "segmentCount": count, "segmentIndex": index,
+            }));
+            let (st, _, b) = call(&r, "/ListVectors", &body).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{body} {b}");
+        }
+
+        // maxResults range + garbage token
+        let (st, _, b) = call(
+            &r,
+            "/ListVectors",
+            r#"{"vectorBucketName":"lvb","indexName":"lix","maxResults":0}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["fieldList"][0]["path"], json!("maxResults"));
+        let (st, _, _) = call(
+            &r,
+            "/ListVectors",
+            r#"{"vectorBucketName":"lvb","indexName":"lix","maxResults":1001}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let (st, _, _) = call(
+            &r,
+            "/ListVectors",
+            r#"{"vectorBucketName":"lvb","indexName":"lix","nextToken":"@@not-base64@@"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // empty index -> 200 with empty vectors
+        mkindex(&r, "lvb", "lix2", 2, "euclidean").await;
+        let (st, _, b) = call(
+            &r,
+            "/ListVectors",
+            r#"{"vectorBucketName":"lvb","indexName":"lix2"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["vectors"].as_array().unwrap().len(), 0);
+        assert!(b.get("nextToken").is_none());
+
+        // missing index -> 404
+        let (st, h, _) = call(
+            &r,
+            "/ListVectors",
+            r#"{"vectorBucketName":"lvb","indexName":"zz"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(errortype(&h), Some("NotFoundException"));
+    }
+
+    /// 1 MiB page budget: 30 vectors x ~39 KB non-filterable metadata exceed
+    /// the budget mid-walk; the page must cut at the last COMPLETE vector and
+    /// hand out a nextToken (AWS: "processed dataset size exceeds 1 MB" —
+    /// approximation documented at LIST_PAGE_BUDGET).
+    #[tokio::test]
+    async fn list_vectors_1mib_page_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"mbvb"}"#).await;
+        let (st, _, b) = call(
+            &r,
+            "/CreateIndex",
+            &jbody(json!({
+                "vectorBucketName": "mbvb", "indexName": "mbix", "dataType": "float32",
+                "dimension": 2, "distanceMetric": "euclidean",
+                "metadataConfiguration": {"nonFilterableMetadataKeys": ["blob"]},
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let blob = "x".repeat(39_000);
+        let vectors: Vec<serde_json::Value> = (0..30)
+            .map(|i| {
+                json!({"key": format!("big-{i:02}"), "data": {"float32": [1, 0]},
+                       "metadata": {"blob": blob}})
+            })
+            .collect();
+        let (st, _, b) = call(
+            &r,
+            "/PutVectors",
+            &jbody(json!({"vectorBucketName": "mbvb", "indexName": "mbix", "vectors": vectors})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+
+        // page 1: truncated below 30 entries, token present, under budget
+        let (st, _, b) = call(
+            &r,
+            "/ListVectors",
+            r#"{"vectorBucketName":"mbvb","indexName":"mbix",
+                "returnMetadata":true}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let vs = b["vectors"].as_array().unwrap();
+        assert!(
+            vs.len() < 30 && vs.len() >= 26,
+            "truncated at a complete vector: {} entries",
+            vs.len()
+        );
+        assert!(
+            b.get("nextToken").is_some(),
+            "budget truncation hands out a token"
+        );
+        assert!(
+            serde_json::to_vec(&b).unwrap().len() <= 1024 * 1024,
+            "emitted page stays within the 1 MiB budget"
+        );
+        assert_eq!(vs.last().unwrap()["key"], json!("big-25")); // 26 full entries fit
+
+        // the walk still covers everything, in order
+        let (seen, pages) = list_all(
+            &r,
+            json!({"vectorBucketName": "mbvb", "indexName": "mbix", "returnMetadata": true}),
+        )
+        .await;
+        assert_eq!(pages, 2, "second page holds the remaining 4");
+        assert_eq!(
+            seen,
+            (0..30).map(|i| format!("big-{i:02}")).collect::<Vec<_>>()
+        );
+    }
+
+    /// PutVectors full limit set: 20 MiB payload, 40 KB metadata, 50 keys,
+    /// 2 KB filterable (with the non-filterable exemption), value types,
+    /// same-batch duplicate keys (last wins).
+    #[tokio::test]
+    async fn put_vectors_full_limit_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"pvb"}"#).await;
+        mkindex(&r, "pvb", "sml", 2, "euclidean").await; // plain index
+        let (st, _, b) = call(
+            &r,
+            "/CreateIndex",
+            &jbody(json!({
+                "vectorBucketName": "pvb", "indexName": "big", "dataType": "float32",
+                "dimension": 1024, "distanceMetric": "euclidean",
+                "metadataConfiguration": {"nonFilterableMetadataKeys": ["blob"]},
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let (st, _, b) = call(
+            &r,
+            "/CreateIndex",
+            &jbody(json!({
+                "vectorBucketName": "pvb", "indexName": "blob2", "dataType": "float32",
+                "dimension": 2, "distanceMetric": "euclidean",
+                "metadataConfiguration": {"nonFilterableMetadataKeys": ["blob"]},
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+
+        // (a) 20 MiB payload cap. 500 vectors x (39 KB blob + dim-1024
+        // vector) ~= 21.6 MB: each vector is individually VALID, only the
+        // payload rule trips. Body sits under the 21 MiB transport cap so the
+        // handler — not the body limit — answers.
+        let vec1024 = format!("[{}]", vec!["0.5"; 1024].join(","));
+        let blob = "x".repeat(39_000);
+        let mut items = String::new();
+        for i in 0..500 {
+            if i > 0 {
+                items.push(',');
+            }
+            items.push_str(&format!(
+                r#"{{"key":"m{:03}","data":{{"float32":{}}},"metadata":{{"blob":"{}"}}}}"#,
+                i, vec1024, blob
+            ));
+        }
+        let over = format!(r#"{{"vectorBucketName":"pvb","indexName":"big","vectors":[{items}]}}"#);
+        assert!(
+            over.len() > 20 * 1024 * 1024 && over.len() < 21 * 1024 * 1024,
+            "test body must be between 20 and 21 MiB, got {}",
+            over.len()
+        );
+        let (st, h, b) = call(&r, "/PutVectors", &over).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(errortype(&h), Some("ValidationException"));
+        assert!(b["message"].as_str().unwrap().contains("20 MiB"), "{b}");
+        // 480 of the same vectors ~= 20.7 MB: under the cap -> 200
+        let under: String = {
+            let mut s = String::new();
+            for i in 0..480 {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&format!(
+                    r#"{{"key":"u{:03}","data":{{"float32":{}}},"metadata":{{"blob":"{}"}}}}"#,
+                    i, vec1024, blob
+                ));
+            }
+            format!(r#"{{"vectorBucketName":"pvb","indexName":"big","vectors":[{s}]}}"#)
+        };
+        assert!(under.len() < 20 * 1024 * 1024, "{}", under.len());
+        let (st, _, b) = call(&r, "/PutVectors", &under).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+
+        // (b) 40 KB total metadata cap (blob-declared key: only the total trips)
+        let (st, _, b) = call(
+            &r,
+            "/PutVectors",
+            &jbody(json!({
+                "vectorBucketName": "pvb", "indexName": "blob2",
+                "vectors": [{"key": "fat", "data": {"float32": [0, 1]},
+                             "metadata": {"blob": "x".repeat(41_000)}}]
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert!(b["message"].as_str().unwrap().contains("40 KB"), "{b}");
+
+        // (c) 51 keys -> rejection
+        let mut many = serde_json::Map::new();
+        for i in 0..51 {
+            many.insert(format!("k{i:02}"), json!(i));
+        }
+        let (st, _, b) = call(
+            &r,
+            "/PutVectors",
+            &jbody(json!({
+                "vectorBucketName": "pvb", "indexName": "sml",
+                "vectors": [{"key": "k", "data": {"float32": [0, 1]},
+                             "metadata": many}]
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert!(b["message"].as_str().unwrap().contains("50"), "{b}");
+
+        // (d) filterable 2 KB per vector: over on a plain index, exempt under
+        // a declared non-filterable key of the same size.
+        let big_value = "v".repeat(2_100);
+        let (st, h, b) = call(
+            &r,
+            "/PutVectors",
+            &jbody(json!({
+                "vectorBucketName": "pvb", "indexName": "sml",
+                "vectors": [{"key": "f", "data": {"float32": [0, 1]},
+                             "metadata": {"s": big_value}}]
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(errortype(&h), Some("ValidationException"));
+        assert!(b["message"].as_str().unwrap().contains("2 KB"), "{b}");
+        let (st, _, b) = call(
+            &r,
+            "/CreateIndex",
+            &jbody(json!({
+                "vectorBucketName": "pvb", "indexName": "blb2", "dataType": "float32",
+                "dimension": 2, "distanceMetric": "euclidean",
+                "metadataConfiguration": {"nonFilterableMetadataKeys": ["doc"]},
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let (st, _, b) = call(
+            &r,
+            "/PutVectors",
+            &jbody(json!({
+                "vectorBucketName": "pvb", "indexName": "blb2",
+                "vectors": [{"key": "f", "data": {"float32": [0, 1]},
+                             "metadata": {"doc": big_value}}]
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b} (declared non-filterable: exempt)");
+        let (st, _, b) = call(
+            &r,
+            "/GetVectors",
+            &jbody(json!({"vectorBucketName": "pvb", "indexName": "blb2",
+                          "keys": ["f"], "returnMetadata": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(
+            b["vectors"][0]["metadata"]["doc"].as_str().unwrap().len(),
+            2_100
+        );
+
+        // (e) value types: nested object / null / list-of-object rejected with
+        // the legal types named; flat list round-trips.
+        for bad in [
+            json!({"nested": {"a": 1}}),
+            json!({"nul": null}),
+            json!({"arr": [{"x": 1}]}),
+            json!({"arr2": [[1]]}),
+        ] {
+            let (st, _, b) = call(
+                &r,
+                "/PutVectors",
+                &jbody(json!({
+                    "vectorBucketName": "pvb", "indexName": "sml",
+                    "vectors": [{"key": "t", "data": {"float32": [0, 1]}, "metadata": bad}]
+                })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{bad} {b}");
+            let msg = b["message"].as_str().unwrap();
+            assert!(
+                msg.contains("string, number, boolean"),
+                "message names the legal types: {msg}"
+            );
+        }
+        let (st, _, b) = call(
+            &r,
+            "/PutVectors",
+            &jbody(json!({
+                "vectorBucketName": "pvb", "indexName": "sml",
+                "vectors": [{"key": "t", "data": {"float32": [0, 1]},
+                             "metadata": {"s": "str", "n": 1.5, "b": false,
+                                          "l": ["a", 2, true]}}]
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let (st, _, b) = call(
+            &r,
+            "/GetVectors",
+            &jbody(json!({"vectorBucketName": "pvb", "indexName": "sml",
+                          "keys": ["t"], "returnMetadata": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(
+            b["vectors"][0]["metadata"],
+            json!({"s": "str", "n": 1.5, "b": false, "l": ["a", 2, true]})
+        );
+
+        // (f) same-batch duplicate keys: last occurrence wins
+        let (st, _, b) = call(
+            &r,
+            "/PutVectors",
+            &jbody(json!({
+                "vectorBucketName": "pvb", "indexName": "sml",
+                "vectors": [
+                    {"key": "d", "data": {"float32": [0, 0]}, "metadata": {"v": 1}},
+                    {"key": "d", "data": {"float32": [1, 1]}, "metadata": {"v": 2}}
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let (st, _, b) = call(
+            &r,
+            "/GetVectors",
+            &jbody(json!({"vectorBucketName": "pvb", "indexName": "sml",
+                          "keys": ["d"], "returnData": true, "returnMetadata": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(
+            b["vectors"][0]["metadata"]["v"],
+            json!(2),
+            "last write wins"
+        );
+        assert_eq!(b["vectors"][0]["data"]["float32"], json!([1.0, 1.0]));
+
+        // empty metadata object is legal
+        let (st, _, b) = call(
+            &r,
+            "/PutVectors",
+            &jbody(json!({
+                "vectorBucketName": "pvb", "indexName": "sml",
+                "vectors": [{"key": "e", "data": {"float32": [0, 1]}, "metadata": {}}]
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
     }
 }

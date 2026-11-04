@@ -17,7 +17,10 @@
 //!   `memory://vf/…`, S3: `s3://<bucket>[/<prefix>]/…`), opened through the
 //!   backend's shared `Session` (per-registry object stores). A fresh
 //!   `Connection` per operation remains a spike simplification — no connection
-//!   cache; M0 REPORT 遗留 3, TODO for a later M1 task.
+//!   cache; M0 REPORT 遗留 3, TODO for a later M1 task. M1 T4 adds the
+//!   vector-surface engine paths: key point-lookup (GetVectors), key-ordered
+//!   cursor scan (ListVectors) and key-bound delete (DeleteVectors) — all via
+//!   DataFusion expression predicates (see `keys_in`), never SQL strings.
 //!
 //! Lance schema: `key: utf8 not null`, `vector: fixed_size_list<f32, dim>` (not null),
 //! `metadata_json: utf8 nullable` (metadata blob — no dynamic columns yet; the
@@ -32,6 +35,11 @@ use lancedb::arrow::arrow_array::{
 // Arrow numeric type marker used by `as_primitive`.
 use lancedb::arrow::arrow_array::types::Float32Type;
 use lancedb::arrow::arrow_schema::{ArrowError, DataType, Field, Schema};
+// DataFusion expression builders (lancedb re-exports): the ONLY route used for
+// key predicates — values become ScalarValue literals serialized as substrait,
+// never SQL text, so arbitrary UTF-8 keys cannot inject or escape (M1 T4:
+// GetVectors / ListVectors / DeleteVectors all share this discipline).
+use lancedb::expr::{col, is_in, lit};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, DistanceType, Table};
 
@@ -489,6 +497,78 @@ impl Storage {
         let table = self.open_table(vb, ix).await?;
         query_table(&table, dim, metric, query, top_k, filter).await
     }
+
+    // ---- engine: M1 T4 vector-surface reads/writes ----
+
+    /// Batch point lookup by primary key (GetVectors, ≤100 keys): ONE scan
+    /// with an arrow-bound IN predicate. Keys are bound as DataFusion
+    /// `ScalarValue` literals — no SQL string is ever built, so keys
+    /// containing quotes / backslashes / unicode / emoji cannot inject.
+    pub async fn get_vectors(
+        &self,
+        vb: &str,
+        ix: &str,
+        keys: &[String],
+    ) -> Result<Vec<FoundVector>, StoreError> {
+        let table = self.open_table(vb, ix).await?;
+        let pred = keys_in(keys);
+        let stream = table
+            .query()
+            .only_if_expr(pred)
+            .execute()
+            .await
+            .map_err(internal)?;
+        let mut out = Vec::new();
+        let mut stream = stream;
+        use futures_util::StreamExt;
+        while let Some(batch) = stream.next().await {
+            out.extend(found_from_batch(&batch.map_err(internal)?)?);
+        }
+        Ok(out)
+    }
+
+    /// Key-ordered scan with an optional `key > after` cursor bound
+    /// (ListVectors pagination). The comparison is arrow/datafusion UTF-8
+    /// byte order — identical to Rust `str` ordering, so the cursor written
+    /// by the ops layer round-trips across engines. TODO(M1): the scan is
+    /// materialized and sorted Rust-side (spike-consistent; predicate
+    /// pushdown + engine-side ORDER BY is the M0 REPORT 遗留 1 follow-up).
+    pub async fn scan_vectors(
+        &self,
+        vb: &str,
+        ix: &str,
+        after: Option<&str>,
+    ) -> Result<Vec<FoundVector>, StoreError> {
+        let table = self.open_table(vb, ix).await?;
+        let mut query = table.query();
+        if let Some(a) = after {
+            query = query.only_if_expr(col("key").gt(lit(a.to_string())));
+        }
+        let stream = query.execute().await.map_err(internal)?;
+        let mut out = Vec::new();
+        let mut stream = stream;
+        use futures_util::StreamExt;
+        while let Some(batch) = stream.next().await {
+            out.extend(found_from_batch(&batch.map_err(internal)?)?);
+        }
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(out)
+    }
+
+    /// Delete rows by primary key (DeleteVectors, ≤500 keys) through the
+    /// same arrow-bound predicate (`Predicate::Expr` → substrait; the SQL
+    /// string route is deliberately unused). Deleting absent keys is a no-op
+    /// — idempotent success, AWS semantics.
+    pub async fn delete_vectors(
+        &self,
+        vb: &str,
+        ix: &str,
+        keys: &[String],
+    ) -> Result<(), StoreError> {
+        let table = self.open_table(vb, ix).await?;
+        table.delete(&keys_in(keys)).await.map_err(internal)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +641,59 @@ pub struct QueryHit {
     pub key: String,
     pub distance: f32,
     pub metadata: Option<serde_json::Value>,
+}
+
+/// A stored vector as returned by the point-lookup/scan paths (GetVectors /
+/// ListVectors): full row, distance computed by the caller if it wants one.
+pub struct FoundVector {
+    pub key: String,
+    pub vector: Vec<f32>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// `key IN (lit(k1), …, lit(kn))` — the arrow/datafusion-bound key predicate
+/// shared by get/delete. Injection safety: values ride as typed literals in
+/// the serialized expression plan, never as SQL text (see module doc).
+fn keys_in(keys: &[String]) -> lancedb::expr::DfExpr {
+    is_in(
+        col("key"),
+        keys.iter().map(|k| lit(k.clone())).collect::<Vec<_>>(),
+    )
+}
+
+/// Read whole rows (key, vector, metadata) from a scan batch.
+fn found_from_batch(batch: &RecordBatch) -> Result<Vec<FoundVector>, StoreError> {
+    let Some(keys) = batch.column_by_name("key") else {
+        return Err(StoreError::Internal("missing key column".into()));
+    };
+    let keys = keys
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| StoreError::Internal("key column not utf8".into()))?;
+    let Some(vectors) = batch.column_by_name("vector") else {
+        return Err(StoreError::Internal("missing vector column".into()));
+    };
+    let vectors = vectors
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .ok_or_else(|| StoreError::Internal("vector column not fixed_size_list".into()))?;
+    let metas = batch
+        .column_by_name("metadata_json")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        let v = vectors.value(i);
+        let v = v
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| StoreError::Internal("vector values not float32".into()))?;
+        out.push(FoundVector {
+            key: keys.value(i).to_string(),
+            vector: v.values().to_vec(),
+            metadata: metadata_at(metas, i),
+        });
+    }
+    Ok(out)
 }
 
 /// Flat exact KNN.
