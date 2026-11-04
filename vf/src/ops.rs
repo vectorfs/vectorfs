@@ -83,6 +83,7 @@ pub struct AppState {
 // error protocol
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct ApiError {
     pub status: StatusCode,
     pub shape: &'static str,
@@ -92,7 +93,7 @@ pub struct ApiError {
     pub field_list: Option<Vec<FieldError>>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct FieldError {
     pub path: String,
     pub message: String,
@@ -213,8 +214,9 @@ fn now() -> (f64, String) {
     (secs, epoch_to_rfc3339(secs))
 }
 
-/// days->civil (Howard Hinnant); no chrono dependency.
-fn epoch_to_rfc3339(secs: f64) -> String {
+/// days->civil (Howard Hinnant); no chrono dependency. `vf status` reuses
+/// this for LOCK start times (M1 T6).
+pub(crate) fn epoch_to_rfc3339(secs: f64) -> String {
     let millis = (secs.fract() * 1000.0).round().rem_euclid(1000.0) as u32;
     let total = secs.floor() as i64;
     let days = total.div_euclid(86400);

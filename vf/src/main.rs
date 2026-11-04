@@ -1,21 +1,35 @@
-//! `vf` CLI (M1: serve + init; status/doctor land in M1 T6, design.md §5.8).
+//! `vf` CLI (M1: serve + init + status + doctor + mcp, design.md §5.8).
 //!
 //! `vf serve` is the fully functional s3vectors server harvested from the M0
 //! spike, now on the unified backend (file/memory/S3), the flag > env >
 //! vf.json > default config chain (config.rs), and the single-writer lock
-//! (lock.rs).
+//! (lock.rs). `vf status` / `vf doctor` are the read-only inspection pair
+//! (status.rs / doctor.rs) and `vf mcp` is the stdio MCP server for the
+//! agent single-user mode (mcp.rs).
+//!
+//! Output contract everywhere (report.rs, §5.8): stdout = results, stderr =
+//! progress, exit codes grep-compatible, abnormal exits print
+//! {code, message, hint}.
 
 use std::sync::Arc;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use vectorfs::config::{self, ServeFlags};
 use vectorfs::ops::AppState;
-use vectorfs::{backends, lock, store};
+use vectorfs::report::Failure;
+use vectorfs::{backends, lock, mcp, status, store};
+
+/// `--version` needs a `&'static str` for clap; compute once (report.rs
+/// explains the VF_GIT_HASH compile-time option).
+fn version_str() -> &'static str {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(vectorfs::report::version_string)
+}
 
 #[derive(Parser, Debug)]
 #[command(
     name = "vf",
-    version,
+    version = version_str(),
     about = "vectorfs — turn any S3 into S3 Vectors. Single binary.",
     arg_required_else_help = true
 )]
@@ -31,10 +45,39 @@ enum Command {
 
     /// Generate static credentials and write <data-dir>/vf.json
     Init(InitArgs),
-    /// Show daemon / backend / bucket+index overview (TODO: M1 T6)
-    Status,
-    /// Probe backend connectivity & conditional-write capability (TODO: M1 T6)
-    Doctor,
+
+    /// Read-only data-root overview: LOCK holder, backend, buckets/indexes,
+    /// per-index vector counts, data volume — or probe a daemon with
+    /// --endpoint
+    ///
+    /// Examples (copy-paste ready):
+    ///
+    ///   vf status --data-dir ./vectorfs-data
+    ///
+    ///   vf status --data-dir ./vectorfs-data --json | jq .
+    ///
+    ///   vf status --endpoint http://127.0.0.1:8787
+    Status(StatusArgs),
+
+    /// Diagnose a data root: writable/conditional-write probe, vf.json,
+    /// LOCK state, per-index dataset health, disk headroom
+    ///
+    /// Examples:
+    ///
+    ///   vf doctor --data-dir ./vectorfs-data
+    ///
+    ///   vf doctor --data-dir ./vectorfs-data --json | jq '.overall'
+    Doctor(DoctorArgs),
+
+    /// Run the stdio MCP server (agent single-user mode: this process is
+    /// the ONLY writer — it takes the same LOCK as `vf serve`)
+    ///
+    /// Examples (for an MCP client config):
+    ///
+    ///   vf mcp --data-dir ./vectorfs-data
+    ///
+    ///   vf mcp --data-dir ./vectorfs-data --tools ro
+    Mcp(McpArgs),
 }
 
 /// `vf init` arguments.
@@ -108,9 +151,58 @@ struct ServeArgs {
     trace: bool,
 }
 
-fn placeholder(name: &str, task: &str) -> ! {
-    eprintln!("vf {name}: not implemented yet ({task})");
-    std::process::exit(2);
+/// `vf status` arguments (data-dir mode resolves exactly like serve's
+/// storage slice; see config::resolve_storage).
+#[derive(Parser, Debug)]
+struct StatusArgs {
+    /// Data directory to inspect [env: VF_DATA_DIR] [default: ./vectorfs-data]
+    #[arg(long)]
+    data_dir: Option<String>,
+
+    /// Backend: file | memory | s3+http(s)://host:port/bucket[/prefix]
+    /// [env: VF_BACKEND] [default: file]
+    #[arg(long)]
+    backend: Option<String>,
+
+    /// Probe a RUNNING daemon instead of the local data root: GETs
+    /// <endpoint>/healthz and prints what it reports (http only)
+    #[arg(long, conflicts_with = "data_dir")]
+    endpoint: Option<String>,
+
+    /// Structured output (schema_version'd JSON) instead of the human table
+    #[arg(long)]
+    json: bool,
+}
+
+/// `vf doctor` arguments.
+#[derive(Parser, Debug)]
+struct DoctorArgs {
+    /// Data directory to diagnose [env: VF_DATA_DIR] [default: ./vectorfs-data]
+    #[arg(long)]
+    data_dir: Option<String>,
+
+    /// Backend: file | memory | s3+http(s)://host:port/bucket[/prefix]
+    /// [env: VF_BACKEND] [default: file]
+    #[arg(long)]
+    backend: Option<String>,
+
+    /// Structured output: {schema_version, overall, checks:[…]}
+    #[arg(long)]
+    json: bool,
+}
+
+/// `vf mcp` arguments.
+#[derive(Parser, Debug)]
+struct McpArgs {
+    /// Data directory to serve exclusively [env: VF_DATA_DIR]
+    /// [default: ./vectorfs-data]
+    #[arg(long)]
+    data_dir: Option<String>,
+
+    /// Tool set: `ro` = list/query/get only; `rw` adds put/delete
+    /// [default: rw]
+    #[arg(long, default_value = "rw")]
+    tools: mcp::ToolsMode,
 }
 
 #[tokio::main]
@@ -119,13 +211,107 @@ async fn main() {
     match cli.command {
         Some(Command::Serve(args)) => serve(args).await,
         Some(Command::Init(args)) => init(args),
+        Some(Command::Status(args)) => status_cmd(args).await,
+        Some(Command::Doctor(args)) => doctor_cmd(args).await,
+        Some(Command::Mcp(args)) => mcp_cmd(args).await,
         // Bare `vf` already gets help from arg_required_else_help; this arm is
         // the explicit fallback for a None subcommand.
         None => {
             Cli::command().print_help().expect("print help");
         }
-        Some(Command::Status) => placeholder("status", "M1 T6"),
-        Some(Command::Doctor) => placeholder("doctor", "M1 T6"),
+    }
+}
+
+/// Storage-only flags for the inspection commands (status/doctor/mcp): only
+/// the flag layer — the env (`VF_DATA_DIR` / `VF_BACKEND`) and default
+/// layers are applied by config::resolve_storage.
+fn storage_flags(data_dir: &Option<String>, backend: &Option<String>) -> ServeFlags {
+    ServeFlags {
+        data_dir: data_dir.as_deref().map(std::path::PathBuf::from),
+        backend: backend.clone(),
+        ..Default::default()
+    }
+}
+
+async fn status_cmd(args: StatusArgs) {
+    if let Some(url) = &args.endpoint {
+        match status::endpoint_probe(url).await {
+            Ok(report) => {
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).expect("report serializes")
+                    );
+                } else {
+                    print!("{}", status::render_endpoint_human(&report));
+                }
+            }
+            Err(f) => f.fail(args.json, 1),
+        }
+        return;
+    }
+    let flags = storage_flags(&args.data_dir, &args.backend);
+    let cfg = config::resolve_storage(&flags).unwrap_or_else(|e| {
+        Failure::new("CONFIG", e, "fix the data dir / backend flags").fail(args.json, 2)
+    });
+    eprintln!("vf: inspecting data root at {} …", cfg.data_dir.display());
+    match status::gather(&cfg).await {
+        Ok(report) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).expect("report serializes")
+                );
+            } else {
+                print!("{}", status::render_human(&report));
+            }
+        }
+        Err(f) => f.fail(args.json, 1),
+    }
+}
+
+async fn doctor_cmd(args: DoctorArgs) {
+    let flags = storage_flags(&args.data_dir, &args.backend);
+    let cfg = config::resolve_storage(&flags).unwrap_or_else(|e| {
+        Failure::new("CONFIG", e, "fix the data dir / backend flags").fail(args.json, 2)
+    });
+    eprintln!("vf: probing data root at {} …", cfg.data_dir.display());
+    match vectorfs::doctor::run(&cfg).await {
+        Ok(report) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).expect("report serializes")
+                );
+            } else {
+                print!("{}", vectorfs::doctor::render_human(&report));
+            }
+            if report.any_fail() {
+                std::process::exit(1);
+            }
+        }
+        Err(f) => f.fail(args.json, 1),
+    }
+}
+
+async fn mcp_cmd(args: McpArgs) {
+    let flags = storage_flags(&args.data_dir, &None);
+    let cfg = config::resolve_storage(&flags)
+        .unwrap_or_else(|e| Failure::new("CONFIG", e, "fix the data dir flag").fail(false, 2));
+    match mcp::run(&cfg, args.tools).await {
+        mcp::McpExit::Ok => {}
+        mcp::McpExit::Held(who, hint) => Failure::new(
+            "DATA_ROOT_HELD",
+            format!("refusing to start: another writer owns this data root ({who})"),
+            hint,
+        )
+        .fail(false, 3),
+        mcp::McpExit::Failed(msg) => Failure::new(
+            "MCP_START_FAILED",
+            msg,
+            "check the data root (vf doctor) and that stdin/stdout are a pipe pair",
+        )
+        .fail(false, 2),
     }
 }
 

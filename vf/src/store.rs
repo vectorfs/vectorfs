@@ -664,6 +664,13 @@ impl Storage {
         table.delete(&keys_in(keys)).await.map_err(internal)?;
         Ok(())
     }
+
+    /// Read-only row count of one index's dataset — the `vf status` /
+    /// `vf doctor` inspection path (M1 T6). Never opens a write path.
+    pub async fn count_vectors(&self, vb: &str, ix: &str) -> Result<usize, StoreError> {
+        let table = self.open_table(vb, ix).await?;
+        table.count_rows(None).await.map_err(internal)
+    }
 }
 
 // ---------------------------------------------------------------------------

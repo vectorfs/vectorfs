@@ -97,6 +97,65 @@ pub fn resolve(flags: &ServeFlags) -> Result<ResolvedConfig, String> {
     resolve_impl(flags, &env)
 }
 
+/// Storage-only slice of the chain (flag > `VF_*` env > default), for the
+/// inspection commands `vf status` / `vf doctor` (M1 T6): data dir, backend
+/// spec and S3 connection settings — deliberately NO credential requirement,
+/// these commands read the data root and never serve the wire.
+#[derive(Debug, Clone)]
+pub struct StorageConfig {
+    pub data_dir: PathBuf,
+    /// Backend spec BEFORE `Backend::parse` (file|memory|s3+…).
+    pub backend_spec: String,
+    pub s3_region: String,
+    pub s3_access_key: Option<String>,
+    pub s3_secret_key: Option<String>,
+}
+
+impl StorageConfig {
+    /// Parse into a [`crate::backends::Backend`], injecting the S3
+    /// connection settings. CAUTION: on the `file` backend `Backend::parse`
+    /// CREATES + canonicalizes the data dir — callers that must not create
+    /// it (`vf status` / `vf doctor` probing a possibly-missing root) check
+    /// existence first.
+    pub fn backend(&self) -> Result<crate::backends::Backend, String> {
+        let mut backend = crate::backends::Backend::parse(&self.backend_spec, &self.data_dir)?;
+        if let crate::backends::Backend::S3(cfg) = &mut backend {
+            cfg.region = self.s3_region.clone();
+            cfg.access_key = self.s3_access_key.clone();
+            cfg.secret_key = self.s3_secret_key.clone();
+        }
+        Ok(backend)
+    }
+
+    /// True when the resolved backend stores data under the local data dir
+    /// (i.e. the "no data root" early-exit of the inspection commands
+    /// applies).
+    pub fn is_file_backend(&self) -> bool {
+        matches!(self.backend_spec.as_str(), "file") || self.backend_spec.starts_with("file:")
+    }
+}
+
+/// Test seam, same as [`resolve_with`].
+pub fn resolve_storage_with(
+    flags: &ServeFlags,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<StorageConfig, String> {
+    let env = &env as &dyn Fn(&str) -> Option<String>;
+    let (s3_region, s3_access_key, s3_secret_key) = s3_conn_of(flags, env);
+    Ok(StorageConfig {
+        data_dir: data_dir_of(flags, env),
+        backend_spec: backend_spec_of(flags, env),
+        s3_region,
+        s3_access_key,
+        s3_secret_key,
+    })
+}
+
+/// The production entry: storage-only resolution against the real environment.
+pub fn resolve_storage(flags: &ServeFlags) -> Result<StorageConfig, String> {
+    resolve_storage_with(flags, env)
+}
+
 /// Read `<dir>/vf.json` if present. Missing file -> Ok(None); present but
 /// unreadable/corrupt -> Err (fail closed: silently ignoring credentials the
 /// operator thinks are active is worse than refusing to start).
@@ -111,6 +170,52 @@ pub fn read_vf_json(dir: &Path) -> Result<Option<VfJson>, String> {
     }
 }
 
+/// Data dir resolution: flag (`--data-dir`) > env (`VF_DATA_DIR`) > default
+/// (`./vectorfs-data`). Shared by the daemon and inspection resolutions.
+fn data_dir_of(flags: &ServeFlags, env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    flags
+        .data_dir
+        .clone()
+        .or_else(|| env("VF_DATA_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR))
+}
+
+/// Backend spec resolution: flag (`--backend`) > env (`VF_BACKEND`) > `file`.
+/// vf.json never carries a backend — it is per-machine credentials/config,
+/// the backend is per-invocation.
+fn backend_spec_of(flags: &ServeFlags, env: &dyn Fn(&str) -> Option<String>) -> String {
+    flags
+        .backend
+        .clone()
+        .or_else(|| env("VF_BACKEND"))
+        .unwrap_or_else(|| "file".to_string())
+}
+
+/// S3 backend connection settings: flag > `VF_S3_*` env > `AWS_*` env.
+fn s3_conn_of(
+    flags: &ServeFlags,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> (String, Option<String>, Option<String>) {
+    let region = flags
+        .s3_region
+        .clone()
+        .or_else(|| env("VF_S3_REGION"))
+        .or_else(|| env("AWS_REGION"))
+        .or_else(|| env("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|| DEFAULT_REGION.to_string());
+    let access_key = flags
+        .s3_access_key
+        .clone()
+        .or_else(|| env("VF_S3_ACCESS_KEY"))
+        .or_else(|| env("AWS_ACCESS_KEY_ID"));
+    let secret_key = flags
+        .s3_secret_key
+        .clone()
+        .or_else(|| env("VF_S3_SECRET_KEY"))
+        .or_else(|| env("AWS_SECRET_ACCESS_KEY"));
+    (region, access_key, secret_key)
+}
+
 /// Resolve: flag > env (`VF_*`) > `<data-dir>/vf.json` > default.
 ///
 /// The data dir itself resolves flag (`--data-dir`) > env (`VF_DATA_DIR`) >
@@ -122,11 +227,7 @@ fn resolve_impl(
     flags: &ServeFlags,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedConfig, String> {
-    let data_dir: PathBuf = flags
-        .data_dir
-        .clone()
-        .or_else(|| env("VF_DATA_DIR").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
+    let data_dir = data_dir_of(flags, env);
 
     let file_cfg = read_vf_json(&data_dir)?;
 
@@ -178,35 +279,15 @@ fn resolve_impl(
         ));
     }
 
-    let backend_spec = flags
-        .backend
-        .clone()
-        .or_else(|| env("VF_BACKEND"))
-        .unwrap_or_else(|| "file".to_string());
+    let backend_spec = backend_spec_of(flags, env);
 
     let port = flags
         .port
         .or_else(|| env("VF_PORT").and_then(|p| p.parse().ok()))
         .unwrap_or(DEFAULT_PORT);
 
-    // S3 backend connection config: flag > VF_S3_* env > AWS_* env.
-    let s3_region = flags
-        .s3_region
-        .clone()
-        .or_else(|| env("VF_S3_REGION"))
-        .or_else(|| env("AWS_REGION"))
-        .or_else(|| env("AWS_DEFAULT_REGION"))
-        .unwrap_or_else(|| DEFAULT_REGION.to_string());
-    let s3_access_key = flags
-        .s3_access_key
-        .clone()
-        .or_else(|| env("VF_S3_ACCESS_KEY"))
-        .or_else(|| env("AWS_ACCESS_KEY_ID"));
-    let s3_secret_key = flags
-        .s3_secret_key
-        .clone()
-        .or_else(|| env("VF_S3_SECRET_KEY"))
-        .or_else(|| env("AWS_SECRET_ACCESS_KEY"));
+    // S3 backend connection config (shared helper).
+    let (s3_region, s3_access_key, s3_secret_key) = s3_conn_of(flags, env);
 
     Ok(ResolvedConfig {
         port,

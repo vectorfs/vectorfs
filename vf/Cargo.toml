@@ -24,8 +24,17 @@ path = "src/main.rs"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 
 # Runtime: deliberately narrow ("signal" for the SIGTERM half of graceful
-# shutdown, design.md §5.1).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal"] }
+# shutdown, design.md §5.1). "io-util" is used directly by the M1 T6 tests
+# (tokio::io::duplex for the in-process MCP smoke); rmcp's stdio transport
+# brings its own tokio/io-std + io-util features into the unified build.
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "fs",
+  "signal",
+  "io-util",
+] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -80,12 +89,47 @@ async-trait = "0.1"
 # dependency tree, so this adds zero new crates.
 getrandom = "0.3"
 
-# Local flock for the same-machine single-writer guard (design.md §5.1).
-# Same version already in the tree via datafusion; only the fs module is used.
+# Local flock for the same-machine single-writer guard (design.md §5.1) and
+# statvfs(2) for `vf doctor`'s free-space check (M1 T6). Same version already
+# in the tree via datafusion; only the fs module is used.
 rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+
+# MCP server (design.md §5.8, selected in §5.7 as "rmcp 3.x stable"): the
+# official Rust MCP SDK, stdio tool server only. Feature set is the minimum:
+# `server` (tool system + schemars schema generation + async-rw transport),
+# `macros` (#[tool]…), `transport-io` (stdio). Default features are REPLACED:
+# the default also turns on `base64` 0.23 for image content — we only emit
+# text content and the tree already pins base64 0.22, so a second copy would
+# be pure weight. Zero AWS-SDK / arrow crates enter via rmcp (deps_guard
+# stays green; rmcp's transitive licenses are MIT/Apache-2.0 — inside the
+# deny.toml allow list).
+rmcp = { version = "3.8", default-features = false, features = [
+  "server",
+  "macros",
+  "transport-io",
+] }
+
+# `vf status --endpoint` health probe (M1 T6): hyper's client through
+# hyper-util. hyper-util 0.1 / http-body-util / http 1 are ALREADY transitive
+# deps of axum in this tree — declaring them directly adds ZERO new crates
+# (recorded for the deps_guard/deny review). http only, no TLS provider is
+# linked: matches the no-outbound-network posture (§5.7 "出网: 无") — the
+# probe is a user-initiated liveness check of a local daemon.
+hyper-util = { version = "0.1", default-features = false, features = [
+  "client",
+  "client-legacy",
+  "http1",
+  "tokio",
+] }
+http-body-util = "0.1"
+http = "1"
 
 [dev-dependencies]
 # tower::oneshot for in-process integration tests (no network port).
 tower = { version = "0.5", features = ["util"] }
 # temp data dirs for tests.
 tempfile = "3"
+# rmcp "client" role for the in-process MCP e2e smoke test (duplex pair +
+# raw JSON-RPC, the same harness rmcp's own protocol tests use). Test builds
+# only — the shipped binary never links the client half (adds tokio-stream).
+rmcp = { version = "3.8", features = ["client"] }

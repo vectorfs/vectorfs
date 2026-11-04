@@ -11,10 +11,14 @@
 
 pub mod backends;
 pub mod config;
+pub mod doctor;
 pub mod filter;
 pub mod lock;
+pub mod mcp;
 pub mod ops;
+pub mod report;
 pub mod sigv4;
+pub mod status;
 pub mod store;
 
 /// Engine-level experiments carried over from the spike as regression tests
@@ -38,7 +42,12 @@ use axum::{Json, Router};
 /// middleware's read, never a bare 413.
 pub const MAX_BODY: usize = 21 * 1024 * 1024;
 
+/// Process-start reference for /healthz `uptimeSeconds` — initialized when
+/// the router is built (server start), read by every healthz hit.
+static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 pub fn build_router(state: ops::AppState) -> Router {
+    STARTED_AT.get_or_init(std::time::Instant::now);
     let authed = Router::new()
         .route("/healthz", get(healthz))
         .route("/CreateVectorBucket", post(ops::create_vector_bucket))
@@ -95,8 +104,19 @@ pub fn build_router(state: ops::AppState) -> Router {
         .with_state(state)
 }
 
+/// /healthz (M1 T6 upgrade): `{"ok": true}` is kept verbatim — liveness
+/// probes keyed on it stay compatible — with `version` and `uptimeSeconds`
+/// added for `vf status --endpoint` (see STARTED_AT above).
 async fn healthz() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true }))
+    let uptime = STARTED_AT
+        .get()
+        .map(|t| t.elapsed().as_secs_f64())
+        .unwrap_or(0.0);
+    Json(serde_json::json!({
+        "ok": true,
+        "version": report::version_string(),
+        "uptimeSeconds": uptime,
+    }))
 }
 
 /// Unknown path/method -> plain 404 JSON.
@@ -335,6 +355,26 @@ mod tests {
                 ("x-amz-date", &s.x_amz_date),
             ],
         )
+    }
+
+    /// /healthz (M1 T6): `ok:true` stays byte-stable (liveness probes keyed
+    /// on it keep working); version + uptimeSeconds are ADDITIVE members.
+    #[tokio::test]
+    async fn healthz_keeps_ok_and_adds_version_uptime() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = build_router(test_state(dir.path(), None));
+        let req = HttpRequest::get("/healthz").body(Body::empty()).unwrap();
+        let (status, _, body) = send(&router, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], serde_json::json!(true));
+        assert!(
+            body["version"].as_str().unwrap().starts_with("0."),
+            "{body}"
+        );
+        assert!(
+            body["uptimeSeconds"].as_f64().is_some_and(|u| u >= 0.0),
+            "{body}"
+        );
     }
 
     #[tokio::test]

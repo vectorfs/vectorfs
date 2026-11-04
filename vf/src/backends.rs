@@ -592,6 +592,31 @@ pub async fn list_prefix(
     Ok(out)
 }
 
+/// (object count, total byte size) under a prefix — `vf status` data-root
+/// volume accounting (M1 T6). Sizes come from list metadata only; no object
+/// body is ever fetched. `None` = the whole store root (on the file backend
+/// that is everything in the data dir; on S3 it is the entire bucket, so S3
+/// callers should pass their configured prefix instead).
+pub async fn prefix_stats(
+    store: &dyn object_store::ObjectStore,
+    prefix: Option<&object_store::path::Path>,
+) -> Result<(usize, u64), String> {
+    use futures_util::StreamExt;
+    let mut stream = store.list(prefix);
+    let (mut objects, mut bytes) = (0usize, 0u64);
+    while let Some(item) = stream.next().await {
+        let meta = item.map_err(|e| {
+            format!(
+                "list {}: {e}",
+                prefix.map(|p| p.as_ref().to_string()).unwrap_or_default()
+            )
+        })?;
+        objects += 1;
+        bytes += meta.size;
+    }
+    Ok((objects, bytes))
+}
+
 // ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
