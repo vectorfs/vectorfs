@@ -28,3 +28,6 @@ conformance/go/*.out
 # --- editor / OS noise ---
 .DS_Store
 *.swp
+
+# --- IDE ---
+.idea/

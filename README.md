@@ -5,14 +5,17 @@
 - Single static binary — no daemon fleet, no containers, starts in seconds.
 - Any S3-compatible object store as persistence; a local directory or memory works too (dev/CI emulator mode).
 - Official AWS SDKs (boto3, aws-sdk-go-v2) connect unmodified, SigV4-verified,
-  strongly consistent read-after-write. No bundled embeddings — it stores the vectors your client sends.
+  strongly consistent read-after-write. No bundled embeddings yet — it stores the vectors
+  your client sends (a pluggable file→vector ingestion pipeline lands in v0.2, see
+  [design.md](design.md)).
 
 [![CI](https://github.com/vectorfs/vectorfs/actions/workflows/ci.yml/badge.svg)](https://github.com/vectorfs/vectorfs/actions/workflows/ci.yml)
 
 > **Status: pre-release.** Protocol face complete: all 21 `s3vectors-2025-07-15`
 > operations conformance-tested through boto3 and aws-sdk-go-v2 (32 steps each,
 > green in CI). Superset features (hybrid search, full-text) in progress — see
-> [design.md](design.md).
+> [design.md](design.md). v0.2 adds the file layer: drop files in, search by
+> meaning (design.md §5.10).
 
 ## Five-minute quickstart
 
@@ -104,6 +107,7 @@ multi-tenant quotas are not enforced locally.
 | Metadata per vector | ≤ 50 keys, ≤ 40 KB; filterable keys ≤ 2 KB | same (enforced) |
 | nonFilterableMetadataKeys | 1–10 keys, immutable | same (enforced) |
 | QueryVectors topK | ≤ 10,000 (100/page + nextToken) | same (enforced) |
+| Filter constraints per query | ≤ 100 (ENHANCED indexes) | same (enforced) |
 | ListVectors maxResults | 1–1000 (default 500) | same (enforced) |
 | ListVectorBuckets/ListIndexes maxResults | 1–500 + prefix | same (enforced) |
 | Segment count/index | 1–16 / 0–15, paired | same (enforced) |
