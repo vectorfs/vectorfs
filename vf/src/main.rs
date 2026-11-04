@@ -366,7 +366,10 @@ async fn serve(args: ServeArgs) {
     };
 
     // ---- backend ----
-    let backend = match backends::Backend::parse(&cfg.backend_spec, &cfg.data_dir) {
+    // ResolvedConfig::backend() (NOT raw Backend::parse): injects the S3
+    // connection settings — see the doc comment there for the unsigned-
+    // request bug this guards against.
+    let backend = match cfg.backend() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("vf: {e}");

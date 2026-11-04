@@ -111,6 +111,24 @@ pub struct StorageConfig {
     pub s3_secret_key: Option<String>,
 }
 
+impl ResolvedConfig {
+    /// Parse the backend spec WITH the resolved S3 connection settings.
+    /// CAUTION: calling `Backend::parse` directly on `backend_spec` (as
+    /// serve did before 2026-11-04) silently drops the S3 credentials —
+    /// requests go out unsigned (`SkipSignature=true`), which SeaweedFS's
+    /// anonymous-admin setup tolerates but real clouds (R2: 400
+    /// InvalidArgument "Authorization") reject.
+    pub fn backend(&self) -> Result<crate::backends::Backend, String> {
+        let mut backend = crate::backends::Backend::parse(&self.backend_spec, &self.data_dir)?;
+        if let crate::backends::Backend::S3(cfg) = &mut backend {
+            cfg.region = self.s3_region.clone();
+            cfg.access_key = self.s3_access_key.clone();
+            cfg.secret_key = self.s3_secret_key.clone();
+        }
+        Ok(backend)
+    }
+}
+
 impl StorageConfig {
     /// Parse into a [`crate::backends::Backend`], injecting the S3
     /// connection settings. CAUTION: on the `file` backend `Backend::parse`
@@ -583,5 +601,38 @@ mod tests {
         .unwrap();
         assert!(c.creds.is_none());
         assert!(c.no_auth);
+    }
+}
+
+#[test]
+fn resolved_backend_carries_s3_credentials_regression() {
+    // 2026-11-04 R2 incident: serve called Backend::parse directly, so S3
+    // creds from env/flags never reached the backend -> unsigned requests
+    // (tolerated by SeaweedFS anonymous-admin, rejected by R2 with 400
+    // InvalidArgument "Authorization"). ResolvedConfig::backend() must
+    // inject them.
+    let dir = tempfile::tempdir().unwrap();
+    let c = resolve_with(
+        &ServeFlags {
+            backend: Some("s3+https://h.example/b".into()),
+            no_auth: true,
+            data_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        },
+        |k| match k {
+            "VF_S3_ACCESS_KEY" => Some("ak".into()),
+            "VF_S3_SECRET_KEY" => Some("sk".into()),
+            "VF_S3_REGION" => Some("auto".into()),
+            _ => None,
+        },
+    )
+    .unwrap();
+    match c.backend().unwrap() {
+        crate::backends::Backend::S3(cfg) => {
+            assert_eq!(cfg.access_key.as_deref(), Some("ak"));
+            assert_eq!(cfg.secret_key.as_deref(), Some("sk"));
+            assert_eq!(cfg.region, "auto");
+        }
+        other => panic!("expected S3 backend, got {other:?}"),
     }
 }

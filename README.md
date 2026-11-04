@@ -7,8 +7,7 @@
 - Official AWS SDKs (boto3, aws-sdk-go-v2) connect unmodified, SigV4-verified,
   strongly consistent read-after-write. No bundled embeddings — it stores the vectors your client sends.
 
-[![CI](https://github.com/OWNER/vectorfs/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/vectorfs/actions/workflows/ci.yml)
-<!-- TODO(repo public): replace OWNER with the GitHub org once the repo is public -->
+[![CI](https://github.com/vectorfs/vectorfs/actions/workflows/ci.yml/badge.svg)](https://github.com/vectorfs/vectorfs/actions/workflows/ci.yml)
 
 > **Status: pre-release.** Protocol face complete: all 21 `s3vectors-2025-07-15`
 > operations conformance-tested through boto3 and aws-sdk-go-v2 (32 steps each,
@@ -18,7 +17,7 @@
 ## Five-minute quickstart
 
 Download a release tarball for Linux x86_64/aarch64 from
-[Releases](https://github.com/OWNER/vectorfs/releases) (published on `v*` tags with
+[Releases](https://github.com/vectorfs/vectorfs/releases) (published on `v*` tags with
 `sha256sums.txt`), or build from source (Rust 1.94+, C toolchain, cmake, protoc):
 
 ```bash
@@ -75,9 +74,10 @@ res, err := client.QueryVectors(ctx, &s3vectors.QueryVectorsInput{
   (no SigV4 verification, no persistence; start/stop in seconds, deterministic).
 - `s3` — any S3-compatible endpoint: `vf serve --backend 's3+http://host:8333/bucket[/prefix]'`
   with `--s3-access-key/--s3-secret-key/--s3-region` (or `VF_S3_*`/`AWS_*` env).
-  Verified on SeaweedFS 4.52 (full conformance + conditional writes). AWS S3, R2
-  and MinIO support `If-None-Match:*` per their docs; real-endpoint conformance
-  runs are pending cloud credentials.
+  Verified end-to-end on SeaweedFS 4.52 and Cloudflare R2 (dual-SDK conformance,
+  conditional writes; R2 `auto` region and constant-size upload parts are
+  handled automatically). AWS S3 and MinIO follow the same S3 semantics
+  (`If-None-Match:*` documented by both).
 
 ## What works / what's different
 

@@ -155,7 +155,7 @@ AWS SDK / CLI(vf) / MCP 客户端
 ### 5.2 存储后端抽象
 
 - **接入路线定稿（M0 实证，零 AWS SDK）**：object_store 0.14（aws feature）自建客户端 → 实现 `lance_io::ObjectStoreProvider` → 自定义 lancedb `Session` 注入。例外记录：需直接依赖 lance-io（lancedb 未 re-export provider trait）。代价：aws feature 硬绑 aws-lc-rs（cmake 构建依赖），体积 +67.7MiB——接受（风险 #11）。
-- v0.1 矩阵：`file://`（默认，零配置）、`memory://`（CI/测试）、`s3://`（**SeaweedFS 4.52 已实测 9/9 + 条件写 + 延迟**；AWS S3 / R2 / MinIO 存量——If-None-Match:\* 文档核实均支持，M1 在真实云 S3 补实测 conformance）。v0.2 验证扩展：Ceph RGW、Garage/Silo。
+- v0.1 矩阵：`file://`（默认，零配置）、`memory://`（CI/测试）、`s3://`——**已实测：SeaweedFS 4.52（M0，9/9+延迟+条件写）与 Cloudflare R2（2026-11-04，双 SDK 32+32 conformance+条件写+doctor 探针，region=auto）**；AWS S3 / MinIO 存量——If-None-Match:\* 文档核实，未实测。R2 首测暴露真 bug：serve 绕过 `StorageConfig::backend()` 致 S3 凭证未注入、请求未签名（SeaweedFS 匿名 Admin 掩蔽此问题，R2 以 400 InvalidArgument 揭露）——已修复并加回归测试；教训：**匿名宽容后端会掩蔽签名路径缺陷，后端 conformance 必须含一个强制鉴权的真实云**。R2 的 `use_constant_size_upload_parts` 已按 endpoint 自动启用。v0.2 验证扩展：Ceph RGW、Garage/Silo。
 - **条件写矩阵（M0 结论）**：LocalFS / SeaweedFS 实测，AWS / R2 / MinIO 文档核实——全部支持 If-None-Match:\*；Lance manifest 提交即走此路径 ⇒ **提交原子性在全部目标后端成立**；LOCK 对象降级保留为防御性设计，非必需。
 
 ### 5.3 数据布局与 Lance schema

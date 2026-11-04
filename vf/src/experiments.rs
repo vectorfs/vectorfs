@@ -303,3 +303,45 @@ async fn merge_insert_with_schema_evolution() {
     assert_eq!(by_key["a"].0, Some(0));
     assert_eq!(by_key["c"].0, Some(0));
 }
+
+/// S3 backend GET/LIST probe (diagnostics for cloud endpoints: which verb
+/// fails, with what exact server response). Env: same as conditional_put_s3.
+#[tokio::test]
+#[ignore = "needs live S3 server; set VF_S3CP_URI"]
+async fn s3_get_list_probe() {
+    let uri =
+        std::env::var("VF_S3CP_URI").expect("VF_S3CP_URI=s3+http://host:port/bucket[/prefix]");
+    let cfg = crate::backends::S3BackendConfig::parse(&uri).expect("parse s3+ uri");
+    let cfg = crate::backends::S3BackendConfig {
+        access_key: std::env::var("VF_S3_ACCESS_KEY").ok().or(cfg.access_key),
+        secret_key: std::env::var("VF_S3_SECRET_KEY").ok().or(cfg.secret_key),
+        ..cfg
+    };
+    let store = cfg.build_catalog_store().expect("build store");
+    let path = cfg.catalog_key("cond-test/get-probe.json");
+    let _ = store.delete(&path).await;
+    store
+        .put(&path, b"probe".to_vec().into())
+        .await
+        .expect("plain put");
+    match store.get(&path).await {
+        Ok(r) => {
+            let bytes = r.bytes().await.expect("read body");
+            assert_eq!(bytes.as_ref(), b"probe");
+            println!("GET: OK");
+        }
+        Err(e) => println!("GET FAILED: {e:#}"),
+    }
+    use futures_util::TryStreamExt as _;
+    use object_store::ObjectStore as _;
+    match store
+        .list(Some(&cfg.catalog_key("cond-test/")))
+        .map_ok(|m| m.location.to_string())
+        .try_collect::<Vec<_>>()
+        .await
+    {
+        Ok(v) => println!("LIST: OK {:?}", v),
+        Err(e) => println!("LIST FAILED: {e:#}"),
+    }
+    let _ = store.delete(&path).await;
+}

@@ -82,6 +82,17 @@ impl ObjectStoreProvider for StaticS3Provider {
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(builder.build().map_err(lance_err)?);
 
+        // Cloudflare R2 rejects variable-size upload parts (only the LAST part
+        // may differ) — Lance multipart writes must use constant part sizes
+        // there (M0 REPORT 必答2 matrix). Detected from the endpoint host;
+        // force-enable via `use_constant_size_upload_parts=true` storage option.
+        let constant_parts = opts
+            .get("endpoint")
+            .is_some_and(|e| e.contains("r2.cloudflarestorage.com"))
+            || opts
+                .get("use_constant_size_upload_parts")
+                .is_some_and(|v| v == "true" || v == "1");
+
         // Public constructor (struct literals are not possible from outside
         // lance-io: private fields). NOTE: it derives the metrics prefix from a
         // default registry that has no "s3" provider without lance-io's aws
@@ -91,8 +102,8 @@ impl ObjectStoreProvider for StaticS3Provider {
             base_path.clone(),
             Some(CLOUD_BLOCK_SIZE),
             None,
-            false, // use_constant_size_upload_parts (only Cloudflare R2 needs true)
-            true,  // list_is_lexically_ordered (true for object stores)
+            constant_parts,
+            true, // list_is_lexically_ordered (true for object stores)
             lance_io::object_store::DEFAULT_CLOUD_IO_PARALLELISM,
             lance_io::object_store::DEFAULT_DOWNLOAD_RETRY_COUNT,
             Some(&opts_for_prefix(&opts)),
