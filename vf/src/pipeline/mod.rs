@@ -1,4 +1,5 @@
-//! File-layer pipeline plugin system — the M2 T2 skeleton (design.md §5.10).
+//! File-layer pipeline plugin system (design.md §5.10; skeleton in M2-T2,
+//! extractor/chunker kinds in T4, embedder kinds + model prefetch in T5).
 //!
 //! Three strategy axes live behind traits ([`Extractor`], [`Chunker`],
 //! [`Embedder`]) plus the query-side merge option ([`merge_hitlists`]);
@@ -24,7 +25,8 @@
 //!
 //! Engine-native types — ort sessions, pdfium handles, HTTP clients — may
 //! only appear INSIDE a kind module (`extract/txt.rs`,
-//! `chunk/token_window.rs`, the future `embed/ort.rs` / `embed/openai.rs`).
+//! `chunk/token_window.rs`, `embed/ort.rs`, `embed/openai.rs` + the shared
+//! `embed/http.rs` leaf).
 //! This module tree's core (traits, errors, merge, config) sees only the
 //! traits and [`PipelineError`]; swapping pdfium for another PDF engine must
 //! not touch anything outside `extract/pdf_*.rs`.
@@ -42,6 +44,7 @@ pub mod config;
 pub mod contract;
 pub mod embed;
 pub mod extract;
+pub mod models;
 
 use std::collections::BTreeMap;
 

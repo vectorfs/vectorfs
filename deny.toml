@@ -78,6 +78,13 @@ deny = [
     { name = "aws-credential-types" },
     { name = "aws-sigv4" },
     { name = "opendal" },
+    # openssl-sys ban (design.md §5.7 v2.1: "deny.toml ban openssl-sys"):
+    # the TLS posture is rustls-only (object_store + the M2-T5 openai
+    # embedder both use rustls with the aws-lc-rs provider). A crate dragging
+    # openssl-sys into the graph would silently add a system-openssl link
+    # dependency — exactly the kind of build surprise the deny list exists
+    # to catch. Verified 2026-11-05: nothing in the tree depends on it.
+    { name = "openssl-sys" },
 ]
 multiple-versions = "warn"
 wildcards = "allow"

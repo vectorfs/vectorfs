@@ -1,38 +1,59 @@
-//! Embedder axis: registration SKELETON only (M2 T2).
+//! Embedder axis: closed-enum registration + dispatch, filled in M2-T5
+//! (design.md §5.10.2 Embedder row; §5.10.4 config shapes).
 //!
-//! **No embedder kinds are registered yet** — `ort` and `openai` land in
-//! M2-T5 (design.md §7). The trait itself lives in
-//! [`crate::pipeline`] (it is axis-shared, not per-kind); this module hosts
-//! the registration entry and the closed dispatch enum so the pattern —
-//! identical to [`crate::pipeline::extract`] / [`crate::pipeline::chunk`] —
-//! is in place for T5 to fill:
+//! # Two objects, by design
 //!
-//! * T5 adds `embed/ort.rs` + `embed/openai.rs`, turns
-//!   [`EmbedderKind`] into `enum { Ort(OrtConfig), Openai(OpenaiConfig) }`,
-//!   and wires per-kind config structs per §5.10.4
-//!   (`kind/model/path/offline` for ort; `kind/endpoint/model/dim` for
-//!   openai), each `deny_unknown_fields`.
-//! * Until then, ANY `[embedder.<name>]` section fails at load with the
-//!   line number and this module's "no kinds yet" message — the honest
-//!   fail-fast answer, better than silently ignoring the section.
+//! * [`EmbedderKind`] is the CONFIG object: plain data, `Clone`, serializes
+//!   flat into pipeline fingerprints, and lives inside `PipelineConfig`
+//!   (which `pipelines check` and the serve gate parse — parsing must be
+//!   network-free, .so-free and credential-free).
+//! * [`LoadedEmbedder`] is the RUNTIME object produced by
+//!   [`EmbedderKind::load`]: real tokenizer/session/HTTP client. It is NOT
+//!   `Clone` and not serializable — loading is where the startup contract is
+//!   enforced (ort dim probe, api-key resolution, endpoint scheme) and where
+//!   side effects are allowed (missing-model prefetch when not offline).
+//!   T3's ingest worker owns one `LoadedEmbedder` per configured instance.
 //!
-//! DIP boundary (pipeline/mod.rs): ort session / HTTP client types stay
-//! inside the per-kind modules added in T5.
+//! Both are closed enums dispatched by exhaustive match — zero vtables; `dyn`
+//! remains reserved for the v2 wasm slot and the contract tests.
+//!
+//! # DIP boundary
+//!
+//! ort/tokenizers/HTTP types stay inside `ort.rs` / `openai.rs` /
+//! [`http`]. This module sees only the two config structs and the two
+//! runtime structs.
+//!
+//! # Kinds (M2)
+//!
+//! * `ort` — local ONNX Runtime inference (dynamic .so; gte family defaults).
+//! * `openai` — remote OpenAI-compatible /embeddings API over hand-rolled
+//!   HTTP.
 
-use super::{Chunk, Embedder, Modality, PipelineError, Query};
+pub mod http;
+pub mod openai;
+pub mod ort;
 
-/// Registered embedder kinds. UNINHABITED in M2-T2 (see module docs): there
-/// is nothing to construct, and every match over it is vacuously exhaustive
-/// — the moment T5 adds the first variant, the compiler lists every site
-/// that must handle it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EmbedderKind {}
+use super::{Modality, PipelineError};
+use openai::{OpenAiConfig, OpenAiEmbedder};
+use ort::{OrtConfig, OrtEmbedder};
+
+/// The available-kind list embedded in unknown-kind errors.
+pub const EMBEDDER_KINDS: &str = "ort, openai";
+
+/// Registered embedder kinds (the CONFIG object; see module docs).
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmbedderKind {
+    /// Local ONNX inference (embed/ort.rs).
+    Ort(OrtConfig),
+    /// Remote OpenAI-compatible provider (embed/openai.rs).
+    OpenAi(OpenAiConfig),
+}
 
 impl EmbedderKind {
-    /// Two-stage config parse; with an empty registry the dispatch always
-    /// answers "no kinds yet". Kept (not stubbed away) so the config
-    /// framework — including the per-kind `deny_unknown_fields` struct
-    /// plumbing — is exercised end-to-end by `[embedder.*]` sections today.
+    /// Two-stage config parse (§5.10.2): stage 1 reads the `kind` string,
+    /// stage 2 deserializes the per-kind struct with `deny_unknown_fields`
+    /// (unknown-field errors get section context + line via
+    /// `config::stage2_error`).
     pub fn from_config(
         section: &str,
         raw: &toml::Value,
@@ -40,49 +61,157 @@ impl EmbedderKind {
     ) -> Result<Self, PipelineError> {
         let kind = super::config::probe_kind(raw)
             .map_err(|m| PipelineError::config(format!("[{section}]: {m}"), line))?;
-        Err(PipelineError::config(
-            format!(
-                "[{section}]: unknown embedder kind '{kind}' (no embedder kinds registered \
-                 yet; ort/openai land in M2-T5)"
-            ),
-            line,
-        ))
+        match kind.as_str() {
+            "ort" => {
+                let cfg: OrtConfig = raw.clone().try_into().map_err(|e: toml::de::Error| {
+                    super::config::stage2_error(section, Some(&kind), e.message(), line)
+                })?;
+                Ok(EmbedderKind::Ort(cfg))
+            }
+            "openai" => {
+                let cfg: OpenAiConfig = raw.clone().try_into().map_err(|e: toml::de::Error| {
+                    super::config::stage2_error(section, Some(&kind), e.message(), line)
+                })?;
+                Ok(EmbedderKind::OpenAi(cfg))
+            }
+            other => Err(PipelineError::config(
+                format!(
+                    "[{section}]: unknown embedder kind '{other}' (available kinds: \
+                     {EMBEDDER_KINDS})"
+                ),
+                line,
+            )),
+        }
     }
 
-    /// Human-readable kind + params (CLI summary lines); no kinds yet.
+    /// Modalities accepted on the DOCUMENT side — drives the §5.10.3
+    /// modality carry-over check at config time. Both M2 kinds are text-only;
+    /// M3's image/audio kinds add values next to these arms.
+    pub fn doc_modalities(&self) -> &'static [Modality] {
+        match self {
+            EmbedderKind::Ort(_) | EmbedderKind::OpenAi(_) => &[Modality::Text],
+        }
+    }
+
+    /// Modalities accepted on the QUERY side.
+    pub fn query_modalities(&self) -> &'static [Modality] {
+        match self {
+            EmbedderKind::Ort(_) | EmbedderKind::OpenAi(_) => &[Modality::Text],
+        }
+    }
+
+    /// Human-readable kind + params (CLI summary lines). NOTE: deliberately
+    /// excludes `api_key` (secrets do not belong in summaries) — the same
+    /// rule `describe()` output will follow for every future kind. When ort
+    /// runs from `path`, the model NAME is not shown: the default name would
+    /// mislead (the artifact under `path` is what embeds).
     pub fn describe(&self) -> String {
-        match *self {}
+        match self {
+            EmbedderKind::Ort(c) => match &c.path {
+                Some(p) => format!("ort(path={p})"),
+                None => {
+                    format!(
+                        "ort(model={}{})",
+                        c.model,
+                        if c.offline { ", offline" } else { "" }
+                    )
+                }
+            },
+            EmbedderKind::OpenAi(c) => format!(
+                "openai(model={}, dim={}, endpoint={})",
+                c.model, c.dim, c.endpoint
+            ),
+        }
+    }
+
+    /// Build the runtime object (the STARTUP gate: dim probe for ort,
+    /// credential + scheme checks for openai, model prefetch when allowed).
+    /// `models_dir` is the resolved cache root (config `models_dir` or the
+    /// `<data-dir>/.vectorfs/models` default).
+    pub async fn load(
+        &self,
+        models_dir: &std::path::Path,
+    ) -> Result<LoadedEmbedder, PipelineError> {
+        match self {
+            EmbedderKind::Ort(cfg) => Ok(LoadedEmbedder::Ort(
+                OrtEmbedder::new(cfg, models_dir).await?,
+            )),
+            EmbedderKind::OpenAi(cfg) => Ok(LoadedEmbedder::OpenAi(OpenAiEmbedder::new(cfg)?)),
+        }
     }
 }
 
-/// Dispatch: vacuously exhaustive until T5 adds variants.
+/// The runtime object: one loaded embedder instance (see module docs).
+/// Dispatches by exhaustive match — no `dyn`, no Box.
+// clippy: the OpenAi variant embeds the HTTP client (a few hundred bytes);
+// there is one LoadedEmbedder per configured instance, never in a hot
+// collection, so boxing a variant would only add indirection.
+#[allow(clippy::large_enum_variant)]
+pub enum LoadedEmbedder {
+    Ort(OrtEmbedder),
+    OpenAi(OpenAiEmbedder),
+}
+
+impl LoadedEmbedder {
+    /// Same summary as the config object (status lines after load).
+    pub fn describe(&self) -> String {
+        match self {
+            LoadedEmbedder::Ort(_) => "ort".to_string(),
+            LoadedEmbedder::OpenAi(_) => "openai".to_string(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
-impl Embedder for EmbedderKind {
-    async fn embed_query(&self, _q: &Query) -> Result<Vec<f32>, PipelineError> {
-        match *self {}
+impl super::Embedder for LoadedEmbedder {
+    async fn embed_query(&self, q: &super::Query) -> Result<Vec<f32>, PipelineError> {
+        match self {
+            LoadedEmbedder::Ort(e) => e.embed_query(q).await,
+            LoadedEmbedder::OpenAi(e) => e.embed_query(q).await,
+        }
     }
 
-    async fn embed_documents(&self, _chunks: &[Chunk]) -> Result<Vec<Vec<f32>>, PipelineError> {
-        match *self {}
+    async fn embed_documents(
+        &self,
+        chunks: &[super::Chunk],
+    ) -> Result<Vec<Vec<f32>>, PipelineError> {
+        match self {
+            LoadedEmbedder::Ort(e) => e.embed_documents(chunks).await,
+            LoadedEmbedder::OpenAi(e) => e.embed_documents(chunks).await,
+        }
     }
 
     fn dim(&self) -> usize {
-        match *self {}
+        match self {
+            LoadedEmbedder::Ort(e) => e.dim(),
+            LoadedEmbedder::OpenAi(e) => e.dim(),
+        }
     }
 
     fn doc_modalities(&self) -> &'static [Modality] {
-        match *self {}
+        match self {
+            LoadedEmbedder::Ort(e) => e.doc_modalities(),
+            LoadedEmbedder::OpenAi(e) => e.doc_modalities(),
+        }
     }
 
     fn query_modalities(&self) -> &'static [Modality] {
-        match *self {}
+        match self {
+            LoadedEmbedder::Ort(e) => e.query_modalities(),
+            LoadedEmbedder::OpenAi(e) => e.query_modalities(),
+        }
     }
 }
 
-/// Fingerprint-facing serialization: nothing to serialize until T5.
+/// Fingerprint-facing serialization: the INNER config only — the kind tag is
+/// already a field of every per-kind config struct, keeping the canonical
+/// form flat (`kind = "ort"`, …) like the extractor/chunker axes.
 impl serde::Serialize for EmbedderKind {
-    fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
-        match *self {}
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            EmbedderKind::Ort(c) => c.serialize(serializer),
+            EmbedderKind::OpenAi(c) => c.serialize(serializer),
+        }
     }
 }
 
@@ -91,15 +220,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn any_embedder_section_fails_with_t5_pointer() {
+    fn from_config_parses_both_kinds() {
         let raw: toml::Value =
             toml::from_str("kind = \"ort\"\nmodel = \"gte-multilingual-base\"").unwrap();
-        let err = EmbedderKind::from_config("embedder.text", &raw, Some(7)).unwrap_err();
+        let k = EmbedderKind::from_config("embedder.text", &raw, Some(7)).unwrap();
+        match &k {
+            EmbedderKind::Ort(c) => {
+                assert_eq!(c.model, "gte-multilingual-base");
+                assert!(!c.offline);
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+        assert_eq!(k.doc_modalities(), &[Modality::Text]);
+        assert_eq!(k.query_modalities(), &[Modality::Text]);
+        assert_eq!(
+            k.describe(),
+            "ort(model=gte-multilingual-base)",
+            "no-path describe omits empty suffix"
+        );
+
+        let raw: toml::Value = toml::from_str(
+            "kind = \"openai\"\nendpoint = \"https://api.bigmodel.cn/v1\"\nmodel = \
+             \"embedding-3\"\ndim = 2048",
+        )
+        .unwrap();
+        let k = EmbedderKind::from_config("embedder.remote", &raw, Some(1)).unwrap();
+        assert!(k.describe().contains("dim=2048"));
+        assert!(!k.describe().contains("api_key"), "no secrets in describe");
+    }
+
+    #[test]
+    fn from_config_unknown_kind_lists_available() {
+        let raw: toml::Value = toml::from_str("kind = \"fastembed\"").unwrap();
+        let err = EmbedderKind::from_config("embedder.x", &raw, Some(3)).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("[embedder.text]"), "{msg}");
-        assert!(msg.contains("unknown embedder kind 'ort'"), "{msg}");
-        assert!(msg.contains("M2-T5"), "{msg}");
-        assert!(msg.contains("at line 7"), "{msg}");
+        assert!(msg.contains("unknown embedder kind 'fastembed'"), "{msg}");
+        assert!(msg.contains("available kinds: ort, openai"), "{msg}");
+        assert!(msg.contains("at line 3"), "{msg}");
+    }
+
+    #[test]
+    fn from_config_unknown_field_is_shaped_with_line() {
+        let raw: toml::Value =
+            toml::from_str("kind = \"ort\"\nmodel = \"x\"\npool_size = 4").unwrap();
+        let err = EmbedderKind::from_config("embedder.t", &raw, Some(2)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[embedder.t]: unknown field 'pool_size' for kind 'ort'"),
+            "{msg}"
+        );
+        assert!(msg.contains("allowed: kind, model, path, offline"), "{msg}");
+        assert!(msg.contains("at line 2"), "{msg}");
     }
 
     #[test]
@@ -107,5 +278,19 @@ mod tests {
         let raw: toml::Value = toml::from_str("model = \"x\"").unwrap();
         let err = EmbedderKind::from_config("embedder.e", &raw, None).unwrap_err();
         assert!(err.to_string().contains("missing field 'kind'"), "{err}");
+    }
+
+    #[test]
+    fn fingerprint_serialization_is_flat() {
+        let raw: toml::Value = toml::from_str(
+            "kind = \"openai\"\nendpoint = \"https://e/v1\"\
+             \nmodel = \"m\"\ndim = 8",
+        )
+        .unwrap();
+        let k = EmbedderKind::from_config("e", &raw, None).unwrap();
+        assert_eq!(
+            toml::to_string(&k).unwrap().trim(),
+            "kind = \"openai\"\nendpoint = \"https://e/v1\"\nmodel = \"m\"\ndim = 8"
+        );
     }
 }

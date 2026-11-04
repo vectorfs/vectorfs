@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 use super::chunk::ChunkerKind;
 use super::embed::EmbedderKind;
 use super::extract::ExtractorKind;
-use super::{Embedder, Merge, Modality, PipelineError};
+use super::{Merge, Modality, PipelineError};
 
 /// Length of the hex fingerprint prefix actually consumed (see
 /// [`pipeline_fingerprint`]); 16 hex chars = 64 bits, far beyond any
@@ -56,6 +56,11 @@ struct RawFile {
     account_id: Option<toml::Value>,
     access_key_id: Option<toml::Value>,
     secret_access_key: Option<toml::Value>,
+    // M2 T5: models cache root override (scalar; defaults to
+    // `<data-dir>/.vectorfs/models` — see pipeline::models). Docker
+    // deployments materialize this pointing at the /vectorfs/models volume
+    // (§5.10.7).
+    models_dir: Option<String>,
     // M2 T2 plugin sections: instance name -> spanned section table.
     extractor: Option<BTreeMap<String, toml::Spanned<toml::Value>>>,
     embedder: Option<BTreeMap<String, toml::Spanned<toml::Value>>>,
@@ -85,10 +90,110 @@ struct IngestRaw {
 pub struct PipelineConfig {
     /// `[extractor.<name>]` instances, parsed.
     pub extractors: BTreeMap<String, ExtractorKind>,
-    /// `[embedder.<name>]` instances, parsed (EMPTY in T2 — no kinds yet).
+    /// `[embedder.<name>]` instances, parsed (T5: ort + openai kinds).
     pub embedders: BTreeMap<String, EmbedderKind>,
     /// `[ingest.<bucket>]` sections, validated.
     pub ingest: BTreeMap<String, IngestConfig>,
+    /// Top-level `models_dir` override (None = the
+    /// `<data-dir>/.vectorfs/models` default, resolved at USE time — the
+    /// parser has no data dir).
+    pub models_dir: Option<std::path::PathBuf>,
+    /// Non-fatal advisories (warnings) collected during validation — e.g. an
+    /// ort embedder pointing `path` at a model outside the built-in table
+    /// (license then being the operator's audit, §5.10.5). `pipelines check`
+    /// prints these to stderr; they never block startup.
+    pub warnings: Vec<String>,
+    /// 1-based TOML line of each plugin section header, keyed
+    /// `"<axis>.<name>"` — runtime availability gates
+    /// ([`PipelineConfig::validate_model_availability`]) report with the
+    /// same fail-fast line attribution as parse errors (§5.10.3).
+    pub(crate) section_lines: BTreeMap<String, usize>,
+}
+
+impl PipelineConfig {
+    /// Section header line for `"<axis>.<name>"` (see `section_lines`).
+    pub fn section_line(&self, section: &str) -> Option<usize> {
+        self.section_lines.get(section).copied()
+    }
+
+    /// Model-AVAILABILITY gate (the fs-checking half of fail-fast, run by
+    /// `pipelines check` and the serve gate; parsing itself stays
+    /// side-effect-free). `data_dir` resolves the models cache when the
+    /// config does not override `models_dir`.
+    ///
+    /// Per ort embedder (§5.10.4 semantics):
+    /// * `path` set: the directory must already hold `model.onnx` +
+    ///   `tokenizer.json` (a `path` is never prefetched);
+    /// * builtin name, `offline = true`: the prefetched cache dir must be
+    ///   ready — no network will fix it (§5.10.4 air-gapped variant);
+    /// * builtin name, online, cache not ready: OK — load-time prefetch
+    ///   fetches it;
+    /// * unknown name without `path`: Err — prefetch cannot fix an unknown
+    ///   model.
+    pub fn validate_model_availability(
+        &self,
+        data_dir: &std::path::Path,
+    ) -> Result<(), PipelineError> {
+        let models_dir = self
+            .models_dir
+            .clone()
+            .unwrap_or_else(|| super::models::default_models_dir(data_dir));
+        for (name, kind) in &self.embedders {
+            let EmbedderKind::Ort(cfg) = kind else {
+                continue; // openai needs no local artifacts
+            };
+            let section = format!("embedder.{name}");
+            let line = self.section_line(&section);
+            match &cfg.path {
+                Some(p) => {
+                    let dir = std::path::PathBuf::from(p);
+                    let missing: Vec<&str> = ["model.onnx", "tokenizer.json"]
+                        .iter()
+                        .filter(|f| !dir.join(f).is_file())
+                        .copied()
+                        .collect();
+                    if !missing.is_empty() {
+                        return Err(PipelineError::config(
+                            format!(
+                                "[{section}]: path {} does not contain {} (a path is never \
+                                 prefetched — point it at a complete model directory: \
+                                 model.onnx + tokenizer.json)",
+                                dir.display(),
+                                missing.join(", ")
+                            ),
+                            line,
+                        ));
+                    }
+                }
+                None => {
+                    let Some(builtin) = super::models::builtin(&cfg.model) else {
+                        return Err(PipelineError::config(
+                            format!(
+                                "[{section}]: unknown model '{}' (built-in models: {})",
+                                cfg.model,
+                                super::models::builtin_names().join(", ")
+                            ),
+                            line,
+                        ));
+                    };
+                    let dir = models_dir.join(&cfg.model);
+                    if cfg.offline && !super::models::is_ready(&dir, builtin) {
+                        return Err(PipelineError::config(
+                            format!(
+                                "[{section}]: offline = true but model '{}' is not present under \
+                                 {} — prefetch on a connected machine (vectorfs init --preset \
+                                 text-rag) or set path = \"…\"; the network will not be used",
+                                cfg.model,
+                                dir.display()
+                            ),
+                            line,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One `[ingest.<bucket>]` section (design.md §5.10.4).
@@ -199,16 +304,23 @@ fn unknown_field_parts(message: &str) -> Option<(&str, String)> {
 ///   with the section's line);
 /// * `extract` values are `"auto"` or a DECLARED extractor instance;
 /// * the inline chunker exists and satisfies `0 < overlap < size`;
-/// * `embedders` entries are DECLARED embedder instances — in T2 no embedder
-///   kinds exist, so any non-empty list fails pointing at M2-T5 (an absent
-///   or empty list is the pure-protocol face and is legal);
+/// * `embedders` entries are DECLARED embedder instances (an absent or empty
+///   list is the pure-protocol face and is legal);
 /// * extractor output modalities are carried by the listed embedders' doc
-///   modalities (§5.10.3 modality carry-over; dormant until T5 registers
-///   kinds, but wired and unit-tested);
+///   modalities (§5.10.3 modality carry-over; live since T5);
 /// * `merge` parses (M2: exactly `rrf`).
+///
+/// Parsing is side-effect free by contract: no network, no .so load, no
+/// credential reads — `pipelines check` must run on an air-gapped box
+/// without keys. Runtime gates (dim probe, api key, prefetch) live behind
+/// `EmbedderKind::load`.
 pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError> {
     let raw: RawFile = toml::from_str(text)
         .map_err(|e| PipelineError::config(e.message().to_string(), toml_line(text, &e)))?;
+
+    // section-header lines for the runtime availability gate (§5.10.3
+    // fail-fast with line attribution)
+    let mut section_lines = BTreeMap::new();
 
     // ---- extractor instances ----
     let mut extractors = BTreeMap::new();
@@ -216,15 +328,36 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
         let section = format!("extractor.{name}");
         let line = Some(line_of(text, sv.span().start));
         let kind = ExtractorKind::from_config(&section, sv.get_ref(), line)?;
+        section_lines.insert(section, line.expect("line computed above"));
         extractors.insert(name, kind);
     }
 
-    // ---- embedder instances (T2: declaration always fails — no kinds) ----
+    // ---- embedder instances (T5: ort + openai parse for real) ----
     let mut embedders = BTreeMap::new();
+    let mut warnings = Vec::new();
     for (name, sv) in raw.embedder.unwrap_or_default() {
         let section = format!("embedder.{name}");
         let line = Some(line_of(text, sv.span().start));
+        section_lines.insert(section.clone(), line.expect("line computed above"));
         let kind = EmbedderKind::from_config(&section, sv.get_ref(), line)?;
+        // §5.10.5 license red line: the BUILT-IN table is permissive-only.
+        // ANY `path` means a self-managed artifact (even a gte-named one —
+        // the table's pins are not what loads), so the license audit moves
+        // to the operator. Warn, never reject.
+        if let EmbedderKind::Ort(cfg) = &kind
+            && let Some(p) = &cfg.path
+        {
+            warnings.push(format!(
+                "embedder '{name}' loads a self-managed model via path {p} — outside the \
+                 built-in table{}; its license is your audit (built-ins are \
+                 permissive-only, §5.10.5)",
+                if super::models::builtin(&cfg.model).is_some() {
+                    " (the built-in pins are bypassed)"
+                } else {
+                    ""
+                }
+            ));
+        }
         embedders.insert(name, kind);
     }
 
@@ -284,8 +417,7 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
                     return Err(PipelineError::config(
                         format!(
                             "[{section}]: unknown embedder instance '{instance}' (declared \
-                             embedder instances: {}; no embedder kinds are registered yet — \
-                             ort/openai land in M2-T5, so any list fails until then)",
+                             embedder instances: {})",
                             names_or_none(
                                 &embedders.keys().map(String::as_str).collect::<Vec<_>>()
                             )
@@ -298,8 +430,7 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
         if !rawi.embedders.is_empty() {
             // An empty/absent list is the pure-protocol face and skips the
             // check; a non-empty list must carry every modality its
-            // extractors emit (unreachable in T2 — no kinds — but wired and
-            // unit-tested for T5).
+            // extractors emit (live since T5 — both M2 kinds are text).
             for instance in used_extractor_instances(&rawi.extract) {
                 let output = extractors
                     .get(instance)
@@ -318,6 +449,10 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
             }
         }
 
+        section_lines.insert(
+            format!("ingest.{bucket}"),
+            line.expect("line computed above"),
+        );
         ingest.insert(
             bucket,
             IngestConfig {
@@ -335,6 +470,9 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
         extractors,
         embedders,
         ingest,
+        models_dir: raw.models_dir.map(std::path::PathBuf::from),
+        warnings,
+        section_lines,
     })
 }
 
@@ -596,20 +734,83 @@ index-prefix = "docs"
     }
 
     #[test]
-    fn embedder_section_fails_with_t5_note_and_line() {
-        let text = "[embedder.text]\nkind = \"ort\"\nmodel = \"gte-multilingual-base\"\n";
-        let err = parse(text).unwrap_err();
-        let msg = err.to_string();
+    fn embedder_sections_parse_for_real_kinds() {
+        // the §5.10.4 sample shape, verbatim intent: ort default model +
+        // openai remote + air-gapped variant
+        let text = r#"
+[embedder.text]
+kind = "ort"
+model = "gte-multilingual-base"
+[embedder.remote]
+kind = "openai"
+endpoint = "https://api.bigmodel.cn/v1"
+model = "embedding-3"
+dim = 2048
+[embedder.local-only]
+kind = "ort"
+path = "/models/bge-m3"
+offline = true
+"#;
+        let cfg = parse(text).unwrap();
+        assert_eq!(cfg.embedders.len(), 3);
         assert!(
-            msg.contains("[embedder.text]: unknown embedder kind 'ort'"),
-            "{msg}"
+            cfg.warnings.iter().any(|w| w.contains("'local-only'")
+                && w.contains("/models/bge-m3")
+                && w.contains("license is your audit")),
+            "expected the self-managed-model warning, got {:?}",
+            cfg.warnings
         );
-        assert!(msg.contains("M2-T5"), "{msg}");
-        assert!(msg.contains("at line 1"), "{msg}");
+        // a gte-named self-managed copy also warns (built-in pins bypassed)
+        let gte_path = concat!(
+            "[embedder.selfmanaged]\n",
+            "kind = \"ort\"\n",
+            "model = \"gte-multilingual-base\"\n",
+            "path = \"/models/gte-fp16\"\n"
+        );
+        let cfg2 = parse(gte_path).unwrap();
+        assert!(
+            cfg2.warnings
+                .iter()
+                .any(|w| w.contains("built-in pins are bypassed")),
+            "got {:?}",
+            cfg2.warnings
+        );
+        // the builtin-named ort (no path) does not warn
+        assert_eq!(
+            cfg.warnings.iter().filter(|w| w.contains("'text'")).count(),
+            0
+        );
+        assert_eq!(
+            cfg.embedders["text"].describe(),
+            "ort(model=gte-multilingual-base)"
+        );
+        assert_eq!(
+            cfg.embedders["local-only"].describe(),
+            "ort(path=/models/bge-m3)"
+        );
     }
 
     #[test]
-    fn embedder_reference_fails_with_t5_note_and_line() {
+    fn embedder_section_bad_kind_and_missing_dim_fail_with_line() {
+        // unknown kind
+        let text = "[embedder.t]\nkind = \"fastembed\"\n";
+        let err = parse(text).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown embedder kind 'fastembed'"), "{msg}");
+        assert!(msg.contains("available kinds: ort, openai"), "{msg}");
+        assert!(msg.contains("at line 1"), "{msg}");
+        // openai without dim: stage-2 missing-field, section line attributed
+        let text = "version = 1\n\n[embedder.r]\nkind = \"openai\"\nendpoint = \"https://e/v1\"\nmodel = \"m\"\n";
+        let err = parse(text).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[embedder.r]: missing field `dim`") && msg.contains("at line 3"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn embedder_reference_fails_when_undeclared() {
         let text = "[ingest.d]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
                     embedders = [\"text\"]\n";
         let err = parse(text).unwrap_err();
@@ -617,12 +818,133 @@ index-prefix = "docs"
         assert!(
             msg.contains(
                 "[ingest.d]: unknown embedder instance 'text' (declared embedder \
-                          instances: (none)"
+                          instances: (none))"
             ),
             "{msg}"
         );
-        assert!(msg.contains("M2-T5"), "{msg}");
         assert!(msg.contains("at line 1"), "{msg}");
+    }
+
+    #[test]
+    fn full_design_example_config_parses_with_fingerprint() {
+        // §5.10.4's full example: txt/pdf/md extractors + both embedder kinds
+        // + a complete ingest chain — the acceptance configuration for
+        // `pipelines check`.
+        let text = r#"
+[embedder.text]
+kind = "ort"
+model = "gte-multilingual-base"
+[embedder.remote]
+kind = "openai"
+endpoint = "https://api.bigmodel.cn/v1"
+model = "embedding-3"
+dim = 2048
+
+[extractor.pdf]
+kind = "pdf-text"
+[extractor.plain]
+kind = "txt"
+
+[ingest.docs]
+scope = "docs/**"
+extract = { pdf = "pdf", default = "auto" }
+chunk = { kind = "token-window", size = 512, overlap = 64 }
+embedders = ["text", "remote"]
+merge = "rrf"
+index-prefix = "docs"
+"#;
+        let cfg = parse(text).unwrap();
+        assert_eq!(cfg.extractors.len(), 2);
+        assert_eq!(cfg.embedders.len(), 2);
+        let d = &cfg.ingest["docs"];
+        assert_eq!(d.embedders, ["text", "remote"]);
+        // modality carry-over is live: pdf-text emits Text, both embedders
+        // carry Text on their doc side — parse succeeds (that IS the check)
+        let fp = cfg.fingerprint("docs").unwrap();
+        assert_eq!(fp.len(), FINGERPRINT_HEX_LEN);
+        // embedding config changes must move the fingerprint
+        let swapped = text.replace("model = \"embedding-3\"", "model = \"embedding-4\"");
+        let cfg2 = parse(&swapped).unwrap();
+        assert_ne!(cfg2.fingerprint("docs").unwrap(), fp);
+        // models_dir is plumbed through
+        assert!(cfg.models_dir.is_none());
+        let with_dir = format!("models_dir = \"/volumes/models\"\n{text}");
+        assert_eq!(
+            parse(&with_dir).unwrap().models_dir.as_deref(),
+            Some(std::path::Path::new("/volumes/models"))
+        );
+    }
+
+    #[test]
+    fn model_availability_gate_offline_and_path_rules() {
+        // temp data root: cache is EMPTY
+        let data = tempfile::tempdir().unwrap();
+        let base = "[embedder.e]\nkind = \"ort\"\nmodel = \"gte-multilingual-base\"\n";
+
+        // online + cache empty: OK — load-time prefetch is allowed
+        let cfg = parse(base).unwrap();
+        assert!(cfg.validate_model_availability(data.path()).is_ok());
+        // offline + cache empty: Err with the section line
+        let text = format!("{base}offline = true\n");
+        let cfg = parse(&text).unwrap();
+        let err = cfg.validate_model_availability(data.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("[embedder.e]"), "{msg}");
+        assert!(msg.contains("offline = true"), "{msg}");
+        assert!(msg.contains("the network will not be used"), "{msg}");
+        assert!(msg.contains("at line 1"), "{msg}");
+
+        // a complete path passes; an incomplete path fails with the missing
+        // file names
+        let complete = tempfile::tempdir().unwrap();
+        std::fs::write(complete.path().join("model.onnx"), b"x").unwrap();
+        std::fs::write(complete.path().join("tokenizer.json"), b"x").unwrap();
+        let ok_cfg = parse(&format!(
+            "[embedder.e]\nkind = \"ort\"\npath = \"{}\"",
+            complete.path().display()
+        ))
+        .unwrap();
+        assert!(ok_cfg.validate_model_availability(data.path()).is_ok());
+        let half = tempfile::tempdir().unwrap();
+        std::fs::write(half.path().join("model.onnx"), b"x").unwrap();
+        let bad_cfg = parse(&format!(
+            "[embedder.e]\nkind = \"ort\"\npath = \"{}\"",
+            half.path().display()
+        ))
+        .unwrap();
+        let err = bad_cfg
+            .validate_model_availability(data.path())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("tokenizer.json"),
+            "{}",
+            err.to_string()
+        );
+
+        // unknown model without path: Err listing builtins (prefetch cannot
+        // fix it) — and the license warning for path configs is advisory
+        let unknown = parse("[embedder.e]\nkind = \"ort\"\nmodel = \"bge-m3\"").unwrap();
+        let err = unknown
+            .validate_model_availability(data.path())
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown model 'bge-m3'"), "{err}");
+    }
+
+    #[test]
+    fn modality_carry_over_now_rejects_uncovered_extractor() {
+        // with real kinds on the board the dormant check is reachable: an
+        // extractor is referenced but NO embedder is listed -> Text uncovered.
+        // (txt only ever emits Text in M2, so the practical uncovered case
+        // arrives with M3 image extractors; the empty-list semantics stay
+        // pure-protocol.)
+        let text = "[extractor.t]\nkind = \"txt\"\n\n[embedder.e]\nkind = \"ort\"\n\
+                    [ingest.d]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
+                    extract = { txt = \"t\" }\nembedders = [\"e\"]\n";
+        let cfg = parse(text).unwrap();
+        assert_eq!(cfg.ingest["d"].embedders, ["e"]);
+        // and the negative: referencing an undeclared embedder still fails
+        let bad = text.replace("embedders = [\"e\"]", "embedders = [\"nope\"]");
+        assert!(parse(&bad).is_err());
     }
 
     #[test]

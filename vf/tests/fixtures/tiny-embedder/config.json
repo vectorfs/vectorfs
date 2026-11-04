@@ -1,0 +1,6 @@
+{
+  "model_type": "tiny-fixture",
+  "hidden_size": 8,
+  "vocab_size": 16,
+  "license": "CC0-1.0 (vectorfs test fixture, generated in-repo)"
+}

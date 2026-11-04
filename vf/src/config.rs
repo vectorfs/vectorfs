@@ -63,6 +63,12 @@ pub struct FileConfig {
     /// `[ingest.<bucket>]` sections (raw; parsed by pipeline::config).
     #[serde(default)]
     pub ingest: Option<toml::Table>,
+    /// M2 T5: models cache root override, consumed by pipeline::models (the
+    /// `<data-dir>/.vectorfs/models` default applies when absent). Tolerated
+    /// here for the same reason as the sections above; never written by
+    /// `init` (T1 files keep their byte shape).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_dir: Option<String>,
 }
 
 /// Raw `vectorfs serve` flags — Option everywhere so "not given" stays
@@ -441,6 +447,7 @@ pub fn init(data_dir: &Path, force: bool) -> Result<InitOutcome, String> {
         extractor: None,
         embedder: None,
         ingest: None,
+        models_dir: None,
     };
     let toml_doc = toml::to_string_pretty(&config)
         .map_err(|e| format!("serialize {}: {e}", path.display()))?;

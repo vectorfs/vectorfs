@@ -175,6 +175,71 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # has the rationale). MIT.
 text-splitter = { version = "0.33", default-features = false }
 
+# ---- M2 T5 embedder kinds (design.md §5.7 "文件层" row, §5.10.2 Embedder) ----
+
+# ort embedder: ONNX Runtime bindings, DYNAMIC loading only (the §5.7 ruling:
+# "ort (.so load-dynamic, 不引 fastembed)"). default-features = false drops
+# the default [std, ndarray, tracing, download-binaries, tls-native,
+# fetch-models, ...] set: download-binaries/fetch-models would fetch a
+# prebuilt ORT at BUILD time (we pin + sha the .so ourselves via
+# scripts/fetch_runtime_libs.sh, §5.10.7), ndarray/tacing/half/... are unused
+# weight. Kept features:
+#   - load-dynamic: link nothing at build time; dlopen libonnxruntime.so at
+#     runtime (ort::init_from / ORT_DYLIB_PATH; resolved through our
+#     VF_ORT_PATH > runtime-libs/ > system chain in embed/ort.rs).
+# Version is pinned EXACT (`=`): pre-2.0 rcs break API between releases, and
+# ort-sys 2.0.0-rc.15 pairs with ONNX Runtime 1.31.0 (its bundled dist.tsv)
+# — which is exactly the version fetch_runtime_libs.sh pins.
+# MIT OR Apache-2.0; onnxruntime itself is MIT (allowed binary dep).
+ort = { version = "=2.0.0-rc.15", default-features = false, features = [
+  "load-dynamic",
+] }
+
+# ort embedder tokenizer: the HF `tokenizers` runtime (tokenizer.json — the
+# same file every HF ONNX export ships). default-features = false drops
+# onig (C oniguruma regex backend), esaxx_fast (C++ suffix arrays — Unigram
+# TRAINING only, never inference) and progressbar (indicatif). fancy-regex
+# (pure Rust) is kept because tokenizer.json `Replace` normalizers require
+# a regex backend (compile_error! without one) and C regex engines are
+# exactly what a minimal-footprint binary must not grow. Apache-2.0.
+tokenizers = { version = "0.23", default-features = false, features = [
+  "fancy-regex",
+] }
+
+# openai embedder TLS: rustls 0.23 + hyper-rustls are ALREADY transitive
+# deps in this tree (object_store/reqwest/lance chain, unified version
+# 0.23.x) — declaring them directly adds ZERO new crates beyond
+# webpki-roots. Provider = aws-lc-rs (the crypto object_store already
+# binds, design.md §8 #11; NOT ring). The openai kind is hand-rolled HTTP
+# over hyper-util (§5.7 "自研 HTTP 复用 hyper 树 ~150 行, 零 reqwest") — these
+# are its TLS plumbing only. Features are the minimum: http1, tls12, the
+# aws-lc-rs provider, and webpki-roots for the root store.
+#   - hyper-rustls / rustls: MIT OR Apache-2.0; aws-lc-rs: ISC + OpenSSL
+#     (already accepted in deny.toml).
+#   - webpki-roots: MPL-2.0 — accepted per the M1 ruling recorded in
+#     deny.toml (consumed as a data library; file-level weak copyleft, not
+#     viral). It bundles the Mozilla root set so the binary works on
+#     slim containers without /etc/ssl/certs; the alternative
+#     (rustls-native-certs) depends on the host cert store, which is
+#     exactly the failure mode a self-contained binary must avoid.
+#   - rustls is declared DIRECTLY (same 0.23.x the tree already locks, zero
+#     new crates) because the tree's rustls has BOTH provider features
+#     enabled (hyper-rustls/aws-lc-rs via object_store AND ring via
+#     reqwest's feature unification) — rustls's default provider selection
+#     PANICS on that ambiguity, so embed/http.rs must name the provider
+#     explicitly (aws-lc-rs, the object_store-blessed crypto).
+hyper-rustls = { version = "0.27", default-features = false, features = [
+  "http1",
+  "tls12",
+  "aws-lc-rs",
+  "webpki-tokio",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+  "std",
+  "tls12",
+  "aws-lc-rs",
+] }
+
 [dev-dependencies]
 # tower::oneshot for in-process integration tests (no network port).
 tower = { version = "0.5", features = ["util"] }

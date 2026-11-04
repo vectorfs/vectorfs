@@ -4,9 +4,10 @@
 //! These are PUBlic assertion suites, not just our own tests: any future
 //! implementation (community kind, wasm plugin in v2) runs the SAME suite to
 //! be admitted — `#[cfg(test)]` below runs it against the built-ins
-//! (`txt`, `pdf-text`, `md`, `token-window`) and a local mock embedder. The
-//! real embedder kinds (ort / openai) each run `embedder_contract` once they
-//! land in T5.
+//! (`txt`, `pdf-text`, `md`, `token-window`, the real `ort` kind over the
+//! committed tiny ONNX fixture + the real .so, the real `openai` kind over an
+//! in-process fake provider) and a local mock embedder kept as the LSP canary
+//! for third-party implementations.
 //!
 //! Assertions panic on violation (assertion-suite convention); callers wrap
 //! them in whatever test harness they use.
@@ -378,6 +379,8 @@ fn assert_total_order(hits: &[Hit]) {
 #[cfg(test)]
 mod tests {
     use super::super::chunk::token_window::TokenWindowChunker;
+    use super::super::embed::openai;
+    use super::super::embed::ort;
     use super::super::extract::md::MdExtractor;
     use super::super::extract::pdf_text;
     use super::super::extract::txt::TxtExtractor;
@@ -417,9 +420,28 @@ mod tests {
         chunker_contract(&c, 4, 2);
     }
 
+    #[tokio::test]
+    async fn ort_kind_passes_embedder_contract() {
+        // the REAL ort kind against the committed tiny fixture + the real
+        // .so (locator panics with fetch guidance if missing — same
+        // honest-failure rule as pdfium)
+        let e = ort::tests::embedder_or_panic().await;
+        embedder_contract(&e).await;
+    }
+
+    #[tokio::test]
+    async fn openai_kind_passes_embedder_contract() {
+        // the REAL openai kind against an in-process fake provider
+        let (base, _fake) = openai::tests::fake_openai().await;
+        let e = super::super::embed::openai::OpenAiEmbedder::new(&openai::tests::fake_config(base))
+            .unwrap();
+        embedder_contract(&e).await;
+    }
+
     /// Deterministic pseudo-embedding: sha256(dim_index + text) -> one f32
-    /// in [-1, 1]. Stands in for ort/openai until T5 — when each real kind
-    /// lands, IT must run `embedder_contract` too (asserted in their task).
+    /// in [-1, 1]. Kept alongside the real kinds: it is the LSP canary for
+    /// THIRD-PARTY implementations (the admission gate future kinds/wasm
+    /// plugins must pass) — the real kinds do not make it redundant.
     struct ShaEmbedder {
         dim: usize,
     }

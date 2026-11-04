@@ -239,11 +239,14 @@ enum PipelinesCommand {
 /// `vectorfs pipelines check` arguments.
 #[derive(Parser, Debug)]
 struct PipelinesCheckArgs {
-    /// Explicit config file to check (skips data-dir resolution)
-    #[arg(long, conflicts_with = "data_dir")]
+    /// Explicit config file to check (instead of <data-dir>/.vectorfs/
+    /// vectorfs.toml; the data dir STILL resolves the models cache for the
+    /// availability gate)
+    #[arg(long)]
     config: Option<String>,
 
-    /// Data directory whose <dir>/.vectorfs/vectorfs.toml is checked
+    /// Data directory: config location when --config is absent, and the
+    /// models-cache root for the model availability gate
     /// [env: VF_DATA_DIR] [default: ./vectorfs-data]
     #[arg(long)]
     data_dir: Option<String>,
@@ -404,10 +407,36 @@ fn pipelines_cmd(args: PipelinesArgs) {
             std::process::exit(2);
         }
     };
+    // data dir for the models cache (the availability gate resolves
+    // config models_dir > <data-dir>/.vectorfs/models): same chain as the
+    // no-flag path; with --config the file's own directory context is not
+    // knowable, so flag/env/default apply.
+    let data_dir = check
+        .data_dir
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("VF_DATA_DIR")
+                .ok()
+                .map(std::path::PathBuf::from)
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from(config::DEFAULT_DATA_DIR));
     match vectorfs::pipeline::config::load_pipeline_config(&text) {
         Ok(cfg) => {
+            // availability gate (fs pass over the models cache): an offline
+            // ort config whose model is missing must fail the check, not the
+            // first embed call (§5.10.3 fail-fast with line attribution)
+            if let Err(e) = cfg.validate_model_availability(&data_dir) {
+                eprintln!("vectorfs pipelines check: {e}");
+                std::process::exit(1);
+            }
             println!("vectorfs pipelines check: {} — OK", path.display());
             print_pipeline_summary(&cfg);
+            // warnings (stderr): advisory, never exit-affecting — e.g. the
+            // §5.10.5 license note for models outside the built-in table
+            for w in &cfg.warnings {
+                eprintln!("vectorfs pipelines check: warning: {w}");
+            }
         }
         Err(e) => {
             eprintln!("vectorfs pipelines check: {e}");
@@ -427,10 +456,13 @@ fn print_pipeline_summary(cfg: &vectorfs::pipeline::config::PipelineConfig) {
         println!("extractor {name}: kind={}", kind.describe());
     }
     if cfg.embedders.is_empty() {
-        println!("embedders: (none registered — ort/openai land in M2-T5)");
+        println!("embedders: (none — the pure protocol face)");
     }
-    for (name, _kind) in &cfg.embedders {
-        println!("embedder {name}");
+    for (name, kind) in &cfg.embedders {
+        println!("embedder {name}: kind={}", kind.describe());
+    }
+    if let Some(dir) = &cfg.models_dir {
+        println!("models_dir: {}", dir.display());
     }
     for (bucket, ingest) in &cfg.ingest {
         let scope = ingest.scope.as_deref().unwrap_or("<whole root>");
@@ -508,7 +540,13 @@ async fn serve(args: ServeArgs) {
     // serve starts normally with no file layer.
     match std::fs::read_to_string(config::config_path(&cfg.data_dir)) {
         Ok(text) => {
-            if let Err(e) = vectorfs::pipeline::config::load_pipeline_config(&text) {
+            let invalid = match vectorfs::pipeline::config::load_pipeline_config(&text) {
+                Err(e) => Some(e),
+                // availability gate: a model an embedder needs at startup
+                // must exist where its config says it will be found
+                Ok(parsed) => parsed.validate_model_availability(&cfg.data_dir).err(),
+            };
+            if let Some(e) = invalid {
                 eprintln!("vectorfs: pipeline config invalid: {e}");
                 eprintln!(
                     "vectorfs: hint: fix {} (or run `vectorfs pipelines check --data-dir {}`)",
