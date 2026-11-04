@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod ops;
 pub mod ops_xvf;
 pub mod pipeline;
+pub mod preset;
 pub mod report;
 pub mod sigv4;
 pub mod status;

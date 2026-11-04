@@ -472,10 +472,15 @@ fn cli_full_command_smoke() {
     assert!(out(&o).starts_with("FAILED\tdocs/bad.txt"), "{}", out(&o));
     assert!(err(&o).contains("statusReason"), "{}", err(&o));
 
-    // ---- structured usage error: no credentials ----
+    // ---- no credentials: health-only degradation (M2 T8 container
+    // HEALTHCHECK contract): `vf status` probes the unsigned GET /health and
+    // exits 0 when the daemon is up — the image's HEALTHCHECK runs exactly
+    // this shape with no VF_* env (§5.10.7). Signed DEPTH verbs (put/search/
+    // …) still hard-fail on missing credentials (their own tests above).
     let o = vf(port, &["status"], true);
-    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
-    assert!(err(&o).contains("NO_CREDENTIALS"), "{}", err(&o));
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(out(&o).contains("health-only probe"), "{}", out(&o));
+    assert!(out(&o).contains("health"), "{}", out(&o));
 
     daemon.dump_log_tail("end of smoke (informational)");
 }

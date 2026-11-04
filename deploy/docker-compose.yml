@@ -1,0 +1,67 @@
+# deploy/docker-compose.yml — one-command vectorfs deployment (M2-T8,
+# design.md §5.10.7). Volumes keep data and models OUT of the image layer;
+# scalar overrides ride VF_* env (endpoint/credentials/preset/backend —
+# complex structure belongs in the volume's vectorfs.toml, §5.10.7 boundary).
+#
+# ONE INSTANCE ROOT PER CONTAINER: the daemon is a single writer (LOCK
+# object, §5.1) — do NOT scale this service (`--scale vectorfs=2` will have
+# the second container refuse to start). Point multiple deployments at
+# distinct data volumes or an S3-backed instance root per container instead.
+#
+# K8s: run the image with the same volumes/env; no chart by design.
+#
+# First boot: set VF_PRESET (below) to materialize vectorfs.toml into the
+# data volume on the first start (text-rag downloads the ~1.17 GiB gte model
+# into the models volume at that moment; air-gapped expects you to mount the
+# model directory yourself). Leave it unset to manage vectorfs.toml by hand.
+
+services:
+  vectorfs:
+    # Replace <owner> with the GitHub repository owner (the CI workflow
+    # publishes ghcr.io/${repo}:version + :latest on v* tags). Local images:
+    # comment `image:` out and build with scripts/docker_build.sh.
+    image: ghcr.io/<owner>/vectorfs:latest
+    ports:
+      - "8787:8787"
+    volumes:
+      - data:/vectorfs/data
+      - models:/vectorfs/models
+    environment:
+      # --- first-boot materialization (uncomment ONE) -----------------------
+      # - VF_PRESET=dev          # pure protocol face, no models
+      # - VF_PRESET=text-rag     # downloads gte on first boot (~1.17 GiB)
+      # - VF_PRESET=air-gapped   # no download; mount the model under models/
+      # --- scalar overrides (flag > VF_* env > vectorfs.toml > default) -----
+      # - VF_PORT=8787
+      # - VF_BACKEND=s3+http://minio:9000/my-bucket   # per-invocation backend
+      # - VF_ACCESS_KEY=…        # client-facing SigV4 creds override
+      # - VF_SECRET_KEY=…
+      # - VF_S3_ACCESS_KEY=…     # backend S3 connection creds
+      # - VF_S3_SECRET_KEY=…
+      - VF_PRESET=${VF_PRESET:-}
+    restart: unless-stopped
+    # mirrors the image's built-in healthcheck (vf probes GET /health —
+    # credential-less by design, §5.10.7)
+    healthcheck:
+      test: ["CMD-SHELL", "vf status --endpoint http://127.0.0.1:${VF_PORT:-8787} >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # Emulator variant (CI / testcontainers / local SDK testing): volatile
+  # memory backend, no auth, no volumes — `docker compose --profile emulator
+  # up vectorfs-emulator` (then point boto3 at http://127.0.0.1:8788 with any
+  # static credentials). The explicit `serve …` command bypasses first-boot
+  # init entirely (entrypoint contract).
+  vectorfs-emulator:
+    image: ghcr.io/<owner>/vectorfs:latest
+    command: serve --backend memory --no-auth
+    ports:
+      - "8788:8787"
+    profiles: ["emulator"]
+    restart: unless-stopped
+
+volumes:
+  data:
+  models:

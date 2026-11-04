@@ -689,10 +689,47 @@ async fn reindex_cmd(args: ReindexArgs) {
 }
 
 async fn status_cmd(args: StatusArgs) {
-    let conn = args
-        .common
-        .connect()
-        .unwrap_or_else(|f| f.fail(args.json, 2));
+    // Health-only degradation (container HEALTHCHECK shape, §5.10.7): with
+    // no credentials resolvable the full GetIngestStatus depth is
+    // impossible, but "is the daemon up" must stay answerable — the image's
+    // HEALTHCHECK runs `vf status --endpoint …` with NO VF_* env (the
+    // daemon's credentials live in the data volume's vectorfs.toml). Fall
+    // back to the unsigned GET /health probe and exit on its verdict.
+    let conn = match args.common.connect() {
+        Ok(c) => c,
+        Err(f) if f.code == "NO_CREDENTIALS" => {
+            let probe = Connection::resolve_probe(args.common.endpoint.clone())
+                .unwrap_or_else(|f| f.fail(args.json, 2));
+            let health = match probe.get_health().await {
+                Ok(h) => h,
+                Err(f) => f.fail(args.json, 1),
+            };
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "endpoint": probe.endpoint(),
+                        "health": health,
+                        "ingest": null,
+                        "note": "health-only probe: no credentials (VF_ACCESS_KEY unset)",
+                    }))
+                    .expect("serializes")
+                );
+            } else {
+                println!("vf status (schema v{SCHEMA_VERSION})");
+                println!("  endpoint : {}", probe.endpoint());
+                println!(
+                    "  health   : {} (version {})",
+                    health["ok"],
+                    health["version"].as_str().unwrap_or("?")
+                );
+                println!("  ingest   : (no credentials — health-only probe)");
+            }
+            return;
+        }
+        Err(f) => f.fail(args.json, 2),
+    };
     let health = match conn.get_health().await {
         Ok(h) => h,
         Err(f) => f.fail(args.json, 1),

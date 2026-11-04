@@ -7,9 +7,11 @@
 #
 # Usage: scripts/fetch_runtime_libs.sh <name>...   (name: pdfium | onnxruntime)
 #
-# Pinning discipline (§5.10.7): version + sha256 are HARD-CODED below – no
-# floating "latest". Bumping a pin = editing this script (the sha is the trust
-# root; CI caches runtime-libs/ keyed on the pins via the stamp file).
+# Pinning discipline (§5.10.7): the version+sha256 table lives in
+# scripts/runtime_lib_pins.sh — the SINGLE source shared with the Dockerfile
+# (the image installs the same pins; see that file's header for why sharing
+# is load-bearing). Bumping a pin = editing the pins script; CI caches
+# runtime-libs/ keyed on the pins via the stamp file.
 #
 # Idempotence: after a successful fetch we write runtime-libs/<name>.stamp
 # containing the pinned version+sha; a later run with a matching stamp AND an
@@ -26,37 +28,31 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# shared pin table (also sourced by the Dockerfile build stage)
+# shellcheck source=runtime_lib_pins.sh
+source "$(dirname "$0")/runtime_lib_pins.sh"
+
 RUNTIME_DIR="runtime-libs"
-PDFIUM_RELEASE="chromium/8066"   # PDFium 156.0.8066.0 (2026-09-21)
-PDFIUM_BASE_URL="https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_RELEASE}"
-ORT_RELEASE="v1.31.0"            # ONNX Runtime 1.31.0 (2026-10-09); pairs with ort-sys 2.0.0-rc.15
-ORT_BASE_URL="https://github.com/microsoft/onnxruntime/releases/download/${ORT_RELEASE}"
 
-# Pinned sha256 per release asset. NOTE the macOS artifact ships libpdfium.dylib
-# while Linux ships libpdfium.so — the unpacked file name follows the platform.
-pdfium_asset() {
-    case "$(uname -s)/$(uname -m)" in
-        Linux/x86_64)  echo "pdfium-linux-x64.tgz 0b43f405477cf2cfc4dbff06905093c3309756c6bca1fb9da99234a2ca97fed2 libpdfium.so" ;;
-        Linux/aarch64) echo "pdfium-linux-arm64.tgz 0e6f90dccbc6b81fd5d7106abaf164c4222178f024c204d00d526b60fd2ad535 libpdfium.so" ;;
-        Darwin/arm64)  echo "pdfium-mac-arm64.tgz 336219e80580b93c6523f44db7dc1de59cc497b13a7390ddac84223f68ca162b libpdfium.dylib" ;;
-        Darwin/x86_64) echo "pdfium-mac-x64.tgz 841ecac278cdd46288dd065873522cf72f3996560d8978f473d336f01d59942c libpdfium.dylib" ;;
-        *) echo "unsupported platform for pdfium: $(uname -s)/$(uname -m)" >&2; return 1 ;;
-    esac
-}
+# uname -> pins-script platform axis
+os_of() { case "$(uname -s)" in Linux) echo linux ;; Darwin) echo mac ;; *) echo "unsupported OS: $(uname -s)" >&2; return 1 ;; esac; }
+arch_of() { case "$(uname -m)" in x86_64) echo x64 ;; aarch64|arm64) echo arm64 ;; *) echo "unsupported arch: $(uname -m)" >&2; return 1 ;; esac; }
 
-fetch_pdfium() {
-    local spec lib_name
-    spec="$(pdfium_asset)" || return 1
-    read -r asset sha lib_name <<<"$spec"
-    if [[ "$sha" == "0" ]]; then
-        echo "fetch_runtime_libs: pdfium asset '$asset' has no pinned sha yet — pin it in this script (design.md §5.10.7)" >&2
-        return 1
-    fi
+fetch_one() {
+    local name="$1" spec url asset sha member lib_name
+    spec="$(runtime_lib_spec "$name" "$(os_of)" "$(arch_of)")" || return 1
+    # pins row shape: "<download-url> <sha256> <archive-member> <installed-name>"
+    read -r url sha member lib_name <<<"$spec"
+    asset="$(basename "$url")"
 
-    local stamp="${RUNTIME_DIR}/pdfium.stamp"
-    local stamp_line="${PDFIUM_RELEASE} ${asset} ${sha}"
+    local stamp="${RUNTIME_DIR}/${name}.stamp"
+    # stamp line keeps the pre-refactor byte shape (release + asset + sha) so
+    # existing CI caches stay valid across this refactor
+    local release
+    release="$(release_of "$name")"
+    local stamp_line="${release} ${asset} ${sha}"
     if [[ -f "${RUNTIME_DIR}/${lib_name}" && -f "$stamp" && "$(cat "$stamp")" == "$stamp_line" ]]; then
-        echo "pdfium: ${RUNTIME_DIR}/${lib_name} already at pinned ${PDFIUM_RELEASE} — skip"
+        echo "${name}: ${RUNTIME_DIR}/${lib_name} already at pinned ${release} — skip"
         return 0
     fi
 
@@ -64,76 +60,29 @@ fetch_pdfium() {
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' RETURN
 
-    echo "pdfium: downloading ${PDFIUM_BASE_URL}/${asset}"
-    curl -sSL --fail -o "${tmp}/${asset}" "${PDFIUM_BASE_URL}/${asset}"
+    echo "${name}: downloading ${url}"
+    # retry + http1.1: GitHub release CDNs intermittently drop HTTP/2
+    # streams; a pin-verified artifact redeems itself on retry
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --http1.1 \
+        -o "${tmp}/${asset}" "${url}"
 
-    echo "pdfium: verifying sha256"
+    echo "${name}: verifying sha256"
     echo "${sha}  ${tmp}/${asset}" | sha256sum -c - >/dev/null
 
-    # Extract ONLY the shared library member (lib/libpdfium.*); the archive
-    # also carries headers/cmake we do not want in runtime-libs/.
-    mkdir -p "$RUNTIME_DIR"
-    tar -xzf "${tmp}/${asset}" -C "$tmp" "lib/${lib_name}"
-    mv "${tmp}/lib/${lib_name}" "${RUNTIME_DIR}/${lib_name}"
-    printf '%s\n' "$stamp_line" >"$stamp"
-    echo "pdfium: installed ${RUNTIME_DIR}/${lib_name} (${PDFIUM_RELEASE}, sha256 verified)"
-}
-
-# Pinned sha256 per release asset. The archives keep the real library under a
-# VERSIONED name (libonnxruntime.so.1.31.0 / libonnxruntime.1.31.0.dylib) with
-# unversioned names as symlinks — we extract the REAL file and install it under
-# the plain name ort's dlopen expects, so runtime-libs/ never carries a dangling
-# symlink after a selective tar extraction.
-# NOTE macOS-x64: upstream stopped publishing osx-x64 assets (only arm64
-# remains), so an Intel-Mac CI/dev box must supply its own dylib via VF_ORT_PATH.
-ort_asset() {
-    case "$(uname -s)/$(uname -m)" in
-        Linux/x86_64)  echo "onnxruntime-linux-x64-1.31.0.tgz cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57 onnxruntime-linux-x64-1.31.0/lib/libonnxruntime.so.1.31.0 libonnxruntime.so" ;;
-        Linux/aarch64) echo "onnxruntime-linux-aarch64-1.31.0.tgz c5b8b3cca31f3d643a3b313b8f42e2d0f16a4fcefd02cda343d97bd5306afaab onnxruntime-linux-aarch64-1.31.0/lib/libonnxruntime.so.1.31.0 libonnxruntime.so" ;;
-        Darwin/arm64)  echo "onnxruntime-osx-arm64-1.31.0.tgz 1031b36dd3bdaa8d976a6130d9cf2a05e9be320b93ae804f8427b91dc3432afc ./onnxruntime-osx-arm64-1.31.0/lib/libonnxruntime.1.31.0.dylib libonnxruntime.dylib" ;;
-        Darwin/x86_64) echo "" ;;
-        *) echo "unsupported platform for onnxruntime: $(uname -s)/$(uname -m)" >&2; return 1 ;;
-    esac
-}
-
-fetch_onnxruntime() {
-    local spec asset sha member lib_name
-    spec="$(ort_asset)" || return 1
-    if [[ -z "$spec" ]]; then
-        echo "fetch_runtime_libs: onnxruntime $ORT_RELEASE publishes no macOS-x64 asset (upstream ships arm64 only)" >&2
-        echo "  -> build one from source, or install via Homebrew, and point VF_ORT_PATH at the dylib" >&2
-        return 1
-    fi
-    read -r asset sha member lib_name <<<"$spec"
-    if [[ "$sha" == "0" ]]; then
-        echo "fetch_runtime_libs: onnxruntime asset '$asset' has no pinned sha yet — pin it in this script (design.md §5.10.7)" >&2
-        return 1
-    fi
-
-    local stamp="${RUNTIME_DIR}/onnxruntime.stamp"
-    local stamp_line="${ORT_RELEASE} ${asset} ${sha}"
-    if [[ -f "${RUNTIME_DIR}/${lib_name}" && -f "$stamp" && "$(cat "$stamp")" == "$stamp_line" ]]; then
-        echo "onnxruntime: ${RUNTIME_DIR}/${lib_name} already at pinned ${ORT_RELEASE} — skip"
-        return 0
-    fi
-
-    local tmp
-    tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' RETURN
-
-    echo "onnxruntime: downloading ${ORT_BASE_URL}/${asset}"
-    curl -sSL --fail -o "${tmp}/${asset}" "${ORT_BASE_URL}/${asset}"
-
-    echo "onnxruntime: verifying sha256"
-    echo "${sha}  ${tmp}/${asset}" | sha256sum -c - >/dev/null
-
-    # Extract ONLY the real library member (headers/cmake stay out). macOS
-    # archives carry a "./" path prefix, Linux ones do not — strip it either way.
+    # Extract ONLY the library member (headers/cmake stay out). macOS archives
+    # carry a "./" path prefix, Linux ones do not — strip it either way.
     mkdir -p "$RUNTIME_DIR"
     tar -xzf "${tmp}/${asset}" -C "$tmp" "${member#./}"
     mv "${tmp}/${member#./}" "${RUNTIME_DIR}/${lib_name}"
     printf '%s\n' "$stamp_line" >"$stamp"
-    echo "onnxruntime: installed ${RUNTIME_DIR}/${lib_name} (${ORT_RELEASE}, sha256 verified; pairs with ort-sys 2.0.0-rc.15)"
+    echo "${name}: installed ${RUNTIME_DIR}/${lib_name} (${release}, sha256 verified)"
+}
+
+release_of() {
+    case "$1" in
+        pdfium)      echo "$PDFIUM_RELEASE" ;;
+        onnxruntime) echo "$ORT_RELEASE" ;;
+    esac
 }
 
 if [[ $# -eq 0 ]]; then
@@ -142,5 +91,8 @@ if [[ $# -eq 0 ]]; then
 fi
 
 for name in "$@"; do
-    "fetch_${name}"
+    case "$name" in
+        pdfium|onnxruntime) fetch_one "$name" ;;
+        *) echo "unknown library '${name}' (available: pdfium, onnxruntime)" >&2; exit 2 ;;
+    esac
 done

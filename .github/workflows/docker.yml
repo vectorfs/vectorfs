@@ -1,0 +1,171 @@
+# Docker image pipeline (M2-T8, design.md §5.10.7): ghcr multi-arch image
+# (linux/amd64 + linux/arm64, aligned with the release matrix). Trigger: tag
+# v* (publishes :version + :latest) or workflow_dispatch (publishes :sha-…).
+#
+# Jobs:
+#   binaries (matrix) — release-prod builds per target, the SAME shape as
+#                       release.yml (VF_GIT_HASH baked in; cross-rs for
+#                       aarch64). Artifacts carry the two binaries.
+#   image             — stages both targets + deploy/entrypoint.sh + the
+#                       shared pin script exactly like scripts/docker_build.sh
+#                       (the Dockerfile never compiles — its .so layer pulls
+#                       the pinned ort/pdfium per TARGETARCH itself), then
+#                       docker buildx builds BOTH platforms in ONE invocation
+#                       and pushes to ghcr.io/<repo> (lowercased).
+#
+# Local verification never needs buildx multi-arch: scripts/docker_build.sh
+# stages and `docker build`s the host platform only.
+name: Docker
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write # push to ghcr.io
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binaries:
+    name: build ${{ matrix.target }} (release-prod)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            docker-arch: amd64
+            use-cross: false
+          - target: aarch64-unknown-linux-gnu
+            docker-arch: arm64
+            use-cross: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Host-side protoc for the native build; the cross build gets it from
+      # Cross.toml's pre-build hook (inside the container).
+      - name: install protoc (lance-encoding build dep)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-prod-${{ matrix.target }}
+
+      # GLIBC ALIGNMENT (the trap this job exists to avoid): the runtime
+      # image is debian:bookworm-slim (glibc 2.36); ubuntu-latest is NEWER
+      # (2.39+), and binaries built there can demand symbol versions
+      # bookworm lacks (observed: GLIBC_2.38). So the amd64 build runs
+      # inside rust:1-bookworm — glibc-identical to the image by
+      # construction. aarch64 keeps cross-rs (its container is
+      # ubuntu:20.04-based, glibc 2.31 — strictly older than the image, safe).
+      - name: cache (cargo registry + in-container target dir)
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/.cargo-registry
+            /tmp/cargo-target
+          key: docker-binaries-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: export VF_GIT_HASH (short sha)
+        run: echo "VF_GIT_HASH=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: build (release-prod; bookworm container / cross-rs) + stage
+        run: |
+          set -euo pipefail
+          mkdir -p "stage/${{ matrix.docker-arch }}"
+          if [[ "${{ matrix.use-cross }}" == "true" ]]; then
+            cargo install cross --locked
+            cross build --profile release-prod --workspace --target "${{ matrix.target }}"
+            cp "target/${{ matrix.target }}/release-prod/vectorfs" "stage/${{ matrix.docker-arch }}/"
+            cp "target/${{ matrix.target }}/release-prod/vf" "stage/${{ matrix.docker-arch }}/"
+          else
+            docker run --rm -v "$PWD:/work" -w /work \
+              -e CARGO_TARGET_DIR=/tmp/cargo-target \
+              -e VF_GIT_HASH \
+              -v /tmp/.cargo-registry:/usr/local/cargo/registry \
+              -v /tmp/cargo-target:/tmp/cargo-target \
+              rust:1-bookworm bash -c '
+                set -euo pipefail
+                apt-get update -qq
+                apt-get install -y -qq --no-install-recommends cmake protobuf-compiler libprotobuf-dev
+                cargo build --profile release-prod --workspace --target '"${{ matrix.target }}"'
+                cp "/tmp/cargo-target/${{ matrix.target }}/release-prod/vectorfs" "'"$PWD"'/stage/${{ matrix.docker-arch }}/"
+                cp "/tmp/cargo-target/${{ matrix.target }}/release-prod/vf" "'"$PWD"'/stage/${{ matrix.docker-arch }}/"
+              '
+          fi
+          ls -la "stage/${{ matrix.docker-arch }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.docker-arch }}
+          path: stage/
+          if-no-files-found: error
+
+  image:
+    name: buildx multi-arch + push ghcr
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: stage/
+          merge-multiple: true
+
+      # ghcr requires all-lowercase repository names
+      - name: resolve image name + tags
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            TAGS="${IMAGE}:${VERSION},${IMAGE}:latest"
+          else
+            TAGS="${IMAGE}:sha-${GITHUB_SHA::7}"
+          fi
+          echo "TAGS=$TAGS" >> "$GITHUB_ENV"
+          echo "image: $TAGS"
+
+      # the staging layout the Dockerfile expects (mirrors
+      # scripts/docker_build.sh): amd64/{vectorfs,vf}, arm64/{vectorfs,vf},
+      # entrypoint.sh, runtime_lib_pins.sh, Dockerfile
+      - name: stage context (entrypoint + shared .so pins + Dockerfile)
+        run: |
+          set -euo pipefail
+          cp deploy/entrypoint.sh stage/
+          cp scripts/runtime_lib_pins.sh stage/
+          cp Dockerfile stage/
+          ls -laR stage/ | head -40
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # One buildx invocation, both platforms: each platform's .so layer
+      # resolves its own pinned artifacts via TARGETARCH (Dockerfile stage
+      # 1); binaries come from the per-target staging dirs.
+      - name: build + push (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: stage/
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.TAGS }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

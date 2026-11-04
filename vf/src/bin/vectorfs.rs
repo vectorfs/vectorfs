@@ -102,6 +102,34 @@ struct InitArgs {
     #[arg(long)]
     data_dir: Option<String>,
 
+    /// Configuration preset to materialize (design.md §5.10.4): dev = pure
+    /// protocol face (default, identical to the pre-preset init);
+    /// text-rag = gte text pipeline + model PREFETCH (~1.17 GiB, stderr
+    /// progress, HF_ENDPOINT mirror honored); air-gapped = offline ort
+    /// embedder, no download — supply the model directory yourself
+    #[arg(long)]
+    preset: Option<vectorfs::preset::Preset>,
+
+    /// Report-only hint: the endpoint the daemon will serve on (host or
+    /// host:port). Shapes the printed serve command + client env snippet;
+    /// never written to vectorfs.toml (the bind address is a serve-time
+    /// flag, §5.10.7 env-override boundary)
+    #[arg(long)]
+    listen: Option<String>,
+
+    /// Report-only hint: backend spec echoed into the printed serve
+    /// command. Backends are per-invocation and never written to
+    /// vectorfs.toml (config.rs resolution chain owns the real behavior)
+    #[arg(long)]
+    backend: Option<String>,
+
+    /// Models cache root (container deployments: the /vectorfs/models
+    /// VOLUME, §5.10.7 — text-rag records it as `models_dir`, air-gapped
+    /// bakes it into the embedder `path`; bare metal leaves it unset and
+    /// the <data-dir>/.vectorfs/models default applies)
+    #[arg(long)]
+    models_dir: Option<String>,
+
     /// Regenerate credentials even if vectorfs.toml already exists
     #[arg(long)]
     force: bool,
@@ -115,6 +143,14 @@ struct ServeArgs {
     /// TCP port to listen on [env: VF_PORT] [default: 8787]
     #[arg(long)]
     port: Option<u16>,
+
+    /// Bind address for the HTTP listener: `host` or `host:port` (an
+    /// embedded port wins over --port/VF_PORT). Default 127.0.0.1 — set
+    /// 0.0.0.0 in containers so `-p` port mapping reaches the daemon (the
+    /// image does this via VF_LISTEN, design.md §5.10.7)
+    /// [env: VF_LISTEN]
+    #[arg(long)]
+    listen: Option<String>,
 
     /// Data directory (file backend root + where .vectorfs/vectorfs.toml is
     /// read from) [env: VF_DATA_DIR] [default: ./vectorfs-data]
@@ -265,7 +301,7 @@ async fn main() {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Serve(args)) => serve(args).await,
-        Some(Command::Init(args)) => init(args),
+        Some(Command::Init(args)) => init(args).await,
         Some(Command::Status(args)) => status_cmd(args).await,
         Some(Command::Doctor(args)) => doctor_cmd(args).await,
         Some(Command::Mcp(args)) => mcp_cmd(args).await,
@@ -489,7 +525,11 @@ fn print_pipeline_summary(cfg: &vectorfs::pipeline::config::PipelineConfig) {
     }
 }
 
-fn init(args: InitArgs) {
+/// `vectorfs init`: materialize credentials (+ preset pipeline sections,
+/// §5.10.4) and — for text-rag — PREFETCH the model (progress/sha256/
+/// tmp+rename/HF_ENDPOINT mirror: pipeline::models). Async solely for that
+/// download; everything else is local file IO.
+async fn init(args: InitArgs) {
     let data_dir = args
         .data_dir
         .as_deref()
@@ -506,20 +546,62 @@ fn init(args: InitArgs) {
              previous access key will stop authenticating."
         );
     }
-    match config::init(&data_dir, args.force) {
-        Ok(outcome) => {
-            println!("{}", config::init_report(&outcome));
-        }
+    let opts = config::InitOptions {
+        preset: args.preset.unwrap_or_default(),
+        listen: args.listen,
+        backend: args.backend,
+        models_dir: args.models_dir.map(std::path::PathBuf::from),
+    };
+    let outcome = match config::init_with(&data_dir, args.force, &opts) {
+        Ok(o) => o,
         Err(e) => {
             eprintln!("vectorfs init: {e}");
             std::process::exit(1);
         }
+    };
+    // text-rag: prefetch the default model into the resolved cache dir
+    // BEFORE printing the report (the §3 "model ready" five-minute promise
+    // happens here, at init, not at first serve). air-gapped deliberately
+    // downloads nothing (offline semantics); dev has no models at all.
+    if outcome.preset == vectorfs::preset::Preset::TextRag {
+        eprintln!(
+            "vectorfs init: preset text-rag: prefetching '{}' (3 files, ~1.17 GiB) into {} …",
+            vectorfs::preset::Preset::DEFAULT_MODEL,
+            outcome.models_dir.display()
+        );
+        match vectorfs::pipeline::models::prefetch(
+            vectorfs::preset::Preset::DEFAULT_MODEL,
+            &outcome.models_dir,
+        )
+        .await
+        {
+            Ok(dir) => {
+                eprintln!(
+                    "vectorfs init: model ready at {} (sha256-verified, stamp .complete)",
+                    dir.display()
+                );
+            }
+            Err(e) => {
+                // the config IS materialized: serve retries the prefetch at
+                // embedder load (ort.rs), so the deployment stays fixable
+                // without re-init
+                eprintln!("vectorfs init: model prefetch FAILED: {e}");
+                eprintln!(
+                    "vectorfs init: hint: the config was written; fix the network (or set \
+                     HF_ENDPOINT to a mirror) and re-run with --force, or let `vectorfs serve` \
+                     retry the prefetch at startup"
+                );
+                std::process::exit(1);
+            }
+        }
     }
+    println!("{}", config::init_report(&outcome));
 }
 
 async fn serve(args: ServeArgs) {
     let flags = ServeFlags {
         port: args.port,
+        listen: args.listen,
         data_dir: args.data_dir.map(std::path::PathBuf::from),
         backend: args.backend,
         no_auth: args.no_auth,
@@ -750,8 +832,9 @@ async fn serve(args: ServeArgs) {
         eprintln!("vectorfs: ingest worker running (SIGTERM drains in-flight files, ≤8s)");
     }
     eprintln!(
-        "vectorfs: starting on 127.0.0.1:{} backend={backend} auth={auth_desc} \
+        "vectorfs: starting on {}:{} backend={backend} auth={auth_desc} \
          region={} account={} owner={} trace={}",
+        cfg.bind_host,
         cfg.port,
         cfg.region,
         cfg.account,
@@ -760,10 +843,10 @@ async fn serve(args: ServeArgs) {
     );
 
     let app = vectorfs::build_router(state);
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", cfg.port)).await {
+    let listener = match tokio::net::TcpListener::bind((cfg.bind_host.as_str(), cfg.port)).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("vectorfs: bind 127.0.0.1:{} failed: {e}", cfg.port);
+            eprintln!("vectorfs: bind {}:{} failed: {e}", cfg.bind_host, cfg.port);
             lock_guard.release().await;
             std::process::exit(2);
         }

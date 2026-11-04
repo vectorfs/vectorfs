@@ -1,11 +1,14 @@
 //! `vectorfs init` credentials + `vectorfs serve` configuration resolution
 //! (M1 T2; M2 T1 swaps the file carrier vf.json -> vectorfs.toml, design.md
-//! §0 config ruling — no backward compatibility, direct switch).
+//! §0 config ruling — no backward compatibility, direct switch; M2 T8 adds
+//! preset materialization, §5.10.4 — pipeline templates live in
+//! [`crate::preset`], this module keeps owning credentials + the file).
 //!
 //! Resolution order (design.md §5.8): **flag > environment variable >
 //! `<data-dir>/.vectorfs/vectorfs.toml` > default**. Everything the daemon
-//! needs (auth creds, region, account, backend, data dir, port) flows through
-//! [`resolve`], so there is exactly one precedence to reason (and test) about.
+//! needs (auth creds, region, account, backend, data dir, bind address,
+//! port) flows through [`resolve`], so there is exactly one precedence to
+//! reason (and test) about.
 //!
 //! `<data-dir>/.vectorfs/vectorfs.toml` shape (written by `vectorfs init`;
 //! lives INSIDE the reserved system prefix, design.md §5.3):
@@ -24,6 +27,8 @@
 //! encrypt-at-rest keyed by a passphrase).
 
 use std::path::{Path, PathBuf};
+
+use crate::preset::Preset;
 
 /// Base62 alphabet for generated credentials.
 const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -45,7 +50,9 @@ pub fn config_path(data_dir: &Path) -> PathBuf {
 /// key) tolerates their presence — their strict parse, with TOML line
 /// attribution, is `pipeline::config::load_pipeline_config` over the raw
 /// text (spans need the source, a span-free `Table` cannot carry them).
-/// `init` never writes them, so serialization stays byte-identical to T1.
+/// `init` writes them as TEXT through the preset templates (preset.rs) —
+/// these typed fields stay None in the serialized SERVER part, which keeps
+/// its T1 byte shape.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
@@ -76,6 +83,13 @@ pub struct FileConfig {
 #[derive(Debug, Default, Clone)]
 pub struct ServeFlags {
     pub port: Option<u16>,
+    /// Bind address for the HTTP listener: `host` or `host:port`
+    /// (`--listen` / `VF_LISTEN`). The port part, when present, WINS over
+    /// `--port`/`VF_PORT` (it is the more specific spelling); the host part
+    /// defaults to loopback — the daemon is a local data-root owner, and
+    /// 0.0.0.0 is a CONTAINER decision (Dockerfile sets `VF_LISTEN=0.0.0.0`,
+    /// §5.10.7, so `-p` port mapping reaches the process).
+    pub listen: Option<String>,
     pub data_dir: Option<PathBuf>,
     pub backend: Option<String>,
     pub no_auth: bool,
@@ -92,6 +106,9 @@ pub struct ServeFlags {
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
     pub port: u16,
+    /// Host the HTTP listener binds to (from `--listen`/`VF_LISTEN`,
+    /// default 127.0.0.1 — see [`ServeFlags::listen`]).
+    pub bind_host: String,
     pub data_dir: PathBuf,
     /// Resolved backend spec string (file|memory|s3+…|file:<dir>) BEFORE
     /// Backend::parse — kept for logging.
@@ -249,6 +266,29 @@ fn backend_spec_of(flags: &ServeFlags, env: &dyn Fn(&str) -> Option<String>) -> 
         .unwrap_or_else(|| "file".to_string())
 }
 
+/// Listener address resolution: flag (`--listen`) > env (`VF_LISTEN`) >
+/// loopback. Accepts `host` or `host:port`; an embedded port is returned
+/// separately (and wins over `--port`/`VF_PORT` — the more specific
+/// spelling). IPv6 literals are deliberately NOT special-cased: brackets in
+/// a bind spec are a niche this daemon does not serve, and silently
+/// mis-splitting `[::1]:8787` would be worse than refusing to guess.
+fn listen_of(flags: &ServeFlags, env: &dyn Fn(&str) -> Option<String>) -> (String, Option<u16>) {
+    let raw = flags.listen.clone().or_else(|| env("VF_LISTEN"));
+    match raw {
+        None => ("127.0.0.1".to_string(), None),
+        Some(spec) => match spec.rsplit_once(':') {
+            Some((host, port)) => match port.parse::<u16>() {
+                Ok(p) if !host.is_empty() => (host.to_string(), Some(p)),
+                // trailing colon or non-numeric tail (e.g. an unbracketed
+                // IPv6 literal): treat the WHOLE spec as the host, keep the
+                // existing port chain
+                _ => (spec.clone(), None),
+            },
+            None => (spec, None),
+        },
+    }
+}
+
 /// S3 backend connection settings: flag > `VF_S3_*` env > `AWS_*` env.
 fn s3_conn_of(
     flags: &ServeFlags,
@@ -340,8 +380,9 @@ fn resolve_impl(
 
     let backend_spec = backend_spec_of(flags, env);
 
-    let port = flags
-        .port
+    let (bind_host, listen_port) = listen_of(flags, env);
+    let port = listen_port
+        .or(flags.port)
         .or_else(|| env("VF_PORT").and_then(|p| p.parse().ok()))
         .unwrap_or(DEFAULT_PORT);
 
@@ -350,6 +391,7 @@ fn resolve_impl(
 
     Ok(ResolvedConfig {
         port,
+        bind_host,
         data_dir,
         backend_spec,
         creds,
@@ -407,18 +449,65 @@ pub fn generate_secret_key() -> String {
     base62(40)
 }
 
+/// `vectorfs init` knobs (M2-T8): the preset to materialize plus the two
+/// REPORT-ONLY knobs `--listen` / `--backend` (they shape the printed
+/// serve/env hints and are deliberately NOT written to vectorfs.toml — the
+/// backend is per-invocation, §5.10.7 "env 覆盖收敛为标量项", and the bind
+/// address is a serve-time flag). `models_dir` is the CONTAINER volume path
+/// (§5.10.7): text-rag records it as the top-level `models_dir` key,
+/// air-gapped bakes it into the embedder `path`; bare-metal init leaves it
+/// unset and the derived default applies.
+#[derive(Debug, Default, Clone)]
+pub struct InitOptions {
+    pub preset: Preset,
+    /// Report-only endpoint text (`host` or `host:port`).
+    pub listen: Option<String>,
+    /// Report-only serve hint (backend spec).
+    pub backend: Option<String>,
+    /// Models cache override (container `/vectorfs/models` volume).
+    pub models_dir: Option<PathBuf>,
+}
+
 /// Result of a successful `vectorfs init`.
 pub struct InitOutcome {
     pub config: FileConfig,
     pub path: PathBuf,
     pub regenerated: bool,
+    /// Which preset was materialized (drives the report + the caller's
+    /// prefetch decision).
+    pub preset: Preset,
+    /// Resolved models cache root (explicit `--models-dir` or the
+    /// `<data-dir>/.vectorfs/models` default) — where a text-rag prefetch
+    /// lands / where air-gapped expects the model directory.
+    pub models_dir: PathBuf,
+    /// Client-facing endpoint for the printed env snippet (from
+    /// `--listen`, default `http://127.0.0.1:8787`).
+    pub endpoint: String,
+    /// Report-only `--backend` echo for the printed serve command (never
+    /// written to vectorfs.toml — backends are per-invocation).
+    pub serve_hint_backend: Option<String>,
 }
 
-/// `vectorfs init [--data-dir <dir>] [--force]`:
-/// create the dir + `.vectorfs/`, generate credentials, write
-/// vectorfs.toml. Refuses to overwrite an existing vectorfs.toml unless
-/// `--force` (which regenerates credentials).
+/// `vectorfs init [--data-dir <dir>] [--force]` — the pre-preset shape
+/// (identical to `init_with` with the default `dev` preset): create the dir
+/// + `.vectorfs/`, generate credentials, write vectorfs.toml. Refuses to
+/// overwrite an existing vectorfs.toml unless `--force` (which regenerates
+/// credentials).
 pub fn init(data_dir: &Path, force: bool) -> Result<InitOutcome, String> {
+    init_with(data_dir, force, &InitOptions::default())
+}
+
+/// `vectorfs init` with a preset (§5.10.4, 附录E.4): server fields +
+/// generated credentials FIRST (typed serialization — byte-identical to the
+/// pre-preset server file), then the preset's pipeline template appended as
+/// text. The written file is immediately re-validated through
+/// `load_pipeline_config` — a broken template must fail HERE (the authoring
+/// site), never at the first `serve`. The model AVAILABILITY gate is
+/// deliberately NOT run by init: air-gapped is expected to fail it until
+/// the operator supplies the model (that fail-fast is `pipelines check`'s
+/// job), and text-rag satisfies it via the init-time prefetch the CLI
+/// performs next.
+pub fn init_with(data_dir: &Path, force: bool, opts: &InitOptions) -> Result<InitOutcome, String> {
     // The config lives at <data-dir>/.vectorfs/vectorfs.toml — creating its
     // parent dir covers both levels in one shot.
     std::fs::create_dir_all(data_dir.join(crate::backends::SYSTEM_PREFIX)).map_err(|e| {
@@ -432,36 +521,85 @@ pub fn init(data_dir: &Path, force: bool) -> Result<InitOutcome, String> {
         return Err(format!(
             "{} already exists (refusing to overwrite). \
              Use --force to regenerate credentials (existing clients using the \
-             old key will stop authenticating).",
+             old access key will stop authenticating).",
             path.display()
         ));
     }
+    let models_dir = opts
+        .preset
+        .models_cache_dir(data_dir, opts.models_dir.as_deref());
     let config = FileConfig {
         version: 1,
         region: DEFAULT_REGION.to_string(),
         account_id: DEFAULT_ACCOUNT.to_string(),
         access_key_id: generate_access_key(),
         secret_access_key: generate_secret_key(),
-        // init writes the pure-protocol server file; plugin sections are
-        // the operator's (or a preset's) later additions.
+        // raw section tables stay None: the preset template is appended as
+        // TEXT below (typed round-tripping of the template through
+        // FileConfig would reorder and re-quote it for zero benefit — the
+        // §5.10.4 comparison shape is the point).
         extractor: None,
         embedder: None,
         ingest: None,
-        models_dir: None,
+        // top-level models_dir key: ONLY the text-rag container path needs
+        // it (air-gapped embeds the path; dev has no models at all)
+        models_dir: match (opts.preset, &opts.models_dir) {
+            (Preset::TextRag, Some(dir)) => Some(dir.display().to_string()),
+            _ => None,
+        },
     };
-    let toml_doc = toml::to_string_pretty(&config)
+    let mut toml_doc = toml::to_string_pretty(&config)
         .map_err(|e| format!("serialize {}: {e}", path.display()))?;
+    let template = opts.preset.template(&models_dir);
+    if !template.is_empty() {
+        toml_doc.push('\n');
+        toml_doc.push_str(&template);
+    }
+    // parse-level self-validation (see fn docs): the template must satisfy
+    // the same two-stage parser serve runs, including the modality
+    // carry-over and derived-name gates
+    if let Err(e) = crate::pipeline::config::load_pipeline_config(&toml_doc) {
+        return Err(format!(
+            "internal error: preset '{}' produced an invalid config: {e} \
+             (this is a vectorfs bug — please report it)",
+            opts.preset
+        ));
+    }
     std::fs::write(&path, toml_doc).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(InitOutcome {
         config,
         path,
         regenerated: force,
+        preset: opts.preset,
+        models_dir,
+        endpoint: endpoint_hint(opts.listen.as_deref()),
+        serve_hint_backend: opts.backend.clone(),
     })
 }
 
-/// Success printout for `vectorfs init`: credentials, next command, SDK
-/// endpoint pointers (the §3 five-minute promise: copy-paste from here to
-/// first query).
+/// Endpoint for the report/env snippet: `--listen host[:port]` > the
+/// loopback default. The port defaults to 8787 even when the daemon will
+/// later serve elsewhere (`--port`) — the hint documents the COMMON shape.
+fn endpoint_hint(listen: Option<&str>) -> String {
+    match listen {
+        Some(spec) => {
+            // reuse the serve-side split so the hint and the real bind agree
+            let (host, port) = listen_of(
+                &ServeFlags {
+                    listen: Some(spec.to_string()),
+                    ..Default::default()
+                },
+                &|_| None,
+            );
+            format!("http://{host}:{}", port.unwrap_or(DEFAULT_PORT))
+        }
+        None => format!("http://127.0.0.1:{DEFAULT_PORT}"),
+    }
+}
+
+/// Success printout for `vectorfs init`: credentials, next command, client
+/// env snippet + SDK pointers (the §3 five-minute promise: copy-paste from
+/// here to first query), preset-specific guidance.
 pub fn init_report(outcome: &InitOutcome) -> String {
     let c = &outcome.config;
     // config sits one level down now (<dir>/.vectorfs/vectorfs.toml) — the
@@ -471,8 +609,28 @@ pub fn init_report(outcome: &InitOutcome) -> String {
         .parent()
         .and_then(Path::parent)
         .unwrap_or(Path::new("."));
+    let ep = &outcome.endpoint;
+    // serve hint: --listen/--backend are echoed when the operator gave them
+    // (they are per-invocation flags, never written to vectorfs.toml)
+    let mut serve_cmd = format!("vectorfs serve --data-dir {dir}", dir = dir.display());
+    if let Some(backend) = &outcome.serve_hint_backend {
+        serve_cmd.push_str(&format!(" --backend {backend}"));
+    }
+    let serve_hint = if outcome.endpoint != format!("http://127.0.0.1:{DEFAULT_PORT}") {
+        // --listen was explicit: echo it so the printed command reproduces
+        // the advertised endpoint
+        let host = outcome
+            .endpoint
+            .trim_start_matches("http://")
+            .rsplit_once(':')
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_default();
+        format!("{serve_cmd} --listen {host}")
+    } else {
+        serve_cmd
+    };
     format!(
-        "{sep}vectorfs initialized{regen}\n\
+        "{sep}vectorfs initialized ({preset}){regen}\n\
          data dir : {dir}\n\
          config   : {path}\n\
          \n\
@@ -480,19 +638,25 @@ pub fn init_report(outcome: &InitOutcome) -> String {
          secret key    : {sk}   (stored in vectorfs.toml — see note below)\n\
          \n\
          Next: start the server\n\
-         \x20   vectorfs serve --data-dir {dir}\n\
+         \x20   {serve_hint}\n\
          \n\
-         Point your SDK at the endpoint (http://127.0.0.1:8787):\n\
-         \x20   boto3: client = boto3.client(\"s3vectors\", endpoint_url=\"http://127.0.0.1:8787\",\n\
+         Client env (vf CLI + any SigV4 client):\n\
+         \x20   export VF_ENDPOINT=\"{ep}\"\n\
+         \x20   export VF_ACCESS_KEY=\"{ak}\"\n\
+         \x20   export VF_SECRET_KEY=\"{sk}\"\n\
+         \n\
+         Point your SDK at the endpoint ({ep}):\n\
+         \x20   boto3: client = boto3.client(\"s3vectors\", endpoint_url=\"{ep}\",\n\
          \x20           aws_access_key_id=\"{ak}\", aws_secret_access_key=\"{sk}\", region_name=\"{region}\")\n\
-         \x20   Go:    cfg.BaseEndpoint = aws.String(\"http://127.0.0.1:8787\") // + static creds, region {region}\n\
-         \n\
+         \x20   Go:    cfg.BaseEndpoint = aws.String(\"{ep}\") // + static creds, region {region}\n\
+         {preset_note}\
          note: vectorfs.toml holds the secret key in PLAINTEXT (v0.1\n\
          single-machine tradeoff; the data root already stores all vectors\n\
          unencrypted).\n{sep}",
         sep = "-".repeat(62),
+        preset = outcome.preset,
         regen = if outcome.regenerated {
-            " (credentials REGENERATED — old access key no longer works)"
+            " — credentials REGENERATED, old access key no longer works"
         } else {
             ""
         },
@@ -501,8 +665,41 @@ pub fn init_report(outcome: &InitOutcome) -> String {
         ak = c.access_key_id,
         sk = c.secret_access_key,
         region = c.region,
+        serve_hint = serve_hint,
+        ep = ep,
+        preset_note = preset_note(outcome),
     )
 }
+
+/// Preset-specific guidance block for [`init_report`] (empty for dev — the
+/// pure protocol face needs nothing beyond the credentials).
+fn preset_note(outcome: &InitOutcome) -> String {
+    match outcome.preset {
+        Preset::Dev => String::new(),
+        Preset::TextRag => format!(
+            "\n\
+             File layer (text-rag): put a file, search by meaning:\n\
+             \x20   vf put a.pdf --bucket docs\n\
+             \x20   vf search \"<your query>\" --bucket docs\n\
+             \n"
+        ),
+        Preset::AirGapped => format!(
+            "\n\
+             Air-gapped preset: NO download is performed (offline = true).\n\
+             Place the model directory at\n\
+             \x20   {model_dir}   (model.onnx + tokenizer.json)\n\
+             Docker: mount it under the /vectorfs/models volume; bare metal:\n\
+             copy the directory there or edit `path` in vectorfs.toml.\n\
+             `vectorfs pipelines check` stays red until the model is in place.\n\
+             \n",
+            model_dir = outcome.models_dir.join(Preset::DEFAULT_MODEL).display()
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tests
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // tests
@@ -613,6 +810,105 @@ mod tests {
         assert!(report.contains("endpoint_url"));
         assert!(report.contains("BaseEndpoint"));
         assert!(report.contains(&out.config.access_key_id));
+        // M2 T8: the client env snippet + endpoint are part of the
+        // five-minute promise now
+        assert!(report.contains("export VF_ENDPOINT=\"http://127.0.0.1:8787\""));
+        assert!(report.contains("export VF_ACCESS_KEY="));
+        assert!(report.contains("export VF_SECRET_KEY="));
+        assert!(report.contains("(dev)"));
+    }
+
+    /// --listen / --backend shape the REPORT only; vectorfs.toml keeps its
+    /// T1 byte shape (no backend, no listen — per-invocation flags).
+    #[test]
+    fn init_with_listen_and_backend_are_report_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = init_with(
+            dir.path(),
+            false,
+            &InitOptions {
+                preset: crate::preset::Preset::Dev,
+                listen: Some("0.0.0.0:9431".into()),
+                backend: Some("s3+http://minio:9000/bk".into()),
+                models_dir: None,
+            },
+        )
+        .unwrap();
+        let report = init_report(&out);
+        assert!(report.contains("http://0.0.0.0:9431"), "{report}");
+        assert!(
+            report.contains("--backend s3+http://minio:9000/bk"),
+            "{report}"
+        );
+        assert!(report.contains("--listen 0.0.0.0"), "{report}");
+        // the FILE carries neither knob
+        let text = std::fs::read_to_string(&out.path).unwrap();
+        assert!(!text.contains("backend"));
+        assert!(!text.contains("listen"));
+    }
+
+    /// Bind-address resolution (§5.10.7 container need): `--listen` /
+    /// `VF_LISTEN` accept host or host:port; the embedded port wins over
+    /// --port/VF_PORT; default stays loopback.
+    #[test]
+    fn listen_resolution_forms() {
+        let mk = |listen: Option<String>| ServeFlags {
+            listen,
+            ..Default::default()
+        };
+        let env = env_map(&[]);
+        // default: loopback, port chain untouched
+        let (host, port) = listen_of(&mk(None), &env);
+        assert_eq!((host.as_str(), port), ("127.0.0.1", None));
+        // host only
+        let (host, port) = listen_of(&mk(Some("0.0.0.0".into())), &env);
+        assert_eq!((host.as_str(), port), ("0.0.0.0", None));
+        // host:port — port surfaces separately
+        let (host, port) = listen_of(&mk(Some("0.0.0.0:9000".into())), &env);
+        assert_eq!((host.as_str(), port), ("0.0.0.0", Some(9000)));
+        // env layer feeds it too, flag beats env
+        let (host, _) = listen_of(
+            &mk(Some("10.0.0.1".into())),
+            &env_map(&[("VF_LISTEN", "10.9.9.9")]),
+        );
+        assert_eq!(host, "10.0.0.1");
+
+        // full resolution: embedded listen port beats --port and VF_PORT;
+        // host-only listen defers to the port chain
+        let c = resolve_with(
+            &ServeFlags {
+                listen: Some("0.0.0.0:9100".into()),
+                port: Some(8888),
+                no_auth: true,
+                data_dir: Some(PathBuf::from("/tmp/x")),
+                ..Default::default()
+            },
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!((c.bind_host.as_str(), c.port), ("0.0.0.0", 9100));
+        let c = resolve_with(
+            &ServeFlags {
+                listen: Some("0.0.0.0".into()),
+                port: Some(8888),
+                no_auth: true,
+                data_dir: Some(PathBuf::from("/tmp/x")),
+                ..Default::default()
+            },
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!((c.bind_host.as_str(), c.port), ("0.0.0.0", 8888));
+        let c = resolve_with(
+            &ServeFlags {
+                no_auth: true,
+                data_dir: Some(PathBuf::from("/tmp/x")),
+                ..Default::default()
+            },
+            &env_map(&[("VF_LISTEN", "0.0.0.0"), ("VF_PORT", "7777")]),
+        )
+        .unwrap();
+        assert_eq!((c.bind_host.as_str(), c.port), ("0.0.0.0", 7777));
     }
 
     fn env_map<'a>(m: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {

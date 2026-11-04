@@ -151,41 +151,44 @@ impl Connection {
             .or_else(|| env_nonempty("VF_REGION"))
             .unwrap_or_else(|| "us-east-1".to_string());
 
-        let uri: ::http::Uri = endpoint.parse().map_err(|e| {
-            Failure::new(
-                "ENDPOINT_INVALID",
-                format!("cannot parse endpoint {endpoint:?}: {e}"),
-                "use the form http://127.0.0.1:8787 (or https://host for TLS)",
-            )
-        })?;
-        let scheme = uri.scheme_str().unwrap_or("http");
-        if scheme != "http" && scheme != "https" {
-            return Err(Failure::new(
-                "ENDPOINT_INVALID",
-                format!("unsupported endpoint scheme {scheme:?}"),
-                "use http:// or https://",
-            ));
-        }
-        let authority = uri
-            .authority()
-            .map(|a| a.as_str().to_string())
-            .filter(|a| !a.is_empty())
-            .ok_or_else(|| {
-                Failure::new(
-                    "ENDPOINT_INVALID",
-                    format!("endpoint {endpoint:?} carries no host"),
-                    "use the form http://127.0.0.1:8787",
-                )
-            })?;
-        // normalize: exactly one '/' between base and op paths
-        let base = uri.path().trim_end_matches('/').to_string();
+        let (endpoint, authority) = parse_endpoint(endpoint)?;
         Ok(Connection {
-            endpoint: format!("{scheme}://{authority}{base}"),
+            endpoint,
             authority,
             region,
             creds: Credentials {
                 access_key,
                 secret_key,
+            },
+            client: http::client(),
+        })
+    }
+
+    /// Credential-free constructor for the HEALTH-ONLY probe path: endpoint
+    /// resolution exactly like [`Connection::resolve`], dummy credentials.
+    /// ONLY `get_health` (unsigned GET /health) may be called on the result
+    /// — signed calls would send nonsense. Exists so `vf status --endpoint
+    /// …` works inside a container HEALTHCHECK where no VF_ACCESS_KEY is
+    /// present (the daemon's credentials live in the data volume's
+    /// vectorfs.toml, not the probe's environment; §5.10.7).
+    pub fn resolve_probe(endpoint: Option<String>) -> Result<Connection, Failure> {
+        let endpoint = endpoint
+            .or_else(|| env_nonempty("VF_ENDPOINT"))
+            .ok_or_else(|| {
+                Failure::new(
+                    "NO_ENDPOINT",
+                    "no endpoint given and VF_ENDPOINT is unset",
+                    "pass --endpoint http://127.0.0.1:8787 (or export VF_ENDPOINT)",
+                )
+            })?;
+        let (endpoint, authority) = parse_endpoint(endpoint)?;
+        Ok(Connection {
+            endpoint,
+            authority,
+            region: "us-east-1".to_string(),
+            creds: Credentials {
+                access_key: String::new(),
+                secret_key: String::new(),
             },
             client: http::client(),
         })
@@ -378,6 +381,41 @@ fn parse_error_body(body: &[u8]) -> (String, String) {
 
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// Endpoint string -> `(normalized endpoint, authority)`; the shared URI
+/// validation of [`Connection::resolve`] and [`Connection::resolve_probe`]
+/// (scheme allow-list, authority present, base-path normalization to
+/// exactly one '/' between base and op paths).
+fn parse_endpoint(raw: String) -> Result<(String, String), Failure> {
+    let uri: ::http::Uri = raw.parse().map_err(|e| {
+        Failure::new(
+            "ENDPOINT_INVALID",
+            format!("cannot parse endpoint {raw:?}: {e}"),
+            "use the form http://127.0.0.1:8787 (or https://host for TLS)",
+        )
+    })?;
+    let scheme = uri.scheme_str().unwrap_or("http");
+    if scheme != "http" && scheme != "https" {
+        return Err(Failure::new(
+            "ENDPOINT_INVALID",
+            format!("unsupported endpoint scheme {scheme:?}"),
+            "use http:// or https://",
+        ));
+    }
+    let authority = uri
+        .authority()
+        .map(|a| a.as_str().to_string())
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| {
+            Failure::new(
+                "ENDPOINT_INVALID",
+                format!("endpoint {raw:?} carries no host"),
+                "use the form http://127.0.0.1:8787",
+            )
+        })?;
+    let base = uri.path().trim_end_matches('/');
+    Ok((format!("{scheme}://{authority}{base}"), authority))
 }
 
 // ---------------------------------------------------------------------------
