@@ -404,10 +404,10 @@ ghcr multi-arch（amd64/arm64 对齐发布矩阵）debian-slim non-root，内含
 范围：21 操作全实现（§4 全表）；file/memory/s3(MinIO/AWS/R2) 后端；SigV4 static + --no-auth；CLI 四命令；MCP server；符合性测试套件（boto3 + Go SDK 双客户端，CI 跑全操作矩阵 + 错误码断言）；README（负面清单 + limits 对照表 + 5 分钟上手）；GitHub Actions 全矩阵 + ubuntu:20.04 冒烟 + size-guard。
 门槛（发布即验收，G7）：conformance 全绿 + 发布物就绪（二进制 + README + 5 分钟路径）+ **Show HN 落地帖发出（带可用 v0.1；不做无产物预热帖）**。发布后观察窗 2–4 周（§9 指标）。
 
-### M2 — v0.2 文件层 MVP：text 模态（门槛：M1 外部信号 ≥ 基线，见 §9）
+### M2 — v0.2 文件层 MVP：text 模态 ✅ 完成（2026-11-05，验收门 PASS——证据见 §10 第 8 条执行实录）
 
 范围（v2.1 收窄——五路审查 P0：组合面过载）：`vectorfs.toml`（不做 vf.json 兼容，直接切换）+ 双命令 bin + **`.vectorfs/` 布局**（§5.3 v2.2）；四轴插件骨架（两段式配置 + enum 分发）+ contract test；**scope 扫描摄取**（周期 list-and-diff + 标记；`vf put` = 落普通对象 + 即时触发）+ ingest worker（pdf-text/md/txt + token-window + ort[gte 默认]/openai）；`vf` CLI（put/search/get/rm/sources/reindex）；merge rrf；Docker 镜像 + compose + 三 preset（dev/text-rag/air-gapped，init 预取模型）。
-门槛（发布即验收）：模型就绪后 preset 零配置 put PDF → search 回源 ≤5 分钟；双 SDK conformance 不回退 + **GC 路径测试**；boto3 可直查（README 写明同源条件）；healthcheck 过；体积 ≤155MB 警戒线不破。
+门槛（发布即验收）逐条证据：**①preset 零配置全链 35 秒**（serve+1.2GB 模型加载 20s + put PDF/中文 txt 各 0.5s 至 INDEXED + 中英双语语义检索正确回源；门槛 ≤5 分钟）；**②boto3 直查**已摄取向量拿到全套 `x-vf-src-*`（真实 gte 768 维派生 index，`$eq x-vf-src-uri` 过滤可用）；**③双 SDK conformance 不回退**（boto3+Go 各 32/32，对 release-prod 二进制）；**④GC 路径测试**（防误删两测 + fs 直删下周期收敛 + vf rm 319ms 收敛，进常规测试套件）；**⑤healthcheck**（容器 40s healthy/0 failing）；**⑥体积 159 MiB——超 155 警戒线 4 MiB、硬顶 175 未破**（openai embedder 的 TLS 路径成为 serve 真实引用后不再被 thin-LTO 裁掉，+3.1MiB 功能固有成本；M1 已有"踩警戒线仍接受"先例 §0/§5.7，此处如实记录，自建者可 `CARGO_PROFILE_RELEASE_PROD_LTO=fat` 压回）。
 （图像模态 pdf-pages+siglip2、docx/html、markdown chunker、OCR、reranker、$textMatch、IVF_PQ → M3）
 
 ### M3 — v0.3 图像模态 / 质量 / 规模 / 超集
@@ -483,6 +483,7 @@ ghcr multi-arch（amd64/arm64 对齐发布矩阵）debian-slim non-root，内含
   5. 2026-11-03 M0 执行实录：子代理模式——主会话分派 5 个任务（环境/脚手架/实现/SDK 验收/S3+性能）、逐任务亲自复跑验收（不采信代理自述：测试、双 SDK roundtrip、S3 后端、体积、MinIO 归档均独立复现）、逐任务提交（b5ea181→…）。此为 K0"借助 coding agent 推进"的标准作业形态。
   6. 2026-11-04 重定位会话：两份调研落 `research/`（重定位可行性、多模态嵌入，均一手来源）；设计三轮迭代——策略清单（太平庸）→ pipeline-DAG（否决：为三种实际形态造通用引擎，~9 概念超标）→ 机制/策略分离 + 五轴插件 + 4 新概念（定稿 §5.10；后续口径演进：v2.1 降为四轴+merge 查询选项，v2.2 概念口径 = 2 实体 + 4 轴 + 1 配置节 + Source 标记附属状态）。v2.0 定稿后经**五路子代理独立审查**（简洁性 7/10、健壮性 7/10、协议演化 6.5/10、实用性 6/10、工程 7/10），P0 全部采纳并修订为 v2.1（§0 增补行）。审查的关键收敛发现：配置漂移导致 chunk key 语义破裂（两位审查员独立命中）、换模型隔离仅靠 dim 不可变不成立、模态槽表达力不足、M2 组合面过载。
   7. **优先级纪律（v2.1 增）**：botocore 月度 diff 触发的协议适配（风险 #3 的 7 天窗口承诺）**优先于一切文件层工作**——协议面 conformance 是项目立身资产，上层是增值层，不可反噬。
+  8. **2026-11-05 M2 执行实录（§10.8）**：主会话-子代理标准作业（同 #5 形态），T0–T10 十一个任务逐个「任务书→子代理→**主会话亲自复跑验收**→提交」；每任务一 commit（0fb3a46 之后 12 个）。执行序调整为 **T4→T5→T3**（任务书允许无依赖重排：T3 的 kill -9/全链验收需要真实 extractor+embedder 就位，tiny-embedder 仓内 fixture 使全链 hermetic）。主会话复跑共抓出并自修三个子代理未报的问题：①ort config `model` 字段默认 gte 致 §5.10.4 air-gapped 形态（path-only）必然拒启——model 改 Option 四象限解析；②HF blob URL 漏 `resolve/<ref>` 段（hermetic 假 server 同形路径未暴露）；③T8 提交误纳 target-docker/ staging 目录（amend 修正 + gitignore）。裁决一处设计缺口：「配置变更 ⇒ 启动 fail-fast」与「vf reindex 需运行中 daemon」死锁——增 `vectorfs serve --reindex` 启动旗标（跳指纹门、启动即重嵌、不加新命令，附录E.4 未列 flag 不违）。新增超设计计划但必要的一项：**HTTP 叶子标准代理支持**（HTTPS_PROXY/HTTP_PROXY/NO_PROXY，hyper-util Tunnel CONNECT）——企业网络 HF 下载/openai 出网是真实部署形态，T9 总门环境（仅代理出网）实测暴露。体积终值 159 MiB（超 155 警戒 4 MiB 的成因与处置见 §7 M2 门槛⑥）。遗留如实记录：`/x-vf/Reindex` 与同源 in-flight worker 间极窄竞态（write_lock+in-flight 跳过已收窄，作业级串行留后续）；PutSource 全程内存缓冲（≤210MiB，流式验签留后续）；onnxruntime 无 macOS-x64 官方资产（fetch 脚本 fail-loud 指引自建）。
 
 ---
 

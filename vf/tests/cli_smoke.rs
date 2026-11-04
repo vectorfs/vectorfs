@@ -27,7 +27,13 @@ fn repo_root() -> PathBuf {
 }
 
 fn ort_lib() -> PathBuf {
-    let p = repo_root().join("runtime-libs/libonnxruntime.so");
+    // platform library name (CI fetches the matching asset per runner OS)
+    let lib = if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
+    };
+    let p = repo_root().join("runtime-libs").join(lib);
     assert!(
         p.is_file(),
         "CLI smoke needs the real ONNX Runtime at {} — run \

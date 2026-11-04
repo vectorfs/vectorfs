@@ -1,40 +1,81 @@
 # vectorfs
 
-**Turn any S3 into S3 Vectors. Single binary. Point your AWS SDK at it.**
+**Store files, search by meaning — S3 Vectors-compatible, single binary, Docker-friendly.**
 
-- Single static binary — no daemon fleet, no containers, starts in seconds.
-- Any S3-compatible object store as persistence; a local directory or memory works too (dev/CI emulator mode).
-- Official AWS SDKs (boto3, aws-sdk-go-v2) connect unmodified, SigV4-verified,
-  strongly consistent read-after-write. No bundled embeddings yet — it stores the vectors
-  your client sends (a pluggable file→vector ingestion pipeline lands in v0.2, see
-  [design.md](design.md)).
+单二进制、自托管的「S3 Vectors 兼容向量存储 + 文件即向量化」：文件放进来，语义检索出结果；
+指向本地目录/内存时是即开即用的 s3vectors 开发与 CI 模拟器。
+
+- Two binaries, one tarball: `vectorfs` (server) + `vf` (client).
+- All 21 `s3vectors-2025-07-15` operations, verified through unmodified boto3 and
+  aws-sdk-go-v2 (32-step conformance each, green in CI), SigV4-authenticated,
+  strongly consistent read-after-write.
+- **v0.2 file layer (text modality)**: drop files into the instance root, a built-in
+  pipeline extracts → chunks → embeds them locally (default model
+  [`gte-multilingual-base`](https://huggingface.co/Alibaba-NLP/gte-multilingual-base),
+  Apache-2.0), and `vf search` returns hits that point back at the source file.
+- Any S3-compatible object store as persistence; a local directory or memory works
+  too (dev/CI emulator mode). No own storage engine — your data stays in open
+  formats (Lance + JSON) in your own store.
 
 [![CI](https://github.com/vectorfs/vectorfs/actions/workflows/ci.yml/badge.svg)](https://github.com/vectorfs/vectorfs/actions/workflows/ci.yml)
 
-> **Status: pre-release.** Protocol face complete: all 21 `s3vectors-2025-07-15`
-> operations conformance-tested through boto3 and aws-sdk-go-v2 (32 steps each,
-> green in CI). Superset features (hybrid search, full-text) in progress — see
-> [design.md](design.md). v0.2 adds the file layer: drop files in, search by
-> meaning (design.md §5.10).
+> **Status: pre-release (v0.2).** Protocol face complete; file layer MVP for text
+> (PDF / Markdown / plain text) shipped. Image modality, OCR, docx/html extractors,
+> hybrid full-text search → v0.3 (see [design.md](design.md) §7).
 
 ## Five-minute quickstart
 
 Download a release tarball for Linux x86_64/aarch64 from
 [Releases](https://github.com/vectorfs/vectorfs/releases) (published on `v*` tags with
-`sha256sums.txt`), or build from source (Rust 1.94+, C toolchain, cmake, protoc):
+`sha256sums.txt`; contains `vectorfs` + `vf`), or build from source (Rust 1.94+,
+C toolchain, cmake, protoc):
 
 ```bash
-cargo build --profile release-prod --workspace   # -> target/release-prod/vectorfs (+ the thin `vf` client)
+cargo build --profile release-prod --workspace   # -> target/release-prod/{vectorfs,vf}
 ```
 
-Initialize a data root and start the server:
+### Text-RAG mode (files in, semantic search out)
 
 ```bash
-vectorfs init --data-dir ./vectorfs-data     # generates + prints the access key / secret
-vectorfs serve --data-dir ./vectorfs-data    # listens on http://127.0.0.1:8787
+vectorfs init --preset text-rag --data-dir ./data   # materializes config, downloads the
+                                                    # default model (~1.2 GiB, progress on
+                                                    # stderr; HF_ENDPOINT mirror supported)
+vectorfs serve --data-dir ./data                    # listens on http://127.0.0.1:8787
+
+export VF_ENDPOINT=http://127.0.0.1:8787 VF_ACCESS_KEY=… VF_SECRET_KEY=…   # printed by init
+
+vf put report.pdf --bucket docs          # foreground until INDEXED
+vf search "capacity planning" --bucket docs
+#  #  SCORE   KEY                  INDEX         SOURCE         TEXT
+#  1  0.71    510da8…-text-0       text-fcdd…    report.pdf     Capacity planning for …
 ```
 
-Point boto3 at it (credentials from `vectorfs init`; every command here was executed against a fresh `vectorfs init`):
+Files placed by ANY standard tool (aws s3 cp on the s3 backend, plain file copy on
+the file backend) are picked up by the periodic scan (default 30 s) — the instance
+root IS the data source; deletions are reconciled the same way (chunks GC'd).
+`vf` verbs: `put` (`--async`), `search`, `sources list|status`, `get`, `rm`,
+`reindex`, `status`. Everything is also on the wire as eight `/x-vf/<Op>`
+operations (design.md appendix E) — same SigV4, same error shapes.
+
+Querying through a plain AWS SDK works too (same embedding model required — the
+query vector must come from `gte-multilingual-base` for the default preset):
+
+```python
+client.list_indexes(vectorBucketName="docs")           # -> derived index "text-…"
+client.query_vectors(..., queryVector={"float32": q}, returnMetadata=True)
+# hit metadata carries the provenance keys:
+#   x-vf-src-name (file key)  x-vf-src-uri (short hash, filterable)
+#   x-vf-model                x-vf-chunk-text
+```
+
+### Protocol-only mode (SDK emulator)
+
+```bash
+vectorfs init --data-dir ./data && vectorfs serve --data-dir ./data
+```
+
+Point boto3 at it (credentials from `vectorfs init`; every command here was executed
+against a fresh init):
 
 ```python
 import boto3
@@ -64,7 +105,7 @@ client := s3vectors.NewFromConfig(cfg, func(o *s3vectors.Options) {
 res, err := client.QueryVectors(ctx, &s3vectors.QueryVectorsInput{
     VectorBucketName: aws.String("docs"),
     IndexName:        aws.String("chunks"),
-    QueryVector:      &types.VectorDataMemberFloat32{Value: []float32{1, 0, 0}},
+    QueryVector:      &s3vectors.VectorDataMemberFloat32{Value: []float32{1, 0, 0}},
     TopK:             aws.Int32(2),
     ReturnDistance:   true,
 })
@@ -72,27 +113,44 @@ res, err := client.QueryVectors(ctx, &s3vectors.QueryVectorsInput{
 
 ## Backends
 
-- `file` (default) — data root is a local directory; zero configuration.
-- `memory` — volatile, for CI and emulator use: `vectorfs serve --backend memory --no-auth`
-  (no SigV4 verification, no persistence; start/stop in seconds, deterministic).
-- `s3` — any S3-compatible endpoint: `vectorfs serve --backend 's3+http://host:8333/bucket[/prefix]'`
-  with `--s3-access-key/--s3-secret-key/--s3-region` (or `VF_S3_*`/`AWS_*` env).
-  Verified end-to-end on SeaweedFS 4.52 and Cloudflare R2 (dual-SDK conformance,
-  conditional writes; R2 `auto` region and constant-size upload parts are
-  handled automatically). AWS S3 and MinIO follow the same S3 semantics
-  (`If-None-Match:*` documented by both).
+- `file` (default) — the instance root is a local directory; zero configuration.
+  Your files live there as plain files; vectorfs keeps everything it owns under
+  the reserved `.vectorfs/` prefix (git-style mental model).
+- `memory` — volatile, for CI and emulator use: `vectorfs serve --backend memory
+  --no-auth` (no SigV4, no persistence; start/stop in seconds, deterministic).
+- `s3` — any S3-compatible endpoint: `vectorfs serve --backend
+  's3+http://host:8333/bucket[/prefix]'` with `--s3-access-key/--s3-secret-key/
+  --s3-region` (or `VF_S3_*`/`AWS_*` env). Verified end-to-end on SeaweedFS 4.52
+  and Cloudflare R2 (dual-SDK conformance, conditional writes, multipart).
 
-## What works / what's different
+## The file layer in brief
 
-- All 21 operations of the `s3vectors-2025-07-15` API, including pagination,
-  segments, tags, policies (stored + echoed, not enforced) and index modes.
-- Every query is filter-before-KNN: both CLASSIC and ENHANCED indexes behave as
-  ENHANCED — no post-filter recall loss.
-- Strong read-after-write: Lance manifest commits are the atomicity boundary; a vector
-  written one millisecond ago is immediately visible, and pagination reads a snapshot
-  (writes don't shift results mid-page).
-- Exit path: the data root is open formats (Lance + JSON catalog). If the daemon
-  disappears, any Lance tooling can still read your vectors.
+- Presets: `dev` (protocol only), `text-rag` (default model, zero extra config),
+  `air-gapped` (local model path, `offline = true`, nothing ever leaves the network).
+  `vectorfs init --preset X` materializes `.vectorfs/vectorfs.toml` and prefetches
+  models when needed (`HF_ENDPOINT` mirror respected; sha256-verified, atomic).
+- Pipeline = extractor (pdf-text / md / txt) → chunker (token-window, char-counted,
+  CJK-safe) → embedder (local `ort` [onnxruntime, load-dynamic] or any
+  OpenAI-compatible `/embeddings` endpoint). Config in `.vectorfs/vectorfs.toml`;
+  `vectorfs pipelines check` validates it with TOML line numbers.
+- Correctness is fingerprinted, not hoped for: changing extractor/chunker/embedder
+  config refuses startup until you re-embed explicitly (`vectorfs serve --reindex`).
+- GC only ever deletes vectors in ingest-managed indexes whose keys match the
+  derived chunk format and whose `x-vf-src-uri` resolves to a deleted object —
+  plain protocol-face vectors are never touched (tested).
+
+## Docker
+
+```bash
+docker compose -f deploy/docker-compose.yml up        # data + models volumes, healthcheck on /health
+```
+
+Image: `ghcr.io/vectorfs/vectorfs` (multi-arch linux/amd64+arm64, debian-slim,
+non-root, binaries + pinned onnxruntime/pdfium `.so`; models stay on the volume,
+never in image layers). `VF_PRESET=text-rag` materializes the config on first
+boot. An `emulator` compose profile runs the volatile `memory --no-auth` variant —
+a seconds-to-start s3vectors stand-in for CI/testcontainers. One container per
+instance root (single-writer LOCK semantics).
 
 ## Limits: AWS vs local
 
@@ -115,25 +173,35 @@ multi-tenant quotas are not enforced locally.
 | QPS / throughput quotas | yes | **not enforced** |
 | Total vectors / bucket+index count caps | 2B / 10,000 | **not enforced** |
 
+File-layer provenance metadata budget (per chunk vector, `x-vf-*` keys):
+`x-vf-src-uri` ≤ 100 B (object-key hash, filterable), `x-vf-src-name` full key
+(non-filterable), `x-vf-model`, `x-vf-modality`, `x-vf-chunk-text` (non-filterable,
+stored by default — disable per ingest section with `store_chunk_text = false`).
+
 ## MCP
 
-`vectorfs mcp` is a stdio MCP server for agent single-user mode — the only writer of its data root (same lock as `vectorfs serve`):
+`vectorfs mcp` is a stdio MCP server for agent single-user mode — the only writer of
+its data root (same lock as `vectorfs serve`):
 
 ```json
-{"vectorfs": {"command": "vectorfs", "args": ["mcp", "--data-dir", "/path/to/vectorfs-data"]}}
+{"vectorfs": {"command": "vectorfs", "args": ["mcp", "--data-dir", "/path/to/data"]}}
 ```
 
-Add `"--tools", "ro"` for a read-only toolset. Tools: `list_vector_buckets`,
-`list_indexes`, `query_vectors`, `get_vectors`, `put_vectors`, `delete_vectors`.
+Add `"--tools", "ro"` for a read-only toolset. Data-plane tools:
+`list_vector_buckets`, `list_indexes`, `query_vectors`, `get_vectors`, `put_vectors`,
+`delete_vectors`; file-layer tools: `search`, `list_sources`, `put_source`
+(`put_source` is rw-only).
 
 ## Non-goals
 
 - No own object-storage backend or storage engine — persistence is always an
-  existing object store or a local directory.
-- No homegrown versioning, embedding-model hosting, chat UI, write-time entity
-  extraction, kernel-mode implementation, plugin marketplace, AWS-console UI
-  clone, non-AWS native API faces.
-- No distributed multi-writer coordination (v1: one writer per data root).
+  existing object store or a local directory. Files are stored as ordinary
+  objects; vectorfs adds no second copy and no content-addressed store.
+- No homegrown versioning, embedding-model hosting/training platform, chat UI,
+  write-time entity extraction, kernel-mode implementation, plugin marketplace,
+  AWS-console UI clone, non-AWS native API faces.
+- No distributed multi-writer coordination (one writer per instance root; the LOCK
+  object heartbeats and takeovers follow TTL semantics).
 
 ## Compatibility notes
 
@@ -141,13 +209,18 @@ Add `"--tools", "ro"` for a read-only toolset. Tools: `list_vector_buckets`,
   `ConflictException` 409, `ServiceQuotaExceededException` 402, throttling 429, …),
   emitted as both the `X-Amzn-Errortype` header and body `__type` for maximum
   client compatibility.
-- Known pending items: a few wire-level details (error body nuances, ARN
-  encoding in tag paths) are SDK-round-trip-verified but not yet cross-checked
-  against the real AWS endpoint — tracked in [design.md](design.md) appendix B.
+- The eight file-layer operations live under `/x-vf/<Op>` — an isolated namespace
+  so AWS surface and superset can never collide; same SigV4, same error model,
+  202 + status-polling for async verbs (design.md appendix E).
+- `vf` shares its name with fish's VirtualFish — if you use both, alias as needed.
+- Egress: none for the protocol face. The file layer reaches out only for model
+  download (init/prefetch; `HF_ENDPOINT` mirror, standard `HTTPS_PROXY`/`NO_PROXY`
+  env honored) or an explicitly configured OpenAI-compatible embedder endpoint.
 
 ## Docs
 
-- [design.md](design.md) — positioning, protocol spec, architecture, milestones.
+- [design.md](design.md) — positioning, protocol spec, architecture, milestones,
+  and appendix E (the CLI/`/x-vf` command tables — the authoritative list).
 - [spike/REPORT.md](spike/REPORT.md) — M0 measurements (latency, binary size);
   [conformance/](conformance/) — the 32-step dual-SDK conformance suite.
 

@@ -230,8 +230,16 @@ jobs:
           path: runtime-libs
           key: runtime-libs-${{ runner.os }}-${{ runner.arch }}-pdfium-8066-ort-1.31.0
       - run: cargo fmt --all --check
+      # ubuntu-24.04-arm runners are 16 GB; linking the three integration
+      # test binaries in parallel alongside the bins OOM-kills cargo (exit
+      # 143, observed 2026-11-05). Fewer build jobs serializes the link
+      # units; compile time on the cached arm runner stays acceptable.
       - run: cargo build --workspace --all-targets
+        env:
+          CARGO_BUILD_JOBS: "2"
       - run: cargo test --workspace
+        env:
+          CARGO_BUILD_JOBS: "2"
 
   size-guard-arm:
     name: release-prod size (ubuntu-24.04-arm)
@@ -265,5 +273,13 @@ jobs:
           path: runtime-libs
           key: runtime-libs-${{ runner.os }}-${{ runner.arch }}-pdfium-8066-ort-1.31.0
       - run: cargo fmt --all --check
+      # ubuntu-24.04-arm runners are 16 GB; linking the three integration
+      # test binaries in parallel alongside the bins OOM-kills cargo (exit
+      # 143, observed 2026-11-05). Fewer build jobs serializes the link
+      # units; compile time on the cached arm runner stays acceptable.
       - run: cargo build --workspace --all-targets
+        env:
+          CARGO_BUILD_JOBS: "2"
       - run: cargo test --workspace
+        env:
+          CARGO_BUILD_JOBS: "2"

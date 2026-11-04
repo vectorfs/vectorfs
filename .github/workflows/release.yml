@@ -62,9 +62,17 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            use-cross: false
+            # 2026-11-05 M2 finding: building natively on ubuntu-latest (24.04,
+            # glibc 2.39) let M2's new deps (rustls/aws-lc/ort/tokenizers) pick
+            # up GLIBC_2.33/2.34/2.38 symbol versions — the tarball then dies in
+            # the ubuntu:20.04 smoke with "GLIBC_2.38 not found" (M1 passed only
+            # because its binary happened not to reference the newer symbols).
+            # Building inside rust:1-bullseye (debian 11, glibc 2.31 = the smoke
+            # baseline) pins the ABI floor the same way Cross.toml's 20.04 base
+            # already does for aarch64.
+            build-in-container: rust:1-bullseye
           - target: aarch64-unknown-linux-gnu
-            use-cross: true
+            build-in-container: ""
     steps:
       - uses: actions/checkout@v4
 
@@ -72,8 +80,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Host-side protoc for the native x86_64 build (the cross build gets it
-      # from Cross.toml's pre-build hook, inside the container).
+      # Host-side protoc (the cross build gets it from Cross.toml's pre-build
+      # hook, inside the container).
       - name: install protoc (lance-encoding build dep)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
 
@@ -95,14 +103,17 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "version: $VERSION"
 
-      - name: build (release-prod; cross-rs for aarch64)
+      - name: build (release-prod; cross-rs for aarch64, glibc-2.31 container for x86_64)
         run: |
           set -euo pipefail
-          if [[ "${{ matrix.use-cross }}" == "true" ]]; then
+          if [[ -n "${{ matrix.build-in-container }}" ]]; then
+            # rust:1-bullseye ships no protoc — install it inside the same run
+            docker run --rm --user "$(id -u):$(id -g)"               -e VF_GIT_HASH -e CARGO_NET_GIT_FETCH_WITH_CLI=true               -v "$PWD:/ws" -w /ws               "${{ matrix.build-in-container }}"               bash -c 'set -euo pipefail;
+                       apt-get update -qq && apt-get install -y -qq --no-install-recommends protobuf-compiler libprotobuf-dev >/dev/null;
+                       cargo build --profile release-prod --workspace --target ${{ matrix.target }}'
+          else
             cargo install cross --locked
             cross build --profile release-prod --workspace --target "${{ matrix.target }}"
-          else
-            cargo build --profile release-prod --workspace --target "${{ matrix.target }}"
           fi
 
       # size_guard.sh takes the binary path as $1 (default
