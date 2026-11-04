@@ -326,3 +326,5 @@ Task D release-prod(§5.7 产品 profile):    172,523,448 B (164.5 MiB)  ← lto
   - 待AWS实测：AWS 的确切公式与 tie 次序声明、AWS 空 body 响应的真实头集合（x-amzn-RequestId 等）。
 - **B8 Go SDK v1.17.x schema-serde 与旧版差异**：✅ 已闭环（客户端实证）：s3vectors **自 v1.0.0 起就是 document.Interface + union（VectorData 接口）的新路径 API**，不存在"旧路径"版本可比；v1.0.0 与 v1.17.1 对 nil/空 document 序列化**字节级一致**（省略 / `{}` / `null` 三态同形，离线抓包对比）。结论：B8 对 s3vectors 无风险，问题关闭。
 - 范围外（本任务未触碰，M1 或对 AWS 实测再答）：B4 filter 语义、B5 PutVectors 覆盖语义（本轮仅钉死 server 自身行为 = 整行替换、无 legacy 残留；AWS 对拍待实测）、B6 nextToken、B9 tags ARN 编码、B10 merge-insert 叠加。
+
+2026-11-04 conformance 迁至仓库根 conformance/

@@ -1,0 +1,125 @@
+# CI skeleton (M1 Task 1). Three jobs, all commands verified locally first:
+#   build-test  — cargo fmt --check / cargo build / cargo test
+#   deps-guard  — scripts/deps_guard.sh (zero AWS SDK + unified arrow/lance),
+#                 cargo-machete (unused deps), cargo-deny (licenses/bans;
+#                 advisories warn-only)
+#   size-guard  — release-prod build + binary size gate (warn >155MiB,
+#                 fail >175MiB, design.md §5.7)
+#
+# NOTE: aws-lc-sys (via object_store "aws") needs cmake + a C toolchain — both
+# preinstalled on ubuntu-latest runners (design.md §8 risk #11).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: fmt + build + test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo build
+        run: cargo build --workspace --all-targets
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  deps-guard:
+    name: dependency guard (no aws sdk / single arrow / licenses)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # a) zero-AWS-SDK red line + arrow/lance version unification
+      - name: deps_guard.sh
+        run: ./scripts/deps_guard.sh
+
+      # b) unused-dependency detection (runs on the product workspace; spike/
+      #    is a frozen throwaway crate and intentionally not machete'd — hence
+      #    the explicit path argument)
+      - name: cargo-machete
+        uses: bnjbvr/cargo-machete@v1
+        with:
+          args: vf
+
+      # c) license whitelist + bans (deny.toml). Advisory classes that
+      #    cargo-deny 0.20 can downgrade are warn/non-fatal in deny.toml;
+      #    actual vulnerabilities still gate (see deny.toml header).
+      - name: cargo-deny (licenses / bans / advisories)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: check licenses bans advisories
+
+  size-guard:
+    name: release-prod binary size (warn >155MiB / fail >175MiB)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --profile release-prod
+        run: cargo build --profile release-prod --workspace
+
+      - name: size check
+        run: ./scripts/size_guard.sh
+
+  # ---------------------------------------------------------------------------
+  # TODO(repo public): enable once the repository turns public — arm64 + macOS
+  # hosted runners are free for public repos only (design.md §5.9 "Linux
+  # x64+arm64 首发, macOS CI 绿灯"). Definitions kept ready below; uncomment,
+  # no other change needed.
+  #
+  # build-test-arm:
+  #   name: fmt + build + test (ubuntu-24.04-arm)
+  #   runs-on: ubuntu-24.04-arm
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - uses: Swatinem/rust-cache@v2
+  #     - run: cargo fmt --all --check
+  #     - run: cargo build --workspace --all-targets
+  #     - run: cargo test --workspace
+  #
+  # size-guard-arm:
+  #   name: release-prod size (ubuntu-24.04-arm)
+  #   runs-on: ubuntu-24.04-arm
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - uses: Swatinem/rust-cache@v2
+  #     - run: cargo build --profile release-prod --workspace
+  #     - run: ./scripts/size_guard.sh
+  #
+  # build-test-macos:
+  #   name: fmt + build + test (macos-latest)
+  #   runs-on: macos-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - uses: Swatinem/rust-cache@v2
+  #     - run: cargo fmt --all --check
+  #     - run: cargo build --workspace --all-targets
+  #     - run: cargo test --workspace
+  #     # note: aws-lc-sys needs cmake on macOS runners too (preinstalled).
+  # ---------------------------------------------------------------------------

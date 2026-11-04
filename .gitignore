@@ -15,15 +15,15 @@ __pycache__/
 *.pyc
 
 # --- Go (aws-sdk-go-v2 conformance client): build outputs only ---
-# (module dir spike/conformance/go/ and the scripts in spike/conformance/ stay
-# tracked; bare "conformance" patterns would ignore the whole directory — fixed
-# by anchoring to the module dir where `go build` emits binaries)
-spike/conformance/go/conformance
-spike/conformance/go/vf-conformance
-spike/conformance/go/conformance-*
-spike/conformance/go/vf-conformance-*
-spike/conformance/go/*.test
-spike/conformance/go/*.out
+# (module dir conformance/go/ and the scripts in conformance/ stay tracked;
+# bare "conformance" patterns would ignore the whole directory — fixed by
+# anchoring to the module dir where `go build` emits binaries)
+conformance/go/conformance
+conformance/go/vf-conformance
+conformance/go/conformance-*
+conformance/go/vf-conformance-*
+conformance/go/*.test
+conformance/go/*.out
 
 # --- editor / OS noise ---
 .DS_Store

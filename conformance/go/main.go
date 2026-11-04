@@ -1,10 +1,11 @@
 // aws-sdk-go-v2 conformance check against an s3vectors-compatible server
-// (M0 Task C). Talks to an already-running server; owns no server lifecycle.
-// Steps 1-9 mirror spike/conformance/boto3_check.py. Any FAIL -> exit 1.
+// (M0 Task C; moved to repo-root conformance/ 2026-11-04). Talks to an
+// already-running server; owns no server lifecycle.
+// Steps 1-9 mirror conformance/boto3_check.py. Any FAIL -> exit 1.
 //
 // Usage:
 //
-//	go run ./spike/conformance/go --endpoint http://127.0.0.1:8787 \
+//	go run ./conformance/go --endpoint http://127.0.0.1:8787 \
 //	    --access-key test --secret-key testsecret [--region us-east-1] [--prefix XXX]
 package main
 

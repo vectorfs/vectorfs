@@ -1,0 +1,87 @@
+# cargo-deny configuration (design.md §5.7: cargo-deny 拒 GPL/AGPL/CC-BY-NC).
+# Check command used in CI: `cargo deny check licenses bans advisories`.
+#
+# License policy: permissive-only whitelist. Copyleft (GPL/AGPL/LGPL) and
+# non-commercial (CC-BY-NC) licenses are NOT in the allow list, so any crate
+# carrying them fails the licenses check.
+#
+# MPL-2.0 justification (recorded per M1 T1 task): MPL-2.0 deps (if any) are
+# consumed as libraries; MPL's file-level weak copyleft obligates source
+# availability for the MPL-covered files themselves, not the linking binary —
+# accepted for the vectorfs distribution model after review.
+
+[graph]
+# Match what CI builds/tests: all targets (dev-deps included), no extra features.
+all-features = false
+
+[advisories]
+version = 2
+# M1 policy ("advisories 只开 warn"): advisory classes are non-fatal where
+# cargo-deny 0.20 allows it — yanked = warn, unmaintained/unsound scoped off
+# (the tree currently carries RUSTSEC-2024-0449 unsafe-libyaml via
+# lance-tokenizer -> lindera -> serde_yaml_ng; unmaintained-only, no fix
+# exists upstream, tracked as an M1 TODO). NOTE: cargo-deny 0.20 has NO warn
+# level for actual vulnerability advisories — those remain deny. Accepted:
+# a real vulnerability SHOULD gate; the escape hatch is `ignore` + reason.
+yanked = "warn"
+unmaintained = "none"
+unsound = "workspace"
+ignore = [
+    # Add RUSTSEC ids here with a reason + expiry when deliberately accepted.
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0", # justification recorded in the header comment above
+    # aws-lc (object_store "aws" crypto provider, design.md §8 #11) and the
+    # openssl-derived code it vendors surface as these SPDX ids:
+    "OpenSSL",
+    "ISC",     # (duplicate-safe; aws-lc is Apache-2.0 OR ISC)
+    # ---- additions beyond the M1 T1 task whitelist, recorded honestly after
+    # local `cargo deny check licenses` runs (task instruction: 跑不过就如实调整并记录):
+    # BSL-1.0 (Boost Software License): xxhash-rust (lance hashing). Permissive,
+    #     GPL-compatible, no copyleft — same class as MIT/BSD.
+    "BSL-1.0",
+    # CDLA-Permissive-2.0: webpki-root-certs (root CA bundle data via
+    #     rustls-platform-verifier / reqwest). A permissive DATA license for the
+    #     certificate bundle, not code copyleft; redistribution allowed.
+    "CDLA-Permissive-2.0",
+]
+private = { ignore = true }
+
+[[licenses.clarify]]
+# ring carries a non-SPDX license expression (15+ licenses incl. OpenSSL);
+# cargo-deny's documented clarification for it:
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+# Zero-AWS-SDK red line (design.md §5.7) — machine enforcement twin of
+# scripts/deps_guard.sh. aws-lc-rs / aws-lc-sys are the accepted crypto
+# provider and intentionally NOT denied.
+deny = [
+    { name = "aws-config" },
+    { name = "aws-types" },
+    { name = "aws-runtime" },
+    { name = "aws-credential-types" },
+    { name = "aws-sigv4" },
+    { name = "opendal" },
+]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"

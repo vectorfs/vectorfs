@@ -1,0 +1,74 @@
+[package]
+name = "vectorfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Single-binary, self-hosted AWS S3 Vectors compatible gateway"
+publish = false
+
+[[bin]]
+name = "vf"
+path = "src/main.rs"
+
+# Dependencies carried over from the verified M0 spike (spike/Cargo.toml,
+# spike/REPORT.md 2026-11-03): same versions, same feature convergence.
+# ONE deliberate deviation, recorded here: `lance` and `lance-io` are now
+# `default-features = false`. Their defaults re-enable the full AWS SDK chain
+# (lance-io/aws -> aws-config -> aws-sdk-sso/sts/ssooidc + opendal), which the
+# M0 spike accidentally linked — violating the zero-AWS-SDK red line
+# (design.md §5.7, machine-enforced by scripts/deps_guard.sh). The S3 backend
+# route is unchanged: object_store's own client (aws-lc-rs crypto only).
+[dependencies]
+# HTTP: converged features (no default catch-all). http1 + json + tokio runtime glue only.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+
+# Runtime: deliberately narrow.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+
+# SigV4 (hand-rolled verify, design.md §5.7: no aws-* SDK crates).
+# Versions chosen to match already-locked transitive copies (zero new subgraph).
+# NOTE: the spike also declared `hex` here, but nothing ever imported it
+# (sigv4.rs hand-rolls its own hex encoder — the zero-dep point). Dropped in
+# the product crate; caught by cargo-machete in CI.
+sha2 = "0.10"
+hmac = "0.12"
+futures-util = { version = "0.3", default-features = false }
+
+# CLI args (env override needs clap "env" feature).
+clap = { version = "4", features = ["derive", "env"] }
+
+# Engine. Minor locked to 0.41. Default features of lancedb are empty (fs object_store only).
+# DELIBERATELY NOT enabling lancedb "aws" feature: it pulls the full AWS SDK chain
+# (design.md §5.7 red line, scripts/deps_guard.sh).
+lancedb = "0.41"
+
+# S3 backend WITHOUT the AWS SDK. object_store ships its own SigV4 + HTTP S3
+# client (reqwest + aws-lc-rs crypto only; no aws-config chain). Version unified
+# with the object_store lance already locks -> no duplicate. NOTE: "aws" feature
+# hard-depends on aws-lc-rs (cmake needed to build; design.md §8 risk #11).
+object_store = { version = "0.14", features = ["aws"] }
+
+# Injection seam: lancedb 0.41 re-exports Session + ObjectStoreRegistry but NOT
+# the ObjectStoreProvider trait -> direct dep on lance-io, same version lancedb
+# already locks. default-features = false: lance-io defaults (aws/azure/gcp)
+# pull aws-config + opendal (zero-AWS-SDK red line).
+lance-io = { version = "14.0.2", default-features = false }
+
+# NewColumnTransform (metadata schema evolution, design.md §5.3) + lance
+# Result/Error types; same version already in tree via lancedb -> zero new
+# crates compiled. default-features = false for the same red-line reason.
+lance = { version = "14.0.2", default-features = false }
+
+url = "2"
+async-trait = "0.1"
+
+[dev-dependencies]
+# tower::oneshot for in-process integration tests (no network port).
+tower = { version = "0.5", features = ["util"] }
+# temp data dirs for tests.
+tempfile = "3"

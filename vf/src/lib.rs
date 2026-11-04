@@ -1,0 +1,381 @@
+//! vectorfs — single-binary, self-hosted AWS S3 Vectors compatible gateway.
+//!
+//! Harvested from the verified M0 spike (spike/REPORT.md, 2026-11-03): four
+//! operations (CreateVectorBucket / CreateIndex / PutVectors / QueryVectors),
+//! hand-rolled SigV4 verification, file + S3-compatible backends (lancedb +
+//! object_store, zero AWS SDK). The full 21-operation surface, `vf init` and
+//! `vf doctor` land across M1 (design.md §4 / §5.8 / §7 M1).
+//!
+//! Wire protocol per botocore `s3vectors/2025-07-15` model: rest-json,
+//! `POST /<OperationName>`, JSON bodies; PutVectors success = 200 empty body.
+
+pub mod ops;
+pub mod s3;
+pub mod sigv4;
+pub mod store;
+
+/// Engine-level experiments carried over from the spike as regression tests
+/// (conditional writes, merge_insert x schema evolution — design.md §5.2/§5.3).
+#[cfg(test)]
+mod experiments;
+
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+
+/// Max accepted body (AWS PutVectors limit is 500 vectors / 20 MiB).
+pub const MAX_BODY: usize = 21 * 1024 * 1024;
+
+pub fn build_router(state: ops::AppState) -> Router {
+    let authed = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/CreateVectorBucket", post(ops::create_vector_bucket))
+        .route("/CreateIndex", post(ops::create_index))
+        .route("/PutVectors", post(ops::put_vectors))
+        .route("/QueryVectors", post(ops::query_vectors))
+        .fallback(fallback_404);
+    authed
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            gate_middleware,
+        ))
+        .with_state(state)
+}
+
+async fn healthz() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "ok": true }))
+}
+
+/// Unknown path/method -> plain 404 JSON.
+async fn fallback_404(uri: Uri) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "__type": "NotFoundException",
+            "message": format!("no route for {}", uri.path()),
+        })),
+    )
+        .into_response()
+}
+
+/// Headers -> JSON object preserving multi-values (M0 Task C wire observation:
+/// nothing may be dropped).
+fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    for (name, value) in headers.iter() {
+        let v = String::from_utf8_lossy(value.as_bytes()).into_owned();
+        m.entry(name.as_str().to_string())
+            .and_modify(|e| {
+                if let serde_json::Value::Array(a) = e {
+                    a.push(serde_json::Value::String(v.clone()));
+                }
+            })
+            .or_insert_with(|| serde_json::json!([v]));
+    }
+    serde_json::Value::Object(m)
+}
+
+fn trace_line(event: &str, mut fields: serde_json::Map<String, serde_json::Value>) {
+    fields.insert("ev".into(), serde_json::json!(event));
+    eprintln!("{}", serde_json::Value::Object(fields));
+}
+
+/// The single gate: (1) buffer body, (2) emit request trace, (3) verify SigV4
+/// (except /healthz), (4) call inner service, (5) buffer + emit response trace.
+///
+/// Note: buffering the response body means the trace always shows the final
+/// bytes; /healthz and 404s are traced too (they are part of the wire picture).
+async fn gate_middleware(State(state): State<ops::AppState>, req: Request, next: Next) -> Response {
+    let (parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, MAX_BODY).await {
+        Ok(b) => b,
+        Err(e) => {
+            return ops::ApiError::validation(format!("failed to read body: {e}")).into_response();
+        }
+    };
+
+    if state.trace {
+        let mut f = serde_json::Map::new();
+        f.insert("method".into(), serde_json::json!(parts.method.as_str()));
+        f.insert(
+            "path".into(),
+            serde_json::json!(
+                parts
+                    .uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or("")
+            ),
+        );
+        f.insert("headers".into(), headers_to_json(&parts.headers));
+        f.insert(
+            "body".into(),
+            serde_json::json!(String::from_utf8_lossy(&bytes).into_owned()),
+        );
+        trace_line("http_request", f);
+    }
+
+    if parts.uri.path() != "/healthz"
+        && let Some(creds) = &state.creds
+    {
+        let header_pairs: Vec<(String, String)> = parts
+            .headers
+            .iter()
+            .map(|(n, v)| {
+                (
+                    n.as_str().to_string(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let uri = &parts.uri;
+        let res = sigv4::verify(
+            parts.method.as_str(),
+            uri.path(),
+            uri.query(),
+            &header_pairs,
+            &bytes,
+            creds,
+            &state.region,
+            now,
+        );
+        if let Err(msg) = res {
+            let resp = ops::ApiError::access_denied(msg).into_response();
+            // auth failures short-circuit before `next` — trace them too so
+            // every wire exchange is visible.
+            let (rparts, rbody) = resp.into_parts();
+            let rbytes = axum::body::to_bytes(rbody, MAX_BODY)
+                .await
+                .unwrap_or_default();
+            if state.trace {
+                let mut f = serde_json::Map::new();
+                f.insert("status".into(), serde_json::json!(rparts.status.as_u16()));
+                f.insert("headers".into(), headers_to_json(&rparts.headers));
+                f.insert(
+                    "body".into(),
+                    serde_json::json!(String::from_utf8_lossy(&rbytes).into_owned()),
+                );
+                trace_line("http_response", f);
+            }
+            return Response::from_parts(rparts, Body::from(rbytes));
+        }
+    }
+
+    let req = Request::from_parts(parts, Body::from(bytes));
+    let res = next.run(req).await;
+
+    let (rparts, rbody) = res.into_parts();
+    let rbytes = match axum::body::to_bytes(rbody, MAX_BODY).await {
+        Ok(b) => b,
+        Err(e) => {
+            return ops::ApiError::internal(format!("failed to read response body: {e}"))
+                .into_response();
+        }
+    };
+
+    if state.trace {
+        let mut f = serde_json::Map::new();
+        f.insert("status".into(), serde_json::json!(rparts.status.as_u16()));
+        f.insert("headers".into(), headers_to_json(&rparts.headers));
+        f.insert(
+            "body".into(),
+            serde_json::json!(String::from_utf8_lossy(&rbytes).into_owned()),
+        );
+        trace_line("http_response", f);
+    }
+
+    Response::from_parts(rparts, Body::from(rbytes))
+}
+
+// ---------------------------------------------------------------------------
+// tests (in-process: tower::oneshot, no network port)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt; // oneshot
+
+    fn test_state(dir: &std::path::Path, creds: Option<sigv4::Credentials>) -> ops::AppState {
+        ops::AppState {
+            storage: std::sync::Arc::new(store::Storage::file(dir)),
+            creds,
+            region: "us-east-1".into(),
+            account: "000000000000".into(),
+            trace: false,
+        }
+    }
+
+    async fn send(
+        router: &Router,
+        req: Request<Body>,
+    ) -> (StatusCode, Vec<(String, String)>, serde_json::Value) {
+        let res = router.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let headers: Vec<(String, String)> = res
+            .headers()
+            .iter()
+            .map(|(n, v)| (n.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let body = axum::body::to_bytes(res.into_body(), MAX_BODY)
+            .await
+            .unwrap();
+        let val = if body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(&body).into_owned())
+            })
+        };
+        (status, headers, val)
+    }
+
+    fn post_json(path: &str, body: &str, extra: &[(&str, &str)]) -> Request<Body> {
+        let mut b = HttpRequest::post(path)
+            .header("content-type", "application/json")
+            .header("host", "127.0.0.1:8787");
+        for (k, v) in extra {
+            b = b.header(*k, *v);
+        }
+        b.body(Body::from(body.to_string())).unwrap()
+    }
+
+    fn header_of<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    // ---------------- SigV4 request-level tests (auth ON) ----------------
+
+    fn creds() -> sigv4::Credentials {
+        sigv4::Credentials {
+            access_key: "AKIDEXAMPLE".into(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
+        }
+    }
+
+    fn signed_post(path: &str, body: &str, c: &sigv4::Credentials, date: &str) -> Request<Body> {
+        let s = sigv4::signer::sign(
+            "POST",
+            path,
+            None,
+            "127.0.0.1:8787",
+            body.as_bytes(),
+            c,
+            "us-east-1",
+            "s3vectors",
+            date,
+            &[("content-type", "application/json")],
+        );
+        post_json(
+            path,
+            body,
+            &[
+                ("authorization", &s.authorization),
+                ("x-amz-date", &s.x_amz_date),
+            ],
+        )
+    }
+
+    #[tokio::test]
+    async fn sigv4_valid_request_passes_and_creates_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = build_router(test_state(dir.path(), Some(creds())));
+        let req = signed_post(
+            "/CreateVectorBucket",
+            r#"{"vectorBucketName":"auth-bucket"}"#,
+            &creds(),
+            &sigv4::signer::now_amz_date(),
+        );
+        let (status, _, body) = send(&router, req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["vectorBucket"]["vectorBucketName"],
+            serde_json::json!("auth-bucket")
+        );
+    }
+
+    #[tokio::test]
+    async fn sigv4_tampered_body_rejected_403() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = build_router(test_state(dir.path(), Some(creds())));
+        let req = signed_post(
+            "/CreateVectorBucket",
+            r#"{"vectorBucketName":"legit"}"#,
+            &creds(),
+            &sigv4::signer::now_amz_date(),
+        );
+        // flip one byte of the body after signing
+        let (parts, body) = req.into_parts();
+        let raw = axum::body::to_bytes(body, MAX_BODY).await.unwrap();
+        let mut raw = raw.to_vec();
+        let last = raw.len() - 3; // inside the name
+        raw[last] = b'X';
+        let req = Request::from_parts(parts, Body::from(raw));
+        let (status, headers, body) = send(&router, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            header_of(&headers, "x-amzn-errortype"),
+            Some("AccessDeniedException")
+        );
+        assert_eq!(body["__type"], serde_json::json!("AccessDeniedException"));
+        assert!(body["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn sigv4_wrong_access_key_rejected_403() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = build_router(test_state(dir.path(), Some(creds())));
+        let evil = sigv4::Credentials {
+            access_key: "AKIDATTACKER".into(),
+            secret_key: "nope".into(),
+        };
+        let req = signed_post(
+            "/PutVectors",
+            r#"{"vectors":[]}"#,
+            &evil,
+            &sigv4::signer::now_amz_date(),
+        );
+        let (status, _, body) = send(&router, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["__type"], serde_json::json!("AccessDeniedException"));
+    }
+
+    #[tokio::test]
+    async fn sigv4_stale_date_rejected_403() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = build_router(test_state(dir.path(), Some(creds())));
+        // signed 2h in the past
+        let stale = {
+            sigv4::signer::amz_date_from_epoch(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600),
+            )
+        };
+        let req = signed_post("/PutVectors", r#"{"vectors":[]}"#, &creds(), &stale);
+        let (status, _, body) = send(&router, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["__type"], serde_json::json!("AccessDeniedException"));
+        assert!(body["message"].as_str().unwrap().contains("skew"));
+    }
+
+    #[tokio::test]
+    async fn sigv4_missing_authorization_rejected_403() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = build_router(test_state(dir.path(), Some(creds())));
+        let req = post_json("/PutVectors", r#"{"vectors":[]}"#, &[]);
+        let (status, _, _) = send(&router, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+}
