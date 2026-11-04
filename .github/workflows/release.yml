@@ -1,0 +1,220 @@
+# Release pipeline (M1 Task 8). Trigger: `git tag v0.1.0 && git push --tags`
+# (workflow_dispatch as the manual fallback; it derives the version from
+# Cargo.toml instead of the tag).
+#
+# Jobs:
+#   release (matrix)   — release-prod builds for x86_64 (native) and
+#                        aarch64 (cross-rs in Docker), VF_GIT_HASH baked in;
+#                        size_guard.sh runs PER TARGET on the parameterized
+#                        binary path; artifacts vf-<version>-<target>.tar.gz
+#                        (binary + README copy) uploaded per target.
+#   smoke-ubuntu-20-04 — unpacks the x86_64 tarball inside `docker run
+#                        ubuntu:20.04`, `vf init && vf serve`, apt-installs
+#                        python3+boto3 and drives a 5-step roundtrip
+#                        (create/put/query/get/delete+cleanup). This is the
+#                        glibc-compatibility gate for the release binary.
+#   publish            — needs BOTH green: merges artifacts, writes
+#                        sha256sums.txt, attaches everything via
+#                        softprops/action-gh-release.
+#
+# ---------------------------------------------------------------------------
+# FIRST-VERIFICATION LIST (cannot be exercised without a real tag push /
+# hosted runners; everything else was verified locally where the toolchain
+# allows — see the M1 Task 8 notes):
+#   1. cross-rs aarch64 build: Cross.toml (env passthrough + pre-build apt of
+#      cmake/protoc inside the container) is configuration, not yet run.
+#   2. glibc: the x86_64 binary is linked on ubuntu-latest (24.04). If the
+#      20.04 smoke job fails with versioned-symbol errors, the fix is to
+#      build x86_64 inside an ubuntu:20.04 container as well (or zigbuild).
+#   3. aws-lc-rs CPU baseline: aws-lc-rs may emit newer-CPU instructions than
+#      20.04-era hosts have; if the smoke job dies with "illegal instruction",
+#      record it and pin the baseline explicitly (this is the design.md §5.7
+#      "glibc/CPU baseline: measure, then pin" checkpoint).
+#   4. cargo install cross --locked (crates.io 0.2.5) compiling on the
+#      current stable Rust.
+#   5. ubuntu:20.04 ships Python 3.8: pip must resolve to a boto3 that both
+#      supports 3.8 and carries the s3vectors client (added ~1.39, mid-2025).
+#      If the resolver lands below that, pin boto3 to the newest 3.8-capable
+#      release with s3vectors in the pip3 line below.
+# ---------------------------------------------------------------------------
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # softprops/action-gh-release creates the release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: build ${{ matrix.target }} (release-prod + size guard)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            use-cross: false
+          - target: aarch64-unknown-linux-gnu
+            use-cross: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Host-side protoc for the native x86_64 build (the cross build gets it
+      # from Cross.toml's pre-build hook, inside the container).
+      - name: install protoc (lance-encoding build dep)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-prod-${{ matrix.target }}
+
+      - name: export VF_GIT_HASH (short sha)
+        run: echo "VF_GIT_HASH=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: resolve version (tag v<x> or Cargo.toml fallback)
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(cargo metadata --no-deps --format-version 1 \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "version: $VERSION"
+
+      - name: build (release-prod; cross-rs for aarch64)
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.use-cross }}" == "true" ]]; then
+            cargo install cross --locked
+            cross build --profile release-prod --workspace --target "${{ matrix.target }}"
+          else
+            cargo build --profile release-prod --workspace --target "${{ matrix.target }}"
+          fi
+
+      # size_guard.sh takes the binary path as $1 (default target/release-prod/vf)
+      - name: size guard (per target)
+        run: ./scripts/size_guard.sh "target/${{ matrix.target }}/release-prod/vf"
+
+      - name: package (binary + README copy)
+        run: |
+          set -euo pipefail
+          mkdir -p package
+          cp "target/${{ matrix.target }}/release-prod/vf" package/vf
+          cp README.md package/
+          tar -czf "vf-${VERSION}-${{ matrix.target }}.tar.gz" -C package vf README.md
+          ls -la "vf-${VERSION}-${{ matrix.target }}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vf-${{ matrix.target }}
+          path: vf-*.tar.gz
+          if-no-files-found: error
+
+  smoke-ubuntu-20-04:
+    name: ubuntu:20.04 smoke (glibc gate, 5-step SDK roundtrip)
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vf-x86_64-unknown-linux-gnu
+
+      # The smoke script is written into dist/ so the ubuntu:20.04 container
+      # sees it through the /work mount. It polls /healthz itself (curl is not
+      # assumed in the base image), then drives the 5 steps: create bucket+
+      # index / put / query / get / delete + cleanup. Green = the release
+      # binary runs on 20.04-era glibc and satisfies the README promise.
+      - name: docker run ubuntu:20.04 smoke
+        run: |
+          set -euo pipefail
+          mkdir -p dist && tar -xzf vf-*-x86_64-unknown-linux-gnu.tar.gz -C dist
+          cat > dist/smoke_check.py <<'PYEOF'
+          import argparse, time, urllib.request
+          import boto3
+
+          p = argparse.ArgumentParser()
+          p.add_argument("--endpoint", required=True)
+          p.add_argument("--access-key", required=True)
+          p.add_argument("--secret-key", required=True)
+          a = p.parse_args()
+          for _ in range(30):
+              try:
+                  urllib.request.urlopen(a.endpoint + "/healthz", timeout=1)
+                  print("healthz ok")
+                  break
+              except Exception:
+                  time.sleep(1)
+          else:
+              raise SystemExit("server never became healthy")
+          c = boto3.client("s3vectors", endpoint_url=a.endpoint,
+                           aws_access_key_id=a.access_key,
+                           aws_secret_access_key=a.secret_key,
+                           region_name="us-east-1")
+          b, i = "smoke-bucket", "smoke-index"
+          c.create_vector_bucket(vectorBucketName=b)                        # 1 create
+          c.create_index(vectorBucketName=b, indexName=i, dataType="float32",
+                        dimension=3, distanceMetric="cosine")
+          c.put_vectors(vectorBucketName=b, indexName=i, vectors=[           # 2 put
+              {"key": "k1", "data": {"float32": [1.0, 0.0, 0.0]}},
+              {"key": "k2", "data": {"float32": [0.0, 1.0, 0.0]}}])
+          q = c.query_vectors(vectorBucketName=b, indexName=i,               # 3 query
+                              queryVector={"float32": [1.0, 0.0, 0.0]},
+                              topK=2, returnDistance=True)["vectors"]
+          assert q[0]["key"] == "k1" and q[0]["distance"] < 1e-6, q
+          g = c.get_vectors(vectorBucketName=b, indexName=i,                 # 4 get
+                            keys=["k1", "k2"])["vectors"]
+          assert sorted(v["key"] for v in g) == ["k1", "k2"], g
+          c.delete_index(vectorBucketName=b, indexName=i)                    # 5 delete
+          c.delete_vector_bucket(vectorBucketName=b)
+          print("smoke: 5 steps PASS")
+          PYEOF
+          docker run --rm -v "$PWD:/work" -w /work ubuntu:20.04 bash -euo pipefail -c '
+            set -euo pipefail
+            apt-get update && apt-get install -y --no-install-recommends python3 python3-pip
+            pip3 install --no-cache-dir boto3
+            cd /work/dist
+            ./vf init --data-dir /tmp/vfdata
+            AK=$(python3 -c "import json; print(json.load(open(\"/tmp/vfdata/vf.json\"))[\"access_key_id\"])")
+            SK=$(python3 -c "import json; print(json.load(open(\"/tmp/vfdata/vf.json\"))[\"secret_access_key\"])")
+            ./vf serve --data-dir /tmp/vfdata >/tmp/vf.log 2>&1 &
+            VF_PID=$!
+            trap "kill $VF_PID 2>/dev/null; tail -20 /tmp/vf.log" EXIT
+            python3 smoke_check.py --endpoint http://127.0.0.1:8787 \
+              --access-key "$AK" --secret-key "$SK"
+          '
+
+  publish:
+    name: attach artifacts + sha256sums to the release
+    needs: [release, smoke-ubuntu-20-04]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-out
+          merge-multiple: true
+
+      - name: sha256sums.txt
+        run: |
+          set -euo pipefail
+          cd dist-out
+          ls -la
+          sha256sum vf-*.tar.gz > sha256sums.txt
+          cat sha256sums.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-out/vf-*.tar.gz
+            dist-out/sha256sums.txt
+          generate_release_notes: true

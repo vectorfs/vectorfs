@@ -1,0 +1,17 @@
+# cross-rs configuration for the aarch64-unknown-linux-gnu release build
+# (.github/workflows/release.yml; cross runs inside Docker on the x86_64
+# runner — the runner ships docker, nothing is needed locally).
+#
+# NOT yet exercised on a real tag (first-verification list in release.yml):
+#   - `passthrough` carries VF_GIT_HASH into the build container so
+#     option_env!("VF_GIT_HASH") in vf/src/report.rs bakes the commit;
+#   - `pre-build` apt-installs cmake (aws-lc-sys C build dep) and protoc
+#     (lance-encoding/prost build dep) INSIDE the container — the host-side
+#     apt install does not reach cross's build environment.
+[build.env]
+passthrough = ["VF_GIT_HASH"]
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update && apt-get install -y --no-install-recommends cmake protobuf-compiler",
+]
