@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """boto3 conformance check against an s3vectors-compatible server (M0 Task C
 core 9 steps + M1 T3 management 9 steps + M1 T4 vector data plane 7 steps
-= 26 steps).
++ M1 T5 filter engine 6 steps = 32 steps).
 
 Talks to an ALREADY-RUNNING server (default http://127.0.0.1:8787) — this script
 owns no server lifecycle. Each step prints PASS/FAIL; exit code 1 on any FAIL.
@@ -621,9 +621,116 @@ def main() -> int:
 
     step(25, "put_vectors metadata type validation (nested rejected, list ok)", v26)
 
+    # ------------------------------------------------------------------
+    # M1 T5 filter section (steps 26-31): the full AWS operator set driven
+    # through boto3's typed `filter` document parameter against a stocked
+    # index — eq / and / range / in / startsWith / exists, each asserting the
+    # exact key set (plus any-element list semantics where they land).
+    # Operator/validation negatives live in the tower oneshot unit tests
+    # (vf/src/ops.rs + vf/src/filter.rs); these steps pin the WIRE path.
+    # ------------------------------------------------------------------
+
+    def f_seed():
+        # dedicated index so the assertion universe is exactly these 6
+        # vectors (the main index carries earlier steps' rows).
+        fidx = f"{prefix}-if"
+        state["filter_index"] = fidx
+        client.create_index(vectorBucketName=bucket, indexName=fidx,
+                            dataType="float32", dimension=4, distanceMetric="cosine")
+        # 6 vectors with rich filterable metadata: numbers, strings, bools,
+        # a list, and one row with NO metadata (missing-field semantics).
+        client.put_vectors(
+            vectorBucketName=bucket, indexName=fidx,
+            vectors=[
+                {"key": "f1", "data": {"float32": [1.0, 0.0, 0.0, 0.0]},
+                 "metadata": {"genre": "documentary", "year": 2019, "ok": True}},
+                {"key": "f2", "data": {"float32": [0.9, 0.1, 0.0, 0.0]},
+                 "metadata": {"genre": "comedy", "year": 2021, "ok": False}},
+                {"key": "f3", "data": {"float32": [0.8, 0.2, 0.0, 0.0]},
+                 "metadata": {"genre": "documentary", "year": 2022, "ok": True,
+                              "tags": ["a", "b"]}},
+                {"key": "f4", "data": {"float32": [0.7, 0.3, 0.0, 0.0]},
+                 "metadata": {"genre": "drama", "year": 2020}},
+                {"key": "f5", "data": {"float32": [0.6, 0.4, 0.0, 0.0]},
+                 "metadata": {"s3_path": "/marketing/report.pdf"}},
+                {"key": "f6", "data": {"float32": [0.5, 0.5, 0.0, 0.0]}},
+            ],
+        )
+        return "6 vectors (scalars x3 kinds, list, one without metadata)"
+
+    step(26, "filters: seed metadata-rich vectors", f_seed)
+
+    def fkeys(flt, **kw):
+        resp = client.query_vectors(
+            vectorBucketName=bucket, indexName=state["filter_index"], topK=10,
+            queryVector={"float32": [1.0, 0.0, 0.0, 0.0]}, filter=flt, **kw)
+        keys = sorted(v["key"] for v in resp["vectors"])
+        assert resp["distanceMetric"] == "cosine", resp
+        return keys
+
+    def f27():
+        # $eq: shorthand + explicit + a miss (type mismatch = no match)
+        assert fkeys({"genre": "documentary"}) == ["f1", "f3"], fkeys({"genre": "documentary"})
+        assert fkeys({"genre": {"$eq": "comedy"}}) == ["f2"]
+        assert fkeys({"year": {"$eq": 2020}}) == ["f4"]
+        assert fkeys({"year": "2020"}) == [], "string-on-number must not match"
+        assert fkeys({"ghost": 1}) == [], "missing field must not match"
+        return "eq shorthand/explicit/miss + mismatch + missing"
+
+    step(27, "filter $eq (string/number, mismatch & missing = no match)", f27)
+
+    def f28():
+        # $and + implicit top-level AND + $ne boundary semantics
+        assert fkeys({"$and": [{"genre": {"$eq": "documentary"}},
+                               {"year": {"$gte": 2020}}]}) == ["f3"]
+        assert fkeys({"genre": "documentary", "ok": True}) == ["f1", "f3"]
+        # $ne matches rows WITHOUT the field too (f6 has no metadata)
+        got = fkeys({"genre": {"$ne": "documentary"}})
+        assert got == ["f2", "f4", "f5", "f6"], got
+        # nested: $or inside $and
+        assert fkeys({"$and": [{"$or": [{"genre": "comedy"}, {"year": 2019}]}]}) == ["f1", "f2"]
+        return "and/or nesting + ne matches missing"
+
+    step(28, "filter $and/$or/$ne (implicit AND, nesting)", f28)
+
+    def f29():
+        # numeric range incl. same-field multi-operator AND
+        assert fkeys({"year": {"$gt": 2020}}) == ["f2", "f3"]
+        assert fkeys({"year": {"$gte": 2020}}) == ["f2", "f3", "f4"]
+        assert fkeys({"year": {"$lt": 2020}}) == ["f1"]
+        assert fkeys({"year": {"$lte": 2020}}) == ["f1", "f4"]
+        assert fkeys({"year": {"$gte": 2019, "$lt": 2021}}) == ["f1", "f4"]
+        return "range gt/gte/lt/lte + same-field band"
+
+    step(29, "filter range $gt/$gte/$lt/$lte", f29)
+
+    def f30():
+        # $in with primitives + any-element against list metadata
+        assert fkeys({"genre": {"$in": ["comedy", "drama"]}}) == ["f2", "f4"]
+        assert fkeys({"year": {"$in": [2019, 2022]}}) == ["f1", "f3"]
+        assert fkeys({"tags": {"$in": ["b", "z"]}}) == ["f3"], "list any-element"
+        assert fkeys({"tags": {"$nin": ["b", "z"]}}) == ["f1", "f2", "f4", "f5", "f6"]
+        return "in/nin (mixed filter list + list-metadata any-element)"
+
+    step(30, "filter $in/$nin (+ list any-element)", f30)
+
+    def f31():
+        # $startsWith (string) + $exists (bool), including missing-field rows
+        assert fkeys({"s3_path": {"$startsWith": "/marketing/"}}) == ["f5"]
+        assert fkeys({"s3_path": {"$startsWith": "/sales/"}}) == []
+        assert fkeys({"genre": {"$startsWith": "do"}}) == ["f1", "f3"]
+        assert fkeys({"genre": {"$exists": True}}) == ["f1", "f2", "f3", "f4"]
+        # rows with NO metadata at all satisfy $exists:false
+        got = fkeys({"genre": {"$exists": False}})
+        assert got == ["f5", "f6"], got
+        return "startsWith + exists true/false (missing rows)"
+
+    step(31, "filter $startsWith/$exists", f31)
+
     def m27():
         client.delete_index(vectorBucketName=bucket, indexName=index)
         client.delete_index(vectorBucketName=bucket, indexName=state["index2"])
+        client.delete_index(vectorBucketName=bucket, indexName=state["filter_index"])
         client.delete_vector_bucket(vectorBucketName=bucket)
         for extra in state.get("extra_buckets", []):
             client.delete_vector_bucket(vectorBucketName=extra)
@@ -636,7 +743,7 @@ def main() -> int:
         assert rest == [], f"cleanup left buckets: {[b['vectorBucketName'] for b in rest]}"
         return "index x2 + bucket x3 deleted; prefix drained"
 
-    step(26, "cleanup: delete indexes, buckets; verify prefix drained", m27)
+    step(32, "cleanup: delete indexes, buckets; verify prefix drained", m27)
 
     run_steps()
 

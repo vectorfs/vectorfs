@@ -11,6 +11,7 @@
 
 pub mod backends;
 pub mod config;
+pub mod filter;
 pub mod lock;
 pub mod ops;
 pub mod sigv4;

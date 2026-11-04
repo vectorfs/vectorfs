@@ -67,7 +67,7 @@ use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::store::{self, BucketMeta, IndexMeta, StoreError, VectorRow};
+use crate::store::{self, BucketMeta, IndexMeta, MetaMirror, StoreError, VectorRow};
 
 /// Shared server state (cloned into handlers).
 #[derive(Clone)]
@@ -179,6 +179,7 @@ impl From<StoreError> for ApiError {
     fn from(e: StoreError) -> Self {
         match e {
             StoreError::Conflict(m) => ApiError::conflict(m),
+            StoreError::Validation(m) => ApiError::validation(m),
             StoreError::Internal(m) => ApiError::internal(m),
         }
     }
@@ -307,6 +308,7 @@ struct QueryVectorsInput {
     filter: Option<serde_json::Value>,
     return_distance: Option<bool>,
     return_metadata: Option<bool>,
+    next_token: Option<String>,
     // `queryMode` (model member, IndexMode enum) is accepted and ignored:
     // runtime behavior is always pre-filter/ENHANCED (design.md §4.4).
     #[allow(dead_code)]
@@ -1059,17 +1061,47 @@ pub async fn put_vectors(State(state): State<AppState>, body: Bytes) -> Result<R
         let vec = check_vector(&raw, meta.dimension as i64, &meta.distance_metric, "vector")?;
         // metadata: whole-document replacement on upsert (AWS semantics assumed;
         // omitted metadata stores NULL — TODO: confirm against real service).
-        let metadata_json = match &v.metadata {
-            None | Some(serde_json::Value::Null) => None,
+        let mut metadata_json = None;
+        let mut filterable = std::collections::BTreeMap::new();
+        match v.metadata {
+            None | Some(serde_json::Value::Null) => {}
             Some(m) => {
-                validate_metadata(m, meta.non_filterable_metadata_keys.as_deref())?;
-                Some(m.to_string())
+                validate_metadata(&m, meta.non_filterable_metadata_keys.as_deref())?;
+                if let serde_json::Value::Object(map) = &m {
+                    // M1 T5 mirror classification: every FILTERABLE key of the
+                    // document — scalars become typed mirror-column values,
+                    // list values are recorded as List for the store's drift
+                    // check (a key's kind must stay stable index-wide, §5.3).
+                    for (k, val) in map {
+                        if meta
+                            .non_filterable_metadata_keys
+                            .as_deref()
+                            .is_some_and(|ks| ks.iter().any(|nf| nf == k))
+                        {
+                            continue; // blob-only by declaration
+                        }
+                        let mv = match val {
+                            serde_json::Value::String(s) => MetaMirror::Str(s.clone()),
+                            serde_json::Value::Number(n) => MetaMirror::Num(
+                                // serde_json numbers are always finite f64-representable
+                                n.as_f64().expect("serde_json number fits f64"),
+                            ),
+                            serde_json::Value::Bool(b) => MetaMirror::Bool(*b),
+                            serde_json::Value::Array(_) => MetaMirror::List,
+                            // validate_metadata already rejected null/nested
+                            _ => unreachable!("validate_metadata rejects null/nested values"),
+                        };
+                        filterable.insert(k.clone(), mv);
+                    }
+                }
+                metadata_json = Some(m.to_string());
             }
-        };
+        }
         let row = VectorRow {
             key: v.key.clone(),
             vector: vec,
             metadata_json,
+            filterable,
         };
         match index_of.get(&v.key) {
             Some(&i) => rows[i] = row, // later duplicate replaces the earlier row
@@ -1087,6 +1119,27 @@ pub async fn put_vectors(State(state): State<AppState>, body: Bytes) -> Result<R
     Ok(empty_ok())
 }
 
+/// QueryVectors: filtered flat KNN (pre-filter semantics — ENHANCED always,
+/// design.md §4.4) + AWS pagination (topK ≤ 10000, ≤100 results per page,
+/// nextToken continues the SAME logical query).
+///
+/// Filter engine (M1 T5, design.md §4.6): full AWS operator set, compiled by
+/// [`crate::filter`] (validation there), executed as a lance predicate
+/// pushdown over the metadata mirror columns with an exact in-memory
+/// post-filter (store.rs); the pure in-memory path remains as the reference
+/// route. Filters naming keys declared in the index's
+/// `nonFilterableMetadataKeys` are rejected (AWS: non-filterable metadata
+/// "can't be used in query filters"; error shape undocumented —
+/// ValidationException is the conservative choice, TODO(AWS 对拍)).
+///
+/// Pagination token: opaque base64 `{"v":<dataset version>,"o":<offset>,
+/// "f":<query fingerprint>}`. A follow-up request re-runs the whole query
+/// PINNED to version `v` (lance time-travel — true snapshot isolation: writes
+/// made between pages never change the result) and slices `[o, o+100)`.
+/// Cost note: each page re-computes the query server-side (a stateless
+/// single-binary keeps no per-cursor caches; AWS's own behavior is opaque).
+/// The fingerprint binds topK/queryVector/filter so a token cannot be
+/// replayed against a different query.
 pub async fn query_vectors(
     State(state): State<AppState>,
     body: Bytes,
@@ -1120,20 +1173,50 @@ pub async fn query_vectors(
         "queryVector",
     )?;
 
-    // filter: top-level multi-key implicit AND + $eq + $and; anything else rejected.
-    // TODO(M1): full AWS operator set (design.md §4.6) — subset kept from spike.
+    // filter: full AWS operator set (crate::filter). None/Null = no filter.
     let compiled_filter = match &input.filter {
         None | Some(serde_json::Value::Null) => None,
         Some(f) => {
-            validate_filter_supported(f)?;
-            Some(f.clone())
+            let compiled =
+                crate::filter::Filter::compile(f).map_err(|e| validation_filter(&e.0))?;
+            if let Some(nf) = meta.non_filterable_metadata_keys.as_deref() {
+                for field in compiled.fields() {
+                    if nf.iter().any(|k| k == field) {
+                        return Err(validation_filter(format!(
+                            "metadata key {field:?} is declared non-filterable for this index \
+                             and cannot be used in a query filter"
+                        )));
+                    }
+                }
+            }
+            Some(compiled)
         }
     };
-    let filter_fn = compiled_filter
-        .as_ref()
-        .map(|f| eval_filter_closure(f.clone()));
 
-    let hits = state
+    // pagination: page 0 or a token'd continuation of the same logical query
+    let (offset, as_of) = match input.next_token.as_deref() {
+        None | Some("") => (0usize, None),
+        Some(t) => {
+            let cur = decode_query_token(t)?;
+            let fp = query_fingerprint(&vb, &ix, &meta, top_k, &q, compiled_filter.as_ref());
+            if cur.f != fp {
+                return Err(ApiError::validation_field(
+                    "nextToken",
+                    "nextToken does not match this query (topK, queryVector and filter must be \
+                     identical across pages of one query)",
+                ));
+            }
+            if cur.o >= top_k as usize {
+                return Err(ApiError::validation_field(
+                    "nextToken",
+                    "nextToken offset is past the end of this query's results",
+                ));
+            }
+            (cur.o, Some(cur.v))
+        }
+    };
+
+    let outcome = state
         .storage
         .query_vectors(
             &vb,
@@ -1142,14 +1225,31 @@ pub async fn query_vectors(
             &meta.distance_metric,
             &q,
             top_k as usize,
-            filter_fn.as_deref(),
+            compiled_filter.as_ref(),
+            store::QueryRoute::Pushdown,
+            as_of,
         )
         .await?;
+
+    let remaining = top_k as usize - offset;
+    let take = remaining.min(QUERY_PAGE_MAX);
+    let page: Vec<crate::store::QueryHit> =
+        outcome.hits.into_iter().skip(offset).take(take).collect();
+    let served = page.len();
+    let next_token = if served == take && offset + served < top_k as usize {
+        Some(encode_query_token(&QueryCursor {
+            v: outcome.version,
+            o: offset + served,
+            f: query_fingerprint(&vb, &ix, &meta, top_k, &q, compiled_filter.as_ref()),
+        }))
+    } else {
+        None
+    };
 
     let return_distance = input.return_distance.unwrap_or(false);
     let return_metadata = input.return_metadata.unwrap_or(false);
 
-    let vectors: Vec<serde_json::Value> = hits
+    let vectors: Vec<serde_json::Value> = page
         .into_iter()
         .map(|h| {
             let mut o = serde_json::json!({ "key": h.key });
@@ -1163,10 +1263,13 @@ pub async fn query_vectors(
         })
         .collect();
 
-    let resp = serde_json::json!({
+    let mut resp = serde_json::json!({
         "vectors": vectors,
         "distanceMetric": meta.distance_metric,
     });
+    if let Some(t) = next_token {
+        resp["nextToken"] = json!(t);
+    }
     Ok(Json(resp).into_response())
 }
 
@@ -1838,106 +1941,77 @@ pub async fn update_index_mode(
 }
 
 // ---------------------------------------------------------------------------
-// filter subset
+// filter (M1 T5): validation-error helper + QueryVectors pagination cursors
 // ---------------------------------------------------------------------------
 
-/// Reject operators outside the spike subset: {$eq, $and} + top-level implicit AND
-/// + implicit $eq shorthand. Everything else -> ValidationException "unsupported in spike".
-fn validate_filter_supported(f: &serde_json::Value) -> Result<(), ApiError> {
-    let serde_json::Value::Object(map) = f else {
-        return Err(ApiError::validation(
-            "filter must be a JSON object (unsupported in spike)",
-        ));
+/// ValidationException for filter problems, addressable at `filter` in the
+/// model's fieldList (see crate::filter for the operator/structure rules).
+fn validation_filter(msg: impl Into<String>) -> ApiError {
+    let msg = msg.into();
+    ApiError::validation_field("filter", msg)
+}
+
+/// AWS "Results per page in a QueryVectors response: Up to 100"
+/// (S3 Vectors limitations page, verified 2026-11-04).
+const QUERY_PAGE_MAX: usize = 100;
+
+/// QueryVectors page cursor (see `query_vectors` doc for the semantics).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct QueryCursor {
+    /// dataset (Lance manifest) version the logical query is pinned to.
+    v: u64,
+    /// absolute offset into the (distance, key)-ordered result list.
+    o: usize,
+    /// FNV-1a fingerprint binding topK/queryVector/filter/index identity.
+    f: u64,
+}
+
+fn encode_query_token(c: &QueryCursor) -> String {
+    base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(c).unwrap_or_default())
+}
+
+fn decode_query_token(token: &str) -> Result<QueryCursor, ApiError> {
+    let bad = || ApiError::validation_field("nextToken", "invalid nextToken");
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .map_err(|_| bad())?;
+    serde_json::from_slice(&raw).map_err(|_| bad())
+}
+
+/// FNV-1a 64 (same hash family as `segment_of` — stable, dependency-free)
+/// over the canonical logical-query string. Binds everything that defines the
+/// result sequence: index identity, dimension, metric, topK, the query vector
+/// bits and the compiled filter's canonical JSON.
+fn query_fingerprint(
+    vb: &str,
+    ix: &str,
+    meta: &IndexMeta,
+    top_k: i64,
+    q: &[f32],
+    filter: Option<&crate::filter::Filter>,
+) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |s: &str| {
+        for b in s.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
     };
-    for (k, v) in map {
-        match k.as_str() {
-            "$and" => {
-                let serde_json::Value::Array(items) = v else {
-                    return Err(ApiError::validation("$and must be an array"));
-                };
-                if items.is_empty() {
-                    return Err(ApiError::validation("$and must not be empty"));
-                }
-                for item in items {
-                    validate_filter_supported(item)?;
-                }
-            }
-            other if other.starts_with('$') => {
-                return Err(ApiError::validation(format!(
-                    "filter operator {other} is unsupported in spike (supported: $eq, $and)"
-                )));
-            }
-            _field => match v {
-                serde_json::Value::Object(cond) => {
-                    if cond.is_empty() || cond.len() > 1 {
-                        return Err(ApiError::validation(format!(
-                            "field condition for {k:?} must contain exactly one supported \
-                             operator (spike: $eq)"
-                        )));
-                    }
-                    for (op, _) in cond {
-                        if op != "$eq" {
-                            return Err(ApiError::validation(format!(
-                                "filter operator {op} is unsupported in spike \
-                                 (supported: $eq, $and)"
-                            )));
-                        }
-                    }
-                }
-                _scalar => {} // implicit $eq shorthand
-            },
-        }
+    feed(vb);
+    feed("\x01");
+    feed(ix);
+    feed(&format!(
+        "\x01{}\x01{}\x01{top_k}\x01",
+        meta.dimension, meta.distance_metric
+    ));
+    for v in q {
+        feed(&format!("{}:", v.to_bits()));
     }
-    Ok(())
-}
-
-/// Evaluate the validated filter subset against a vector's metadata document.
-pub fn eval_filter(f: &serde_json::Value, meta: &serde_json::Value) -> bool {
-    let serde_json::Value::Object(map) = f else {
-        return false;
-    };
-    map.iter().all(|(k, v)| match k.as_str() {
-        "$and" => match v {
-            serde_json::Value::Array(items) => items.iter().all(|i| eval_filter(i, meta)),
-            _ => false,
-        },
-        field => {
-            let stored = meta.get(field);
-            match v {
-                serde_json::Value::Object(cond) => cond
-                    .get("$eq")
-                    .map(|want| eq_match(want, stored))
-                    .unwrap_or(false),
-                want => eq_match(want, stored),
-            }
-        }
-    })
-}
-
-fn eval_filter_closure(
-    f: serde_json::Value,
-) -> Box<dyn Fn(&serde_json::Value) -> bool + Send + Sync> {
-    // cheap per-row re-evaluation of the (small) filter tree — carried over
-    // spike simplicity (see store::query_table TODO: predicate pushdown).
-    Box::new(move |meta| eval_filter(&f, meta))
-}
-
-/// $eq semantics: numbers compare as f64 (1 == 1.0); bool/string/null strict;
-/// stored list matches if ANY element equals the filter value; type mismatch -> no match.
-fn eq_match(want: &serde_json::Value, stored: Option<&serde_json::Value>) -> bool {
-    match stored {
-        None | Some(serde_json::Value::Null) => matches!(want, serde_json::Value::Null),
-        Some(serde_json::Value::Array(items)) => items.iter().any(|i| eq_match(want, Some(i))),
-        Some(serde_json::Value::Number(w)) => match want {
-            serde_json::Value::Number(n) => n.as_f64().zip(w.as_f64()).is_some_and(|(a, b)| a == b),
-            _ => false,
-        },
-        Some(serde_json::Value::String(s)) => {
-            matches!(want, serde_json::Value::String(x) if x == s)
-        }
-        Some(serde_json::Value::Bool(b)) => matches!(want, serde_json::Value::Bool(x) if x == b),
-        Some(serde_json::Value::Object(_)) => want == stored.unwrap(),
+    if let Some(f) = filter {
+        feed("\x02");
+        feed(&f.to_json().to_string());
     }
+    h
 }
 
 // ---------------------------------------------------------------------------
@@ -2389,9 +2463,14 @@ mod tests {
         assert!((vs[1]["distance"].as_f64().unwrap() - 5.0).abs() < 1e-5); // 3-4-5
     }
 
-    /// Filter subset: implicit AND + $eq + $and; unsupported ops -> 400.
+    /// Full AWS operator set over HTTP (M1 T5, design.md §4.6): every
+    /// operator hit + miss + the pinned boundary semantics (missing field /
+    /// type mismatch / list any-element), implicit AND, same-field multi-op
+    /// AND, $and/$or nesting, filter-then-topK ordering. Validation errors
+    /// and non-filterable keys: filter_validation_errors /
+    /// filter_nonfilterable_key_rejected.
     #[tokio::test]
-    async fn filter_subset() {
+    async fn filter_full_operator_set() {
         let dir = tempfile::tempdir().unwrap();
         let r = crate::build_router(state(dir.path()));
         call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"vbf"}"#).await;
@@ -2406,15 +2485,40 @@ mod tests {
             &r,
             "/PutVectors",
             r#"{"vectorBucketName":"vbf","indexName":"ixf","vectors":[
-                {"key":"a","data":{"float32":[0,0]},"metadata":{"genre":"jazz","n":1}},
-                {"key":"b","data":{"float32":[1,0]},"metadata":{"genre":"rock","n":2}},
-                {"key":"c","data":{"float32":[2,0]},"metadata":{"genre":"jazz","n":2,"tags":["x","y"]}},
+                {"key":"a","data":{"float32":[0,0]},"metadata":{"genre":"jazz","n":1,"ok":true}},
+                {"key":"b","data":{"float32":[1,0]},"metadata":{"genre":"rock","n":2,"ok":false}},
+                {"key":"c","data":{"float32":[2,0]},
+                 "metadata":{"genre":"jazz","n":2,"tags":["x","y"],"nums":[1,7]}},
                 {"key":"d","data":{"float32":[3,0]}}
             ]}"#,
         )
         .await;
 
-        // $eq single
+        // helper: run a filter against ixf, return sorted key list
+        async fn qkeys(
+            r: &axum::Router,
+            filter: &str,
+        ) -> (
+            StatusCode,
+            Option<Vec<serde_json::Value>>,
+            serde_json::Value,
+        ) {
+            let (st, _, b) = call(
+                r,
+                "/QueryVectors",
+                &format!(
+                    r#"{{"vectorBucketName":"vbf","indexName":"ixf","topK":10,
+                        "queryVector":{{"float32":[0,0]}},"filter":{filter}}}"#
+                ),
+            )
+            .await;
+            let keys = b["vectors"]
+                .as_array()
+                .map(|vs| vs.iter().map(|v| v["key"].clone()).collect());
+            (st, keys, b)
+        }
+
+        // $eq single (shorthand) with distances + metadata round-trip
         let (st, _, b) = call(
             &r,
             "/QueryVectors",
@@ -2429,85 +2533,67 @@ mod tests {
         assert_eq!(vs[0]["key"], json!("a"));
         assert!((vs[0]["distance"].as_f64().unwrap()).abs() < 1e-6);
         assert_eq!(vs[1]["key"], json!("c"));
-        assert!((vs[1]["distance"].as_f64().unwrap() - 2.0).abs() < 1e-6); // Rust path L2
+        assert!((vs[1]["distance"].as_f64().unwrap() - 2.0).abs() < 1e-6);
+        assert_eq!(vs[1]["metadata"]["tags"], json!(["x", "y"]));
 
-        // multi-key implicit AND + numeric $eq (1 == 1.0)
-        let (st, _, b) = call(
-            &r,
-            "/QueryVectors",
-            r#"{"vectorBucketName":"vbf","indexName":"ixf","topK":10,
-                "queryVector":{"float32":[0,0]},
-                "filter":{"genre":"jazz","n":{"$eq":1.0}}}"#,
-        )
-        .await;
-        assert_eq!(st, StatusCode::OK);
-        let vs = b["vectors"].as_array().unwrap();
-        assert_eq!(vs.len(), 1);
-        assert_eq!(vs[0]["key"], json!("a"));
+        // the operator matrix: (filter, expected keys)
+        let cases: Vec<(&str, Vec<&str>)> = vec![
+            ("{\"genre\":\"jazz\"}", vec!["a", "c"]), // $eq shorthand
+            ("{\"genre\":{\"$eq\":\"rock\"}}", vec!["b"]), // explicit $eq
+            ("{\"n\":{\"$eq\":1.0}}", vec!["a"]),     // 1 == 1.0
+            ("{\"n\":1}", vec!["a"]),                 // int literal
+            ("{\"ok\":true}", vec!["a"]),             // bool $eq
+            ("{\"genre\":\"soul\"}", vec![]),         // $eq miss
+            ("{\"ghost\":\"x\"}", vec![]),            // missing -> false
+            ("{\"n\":\"2\"}", vec![]),                // mismatch -> no match
+            ("{\"genre\":{\"$ne\":\"jazz\"}}", vec!["b", "d"]), // $ne (d: missing -> true)
+            ("{\"genre\":{\"$ne\":\"rock\"}}", vec!["a", "c", "d"]),
+            ("{\"n\":{\"$ne\":\"2\"}}", vec!["a", "b", "c", "d"]), // mismatch -> true
+            ("{\"n\":{\"$gt\":1}}", vec!["b", "c"]),               // range
+            ("{\"n\":{\"$gte\":2}}", vec!["b", "c"]),
+            ("{\"n\":{\"$lt\":2}}", vec!["a"]),
+            ("{\"n\":{\"$lte\":1}}", vec!["a"]),
+            ("{\"n\":{\"$gt\":2}}", vec![]),     // strict
+            ("{\"ghost\":{\"$gt\":0}}", vec![]), // missing -> false
+            ("{\"genre\":{\"$startsWith\":\"ja\"}}", vec!["a", "c"]),
+            ("{\"genre\":{\"$startsWith\":\"jazz\"}}", vec!["a", "c"]),
+            ("{\"genre\":{\"$startsWith\":\"jazzy\"}}", vec![]),
+            ("{\"n\":{\"$startsWith\":\"1\"}}", vec![]), // non-string stored
+            ("{\"genre\":{\"$in\":[\"rock\",\"soul\"]}}", vec!["b"]),
+            ("{\"genre\":{\"$in\":[\"jazz\",7,true]}}", vec!["a", "c"]), // mixed types ok
+            ("{\"n\":{\"$in\":[1,2]}}", vec!["a", "b", "c"]),
+            (
+                "{\"genre\":{\"$nin\":[\"rock\",\"soul\"]}}",
+                vec!["a", "c", "d"],
+            ),
+            ("{\"n\":{\"$nin\":[1,2]}}", vec!["d"]), // missing -> true
+            ("{\"genre\":{\"$exists\":true}}", vec!["a", "b", "c"]),
+            ("{\"genre\":{\"$exists\":false}}", vec!["d"]),
+            ("{\"tags\":\"y\"}", vec!["c"]), // list any-element $eq
+            ("{\"tags\":{\"$eq\":7}}", vec![]), // list ["x","y"] has no 7
+            ("{\"nums\":7}", vec!["c"]),     // list [1,7] any-element
+            ("{\"nums\":{\"$in\":[7,9]}}", vec!["c"]), // list x $in
+            ("{\"nums\":{\"$nin\":[7,9]}}", vec!["a", "b", "d"]),
+            ("{\"tags\":{\"$ne\":\"z\"}}", vec!["a", "b", "c", "d"]), // $ne on list owner
+            ("{\"tags\":{\"$startsWith\":\"x\"}}", vec![]), // no any-element for startsWith
+            ("{\"n\":{\"$gte\":1,\"$lte\":1}}", vec!["a"]), // same-field multi-op AND
+            ("{\"genre\":\"jazz\",\"n\":2}", vec!["c"]),    // implicit top-level AND
+            ("{\"$and\":[{\"genre\":\"jazz\"},{\"n\":2}]}", vec!["c"]),
+            ("{\"$or\":[{\"genre\":\"rock\"},{\"n\":1}]}", vec!["a", "b"]),
+            (
+                "{\"$or\":[{\"$and\":[{\"genre\":\"jazz\"},{\"ok\":true}]},{\"n\":3}]}",
+                vec!["a"],
+            ), // 2-level nesting
+            ("{}", vec!["a", "b", "c", "d"]), // empty filter = all
+        ];
+        for (filter, want) in cases {
+            let (st, keys, b) = qkeys(&r, filter).await;
+            assert_eq!(st, StatusCode::OK, "filter {filter}: {b}");
+            let want: Vec<serde_json::Value> = want.into_iter().map(|k| json!(k)).collect();
+            assert_eq!(keys, Some(want), "filter {filter}");
+        }
 
-        // $and explicit
-        let (st, _, b) = call(
-            &r,
-            "/QueryVectors",
-            r#"{"vectorBucketName":"vbf","indexName":"ixf","topK":10,
-                "queryVector":{"float32":[0,0]},
-                "filter":{"$and":[{"genre":"rock"},{"n":2}]}}"#,
-        )
-        .await;
-        assert_eq!(st, StatusCode::OK);
-        let vs = b["vectors"].as_array().unwrap();
-        assert_eq!(vs.len(), 1);
-        assert_eq!(vs[0]["key"], json!("b"));
-
-        // list metadata: any-element match
-        let (st, _, b) = call(
-            &r,
-            "/QueryVectors",
-            r#"{"vectorBucketName":"vbf","indexName":"ixf","topK":10,
-                "queryVector":{"float32":[0,0]},"filter":{"tags":"y"}}"#,
-        )
-        .await;
-        assert_eq!(st, StatusCode::OK);
-        let vs = b["vectors"].as_array().unwrap();
-        assert_eq!(vs.len(), 1);
-        assert_eq!(vs[0]["key"], json!("c"));
-
-        // filter excludes vectors without metadata
-        let (st, _, b) = call(
-            &r,
-            "/QueryVectors",
-            r#"{"vectorBucketName":"vbf","indexName":"ixf","topK":10,
-                "queryVector":{"float32":[0,0]},"filter":{"genre":{"$eq":"jazz"}},
-                "returnMetadata":true}"#,
-        )
-        .await;
-        assert_eq!(st, StatusCode::OK);
-        assert_eq!(b["vectors"].as_array().unwrap().len(), 2);
-
-        // unsupported operator -> ValidationException with "unsupported in spike"
-        let (st, h, b) = call(
-            &r,
-            "/QueryVectors",
-            r#"{"vectorBucketName":"vbf","indexName":"ixf","topK":10,
-                "queryVector":{"float32":[0,0]},"filter":{"n":{"$gt":1}}}"#,
-        )
-        .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
-        assert_eq!(errortype(&h), Some("ValidationException"));
-        let msg = b["message"].as_str().unwrap();
-        assert!(msg.contains("unsupported in spike"), "{msg}");
-
-        // unsupported $or
-        let (st, _, _) = call(
-            &r,
-            "/QueryVectors",
-            r#"{"vectorBucketName":"vbf","indexName":"ixf","topK":10,
-                "queryVector":{"float32":[0,0]},"filter":{"$or":[{"genre":"jazz"}]}}"#,
-        )
-        .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST);
-
-        // filter honoring topK truncation (pre-filter then topK)
+        // pre-filter then topK: b (d=1) beats c (d=2)
         let (st, _, b) = call(
             &r,
             "/QueryVectors",
@@ -2518,7 +2604,531 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         let vs = b["vectors"].as_array().unwrap();
         assert_eq!(vs.len(), 1);
-        assert_eq!(vs[0]["key"], json!("b")); // b dist 1.0 < c dist 2.0
+        assert_eq!(vs[0]["key"], json!("b"));
+        assert!((vs[0]["distance"].as_f64().unwrap() - 1.0).abs() < 1e-6);
+    }
+
+    /// Filter structural validation over HTTP: every illegal shape ->
+    /// ValidationException with fieldList path "filter" (the operator matrix
+    /// lives in filter_full_operator_set; unit-level cases in filter.rs).
+    #[tokio::test]
+    async fn filter_validation_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"vbv"}"#).await;
+        call(
+            &r,
+            "/CreateIndex",
+            r#"{"vectorBucketName":"vbv","indexName":"ixv","dataType":"float32",
+                "dimension":2,"distanceMetric":"euclidean"}"#,
+        )
+        .await;
+        call(
+            &r,
+            "/PutVectors",
+            r#"{"vectorBucketName":"vbv","indexName":"ixv","vectors":[
+                {"key":"a","data":{"float32":[0,0]},"metadata":{"g":"x"}}]}"#,
+        )
+        .await;
+        let q = |filter: &str| {
+            format!(
+                r#"{{"vectorBucketName":"vbv","indexName":"ixv","topK":10,
+                    "queryVector":{{"float32":[0,0]}},"filter":{filter}}}"#
+            )
+        };
+
+        let bad_filters = [
+            "\"just a string\"",
+            "[{\"a\":1}]",
+            "{\"$regex\":\"x\"}", // typo'd / unsupported operator
+            "{\"$nor\":[{\"a\":1}]}",
+            "{\"$and\":[]}",
+            "{\"$or\":[]}",
+            "{\"$and\":{\"a\":1}}",
+            "{\"a\":{\"$typo\":1}}",
+            "{\"a\":{}}",
+            "{\"a\":null}",
+            "{\"a\":[\"x\"]}", // shorthand list = $eq array input
+            "{\"a\":{\"$gt\":\"7\"}}",
+            "{\"a\":{\"$startsWith\":7}}",
+            "{\"a\":{\"$in\":[]}}",
+            "{\"a\":{\"$in\":[\"x\",null]}}",
+            "{\"a\":{\"$nin\":[]}}",
+            "{\"a\":{\"$exists\":\"yes\"}}",
+        ];
+        for f in bad_filters {
+            let (st, _, b) = call(&r, "/QueryVectors", &q(f)).await;
+            assert_eq!(
+                st,
+                StatusCode::BAD_REQUEST,
+                "filter {f} must be rejected: {b}"
+            );
+            assert_eq!(b["__type"], json!("ValidationException"), "{f}: {b}");
+            assert_eq!(b["fieldList"][0]["path"], json!("filter"), "{f}: {b}");
+        }
+
+        // constraint cap: exactly 100 legal, 101 rejected (AWS ENHANCED limit)
+        let list = |n: usize| {
+            format!(
+                "[{}]",
+                (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+            )
+        };
+        let (st, _, b) = call(
+            &r,
+            "/QueryVectors",
+            &q(&format!(
+                "{{\"g\":{{\"$in\":{}}}}}",
+                list(crate::filter::MAX_CONSTRAINTS)
+            )),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "100 constraints must pass: {b}");
+        let (st, _, b) = call(
+            &r,
+            "/QueryVectors",
+            &q(&format!(
+                "{{\"g\":{{\"$in\":{}}}}}",
+                list(crate::filter::MAX_CONSTRAINTS + 1)
+            )),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert!(
+            b["message"].as_str().unwrap().contains("constraints"),
+            "{b}"
+        );
+    }
+
+    /// Filters naming an index's nonFilterableMetadataKeys are rejected (AWS:
+    /// "can't be used in query filters"; error shape undocumented ->
+    /// ValidationException, TODO(AWS 对拍)); the values still round-trip via
+    /// returnMetadata, and non-declared keys filter normally.
+    #[tokio::test]
+    async fn filter_nonfilterable_key_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"vbnf"}"#).await;
+        call(
+            &r,
+            "/CreateIndex",
+            r#"{"vectorBucketName":"vbnf","indexName":"ixnf","dataType":"float32",
+                "dimension":2,"distanceMetric":"euclidean",
+                "metadataConfiguration":{"nonFilterableMetadataKeys":["big"]}}"#,
+        )
+        .await;
+        call(
+            &r,
+            "/PutVectors",
+            r#"{"vectorBucketName":"vbnf","indexName":"ixnf","vectors":[
+                {"key":"a","data":{"float32":[0,0]},"metadata":{"big":"blob","g":"x"}}]}"#,
+        )
+        .await;
+
+        // filter over the declared non-filterable key -> rejected
+        let (st, h, b) = call(
+            &r,
+            "/QueryVectors",
+            r#"{"vectorBucketName":"vbnf","indexName":"ixnf","topK":10,
+                "queryVector":{"float32":[0,0]},"filter":{"big":"blob"}}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(errortype(&h), Some("ValidationException"));
+        assert!(
+            b["message"].as_str().unwrap().contains("non-filterable"),
+            "{b}"
+        );
+        // ...but returnMetadata still surfaces it alongside a legal filter
+        let (st, _, b) = call(
+            &r,
+            "/QueryVectors",
+            r#"{"vectorBucketName":"vbnf","indexName":"ixnf","topK":1,
+                "queryVector":{"float32":[0,0]},"filter":{"g":"x"},"returnMetadata":true}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["vectors"][0]["metadata"], json!({"big":"blob","g":"x"}));
+    }
+
+    /// Dynamic mirror columns + evolution (M1 T5, §5.3):
+    /// - batch 1 creates `i` (number) -> evolution adds metadata.i
+    /// - batch 2 adds three NEW keys at once (multi-child AllNulls)
+    /// - GetVectors output stays byte-identical (blob authoritative)
+    /// - list keys never mirror but round-trip fine
+    /// (drift negatives: metadata_type_drift_rejected)
+    #[tokio::test]
+    async fn metadata_evolution_and_type_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"vbe"}"#).await;
+        call(
+            &r,
+            "/CreateIndex",
+            r#"{"vectorBucketName":"vbe","indexName":"ixe","dataType":"float32",
+                "dimension":2,"distanceMetric":"euclidean"}"#,
+        )
+        .await;
+        // batch 1: one scalar key
+        call(
+            &r,
+            "/PutVectors",
+            r#"{"vectorBucketName":"vbe","indexName":"ixe","vectors":[
+                {"key":"a","data":{"float32":[0,0]},"metadata":{"i":1}}]}"#,
+        )
+        .await;
+        // read back unchanged (number formatting preserved: 1 not 1.0)
+        let (st, _, b) = call(
+            &r,
+            "/GetVectors",
+            r#"{"vectorBucketName":"vbe","indexName":"ixe","keys":["a"],
+                "returnMetadata":true}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["vectors"][0]["metadata"], json!({"i":1}));
+        assert_eq!(b["vectors"][0]["metadata"].to_string(), r#"{"i":1}"#);
+
+        // batch 2: three new keys of all three scalar kinds at once
+        call(
+            &r,
+            "/PutVectors",
+            r#"{"vectorBucketName":"vbe","indexName":"ixe","vectors":[
+                {"key":"b","data":{"float32":[1,0]},
+                 "metadata":{"i":2,"tag":"t1","ok":true,"lst":[1,"x",false]}}]}"#,
+        )
+        .await;
+        // old row: new keys absent; new row: everything round-trips incl. list
+        let (st, _, b) = call(
+            &r,
+            "/GetVectors",
+            r#"{"vectorBucketName":"vbe","indexName":"ixe","keys":["a","b"],
+                "returnMetadata":true}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let by: std::collections::HashMap<_, _> = b["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| (v["key"].clone(), v["metadata"].clone()))
+            .collect();
+        assert_eq!(by[&json!("a")], json!({"i":1}), "old row must be unchanged");
+        assert_eq!(
+            by[&json!("b")],
+            json!({"i":2,"tag":"t1","ok":true,"lst":[1,"x",false]}),
+            "mixed list round-trips"
+        );
+
+        // filtering works across evolved keys (engine pushdown route)
+        let (st, _, b) = call(
+            &r,
+            "/QueryVectors",
+            r#"{"vectorBucketName":"vbe","indexName":"ixe","topK":10,
+                "queryVector":{"float32":[0,0]},"filter":{"tag":{"$startsWith":"t"}}}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["vectors"].as_array().unwrap().len(), 1);
+
+        // whole-document replacement still drops old keys on upsert
+        call(
+            &r,
+            "/PutVectors",
+            r#"{"vectorBucketName":"vbe","indexName":"ixe","vectors":[
+                {"key":"a","data":{"float32":[0,0]},"metadata":{"tag":"only"}}]}"#,
+        )
+        .await;
+        let (st, _, b) = call(
+            &r,
+            "/GetVectors",
+            r#"{"vectorBucketName":"vbe","indexName":"ixe","keys":["a"],
+                "returnMetadata":true}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(b["vectors"][0]["metadata"], json!({"tag":"only"}));
+        // ...and the mirror follows (querying i no longer matches a)
+        let (_st, _, b) = call(
+            &r,
+            "/QueryVectors",
+            r#"{"vectorBucketName":"vbe","indexName":"ixe","topK":10,
+                "queryVector":{"float32":[0,0]},"filter":{"i":1}}"#,
+        )
+        .await;
+        assert_eq!(b["vectors"].as_array().unwrap().len(), 0);
+    }
+
+    /// Metadata scalar type drift -> ValidationException (fail-closed, the
+    /// schema is the per-key type registry; TODO(AWS 对拍) whether the real
+    /// service accepts per-key mixed types): number->string, string->bool,
+    /// number->list, and in-batch drift; list-after-list stays legal.
+    #[tokio::test]
+    async fn metadata_type_drift_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"vbd"}"#).await;
+        call(
+            &r,
+            "/CreateIndex",
+            r#"{"vectorBucketName":"vbd","indexName":"ixd","dataType":"float32",
+                "dimension":2,"distanceMetric":"euclidean"}"#,
+        )
+        .await;
+        call(
+            &r,
+            "/PutVectors",
+            r#"{"vectorBucketName":"vbd","indexName":"ixd","vectors":[
+                {"key":"a","data":{"float32":[0,0]},"metadata":{"i":1,"tag":"t","lst":[1]}}]}"#,
+        )
+        .await;
+
+        let put = |meta: &str| {
+            format!(
+                r#"{{"vectorBucketName":"vbd","indexName":"ixd","vectors":[
+                    {{"key":"c","data":{{"float32":[2,0]}},"metadata":{meta}}}]}}"#
+            )
+        };
+        // number -> string (message names the key)
+        let (st, h, b) = call(&r, "/PutVectors", &put(r#"{"i":"one"}"#)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(errortype(&h), Some("ValidationException"));
+        assert!(b["message"].as_str().unwrap().contains("\"i\""), "{b}");
+        // string -> bool
+        let (st, _, _) = call(&r, "/PutVectors", &put(r#"{"tag":false}"#)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        // number -> list
+        let (st, _, _) = call(&r, "/PutVectors", &put(r#"{"i":[1,2]}"#)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        // in-batch drift (two rows, same new key, different scalar types)
+        let (st, _, _) = call(
+            &r,
+            "/PutVectors",
+            r#"{"vectorBucketName":"vbd","indexName":"ixd","vectors":[
+                {"key":"c","data":{"float32":[2,0]},"metadata":{"fresh":1}},
+                {"key":"d","data":{"float32":[2,0]},"metadata":{"fresh":"x"}}]}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        // list-after-list for the same key is fine (never mirrored)
+        let (st, _, b) = call(&r, "/PutVectors", &put(r#"{"lst":["another"]}"#)).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+    }
+
+    /// QueryVectors pagination (M1 T5, 附录A): topK=250 -> 100 + 100 + 50,
+    /// nextToken round-trips, order is (distance, key) stable across pages,
+    /// token replay against a different query -> 400, garbage token -> 400,
+    /// and paging is isolated from writes made between pages (version pin).
+    #[tokio::test]
+    async fn query_vectors_pagination() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"vbp"}"#).await;
+        call(
+            &r,
+            "/CreateIndex",
+            r#"{"vectorBucketName":"vbp","indexName":"ixp","dataType":"float32",
+                "dimension":2,"distanceMetric":"euclidean"}"#,
+        )
+        .await;
+        // 250 vectors on a line: distance = key index; identical metadata so
+        // the filter passes everything and ordering is fully deterministic
+        let mut vectors =
+            String::from("{\"vectorBucketName\":\"vbp\",\"indexName\":\"ixp\",\"vectors\":[");
+        for i in 0..250 {
+            if i > 0 {
+                vectors.push(',');
+            }
+            vectors.push_str(&format!(
+                r#"{{"key":"k{:03}","data":{{"float32":[{},0]}},"metadata":{{"i":{}}}}}"#,
+                i,
+                i,
+                i % 10
+            ));
+        }
+        vectors.push_str("]}");
+        let (st, _, b) = call(&r, "/PutVectors", &vectors).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+
+        let q = r#"{"vectorBucketName":"vbp","indexName":"ixp","topK":250,
+            "queryVector":{"float32":[0,0]},"filter":{"i":{"$gte":0}},"returnDistance":true}"#;
+
+        // page 1: 100 + token
+        let (st, _, b) = call(&r, "/QueryVectors", q).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let vs = b["vectors"].as_array().unwrap();
+        assert_eq!(vs.len(), 100, "page size cap is 100");
+        assert_eq!(vs[0]["key"], json!("k000"));
+        assert_eq!(vs[99]["key"], json!("k099"));
+        let token = b["nextToken"]
+            .as_str()
+            .expect("token on page 1")
+            .to_string();
+
+        // page 2: next 100
+        let q2 = format!(
+            "{{\"vectorBucketName\":\"vbp\",\"indexName\":\"ixp\",\"topK\":250,
+                \"queryVector\":{{\"float32\":[0,0]}},\"filter\":{{\"i\":{{\"$gte\":0}}}},
+                \"returnDistance\":true,\"nextToken\":\"{token}\"}}"
+        );
+        let (st, _, b) = call(&r, "/QueryVectors", &q2).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let vs = b["vectors"].as_array().unwrap();
+        assert_eq!(vs.len(), 100);
+        assert_eq!(vs[0]["key"], json!("k100"));
+        assert_eq!(vs[99]["key"], json!("k199"));
+        assert!(!b["nextToken"].is_null());
+        let token2 = b["nextToken"].as_str().unwrap().to_string();
+
+        // a write between pages must NOT shift page 3 (version-pinned)
+        let (st, _, b) = call(
+            &r,
+            "/PutVectors",
+            r#"{"vectorBucketName":"vbp","indexName":"ixp","vectors":[
+                {"key":"k000","data":{"float32":[999,0]},"metadata":{"i":0}}]}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+
+        // page 3: final 50, no token
+        let q3 = format!(
+            "{{\"vectorBucketName\":\"vbp\",\"indexName\":\"ixp\",\"topK\":250,
+                \"queryVector\":{{\"float32\":[0,0]}},\"filter\":{{\"i\":{{\"$gte\":0}}}},
+                \"returnDistance\":true,\"nextToken\":\"{token2}\"}}"
+        );
+        let (st, _, b) = call(&r, "/QueryVectors", &q3).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let vs = b["vectors"].as_array().unwrap();
+        assert_eq!(vs.len(), 50);
+        assert_eq!(vs[0]["key"], json!("k200"));
+        assert_eq!(vs[49]["key"], json!("k249"));
+        assert!(
+            b.get("nextToken").is_none() || b["nextToken"].is_null(),
+            "no token at the end"
+        );
+
+        // exact topK <= 100: single page, no token
+        let (st, _, b) = call(
+            &r,
+            "/QueryVectors",
+            r#"{"vectorBucketName":"vbp","indexName":"ixp","topK":100,
+                "queryVector":{"float32":[0,0]},"filter":{"i":0}}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["vectors"].as_array().unwrap().len(), 25); // i%10==0 over 0..250
+        assert!(
+            b.get("nextToken").is_none() || b["nextToken"].is_null(),
+            "{b}"
+        );
+
+        // boto3-shaped flow: default members absent when not requested
+        let (st, _, b) = call(
+            &r,
+            "/QueryVectors",
+            r#"{"vectorBucketName":"vbp","indexName":"ixp","topK":5,
+                "queryVector":{"float32":[0,0]},"filter":{"i":0}}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert!(b["vectors"][0].get("distance").is_none());
+        assert!(b["vectors"][0].get("metadata").is_none());
+        assert_eq!(b["distanceMetric"], json!("euclidean"));
+    }
+
+    /// QueryVectors token negatives: a token replayed against a different
+    /// query (filter or queryVector) -> 400, garbage token -> 400, valid
+    /// base64-but-nonsense -> 400.
+    #[tokio::test]
+    async fn query_vectors_pagination_token_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"vbt"}"#).await;
+        call(
+            &r,
+            "/CreateIndex",
+            r#"{"vectorBucketName":"vbt","indexName":"ixt","dataType":"float32",
+                "dimension":2,"distanceMetric":"euclidean"}"#,
+        )
+        .await;
+        let mut vectors =
+            String::from("{\"vectorBucketName\":\"vbt\",\"indexName\":\"ixt\",\"vectors\":[");
+        for i in 0..150 {
+            if i > 0 {
+                vectors.push(',');
+            }
+            vectors.push_str(&format!(
+                r#"{{"key":"k{:03}","data":{{"float32":[{},0]}},"metadata":{{"i":{}}}}}"#,
+                i,
+                i,
+                i % 10
+            ));
+        }
+        vectors.push_str("]}");
+        let (st, _, b) = call(&r, "/PutVectors", &vectors).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+
+        // page 1 of a topK=150 query -> token
+        let (st, _, b) = call(
+            &r,
+            "/QueryVectors",
+            r#"{"vectorBucketName":"vbt","indexName":"ixt","topK":150,
+                "queryVector":{"float32":[0,0]},"filter":{"i":{"$gte":0}}}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["vectors"].as_array().unwrap().len(), 100);
+        let token = b["nextToken"].as_str().expect("token").to_string();
+
+        // different filter with the same token -> 400
+        let (st, h, b) = call(
+            &r,
+            "/QueryVectors",
+            &format!(
+                r#"{{"vectorBucketName":"vbt","indexName":"ixt","topK":150,
+                    "queryVector":{{"float32":[0,0]}},
+                    "filter":{{"i":{{"$gte":5}}}},"nextToken":"{token}"}}"#
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(errortype(&h), Some("ValidationException"));
+        assert!(b["message"].as_str().unwrap().contains("nextToken"), "{b}");
+
+        // different queryVector with the same token -> 400
+        let (st, _, _) = call(
+            &r,
+            "/QueryVectors",
+            &format!(
+                r#"{{"vectorBucketName":"vbt","indexName":"ixt","topK":150,
+                    "queryVector":{{"float32":[1,0]}},
+                    "filter":{{"i":{{"$gte":0}}}},"nextToken":"{token}"}}"#
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // garbage token -> 400
+        let (st, _, _) = call(
+            &r,
+            "/QueryVectors",
+            r#"{"vectorBucketName":"vbt","indexName":"ixt","topK":150,
+                "queryVector":{"float32":[0,0]},"filter":{"i":0},
+                "nextToken":"@@not-base64@@"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // valid base64 but nonsense JSON -> 400
+        let (st, _, _) = call(
+            &r,
+            "/QueryVectors",
+            r#"{"vectorBucketName":"vbt","indexName":"ixt","topK":150,
+                "queryVector":{"float32":[0,0]},"filter":{"i":0},
+                "nextToken":"bm90anNvbg=="}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
     }
 
     // ------------------------------------------------------------------
