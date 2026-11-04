@@ -18,6 +18,7 @@
 //! object with `schema_version`; stderr = progress; exit 0 normal, non-zero
 //! with `{code, message, hint}` on stderr otherwise.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -126,6 +127,30 @@ pub struct IndexRow {
     pub error: Option<String>,
 }
 
+/// One DERIVED (x_vf_derived-stamped) index of an ingest bucket — the local
+/// ingest block's row (T7). Read from the catalog stamp, never from a
+/// config-derived spec: status is read-only and must not load embedders.
+#[derive(Debug, Serialize)]
+pub struct DerivedIndexRow {
+    pub index: String,
+    pub embedder: String,
+    pub model: String,
+    pub dim: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vectors: Option<u64>,
+}
+
+/// One ingest bucket's local summary (T7): active fingerprint, marker
+/// status counts, derived indexes.
+#[derive(Debug, Serialize)]
+pub struct IngestBucketRow {
+    pub bucket: String,
+    pub fingerprint: String,
+    /// marker status name -> count (the six SourceStatus states).
+    pub sources: BTreeMap<String, u64>,
+    pub derived: Vec<DerivedIndexRow>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct StatusReport {
     pub schema_version: u32,
@@ -142,6 +167,11 @@ pub struct StatusReport {
     pub index_details: Vec<IndexRow>,
     pub objects: usize,
     pub size_bytes: u64,
+    /// File-layer ingest summary (T7): one row per [ingest.<bucket>]
+    /// section; EMPTY when the config has no ingest sections (pure protocol
+    /// face) or is unparseable (doctor reports that case — status stays
+    /// read-only and quiet beyond a stderr warning).
+    pub ingest: Vec<IngestBucketRow>,
 }
 
 #[derive(Debug, Serialize)]
@@ -264,6 +294,7 @@ pub async fn gather(cfg: &StorageConfig) -> Result<StatusReport, Failure> {
         Backend::Memory => "memory",
         Backend::S3(_) => "s3",
     };
+    let ingest = gather_ingest(cfg, &storage).await;
     Ok(StatusReport {
         schema_version: SCHEMA_VERSION,
         mode: "data-dir",
@@ -279,7 +310,76 @@ pub async fn gather(cfg: &StorageConfig) -> Result<StatusReport, Failure> {
         index_details,
         objects,
         size_bytes,
+        ingest,
     })
+}
+
+/// The local ingest block (T7): buckets + source counts + derived indexes.
+/// Derived indexes come from the CATALOG's `x_vf_derived` stamps (not from
+/// config-derived specs — computing those needs loaded embedders, and status
+/// never loads models); the fingerprint is pure TOML. Read-only throughout.
+async fn gather_ingest(cfg: &StorageConfig, storage: &Storage) -> Vec<IngestBucketRow> {
+    let text = match std::fs::read_to_string(crate::config::config_path(&cfg.data_dir)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            eprintln!("vectorfs: warning: cannot read pipeline config: {e}");
+            return Vec::new();
+        }
+    };
+    let pcfg = match crate::pipeline::config::load_pipeline_config(&text) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "vectorfs: warning: pipeline config invalid (vectorfs doctor probes it): {e}"
+            );
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for vb in pcfg.ingest.keys() {
+        let fingerprint = pcfg.fingerprint(vb).expect("bucket in config");
+        let mut sources: BTreeMap<String, u64> = [
+            "PENDING",
+            "IN_PROGRESS",
+            "PARTIALLY_INDEXED",
+            "INDEXED",
+            "FAILED",
+            "DELETING",
+        ]
+        .iter()
+        .map(|s| (s.to_string(), 0))
+        .collect();
+        if let Ok(markers) = storage.list_sources(vb).await {
+            for m in markers {
+                *sources.entry(m.status.as_str().to_string()).or_insert(0) += 1;
+            }
+        }
+        let mut derived = Vec::new();
+        if let Ok(indexes) = storage.list_indexes(vb).await {
+            for meta in indexes.into_iter().filter(|m| m.x_vf_derived.is_some()) {
+                let stamp = meta.x_vf_derived.as_ref().expect("just filtered");
+                derived.push(DerivedIndexRow {
+                    index: meta.index_name.clone(),
+                    embedder: stamp.embedder.clone(),
+                    model: stamp.model.clone(),
+                    dim: stamp.dim,
+                    vectors: storage
+                        .count_vectors(vb, &meta.index_name)
+                        .await
+                        .ok()
+                        .map(|n| n as u64),
+                });
+            }
+        }
+        out.push(IngestBucketRow {
+            bucket: vb.clone(),
+            fingerprint,
+            sources,
+            derived,
+        });
+    }
+    out
 }
 
 fn store_failure(what: &'static str) -> impl Fn(crate::store::StoreError) -> Failure {
@@ -372,6 +472,39 @@ pub fn render_human(r: &StatusReport) -> String {
                 row.distance_metric,
                 vectors
             );
+        }
+    }
+    if !r.ingest.is_empty() {
+        let _ = writeln!(out, "  ingest:");
+        for row in &r.ingest {
+            let _ = writeln!(
+                out,
+                "    {} : fingerprint {}… sources {}",
+                row.bucket,
+                &row.fingerprint[..8],
+                row.sources.values().sum::<u64>()
+            );
+            let _ = writeln!(
+                out,
+                "      INDEXED={} PARTIAL={} PENDING={} IN_PROGRESS={} FAILED={} DELETING={}",
+                row.sources["INDEXED"],
+                row.sources["PARTIALLY_INDEXED"],
+                row.sources["PENDING"],
+                row.sources["IN_PROGRESS"],
+                row.sources["FAILED"],
+                row.sources["DELETING"],
+            );
+            for ix in &row.derived {
+                let vectors = ix
+                    .vectors
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".into());
+                let _ = writeln!(
+                    out,
+                    "      index {} (embedder={}, model={}, dim={}, vectors={})",
+                    ix.index, ix.embedder, ix.model, ix.dim, vectors
+                );
+            }
         }
     }
     out
@@ -522,7 +655,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use crate::store::{BucketMeta, IndexMeta};
+    use crate::store::{BucketMeta, DerivedIndexInfo, IndexMeta};
 
     fn storage_cfg(dir: &std::path::Path) -> StorageConfig {
         StorageConfig {
@@ -665,5 +798,117 @@ mod tests {
         let report = gather(&storage_cfg(dir.path())).await.unwrap();
         assert!(matches!(report.lock.state, LockState::Stale));
         assert!(render_human(&report).contains("STALE"));
+    }
+
+    /// T7: the local ingest block — buckets + source counts + derived
+    /// (stamped) indexes, all read from the catalog without loading any
+    /// model. A bucket whose derived index is a config-change LEFTOVER shows
+    /// up here too (0-row old index visible to the operator).
+    #[tokio::test]
+    async fn status_local_ingest_block_lists_buckets_counts_and_derived() {
+        let dir = tempfile::tempdir().unwrap();
+        // a valid pipeline config (fingerprint is pure TOML — no model load)
+        let fixture_dir = [
+            "vf/tests/fixtures/tiny-embedder",
+            "tests/fixtures/tiny-embedder",
+        ]
+        .iter()
+        .map(|p| p.to_string())
+        .find(|p| std::path::Path::new(p).join("model.onnx").is_file())
+        .expect("tiny-embedder fixture");
+        std::fs::create_dir_all(dir.path().join(".vectorfs")).unwrap();
+        std::fs::write(
+            dir.path().join(".vectorfs/vectorfs.toml"),
+            format!(
+                "[extractor.plain]\nkind = \"txt\"\n\n\
+                 [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {fixture_dir:?}\n\
+                 offline = true\n\n\
+                 [ingest.docs]\nscope = \"docs/**\"\nextract = {{ txt = \"plain\" }}\n\
+                 chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+                 embedders = [\"tiny\"]\n"
+            ),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(dir.path().join(".vectorfs/vectorfs.toml")).unwrap();
+        let pcfg = crate::pipeline::config::load_pipeline_config(&text).unwrap();
+
+        let storage = seed(dir.path()).await;
+        // a stamped derived index + a stale marker
+        storage
+            .create_index(&IndexMeta {
+                vector_bucket_name: "docs".into(),
+                index_name: "tiny-abcd1234".into(),
+                index_arn: "arn".into(),
+                creation_time_rfc3339: "t".into(),
+                creation_time_epoch: 0.0,
+                data_type: "float32".into(),
+                dimension: 8,
+                distance_metric: "cosine".into(),
+                non_filterable_metadata_keys: None,
+                index_mode: None,
+                x_vf_derived: Some(DerivedIndexInfo {
+                    key: "k".repeat(64),
+                    embedder: "tiny".into(),
+                    model: "tiny-fixture".into(),
+                    dim: 8,
+                }),
+            })
+            .await
+            .unwrap();
+        storage
+            .upsert_vectors(
+                "docs",
+                "tiny-abcd1234",
+                8,
+                vec![crate::store::VectorRow {
+                    key: "k1".into(),
+                    vector: vec![1.0; 8],
+                    metadata_json: None,
+                    filterable: Default::default(),
+                }],
+            )
+            .await
+            .unwrap();
+        storage
+            .save_source(
+                "docs",
+                &crate::ingest::marker::object_key_hash("docs/a.txt"),
+                &crate::store::SourceMarker {
+                    object_key: "docs/a.txt".into(),
+                    etag_sig: "s".into(),
+                    content_hash: "c".into(),
+                    pipeline_fingerprint: pcfg.fingerprint("docs").unwrap(),
+                    status: crate::store::SourceStatus::Indexed,
+                    status_reason: None,
+                    retries: 0,
+                    retries_exhausted: false,
+                    updated_at: "t".into(),
+                    chunks: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let report = gather(&storage_cfg(dir.path())).await.unwrap();
+        assert_eq!(report.ingest.len(), 1);
+        let row = &report.ingest[0];
+        assert_eq!(row.bucket, "docs");
+        assert_eq!(row.fingerprint, pcfg.fingerprint("docs").unwrap());
+        assert_eq!(row.sources["INDEXED"], 1);
+        // the UNSTAMPED seed indexes (chunks/titles) are NOT derived rows;
+        // the stamped one is, with its live vector count
+        assert_eq!(row.derived.len(), 1);
+        assert_eq!(row.derived[0].index, "tiny-abcd1234");
+        assert_eq!(row.derived[0].model, "tiny-fixture");
+        assert_eq!(row.derived[0].dim, 8);
+        assert_eq!(row.derived[0].vectors, Some(1));
+        // human rendering carries the block
+        let text = render_human(&report);
+        assert!(text.contains("ingest:"), "{text}");
+        assert!(text.contains("INDEXED=1 PARTIAL=0"), "{text}");
+        assert!(text.contains("tiny-abcd1234"), "{text}");
+        // json carries it too
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["ingest"][0]["bucket"], "docs");
     }
 }

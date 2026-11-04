@@ -826,6 +826,49 @@ impl Storage {
         Ok(out)
     }
 
+    /// Lean full-table enumeration for the file layer's reconciliation (M2
+    /// T7, design.md §5.10.5 "对账走 ListVectors+segments（非 Query）"):
+    /// one column-projected scan returning `(key, metadata)` for EVERY row —
+    /// no vectors, no KNN. This is the engine-side equivalent of paging
+    /// ListVectors for keys and then batching GetVectors for metadata, minus
+    /// the vector-column traffic both of those drag along (40 KB chunk-text
+    /// rows make that non-trivial); the GC and the reindex source-clear both
+    /// group these rows by `x-vf-src-uri`. Key order is the scan's native
+    /// order (callers only aggregate, never paginate).
+    pub async fn scan_vector_metadata(
+        &self,
+        vb: &str,
+        ix: &str,
+    ) -> Result<Vec<(String, Option<serde_json::Value>)>, StoreError> {
+        let table = self.open_table(vb, ix).await?;
+        let stream = table
+            .query()
+            .select(lancedb::query::Select::columns(&["key", "metadata_json"]))
+            .execute()
+            .await
+            .map_err(internal)?;
+        let mut out = Vec::new();
+        let mut stream = stream;
+        use futures_util::StreamExt;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(internal)?;
+            let Some(keys) = batch.column_by_name("key") else {
+                return Err(StoreError::Internal("missing key column".into()));
+            };
+            let keys = keys
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| StoreError::Internal("key column not utf8".into()))?;
+            let metas = batch
+                .column_by_name("metadata_json")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            for i in 0..batch.num_rows() {
+                out.push((keys.value(i).to_string(), metadata_at(metas, i)));
+            }
+        }
+        Ok(out)
+    }
+
     /// Delete rows by primary key (DeleteVectors, ≤500 keys) through the
     /// same arrow-bound predicate (`Predicate::Expr` → substrait; the SQL
     /// string route is deliberately unused). Deleting absent keys is a no-op

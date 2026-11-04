@@ -1,7 +1,8 @@
-//! `vectorfs doctor` (M1 T6, design.md §5.8): environment diagnostics for one data
-//! root. Every check reports PASS / WARN / FAIL, and every non-PASS carries
-//! an **executable** hint ("run: vectorfs init …", "restart the writer …") per the
-//! agent-first output contract (report.rs). Any FAIL exits 1.
+//! `vectorfs doctor` (M1 T6 + M2 T7, design.md §5.8/§5.10.5): environment
+//! diagnostics for one data root. Every check reports PASS / WARN / FAIL, and
+//! every non-PASS carries an **executable** hint ("run: vectorfs init …",
+//! "restart the writer …") per the agent-first output contract (report.rs).
+//! Any FAIL exits 1.
 //!
 //! Checks (in run order):
 //! 1. `backend-write` — data root writable (file) or S3 reachable + the
@@ -17,6 +18,21 @@
 //! 4. `indexes` — every index's Lance dataset opens and `count_rows` works.
 //! 5. `disk-free` — statvfs(2) on the data root (file backend); < 1 GiB
 //!    warns. Not applicable to s3/memory (reported as such).
+//! 6. `multipart` (T7) — PutSource's >100 MB path: a REAL
+//!    `put_multipart` + commit + delete of a multi-part probe object on the
+//!    live backend. S3 multipart semantics are design-verified (§5.10.5);
+//!    file/memory behavior is reported as whatever this probe honestly
+//!    observes, not assumed.
+//! 7. `model-ready` (T7) — every configured embedder's artifacts: ort
+//!    `path` directories complete (model.onnx + tokenizer.json), built-in
+//!    models checked against the `.complete` stamp + pinned files (fixture
+//!    or real model, same layout), openai endpoints shape-checked + api key
+//!    PRESENCE (config or env). No network, no model load.
+//! 8. `ingest` (T7) — the file-layer summary: per ingest bucket its active
+//!    fingerprint, marker counts, stale-fingerprint count (a drift is a WARN
+//!    pointing at `vectorfs serve --reindex`) and its derived (stamped)
+//!    indexes with row counts. The detail also states the GC orphan window
+//!    (= one scan period, `scan_interval_secs`, default 30s).
 //!
 //! A MISSING data root (file backend) is not a check row: it short-circuits
 //! to `{code: NO_DATA_ROOT, hint: run: vectorfs init …}` + exit 1 — there is
@@ -120,6 +136,9 @@ pub async fn run(cfg: &StorageConfig) -> Result<DoctorReport, Failure> {
     checks.push(check_lock(&backend, &storage).await);
     checks.push(check_indexes(&storage).await);
     checks.push(check_disk_free(&backend, cfg));
+    checks.push(check_multipart(&backend, &storage).await);
+    checks.push(check_models(cfg).await);
+    checks.push(check_ingest(cfg, &storage).await);
 
     let overall = if checks.iter().any(|c| c.status == CheckStatus::Fail) {
         CheckStatus::Fail
@@ -357,6 +376,378 @@ async fn check_indexes(storage: &Storage) -> Check {
     )
 }
 
+// ---------------------------------------------------------------------------
+// M2 T7 probes: multipart, model readiness, ingest summary
+// ---------------------------------------------------------------------------
+
+/// `multipart` (T7): run PutSource's big-object path FOR REAL — a probe
+/// object written through `put_multipart` with a deliberately tiny part size
+/// (so several parts commit), then deleted. The backend matrix verified S3
+/// multipart semantics during M0/M2 research; this probe reports whatever
+/// the LIVE backend honestly does on file/memory too (no assumed verdicts).
+async fn check_multipart(backend: &crate::backends::Backend, storage: &Storage) -> Check {
+    use object_store::ObjectStoreExt as _;
+    let key = backend.object_key(&format!(".vf-doctor-multipart-{}", probe_suffix()));
+    let payload = b"vectorfs doctor multipart probe payload: multiple tiny parts on purpose";
+    let upload = match storage.catalog().put_multipart(&key).await {
+        Ok(u) => u,
+        Err(e) => {
+            return Check::not_pass(
+                "multipart",
+                CheckStatus::Fail,
+                format!("starting a multipart upload failed: {e}"),
+                "large PutSource uploads (>100MB) would fail; check backend health and permissions",
+            );
+        }
+    };
+    // 32-byte parts over a 73-byte payload: 3 parts through the real
+    // commit path without moving real data.
+    let mut writer = object_store::WriteMultipart::new_with_chunk_size(upload, 32);
+    writer.write(payload);
+    match writer.finish().await {
+        Ok(_put_result) => {
+            if let Err(e) = crate::backends::delete_object(storage.catalog(), &key).await {
+                return Check::not_pass(
+                    "multipart",
+                    CheckStatus::Warn,
+                    format!("multipart probe object committed but not deletable: {e}"),
+                    "remove the .vectorfs/.vf-doctor-multipart-* object at the data root manually",
+                );
+            }
+            let what = match backend {
+                crate::backends::Backend::File { .. } => {
+                    "file backend: multipart upload (3-part commit + delete of the probe object)"
+                }
+                crate::backends::Backend::Memory => {
+                    "memory backend: multipart upload (3-part commit + delete of the probe object)"
+                }
+                crate::backends::Backend::S3(_) => {
+                    "s3 backend: multipart upload (3-part commit + delete of the probe object)"
+                }
+            };
+            Check::pass("multipart", what)
+        }
+        Err(e) => Check::not_pass(
+            "multipart",
+            CheckStatus::Fail,
+            format!("multipart commit failed: {e}"),
+            "large PutSource uploads (>100MB) would fail; check backend health and free space",
+        ),
+    }
+}
+
+/// `model-ready` (T7): every configured embedder's LOCAL readiness — mirrors
+/// the gates `serve` runs (`validate_model_availability` + the openai
+/// construction checks) WITHOUT loading a model or touching the network:
+/// * ort `path`: directory must hold model.onnx + tokenizer.json (a path is
+///   never prefetched);
+/// * ort built-in name: ready = `.complete` stamp + pinned files present
+///   (fixture and real models share the layout); missing + `offline = true`
+///   is a FAIL (serve refuses), missing + online a WARN (startup prefetch);
+/// * openai: endpoint parses, https off-loopback, api key resolvable from
+///   config or env (existence only — never sent anywhere).
+async fn check_models(cfg: &StorageConfig) -> Check {
+    let path = crate::config::config_path(&cfg.data_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Check::pass("model-ready", "no vectorfs.toml (no pipeline to check)");
+        }
+        Err(e) => {
+            return Check::not_pass(
+                "model-ready",
+                CheckStatus::Fail,
+                format!("cannot read {}: {e}", path.display()),
+                "the config check above reports the same problem — fix that first",
+            );
+        }
+        Ok(t) => t,
+    };
+    let pcfg = match crate::pipeline::config::load_pipeline_config(&text) {
+        Ok(c) => c,
+        Err(e) => {
+            return Check::not_pass(
+                "model-ready",
+                CheckStatus::Fail,
+                format!("pipeline config invalid: {e}"),
+                format!(
+                    "run: vectorfs pipelines check --data-dir {} (names the exact TOML line)",
+                    cfg.data_dir.display()
+                ),
+            );
+        }
+    };
+    if pcfg.embedders.is_empty() {
+        return Check::pass("model-ready", "no embedders configured");
+    }
+    let models_dir = pcfg
+        .models_dir
+        .clone()
+        .unwrap_or_else(|| crate::pipeline::models::default_models_dir(&cfg.data_dir));
+    let mut lines = Vec::new();
+    let mut worst = CheckStatus::Pass;
+    let mut note = |status: CheckStatus, line: String| {
+        if status == CheckStatus::Fail
+            || (status == CheckStatus::Warn && worst != CheckStatus::Fail)
+        {
+            worst = status;
+        }
+        lines.push(line);
+    };
+    for (name, kind) in &pcfg.embedders {
+        match kind {
+            crate::pipeline::embed::EmbedderKind::Ort(c) => match &c.path {
+                Some(p) => {
+                    let dir = std::path::PathBuf::from(p);
+                    let missing: Vec<&str> = ["model.onnx", "tokenizer.json"]
+                        .iter()
+                        .filter(|f| !dir.join(f).is_file())
+                        .copied()
+                        .collect();
+                    if missing.is_empty() {
+                        note(
+                            CheckStatus::Pass,
+                            format!(
+                                "{name}: ort path {} (model.onnx + tokenizer.json)",
+                                dir.display()
+                            ),
+                        );
+                    } else {
+                        note(
+                            CheckStatus::Fail,
+                            format!(
+                                "{name}: path {} missing {}",
+                                dir.display(),
+                                missing.join(", ")
+                            ),
+                        );
+                    }
+                }
+                None => {
+                    let mname = crate::pipeline::embed::ort::resolve_model_name(c);
+                    match crate::pipeline::models::builtin(&mname) {
+                        None => note(
+                            CheckStatus::Fail,
+                            format!("{name}: unknown model '{mname}' (not a built-in; set path)"),
+                        ),
+                        Some(builtin) => {
+                            let dir = models_dir.join(&mname);
+                            if crate::pipeline::models::is_ready(&dir, builtin) {
+                                note(
+                                    CheckStatus::Pass,
+                                    format!("{name}: {mname} ready under {}", dir.display()),
+                                );
+                            } else if c.offline {
+                                note(
+                                    CheckStatus::Fail,
+                                    format!(
+                                        "{name}: {mname} absent under {} and offline = true (serve \
+                                         refuses to start)",
+                                        dir.display()
+                                    ),
+                                );
+                            } else {
+                                note(
+                                    CheckStatus::Warn,
+                                    format!(
+                                        "{name}: {mname} absent under {} — serve prefetches it at \
+                                         startup (network)",
+                                        dir.display()
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            },
+            crate::pipeline::embed::EmbedderKind::OpenAi(c) => {
+                // endpoint shape: mirrors pipeline/embed/openai.rs's
+                // construction gates; the key is only RESOLVED, never sent.
+                let mut line = format!("{name}: openai {} dim={}", c.endpoint, c.dim);
+                let mut ok = true;
+                match c.endpoint.parse::<http::Uri>() {
+                    Err(e) => {
+                        line.push_str(&format!(" (endpoint unparseable: {e})"));
+                        ok = false;
+                    }
+                    Ok(uri) => match uri.scheme_str() {
+                        Some("https") => {}
+                        Some("http") => {
+                            let host = uri.host().unwrap_or_default();
+                            let loopback = host == "localhost"
+                                || host == "127.0.0.1"
+                                || host == "[::1]"
+                                || host.starts_with("127.");
+                            if !loopback {
+                                line.push_str(" (plain http off-loopback — https required)");
+                                ok = false;
+                            }
+                        }
+                        other => {
+                            line.push_str(&format!(" (scheme must be http(s), got {other:?})"));
+                            ok = false;
+                        }
+                    },
+                }
+                let key_there = c.api_key.as_deref().is_some_and(|k| !k.is_empty())
+                    || std::env::var("VF_OPENAI_API_KEY")
+                        .ok()
+                        .is_some_and(|v| !v.is_empty())
+                    || std::env::var("OPENAI_API_KEY")
+                        .ok()
+                        .is_some_and(|v| !v.is_empty());
+                if !key_there {
+                    line.push_str(" (no api key: api_key / VF_OPENAI_API_KEY / OPENAI_API_KEY)");
+                    ok = false;
+                }
+                note(
+                    if ok {
+                        CheckStatus::Pass
+                    } else {
+                        CheckStatus::Fail
+                    },
+                    line,
+                );
+            }
+        }
+    }
+    let detail = lines.join("; ");
+    match worst {
+        CheckStatus::Pass => Check::pass("model-ready", detail),
+        _ => Check::not_pass(
+            "model-ready",
+            worst,
+            detail,
+            match worst {
+                CheckStatus::Fail => format!(
+                    "fix the embedder config / prefetch the models, then: vectorfs pipelines check \
+                     --data-dir {}",
+                    cfg.data_dir.display()
+                ),
+                CheckStatus::Warn => {
+                    "serve will prefetch the missing models at startup (network)".to_string()
+                }
+                CheckStatus::Pass => unreachable!(),
+            },
+        ),
+    }
+}
+
+/// `ingest` (T7): the file-layer summary — per configured bucket the active
+/// pipeline fingerprint, marker count, stale-fingerprint count (drift = WARN
+/// naming `serve --reindex`) and the bucket's DERIVED (x_vf_derived-stamped)
+/// indexes with live row counts. The trailing note states the GC orphan
+/// window (one scan period; `scan_interval_secs`, default 30s — §5.10.5
+/// "孤儿窗口 = 对账周期（默认值文档明示）").
+async fn check_ingest(cfg: &StorageConfig, storage: &Storage) -> Check {
+    let path = crate::config::config_path(&cfg.data_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Check::pass("ingest", "no vectorfs.toml (pure protocol face)");
+        }
+        Err(e) => {
+            return Check::not_pass(
+                "ingest",
+                CheckStatus::Fail,
+                format!("cannot read {}: {e}", path.display()),
+                "the config check above reports the same problem — fix that first",
+            );
+        }
+        Ok(t) => t,
+    };
+    let pcfg = match crate::pipeline::config::load_pipeline_config(&text) {
+        Ok(c) => c,
+        Err(e) => {
+            return Check::not_pass(
+                "ingest",
+                CheckStatus::Fail,
+                format!("pipeline config invalid: {e}"),
+                format!(
+                    "run: vectorfs pipelines check --data-dir {}",
+                    cfg.data_dir.display()
+                ),
+            );
+        }
+    };
+    if pcfg.ingest.is_empty() {
+        return Check::pass("ingest", "no ingest sections (pure protocol face)");
+    }
+    let mut lines = Vec::new();
+    let mut any_stale = false;
+    for vb in pcfg.ingest.keys() {
+        let fp = pcfg.fingerprint(vb).expect("bucket in config");
+        let markers = match storage.list_sources(vb).await {
+            Ok(m) => m,
+            Err(e) => {
+                return Check::not_pass(
+                    "ingest",
+                    CheckStatus::Fail,
+                    format!("cannot list source markers of {vb}: {e}"),
+                    "check backend health (vectorfs doctor's backend-write row)",
+                );
+            }
+        };
+        let stale = markers
+            .iter()
+            .filter(|m| {
+                m.status != crate::store::SourceStatus::Deleting && m.pipeline_fingerprint != fp
+            })
+            .count();
+        any_stale |= stale > 0;
+        let derived = match storage.list_indexes(vb).await {
+            Ok(ix) => ix
+                .into_iter()
+                .filter(|m| m.x_vf_derived.is_some())
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                return Check::not_pass(
+                    "ingest",
+                    CheckStatus::Fail,
+                    format!("cannot list indexes of {vb}: {e}"),
+                    "check backend health (vectorfs doctor's backend-write row)",
+                );
+            }
+        };
+        let mut vectors = 0u64;
+        for meta in &derived {
+            match storage.count_vectors(vb, &meta.index_name).await {
+                Ok(n) => vectors += n as u64,
+                Err(e) => {
+                    return Check::not_pass(
+                        "ingest",
+                        CheckStatus::Fail,
+                        format!("cannot count {vb}/{}: {e}", meta.index_name),
+                        "the indexes check above reports dataset-level detail",
+                    );
+                }
+            }
+        }
+        lines.push(format!(
+            "{vb}: {} source(s), {stale} stale fingerprint(s), {} derived index(es), {vectors} \
+             vectors, fingerprint {}",
+            markers.len(),
+            derived.len(),
+            &fp[..8]
+        ));
+    }
+    let mut detail = lines.join("; ");
+    detail.push_str("; gc orphan window = one scan period (scan_interval_secs, default 30s)");
+    if any_stale {
+        Check::not_pass(
+            "ingest",
+            CheckStatus::Warn,
+            detail,
+            format!(
+                "restart with: vectorfs serve --reindex --data-dir {} (clears old chunks and \
+                 re-embeds drifted sources at startup); a RUNNING daemon with an UNCHANGED config \
+                 can be forced with: vf reindex --bucket <b>",
+                cfg.data_dir.display()
+            ),
+        )
+    } else {
+        Check::pass("ingest", detail)
+    }
+}
+
 /// 1 GiB warning threshold for the file backend's free space.
 const DISK_WARN: u64 = 1024 * 1024 * 1024;
 
@@ -445,6 +836,35 @@ mod tests {
         }
     }
 
+    fn fixture_dir() -> std::path::PathBuf {
+        for p in [
+            "vf/tests/fixtures/tiny-embedder",
+            "tests/fixtures/tiny-embedder",
+        ] {
+            let d = std::path::PathBuf::from(p);
+            if d.join("model.onnx").is_file() {
+                return d;
+            }
+        }
+        panic!("tiny-embedder fixture not found under vf/tests/fixtures/");
+    }
+
+    /// A vectorfs.toml carrying a valid tiny-fixture pipeline (server fields
+    /// via config::init + the pipeline sections appended).
+    fn write_pipeline_config(dir: &std::path::Path, chunk_size: usize) {
+        crate::config::init(dir, false).unwrap();
+        let base = std::fs::read_to_string(crate::config::config_path(dir)).unwrap();
+        let pipeline = format!(
+            "\n[extractor.plain]\nkind = \"txt\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = true\n\n\
+             [ingest.docs]\nscope = \"docs/**\"\nextract = {{ txt = \"plain\" }}\n\
+             chunk = {{ kind = \"token-window\", size = {chunk_size}, overlap = 8 }}\n\
+             embedders = [\"tiny\"]\nscan_interval_secs = 1\n",
+            fixture_dir().display().to_string()
+        );
+        std::fs::write(crate::config::config_path(dir), base + &pipeline).unwrap();
+    }
+
     #[tokio::test]
     async fn no_data_root_short_circuits_with_init_hint() {
         let err = run(&cfg(std::path::Path::new("/nonexistent/vf-doctor-tmp")))
@@ -457,7 +877,7 @@ mod tests {
     #[tokio::test]
     async fn healthy_data_root_all_pass() {
         let dir = tempfile::tempdir().unwrap();
-        crate::config::init(dir.path(), false).unwrap();
+        write_pipeline_config(dir.path(), 32);
         let storage = Storage::file(dir.path());
         storage
             .create_bucket(&BucketMeta {
@@ -494,10 +914,70 @@ mod tests {
         assert!(!report.any_fail());
         let text = render_human(&report);
         assert!(text.contains("[PASS] config"), "{text}");
-        assert!(text.contains("1/1 datasets open"), "{text}");
+        assert!(text.contains("[PASS] multipart"), "{text}");
+        assert!(text.contains("[PASS] model-ready"), "{text}");
+        assert!(text.contains("[PASS] ingest"), "{text}");
+        assert!(text.contains("orphan window"), "{text}");
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["schema_version"], SCHEMA_VERSION);
         assert_eq!(json["overall"], "pass");
+    }
+
+    #[tokio::test]
+    async fn model_ready_fails_on_missing_path_and_stale_markers_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        // pipeline pointing at a nonexistent model dir: parse-valid, but the
+        // artifacts are missing (a `path` is never prefetched)
+        crate::config::init(dir.path(), false).unwrap();
+        let base = std::fs::read_to_string(crate::config::config_path(dir.path())).unwrap();
+        let pipeline = "\n[extractor.plain]\nkind = \"txt\"\n\n\
+             [embedder.dead]\nkind = \"ort\"\npath = \"/nonexistent-model\"\noffline = true\n\n\
+             [ingest.docs]\nscope = \"docs/**\"\nextract = { txt = \"plain\" }\n\
+             chunk = { kind = \"token-window\", size = 32, overlap = 8 }\n\
+             embedders = [\"dead\"]\nscan_interval_secs = 1\n";
+        std::fs::write(crate::config::config_path(dir.path()), base + pipeline).unwrap();
+        let report = run(&cfg(dir.path())).await.unwrap();
+        let models = report
+            .checks
+            .iter()
+            .find(|c| c.name == "model-ready")
+            .unwrap();
+        assert_eq!(models.status, CheckStatus::Fail, "{models:?}");
+        assert!(models.detail.contains("dead"), "{}", models.detail);
+        assert!(models.detail.contains("model.onnx"), "{}", models.detail);
+
+        // a stale-fingerprint marker flips the ingest probe to WARN with the
+        // serve --reindex remedy
+        let storage = Storage::file(dir.path());
+        storage
+            .save_source(
+                "docs",
+                &crate::ingest::marker::object_key_hash("docs/a.txt"),
+                &crate::store::SourceMarker {
+                    object_key: "docs/a.txt".into(),
+                    etag_sig: "s".into(),
+                    content_hash: "c".into(),
+                    pipeline_fingerprint: "deadbeef".into(),
+                    status: crate::store::SourceStatus::Indexed,
+                    status_reason: None,
+                    retries: 0,
+                    retries_exhausted: false,
+                    updated_at: "t".into(),
+                    chunks: None,
+                },
+            )
+            .await
+            .unwrap();
+        let report = run(&cfg(dir.path())).await.unwrap();
+        let ingest = report.checks.iter().find(|c| c.name == "ingest").unwrap();
+        assert_eq!(ingest.status, CheckStatus::Warn, "{ingest:?}");
+        assert!(ingest.detail.contains("1 stale fingerprint"), "{ingest:?}");
+        assert!(
+            ingest.hint.as_deref().unwrap().contains("serve --reindex"),
+            "{ingest:?}"
+        );
+        // the failing model stays the only FAIL; overall degrades to Fail
+        assert!(report.any_fail());
     }
 
     #[tokio::test]

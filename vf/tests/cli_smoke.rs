@@ -84,6 +84,10 @@ struct Daemon {
 
 impl Daemon {
     fn spawn(data_dir: &Path, port: u16, log_name: &str) -> Daemon {
+        Daemon::spawn_with(data_dir, port, log_name, &[])
+    }
+
+    fn spawn_with(data_dir: &Path, port: u16, log_name: &str, extra: &[&str]) -> Daemon {
         let log = data_dir.parent().unwrap().join(log_name);
         let stderr = std::fs::File::create(&log).expect("create log file");
         let child = Command::new(env!("CARGO_BIN_EXE_vectorfs"))
@@ -94,6 +98,7 @@ impl Daemon {
                 "--port",
                 &port.to_string(),
             ])
+            .args(extra)
             .env("VF_ORT_PATH", ort_lib())
             .stdout(Stdio::from(stderr.try_clone().expect("clone log")))
             .stderr(stderr)
@@ -105,6 +110,26 @@ impl Daemon {
     fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    /// Wait for the process to exit on its own; returns (exit code, log).
+    fn wait_exit(&mut self, deadline: Instant) -> (Option<i32>, String) {
+        loop {
+            match self.child.try_wait().expect("poll child") {
+                Some(status) => {
+                    let mut buf = String::new();
+                    if let Ok(mut f) = std::fs::File::open(&self.log) {
+                        let _ = f.read_to_string(&mut buf);
+                    }
+                    return (status.code(), buf);
+                }
+                None if Instant::now() >= deadline => {
+                    self.kill();
+                    panic!("serve did not exit before the deadline");
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
     }
 
     fn dump_log_tail(&self, context: &str) {
@@ -369,6 +394,32 @@ fn cli_full_command_smoke() {
     let o = vf(port, &["rm", "docs/sea.txt", "--bucket", "docs"], false);
     assert!(o.status.success(), "second rm is idempotent: {}", out(&o));
 
+    // ---- T7 GC convergence: within a couple of scan periods the source is
+    // fully reaped (chunks + marker) — `vf sources list` forgets it and the
+    // KB deleted counter advances (202 DELETING -> 404) ----
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let o = vf(
+            port,
+            &["sources", "list", "--bucket", "docs", "--json"],
+            false,
+        );
+        let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+        if v["count"] == 1 && !out(&o).contains("sea.txt") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "sea.txt not reaped: {}", out(&o));
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let o = vf(port, &["status", "--json"], false);
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(
+        v["ingest"]["buckets"][0]["stats"]["numberOfDocumentsDeleted"],
+        1,
+        "{}",
+        out(&o)
+    );
+
     // ---- reindex: jobId printed ----
     let o = vf(port, &["reindex", "--bucket", "docs"], false);
     assert!(
@@ -427,4 +478,117 @@ fn cli_full_command_smoke() {
     assert!(err(&o).contains("NO_CREDENTIALS"), "{}", err(&o));
 
     daemon.dump_log_tail("end of smoke (informational)");
+}
+
+/// SIGKILL leaves the LOCK object behind (a killed process cannot release
+/// it); the documented operator remedy is removing it while nothing runs.
+/// The reindex flow restarts daemons on ONE data root, so it applies that
+/// remedy between kills instead of waiting out the 60s TTL.
+fn remove_stale_lock(data_dir: &Path) {
+    let lock = data_dir.join(".vectorfs/LOCK");
+    if lock.exists() {
+        std::fs::remove_file(&lock).expect("remove stale LOCK");
+    }
+}
+
+/// T7 acceptance run (real daemon, real client): chunk-size config change →
+/// plain serve REFUSES (message names `--reindex`) → `serve --reindex`
+/// clears + re-embeds everything → a subsequent PLAIN serve starts clean.
+#[test]
+fn cli_serve_reindex_flow() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let work = tmp.path().join("work");
+    let data_dir = work.join("data");
+    std::fs::create_dir_all(data_dir.join(".vectorfs")).unwrap();
+    std::fs::write(
+        data_dir.join(".vectorfs/vectorfs.toml"),
+        config_toml(&data_dir),
+    )
+    .unwrap();
+    let long = work.join("long.txt");
+    std::fs::write(
+        &long,
+        "alpha beta gamma delta epsilon zeta eta theta ".repeat(12),
+    )
+    .unwrap();
+
+    // (1) ingest under size 32
+    let port = free_port();
+    let mut daemon = Daemon::spawn(&data_dir, port, "reindex-serve1.log");
+    wait_healthy(port, Instant::now() + Duration::from_secs(60));
+    let o = vf(
+        port,
+        &[
+            "put",
+            long.to_str().unwrap(),
+            "--bucket",
+            "docs",
+            "--key",
+            "docs/long.txt",
+            "--timeout",
+            "120",
+        ],
+        false,
+    );
+    assert!(o.status.success(), "stderr:\n{}", err(&o));
+    daemon.kill();
+    remove_stale_lock(&data_dir);
+
+    // (2) change the chunker: size 32 -> 96 (fingerprint moves)
+    std::fs::write(
+        data_dir.join(".vectorfs/vectorfs.toml"),
+        config_toml(&data_dir).replace("size = 32", "size = 96"),
+    )
+    .unwrap();
+
+    // (3) plain serve refuses, naming --reindex
+    let port = free_port();
+    let mut refused = Daemon::spawn(&data_dir, port, "reindex-refused.log");
+    let (code, log) = refused.wait_exit(Instant::now() + Duration::from_secs(30));
+    assert_eq!(code, Some(2), "gate exits 2:\n{log}");
+    assert!(log.contains("fingerprint mismatch"), "{log}");
+    assert!(log.contains("serve --reindex"), "{log}");
+
+    // (4) serve --reindex: starts, clears, re-embeds, serves normally
+    let port = free_port();
+    let mut daemon = Daemon::spawn_with(&data_dir, port, "reindex-serve2.log", &["--reindex"]);
+    wait_healthy(port, Instant::now() + Duration::from_secs(60));
+    wait_vf_indexed(
+        port,
+        "docs/long.txt",
+        Instant::now() + Duration::from_secs(120),
+    );
+    // the reindex job reports done and the rewrite counted as modified
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let o = vf(port, &["status", "--json"], false);
+        let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+        let b = &v["ingest"]["buckets"][0];
+        if b["reindex"]["status"] == "done"
+            && b["stats"]["numberOfModifiedDocumentsIndexed"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        {
+            assert_eq!(b["counts"]["INDEXED"], 1, "{b}");
+            assert_eq!(b["stats"]["numberOfNewDocumentsIndexed"], 0, "{b}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "reindex job not done: {b}");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    daemon.kill();
+    remove_stale_lock(&data_dir);
+
+    // (5) a PLAIN serve now passes the gate
+    let port = free_port();
+    let mut daemon = Daemon::spawn(&data_dir, port, "reindex-serve3.log");
+    wait_healthy(port, Instant::now() + Duration::from_secs(60));
+    let o = vf(port, &["sources", "list", "--bucket", "docs"], false);
+    assert!(
+        o.status.success() && out(&o).contains("docs/long.txt"),
+        "{}",
+        out(&o)
+    );
+    daemon.kill();
 }

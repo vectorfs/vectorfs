@@ -164,6 +164,14 @@ struct ServeArgs {
     /// One-line-JSON request/response tracing to stderr
     #[arg(long)]
     trace: bool,
+
+    /// Skip the pipeline-fingerprint gate and RE-INDEX at startup: every
+    /// ingest bucket holding fingerprint-drifted markers gets its old chunks
+    /// cleared and its sources re-embedded (mechanism = /x-vf/Reindex), then
+    /// the daemon serves normally with ingest active. The remedy for
+    /// "changed vectorfs.toml, serve now refuses to start"
+    #[arg(long)]
+    reindex: bool,
 }
 
 /// `vectorfs status` arguments (data-dir mode resolves exactly like serve's
@@ -599,15 +607,23 @@ async fn serve(args: ServeArgs) {
 
     // ---- ingest runtime, pre-lock half (M2 T3, design.md §5.10.5) ----
     // With ingest sections configured: (1) the FINGERPRINT gate reads every
-    // source marker and refuses startup on any config-drifted one (explicit
-    // `vf reindex` is the remedy — there is deliberately no background
+    // source marker and refuses startup on any config-drifted one (the
+    // remedy is explicit re-embedding — `serve --reindex` at startup or `vf
+    // reindex` against a running daemon; there is deliberately no background
     // re-embedding engine); (2) embedders LOAD (dim probe, credentials,
     // model prefetch — potentially slow, so it happens while nobody waits on
     // us for the lock). No ingest config = the pure-protocol face, zero
     // extra tasks, behavior unchanged.
     let mut ingest_core = None;
     if let Some(pcfg) = pipeline_cfg.as_ref().filter(|c| !c.ingest.is_empty()) {
-        if let Err(e) = vectorfs::ingest::fingerprint_gate(&storage, pcfg).await {
+        if args.reindex {
+            eprintln!(
+                "vectorfs: --reindex: skipping the fingerprint gate; drifted buckets re-embed \
+                 at startup"
+            );
+        } else if let Err(e) =
+            vectorfs::ingest::fingerprint_gate(&storage, pcfg, &cfg.data_dir).await
+        {
             eprintln!("vectorfs: refusing to start: {e}");
             std::process::exit(2);
         }
@@ -689,6 +705,35 @@ async fn serve(args: ServeArgs) {
         ingest: handle.clone(),
     };
     let ingest_drain = handle.clone();
+    // ---- `serve --reindex` flip (T7): BEFORE any worker exists ----
+    // The startup-flag resolution of the gate/reindex deadlock (主会话
+    // 裁决 2026-11-05): re-index every bucket the gate would have refused —
+    // clear old chunks + flip markers under the lock — then hand the work to
+    // the normal scheduler/workers below (progress via GetIngestStatus's
+    // reindex job). Running it pre-spawn makes it race-free by construction.
+    let mut reindexed_buckets = 0usize;
+    if args.reindex
+        && let Some(handle) = handle.as_ref()
+    {
+        for vb in handle.shared().bucket_names() {
+            match vectorfs::ingest::reindex_bucket_if_stale(&state, handle.shared(), &vb).await {
+                Ok(Some(outcome)) => {
+                    reindexed_buckets += 1;
+                    eprintln!(
+                        "vectorfs: --reindex {vb}: {} source(s) -> PENDING, {} old chunk(s) \
+                         cleared (job {})",
+                        outcome.flipped, outcome.cleared, outcome.job_id
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("vectorfs: --reindex of {vb} failed: {e}");
+                    lock_guard.release().await;
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
     if let Some(handle) = handle {
         let runtime = vectorfs::ingest::IngestRuntime::new(
             Arc::clone(handle.shared()),
@@ -697,6 +742,11 @@ async fn serve(args: ServeArgs) {
             shutdown_rx.clone(),
         );
         runtime.spawn(&handle);
+        if reindexed_buckets > 0 {
+            // the scheduler's first tick is skipped by design; poke it so
+            // the reindex rewrite starts immediately
+            handle.wake();
+        }
         eprintln!("vectorfs: ingest worker running (SIGTERM drains in-flight files, ≤8s)");
     }
     eprintln!(

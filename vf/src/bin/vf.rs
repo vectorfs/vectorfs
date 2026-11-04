@@ -741,6 +741,17 @@ async fn status_cmd(args: StatusArgs) {
         if let Some(at) = b["lastScanAt"].as_str() {
             println!("    lastScan : {at}");
         }
+        let s = &b["stats"];
+        if s.is_object() {
+            println!(
+                "    stats    : scanned={} new={} modified={} deleted={} failed={}",
+                s["numberOfDocumentsScanned"],
+                s["numberOfNewDocumentsIndexed"],
+                s["numberOfModifiedDocumentsIndexed"],
+                s["numberOfDocumentsDeleted"],
+                s["numberOfDocumentsFailed"],
+            );
+        }
         println!(
             "    fingerprint : {}",
             b["pipelineFingerprint"].as_str().unwrap_or("")

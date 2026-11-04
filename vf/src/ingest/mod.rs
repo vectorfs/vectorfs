@@ -1,12 +1,15 @@
 //! Ingest worker — the file layer's fixed ORCHESTRATION mechanism
-//! (design.md §5.10.3 data flow, §5.10.5 robustness; M2 T3).
+//! (design.md §5.10.3 data flow, §5.10.5 robustness; M2 T3 + T7 GC/reindex).
 //!
 //! # Module structure
 //!
 //! * [`marker`] — Source-marker SEMANTICS: no-queue migration rules, key
-//!   hashing, cheap change signatures, scope matching. Pure functions.
+//!   hashing, chunk-key shape, cheap change signatures, scope matching.
+//!   Pure functions.
 //! * [`domain`] — derived-index identity (`hash(model, dim, embedder
 //!   config)`) and the idempotent bucket/index creation + validation.
+//! * [`gc`] — the T7 reconciliation reapers (DELETING reaps + idle-gated
+//!   orphan sweep) and the reindex chunk-clearing they share.
 //! * this module — the RUNTIME: [`IngestCore`] (config + loaded embedders),
 //!   [`IngestRuntime`] (scheduler + workers + queue), [`IngestHandle`]
 //!   (wake/drain handle the protocol face and `vectorfs serve` hold).
@@ -19,7 +22,9 @@
 //! bounded mpsc (capacity 64) — scan-and-diff pushes jobs, a small set of
 //! WORKER tasks (one per CPU) consumes them. CPU segments (extract / chunk /
 //! ort embed) run through `spawn_blocking` behind a semaphore sized to the
-//! CPU count; remote (openai) embeds are I/O-bound and skip the gate.
+//! CPU count; remote (openai) embeds are I/O-bound and skip the gate. Each
+//! scan pass ends with the T7 GC pass ([`IngestRuntime::gc_pass`]): DELETING
+//! sources reaped immediately, orphans swept only when idle.
 //!
 //! # No queue (§5.10.5)
 //!
@@ -36,6 +41,7 @@
 //! joins with a hard budget (8s — inside Docker's 10s SIGKILL grace).
 
 pub mod domain;
+pub mod gc;
 pub mod marker;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -85,10 +91,16 @@ const BATCH_BUDGET_BYTES: usize = 19 * 1024 * 1024;
 
 /// Fingerprint fail-fast (§5.10.5): every marker of every configured ingest
 /// bucket must carry the CURRENT pipeline fingerprint. Any mismatch refuses
-/// startup — no silent background re-embedding engine exists by design; the
-/// remedy is an explicit `vf reindex` (T7 lands the command; the text names
-/// it now so dev-stage config changes have one canonical answer).
-pub async fn fingerprint_gate(storage: &Storage, cfg: &PipelineConfig) -> Result<(), String> {
+/// startup — no silent background re-embedding engine exists by design. The
+/// remedy is EXPLICIT re-embedding (M2 T7): `vectorfs serve --reindex`
+/// re-embeds every drifted source at startup (the flag skips this gate);
+/// `vf reindex --bucket <b>` forces a re-embed of a RUNNING daemon whose
+/// config did NOT change.
+pub async fn fingerprint_gate(
+    storage: &Storage,
+    cfg: &PipelineConfig,
+    data_dir: &Path,
+) -> Result<(), String> {
     for (vb, _) in cfg.ingest.iter().filter(|(_, i)| !i.embedders.is_empty()) {
         let current = cfg.fingerprint(vb).expect("bucket present in config");
         let markers = storage
@@ -101,10 +113,13 @@ pub async fn fingerprint_gate(storage: &Storage, cfg: &PipelineConfig) -> Result
                     "pipeline fingerprint mismatch in bucket '{vb}': source '{}' was ingested \
                      under fingerprint {} but the current configuration derives {current} \
                      (changing extractor/chunker/embedder config invalidates existing chunks). \
-                     Refusing to start. Run `vf reindex` to re-embed explicitly, or delete the \
-                     marker files under .vectorfs/buckets/{vb}/sources/ if the old chunks are \
-                     no longer wanted.",
-                    m.object_key, m.pipeline_fingerprint
+                     Refusing to start. Re-embed explicitly: restart with `vectorfs serve \
+                     --reindex --data-dir {}` (clears old chunks, re-embeds every drifted \
+                     source at startup, then serves normally) — or, for a forced re-embed of a \
+                     RUNNING daemon whose config did not change, `vf reindex --bucket {vb}`.",
+                    m.object_key,
+                    m.pipeline_fingerprint,
+                    data_dir.display()
                 ));
             }
         }
@@ -331,14 +346,6 @@ pub struct IngestRuntime {
     /// UNLOCKED while the next worker picks up the baton and waits. All
     /// workers can hold jobs concurrently; exactly one ever waits.
     rx: Arc<Mutex<mpsc::Receiver<Job>>>,
-    /// live dedup: queued + in-flight jobs (§5.10.5 "幂等 key 防重复入队").
-    inflight: Arc<std::sync::Mutex<HashSet<String>>>,
-    /// Serializes the put path across workers: lance commits are
-    /// optimistic (read-modify-write), so concurrent merge_inserts into ONE
-    /// derived index would race and surface commit-conflict errors that the
-    /// retry loop would then burn attempts on. Extraction/embedding still
-    /// run in parallel — only the final commit is one-at-a-time.
-    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl IngestRuntime {
@@ -356,8 +363,6 @@ impl IngestRuntime {
             shutdown,
             tx,
             rx: Arc::new(Mutex::new(rx)),
-            inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            write_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -431,22 +436,31 @@ impl IngestRuntime {
     }
 
     fn finish(&self, job: &Job) {
-        self.inflight.lock().unwrap().remove(&job.dedup_key());
+        self.shared
+            .inflight()
+            .lock()
+            .unwrap()
+            .remove(&job.dedup_key());
     }
 
     // -- scan --------------------------------------------------------------
 
-    /// One full list-and-diff pass over every configured bucket. Idempotent;
-    /// safe to call concurrently with workers (markers are single-writer —
-    /// this process holds the LOCK).
+    /// One full list-and-diff pass over every configured bucket, followed by
+    /// the GC pass (T7): DELETING reaps first (immediate — a `vf rm` 202 that
+    /// woke this scan must converge HERE), then the idle-gated orphan sweep.
+    /// Idempotent; safe to call concurrently with workers (markers are
+    /// single-writer — this process holds the LOCK).
     pub async fn scan_once(&self) {
         let listing = match list_root(&self.state.storage).await {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("ingest: scan failed (listing the instance root): {e}");
+                // 防误删: without a live listing there is no 真源 to join
+                // against — NO GC of any kind may run this pass.
                 return;
             }
         };
+        let mut pending_work = false;
         for (vb, plan) in &self.shared.core.buckets {
             match self.scan_bucket(vb, plan, &listing).await {
                 Ok(()) => {
@@ -456,6 +470,81 @@ impl IngestRuntime {
                 }
                 Err(e) => eprintln!("ingest: scan of bucket {vb} failed: {e}"),
             }
+            // idle signal for the orphan sweep: any marker the file layer
+            // still owes work on (scan_bucket may have JUST enqueued it).
+            match self.state.storage.list_sources(vb).await {
+                Ok(ms)
+                    if ms.iter().any(|m| {
+                        matches!(m.status, SourceStatus::Pending | SourceStatus::InProgress)
+                    }) =>
+                {
+                    pending_work = true
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("ingest: idle probe of bucket {vb} failed (markers unreadable): {e}")
+                }
+            }
+        }
+        self.gc_pass(&listing, pending_work).await;
+    }
+
+    /// The T7 GC half of one scan pass.
+    ///
+    /// * `live` is the pass's instance-root listing (the 真源): a source is
+    ///   "gone" iff its key hash is absent from it.
+    /// * DELETING reaps are NOT idle-gated (the user behind a `vf rm` 202 is
+    ///   waiting), but they re-verify gone-ness against `live` — a
+    ///   re-appeared object (scan_bucket already flipped the marker back to
+    ///   PENDING in that case) is never reaped on stale state.
+    /// * the orphan sweep runs only when `pending_work` is false AND no job
+    ///   is queued/in flight (the optimize discipline: janitor work never
+    ///   competes with owed ingest). Orphan window = one scan period
+    ///   (`scan_interval_secs`, default 30s).
+    async fn gc_pass(&self, live: &[(String, object_store::ObjectMeta)], pending_work: bool) {
+        let live_uris: BTreeSet<String> = live
+            .iter()
+            .map(|(k, _)| marker::object_key_hash(k))
+            .collect();
+        for vb in self.shared.core.buckets.keys() {
+            let markers = match self.state.storage.list_sources(vb).await {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("ingest: gc of bucket {vb} skipped (markers unreadable): {e}");
+                    continue;
+                }
+            };
+            for m in markers {
+                if m.status != SourceStatus::Deleting {
+                    continue;
+                }
+                let uri = marker::object_key_hash(&m.object_key);
+                if live_uris.contains(&uri) {
+                    continue; // the object is back; scan_bucket owns the flip
+                }
+                match gc::reap_source(&self.state, vb, &m.object_key).await {
+                    Ok(keys) => {
+                        self.shared.record_deleted(vb);
+                        eprintln!(
+                            "ingest: gc {vb}: reaped '{}' ({keys} chunk(s) + marker)",
+                            m.object_key
+                        );
+                    }
+                    Err(e) => eprintln!(
+                        "ingest: gc {vb}: reaping '{}' failed (next scan retries): {e}",
+                        m.object_key
+                    ),
+                }
+            }
+        }
+        let inflight_empty = self.shared.inflight().lock().unwrap().is_empty();
+        if pending_work || !inflight_empty {
+            return; // owed work first; orphans keep (they are only waste)
+        }
+        match gc::orphan_sweep(&self.state, &live_uris).await {
+            Ok(0) => {}
+            Ok(n) => eprintln!("ingest: gc: orphan sweep deleted {n} chunk(s)"),
+            Err(e) => eprintln!("ingest: gc: orphan sweep failed (next scan retries): {e}"),
         }
     }
 
@@ -541,12 +630,15 @@ impl IngestRuntime {
                  {n_gone} deleting"
             );
         }
+        // KB statistics (appendix E.2): sources examined by this COMPLETED
+        // pass — in-scope, extractor-routed, present objects.
+        self.shared.record_scanned(vb, present.len() as u64);
         Ok(())
     }
 
     async fn enqueue(&self, job: Job) {
         let k = job.dedup_key();
-        if !self.inflight.lock().unwrap().insert(k.clone()) {
+        if !self.shared.inflight().lock().unwrap().insert(k.clone()) {
             return; // already queued or in flight
         }
         // bounded send: backpressure into the scanner is the designed
@@ -554,7 +646,7 @@ impl IngestRuntime {
         // whole root).
         if self.tx.send(job).await.is_err() {
             // receivers all gone (shutdown) — undo the dedup entry
-            self.inflight.lock().unwrap().remove(&k);
+            self.shared.inflight().lock().unwrap().remove(&k);
         }
     }
 
@@ -850,7 +942,7 @@ impl IngestRuntime {
                 // domain check + commit under the write lock: the check is
                 // load-then-(maybe)-create, and racing it against another
                 // worker's identical create would surface as Conflict noise.
-                let _guard = self.write_lock.lock().await;
+                let _guard = self.shared.write_lock().lock().await;
                 // per-batch domain check (§5.10.5): the protocol face can
                 // drop/recreate indexes between scans; ours is recreated
                 // idempotently, a FOREIGN one under the name parks the file.
@@ -939,7 +1031,10 @@ impl IngestRuntime {
         Ok(())
     }
 
-    /// Persist the final marker + one stderr progress line per file.
+    /// Persist the final marker + one stderr progress line per file. Also the
+    /// single stats/checkpoint site: KB counters advance here (new vs
+    /// modified decided by the PREVIOUS marker's completion evidence) and
+    /// the reindex job's done counter bumps per completion.
     async fn finish_marker(&self, job: &Job, prev: &SourceMarker, outcome: Outcome) {
         let mut m = prev.clone();
         m.updated_at = marker::now_rfc3339();
@@ -997,6 +1092,25 @@ impl IngestRuntime {
                 eprintln!("ingest: {} -> FAILED/parked ({reason})", job.object_key);
             }
         }
+        // KB statistics (appendix E.2 field names): INDEXED/PARTIALLY count
+        // as indexed work — "modified" when the previous marker carried
+        // completion evidence (a real re-ingest) OR an explicit reindex job
+        // is running (its flip DELIBERATELY wipes the evidence the first
+        // rule reads — the rewrite is still a modified document, not a new
+        // one); FAILED/parked counts as failed. PARTIALLY is not
+        // double-counted as failed: its succeeded half is real indexed work
+        // and the per-source statusReason already tells the story.
+        match m.status {
+            SourceStatus::Indexed | SourceStatus::PartiallyIndexed => {
+                let modified = (!prev.content_hash.is_empty() && prev.chunks.is_some())
+                    || self.shared.reindex_running(&job.vb);
+                self.shared.record_indexed(&job.vb, modified);
+            }
+            SourceStatus::Failed => self.shared.record_failed(&job.vb),
+            _ => unreachable!("finish_marker only persists terminal states"),
+        }
+        // reindex progress (T7): one completion = one unit of done.
+        self.shared.bump_reindex(&job.vb);
         if let Err(e) = self
             .state
             .storage
@@ -1191,16 +1305,42 @@ pub(crate) async fn list_root_at(
 #[derive(Debug, Clone)]
 pub struct ReindexJob {
     pub job_id: String,
-    /// `queued` -> `running` -> `done`; advanced lazily by GetIngestStatus
+    /// `queued` -> `running` -> `done`; advanced by worker completions
+    /// ([`IngestShared::bump_reindex`]) and re-derived by GetIngestStatus
     /// reads (single-process, single-writer — a read is a safe checkpoint).
     pub status: &'static str,
     pub total: usize,
     pub done: usize,
 }
 
+/// KB-aligned ingestion statistics (appendix E.2, field names from Bedrock
+/// KB `IngestionJobStatistics`): PROCESS-LIFETIME cumulative counters, one
+/// set per bucket — they reset on restart by design (nothing persists them;
+/// the markers remain the durable truth).
+#[derive(Debug, Default)]
+pub struct IngestStats {
+    scanned: std::sync::atomic::AtomicU64,
+    new_indexed: std::sync::atomic::AtomicU64,
+    modified_indexed: std::sync::atomic::AtomicU64,
+    deleted: std::sync::atomic::AtomicU64,
+    failed: std::sync::atomic::AtomicU64,
+}
+
+/// Read-only snapshot of one bucket's [`IngestStats`] (GetIngestStatus).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StatsSnapshot {
+    pub scanned: u64,
+    pub new_indexed: u64,
+    pub modified_indexed: u64,
+    pub deleted: u64,
+    pub failed: u64,
+}
+
 /// The piece of the ingest runtime the PROTOCOL face (`AppState.ingest` ->
 /// [`IngestHandle`]) holds: the loaded core (one `Arc` shared with the
-/// runtime's workers), the last-scan clock and the reindex job registry,
+/// runtime's workers), the last-scan clock, the reindex job registry, the
+/// KB statistics, and the two coordination primitives the runtime's workers
+/// and the reindex path share (commit write-lock + in-flight dedup set),
 /// plus `wake()` for the immediate trigger and `shutdown()` for the drain.
 pub struct IngestShared {
     core: Arc<IngestCore>,
@@ -1208,15 +1348,55 @@ pub struct IngestShared {
     last_scan: std::sync::Mutex<BTreeMap<String, String>>,
     /// bucket -> latest reindex job.
     jobs: std::sync::Mutex<BTreeMap<String, ReindexJob>>,
+    /// bucket -> KB statistics (appendix E.2 numberOf* block).
+    stats: BTreeMap<String, IngestStats>,
+    /// live dedup: queued + in-flight jobs (§5.10.5 "幂等 key 防重复入队").
+    /// Shared with the reindex path: a source a worker owns right now is
+    /// skipped by the flip (its current-config result is already valid).
+    inflight: std::sync::Mutex<HashSet<String>>,
+    /// Serializes put/delete commits across workers AND the reindex
+    /// clear+flip section: lance commits are optimistic
+    /// (read-modify-write), so concurrent merge_inserts into ONE derived
+    /// index would race and surface commit-conflict errors that the retry
+    /// loop would then burn attempts on. Extraction/embedding still run in
+    /// parallel — only the final commit is one-at-a-time.
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl IngestShared {
     pub fn new(core: IngestCore) -> Arc<IngestShared> {
+        let stats = core
+            .buckets
+            .keys()
+            .map(|b| (b.clone(), IngestStats::default()))
+            .collect();
         Arc::new(IngestShared {
             core: Arc::new(core),
             last_scan: std::sync::Mutex::new(BTreeMap::new()),
             jobs: std::sync::Mutex::new(BTreeMap::new()),
+            stats,
+            inflight: std::sync::Mutex::new(HashSet::new()),
+            write_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// The commit-serialization lock (workers' put path + reindex's
+    /// clear+flip section).
+    pub(crate) fn write_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.write_lock
+    }
+
+    /// The queued + in-flight dedup set (runtime-internal + reindex skip).
+    pub(crate) fn inflight(&self) -> &std::sync::Mutex<HashSet<String>> {
+        &self.inflight
+    }
+
+    /// Is a worker currently owning `(bucket, object_key)`?
+    pub fn is_inflight(&self, bucket: &str, object_key: &str) -> bool {
+        self.inflight
+            .lock()
+            .unwrap()
+            .contains(&format!("{}\u{1}{}", bucket, object_key))
     }
 
     /// The configured ingest buckets, name-sorted (BTreeMap order).
@@ -1277,6 +1457,57 @@ impl IngestShared {
             .insert(bucket.to_string(), marker::now_rfc3339());
     }
 
+    // ---- KB statistics (appendix E.2 numberOf* block; T7) ----
+
+    /// Sources examined by completed scan passes (worker -> stats).
+    pub(crate) fn record_scanned(&self, bucket: &str, n: u64) {
+        if let Some(s) = self.stats.get(bucket) {
+            s.scanned.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// One terminal INDEXED/PARTIALLY_INDEXED completion (`modified` = the
+    /// previous marker carried completion evidence).
+    pub(crate) fn record_indexed(&self, bucket: &str, modified: bool) {
+        if let Some(s) = self.stats.get(bucket) {
+            let counter = if modified {
+                &s.modified_indexed
+            } else {
+                &s.new_indexed
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// One FAILED/parked terminal outcome.
+    pub(crate) fn record_failed(&self, bucket: &str) {
+        if let Some(s) = self.stats.get(bucket) {
+            s.failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// One DELETING source fully reaped (chunks + marker) by GC.
+    pub(crate) fn record_deleted(&self, bucket: &str) {
+        if let Some(s) = self.stats.get(bucket) {
+            s.deleted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot one bucket's counters (GetIngestStatus `stats` block).
+    pub fn stats_of(&self, bucket: &str) -> StatsSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        match self.stats.get(bucket) {
+            None => StatsSnapshot::default(),
+            Some(s) => StatsSnapshot {
+                scanned: s.scanned.load(Relaxed),
+                new_indexed: s.new_indexed.load(Relaxed),
+                modified_indexed: s.modified_indexed.load(Relaxed),
+                deleted: s.deleted.load(Relaxed),
+                failed: s.failed.load(Relaxed),
+            },
+        }
+    }
+
     /// lastScanAt of one bucket (RFC3339), if a scan ever completed.
     pub fn last_scan_at(&self, bucket: &str) -> Option<String> {
         self.last_scan.lock().unwrap().get(bucket).cloned()
@@ -1303,6 +1534,16 @@ impl IngestShared {
         self.jobs.lock().unwrap().get(bucket).cloned()
     }
 
+    /// Is a reindex job of one bucket outstanding (not yet done)? Drives
+    /// the new-vs-modified statistics split (see `finish_marker`).
+    pub(crate) fn reindex_running(&self, bucket: &str) -> bool {
+        self.jobs
+            .lock()
+            .unwrap()
+            .get(bucket)
+            .is_some_and(|j| j.status != "done")
+    }
+
     /// Advance the latest job of one bucket from live marker counts
     /// (GetIngestStatus is the single reader/checkpointer): `done` = markers
     /// in a terminal state (INDEXED / PARTIALLY_INDEXED / FAILED). A
@@ -1313,6 +1554,160 @@ impl IngestShared {
             job.status = if done >= job.total { "done" } else { "running" };
         }
     }
+
+    /// One more completion under the latest job of one bucket (worker ->
+    /// progress; the GetIngestStatus read-side refresh reconciles the same
+    /// field from markers, so the two paths converge).
+    pub(crate) fn bump_reindex(&self, bucket: &str) {
+        if let Some(job) = self.jobs.lock().unwrap().get_mut(bucket)
+            && job.status != "done"
+        {
+            job.done = (job.done + 1).min(job.total);
+            job.status = if job.done >= job.total {
+                "done"
+            } else {
+                "running"
+            };
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// reindex mechanism (T7, §5.10.5 "按旧指纹清旧块 → 重写 → 更新标记")
+// ---------------------------------------------------------------------------
+
+/// What one [`reindex_bucket`] pass did (both call surfaces report it:
+/// `/x-vf/Reindex` answers with `job_id`, `serve --reindex` logs the rest).
+#[derive(Debug, Clone)]
+pub struct ReindexOutcome {
+    pub job_id: String,
+    /// sources flipped to PENDING under the current fingerprint.
+    pub flipped: usize,
+    /// old chunk keys deleted across the bucket's managed indexes.
+    pub cleared: usize,
+}
+
+/// The reindex MECHANISM, shared by `/x-vf/Reindex` (forced re-embed of a
+/// running daemon) and `vectorfs serve --reindex` (the startup-flag path
+/// that resolves the fingerprint-gate deadlock): for one bucket —
+///
+/// 1. **清旧块** — delete every derived chunk of the target sources across ALL
+///    of the bucket's MANAGED indexes, old-derived ones included (an embedder
+///    config change derives a new index NAME; the previous index keeps its
+///    rows). Per-uri DELETE, not upsert: a chunk-count SHRINK (size 64→96)
+///    must leave zero high-ordinal residue. Old-derived indexes are emptied
+///    but KEPT — deleting an index is destructive and stays the operator's
+///    (DeleteIndex) call in M2; doctor/status show them at 0 rows.
+/// 2. **重写** — flip every non-DELETING marker to PENDING, wipe its
+///    completion evidence, stamp the CURRENT fingerprint; the caller wakes
+///    the scheduler and the normal scan-and-diff re-embeds (chunk keys carry
+///    the object-key hash + new ordinals, so reruns converge by upsert; the
+///    clear above guarantees no orphans).
+/// 3. **job registry** — T6's entry (total = flipped sources; workers bump
+///    `done` per completion).
+///
+/// Sources a worker currently owns are skipped (their result under the
+/// RUNNING config is already valid); the residual race — a worker committing
+/// a batch between this pass's enumeration and its DELETE — only delays
+/// that source's clear to the next reindex and is documented as an M2
+/// limitation.
+pub async fn reindex_bucket(
+    state: &AppState,
+    shared: &Arc<IngestShared>,
+    bucket: &str,
+) -> Result<ReindexOutcome, String> {
+    let fingerprint = shared
+        .fingerprint_of(bucket)
+        .ok_or_else(|| format!("bucket {bucket:?} is not ingest-configured"))?;
+    let markers = state
+        .storage
+        .list_sources(bucket)
+        .await
+        .map_err(|e| e.to_string())?;
+    let targets: Vec<SourceMarker> = markers
+        .into_iter()
+        .filter(|m| {
+            m.status != SourceStatus::Deleting && !shared.is_inflight(bucket, &m.object_key)
+        })
+        .collect();
+    if targets.is_empty() {
+        // nothing to rewrite; still hand the caller a (trivially done) job id
+        let job_id = shared.register_reindex(bucket, 0);
+        return Ok(ReindexOutcome {
+            job_id,
+            flipped: 0,
+            cleared: 0,
+        });
+    }
+    let uris: BTreeSet<String> = targets
+        .iter()
+        .map(|m| marker::object_key_hash(&m.object_key))
+        .collect();
+    // one write-lock section around clear + flip: the workers' per-batch
+    // commits cannot interleave INSIDE this section.
+    let _guard = shared.write_lock().lock().await;
+    let cleared = gc::clear_source_chunks(state, bucket, &uris).await?;
+    let now = marker::now_rfc3339();
+    for m in &targets {
+        // PENDING, current fingerprint, evidence cleared; the last-observed
+        // signature is KEPT — unchanged sig + PENDING is the scanner's
+        // Enqueue case (crash-residue shape), so the very next scan rewakes
+        // these sources even without an explicit wake.
+        let pending = SourceMarker {
+            object_key: m.object_key.clone(),
+            etag_sig: m.etag_sig.clone(),
+            content_hash: String::new(),
+            pipeline_fingerprint: fingerprint.clone(),
+            status: SourceStatus::Pending,
+            status_reason: None,
+            retries: 0,
+            retries_exhausted: false,
+            updated_at: now.clone(),
+            chunks: None,
+        };
+        state
+            .storage
+            .save_source(bucket, &marker::object_key_hash(&m.object_key), &pending)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    drop(_guard);
+    let flipped = targets.len();
+    let job_id = shared.register_reindex(bucket, flipped);
+    eprintln!(
+        "ingest: reindex {bucket}: {flipped} source(s) -> PENDING, {cleared} old chunk(s) \
+         cleared (job {job_id})"
+    );
+    Ok(ReindexOutcome {
+        job_id,
+        flipped,
+        cleared,
+    })
+}
+
+/// `vectorfs serve --reindex` selection rule: re-index ONLY the buckets the
+/// fingerprint gate would have refused (§主会话裁决 — "对该根所有指纹不符的桶
+/// 执行重嵌"). `Ok(None)` = this bucket is already consistent.
+pub async fn reindex_bucket_if_stale(
+    state: &AppState,
+    shared: &Arc<IngestShared>,
+    bucket: &str,
+) -> Result<Option<ReindexOutcome>, String> {
+    let current = shared
+        .fingerprint_of(bucket)
+        .ok_or_else(|| format!("bucket {bucket:?} is not ingest-configured"))?;
+    let markers = state
+        .storage
+        .list_sources(bucket)
+        .await
+        .map_err(|e| e.to_string())?;
+    let stale = markers
+        .iter()
+        .any(|m| m.status != SourceStatus::Deleting && m.pipeline_fingerprint != current);
+    if !stale {
+        return Ok(None);
+    }
+    reindex_bucket(state, shared, bucket).await.map(Some)
 }
 
 /// 32 hex chars from the OS RNG (getrandom is already a direct dep; the same
@@ -1843,11 +2238,22 @@ pub(crate) mod tests {
             "converged"
         );
 
-        // deletion => DELETING (state only; GC is T7)
+        // deletion => the SAME scan pass reaps it (T7: DELETING flip + GC are
+        // one convergence unit — the `vf rm` 202 poll contract)
         std::fs::remove_file(&file).unwrap();
         rt.scan_once().await;
-        let m3 = status_of(&state, "docs", "docs/a.txt").await;
-        assert_eq!(m3.status, SourceStatus::Deleting);
+        let gone = state
+            .storage
+            .load_source("docs", &marker::object_key_hash("docs/a.txt"))
+            .await
+            .unwrap();
+        assert!(gone.is_none(), "marker reaped with the chunks: {gone:?}");
+        let count = state
+            .storage
+            .count_vectors("docs", &spec.index_name)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "every chunk of the gone source deleted");
     }
 
     #[tokio::test]
@@ -1927,11 +2333,17 @@ pub(crate) mod tests {
             .unwrap();
 
         let (_, cfg) = tiny_config("");
-        let err = fingerprint_gate(&state.storage, &cfg).await.unwrap_err();
+        let err = fingerprint_gate(&state.storage, &cfg, Path::new("/tmp/vf-gate"))
+            .await
+            .unwrap_err();
         assert!(err.contains("fingerprint mismatch"), "{err}");
         assert!(
-            err.contains("vf reindex"),
-            "the remedy must be explicit: {err}"
+            err.contains("vectorfs serve --reindex --data-dir /tmp/vf-gate"),
+            "the startup remedy must be the flag: {err}"
+        );
+        assert!(
+            err.contains("vf reindex --bucket docs"),
+            "the running-daemon remedy must be named: {err}"
         );
         assert!(err.contains("docs/a.txt"), "{err}");
 
@@ -1941,7 +2353,11 @@ pub(crate) mod tests {
             .delete_source("docs", &marker::object_key_hash("docs/a.txt"))
             .await
             .unwrap();
-        assert!(fingerprint_gate(&state.storage, &cfg).await.is_ok());
+        assert!(
+            fingerprint_gate(&state.storage, &cfg, Path::new("/tmp"))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -2030,5 +2446,380 @@ pub(crate) mod tests {
             assert!(meta.get("x-vf-chunk-text").is_none(), "{meta:?}");
             assert!(meta.get("x-vf-src-uri").is_some());
         }
+    }
+
+    // ---- T7: reindex / GC / stats ------------------------------------------
+
+    /// tiny-embedder pipeline with a PARAMETERIZED chunk window and model
+    /// alias: the model name moves the derived key (→ a different derived
+    /// index NAME) and the chunker size moves the fingerprint, while the
+    /// fixture path keeps both configs loading the same 8-dim artifact.
+    fn sized_config(chunk_size: usize, model: &str) -> PipelineConfig {
+        let text = format!(
+            "[extractor.plain]\nkind = \"txt\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"{model}\"\npath = {:?}\noffline = true\n\n\
+             [ingest.docs]\nscope = \"docs/**\"\nextract = {{ txt = \"plain\" }}\n\
+             chunk = {{ kind = \"token-window\", size = {chunk_size}, overlap = 8 }}\n\
+             embedders = [\"tiny\"]\nscan_interval_secs = 1\n",
+            fixture_dir().display().to_string(),
+        );
+        crate::pipeline::config::load_pipeline_config(&text).unwrap()
+    }
+
+    /// Un-spawned runtime + handle over a caller-supplied config (the
+    /// reindex tests reconfigure the SAME data dir under a second pipeline).
+    async fn runtime_for(
+        dir: &Path,
+        cfg: &PipelineConfig,
+    ) -> (Arc<IngestRuntime>, Arc<IngestHandle>, Arc<AppState>) {
+        let core = IngestCore::load(cfg, Path::new("/nonexistent-models"))
+            .await
+            .expect("fixture embedder loads");
+        let state = test_state(dir);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let handle = Arc::new(IngestHandle::new(IngestShared::new(core)));
+        let rt = IngestRuntime::new(
+            Arc::clone(handle.shared()),
+            state.clone(),
+            Arc::new(Notify::new()),
+            rx,
+        );
+        (rt, handle, state)
+    }
+
+    /// A body long enough that size 32 and size 96 windows split it very
+    /// differently (the SHRINK case: fewer chunks after reindex).
+    const LONG_BODY: &str = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda \
+         mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega alpha beta gamma delta \
+         epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon \
+         phi chi psi omega alpha beta gamma delta epsilon zeta eta theta iota kappa lambda";
+
+    /// keys of one uri across EVERY index of the bucket (residue check).
+    async fn keys_of_uri(state: &AppState, vb: &str, uri: &str) -> usize {
+        let mut n = 0;
+        for meta in state.storage.list_indexes(vb).await.unwrap() {
+            n += state
+                .storage
+                .scan_vector_metadata(vb, &meta.index_name)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|(k, m)| {
+                    marker::is_chunk_key(k)
+                        && m.as_ref()
+                            .and_then(|m| m.get("x-vf-src-uri"))
+                            .and_then(|v| v.as_str())
+                            == Some(uri)
+                })
+                .count();
+        }
+        n
+    }
+
+    /// The acceptance run of §5.10.5 "清旧块 → 重写 → 更新标记": ingest under
+    /// size 32, reconfigure to size 96 (+ a new model alias ⇒ a NEW derived
+    /// index name), watch the gate refuse, reindex, converge with zero
+    /// residue, and see the gate pass again.
+    #[tokio::test]
+    async fn reindex_full_flow_shrink_zero_residue_and_gate_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("a.txt"), LONG_BODY).unwrap();
+
+        // (1) ingest under the OLD pipeline (size 32 / model tiny-fixture)
+        let old_cfg = sized_config(32, "tiny-fixture");
+        let (rt1, _h1, state) = runtime_for(dir.path(), &old_cfg).await;
+        rt1.scan_once().await;
+        rt1.drain_queue().await;
+        let m1 = status_of(&state, "docs", "docs/a.txt").await;
+        assert_eq!(m1.status, SourceStatus::Indexed);
+        let old_chunks = m1.chunks.as_ref().unwrap()["text"];
+        assert!(old_chunks >= 8, "32-window over a long body: {old_chunks}");
+        let old_spec = rt1.shared.core.buckets["docs"].derived["tiny"].clone();
+        assert_eq!(
+            state
+                .storage
+                .count_vectors("docs", &old_spec.index_name)
+                .await
+                .unwrap(),
+            old_chunks as usize
+        );
+
+        // (2) reconfigure: the gate refuses and names BOTH remedies
+        let new_cfg = sized_config(96, "tiny-v2");
+        let err = fingerprint_gate(&state.storage, &new_cfg, dir.path())
+            .await
+            .unwrap_err();
+        assert!(err.contains("--reindex"), "{err}");
+
+        // (3) serve --reindex selection + mechanism (pre-spawn shape)
+        let (rt2, handle2, state2) = runtime_for(dir.path(), &new_cfg).await;
+        let outcome = reindex_bucket_if_stale(&state2, handle2.shared(), "docs")
+            .await
+            .unwrap()
+            .expect("stale bucket reindexes");
+        assert_eq!(outcome.flipped, 1);
+        assert_eq!(outcome.cleared, old_chunks as usize, "every old chunk gone");
+        // a consistent bucket is a no-op
+        assert!(
+            reindex_bucket_if_stale(&state2, handle2.shared(), "docs")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // markers flipped PENDING under the NEW fingerprint
+        let flipped = status_of(&state2, "docs", "docs/a.txt").await;
+        assert_eq!(flipped.status, SourceStatus::Pending);
+        assert_eq!(
+            flipped.pipeline_fingerprint,
+            new_cfg.fingerprint("docs").unwrap()
+        );
+        assert!(flipped.chunks.is_none(), "completion evidence cleared");
+
+        // (4) rewrite: scan-and-diff re-embeds under the new pipeline
+        rt2.scan_once().await;
+        rt2.drain_queue().await;
+        let m2 = status_of(&state2, "docs", "docs/a.txt").await;
+        assert_eq!(m2.status, SourceStatus::Indexed);
+        let new_chunks = m2.chunks.as_ref().unwrap()["text"];
+        assert!(
+            new_chunks < old_chunks,
+            "96-window SHRINKS the chunk set: {new_chunks} vs {old_chunks}"
+        );
+        let new_spec = rt2.shared.core.buckets["docs"].derived["tiny"].clone();
+        assert_ne!(
+            new_spec.index_name, old_spec.index_name,
+            "model alias moves the derived key"
+        );
+
+        // (5) zero residue: the new index holds exactly the new chunks; the
+        // OLD derived index still EXISTS, emptied (kept for the operator)
+        assert_eq!(
+            state2
+                .storage
+                .count_vectors("docs", &new_spec.index_name)
+                .await
+                .unwrap(),
+            new_chunks as usize
+        );
+        assert!(
+            state2
+                .storage
+                .load_index("docs", &old_spec.index_name)
+                .await
+                .unwrap()
+                .is_some(),
+            "old derived index is KEPT (M2 never auto-deletes)"
+        );
+        assert_eq!(
+            state2
+                .storage
+                .count_vectors("docs", &old_spec.index_name)
+                .await
+                .unwrap(),
+            0,
+            "…but emptied"
+        );
+        let uri = marker::object_key_hash("docs/a.txt");
+        assert_eq!(
+            keys_of_uri(&state2, "docs", &uri).await,
+            new_chunks as usize,
+            "no chunk of this source lives anywhere else"
+        );
+
+        // (6) the gate now passes and the job registry shows real progress
+        assert!(
+            fingerprint_gate(&state2.storage, &new_cfg, dir.path())
+                .await
+                .is_ok()
+        );
+        let job = handle2.shared().reindex_job("docs").unwrap();
+        assert_eq!(job.status, "done");
+        assert_eq!(job.done, 1);
+        assert_eq!(job.total, 1);
+
+        // (7) KB statistics: initial ingest was "new", the reindex rewrite
+        // "modified"
+        let stats = handle2.shared().stats_of("docs");
+        assert!(stats.scanned >= 1, "{stats:?}");
+        assert_eq!(
+            stats.new_indexed, 0,
+            "this process never saw a first ingest"
+        );
+        assert_eq!(stats.modified_indexed, 1, "{stats:?}");
+        assert_eq!(stats.failed, 0, "{stats:?}");
+    }
+
+    /// Orphan sweep: chunks whose marker is GONE (not merely DELETING) are
+    /// reaped by the idle-gated periodic sweep — but only when the file
+    /// layer owes no other work (the optimize discipline).
+    #[tokio::test]
+    async fn orphan_sweep_reaps_markerless_chunks_when_idle_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _h, state) = test_runtime(dir.path(), "").await;
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("a.txt"), LONG_BODY).unwrap();
+        std::fs::write(docs.join("b.txt"), "a second, shorter body").unwrap();
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let spec = &rt.shared.core.buckets["docs"].derived["tiny"];
+        let total = state
+            .storage
+            .count_vectors("docs", &spec.index_name)
+            .await
+            .unwrap();
+        // vanish a.txt AND its marker in one go (crash / operator wipe):
+        // nothing is DELETING — only the orphan sweep can collect it
+        std::fs::remove_file(docs.join("a.txt")).unwrap();
+        state
+            .storage
+            .delete_source("docs", &marker::object_key_hash("docs/a.txt"))
+            .await
+            .unwrap();
+        // a new owed source at the same moment: the sweep must WAIT
+        std::fs::write(docs.join("c.txt"), "owed work blocks the janitor").unwrap();
+        rt.scan_once().await;
+        assert_eq!(
+            state
+                .storage
+                .count_vectors("docs", &spec.index_name)
+                .await
+                .unwrap(),
+            total,
+            "sweep skipped while c.txt is PENDING/in flight"
+        );
+        rt.drain_queue().await; // c.txt INDEXED
+        rt.scan_once().await; // now idle -> sweep
+        let b_chunks = status_of(&state, "docs", "docs/b.txt")
+            .await
+            .chunks
+            .unwrap()["text"] as usize;
+        let c_chunks = status_of(&state, "docs", "docs/c.txt")
+            .await
+            .chunks
+            .unwrap()["text"] as usize;
+        assert_eq!(
+            state
+                .storage
+                .count_vectors("docs", &spec.index_name)
+                .await
+                .unwrap(),
+            b_chunks + c_chunks,
+            "orphan chunks reaped exactly (b + c remain)"
+        );
+        let c_chunks = status_of(&state, "docs", "docs/c.txt")
+            .await
+            .chunks
+            .unwrap()["text"] as usize;
+        assert_eq!(
+            keys_of_uri(&state, "docs", &marker::object_key_hash("docs/c.txt")).await,
+            c_chunks
+        );
+    }
+
+    /// 防误删 (GC 判据 hard gate): inside a MANAGED index a non-derived-format
+    /// key survives; chunk-format keys with source attribution survive in a
+    /// USER-CREATED (unstamped) index — even when their uri points at a
+    /// vanished object.
+    #[tokio::test]
+    async fn gc_spares_foreign_keys_and_unstamped_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _h, state) = test_runtime(dir.path(), "").await;
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("a.txt"), LONG_BODY).unwrap();
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let spec = rt.shared.core.buckets["docs"].derived["tiny"].clone();
+        let gone_uri = marker::object_key_hash("docs/a.txt");
+        let ghost_uri = marker::object_key_hash("docs/ghost.txt");
+
+        // a USER-CREATED index (no x_vf_derived stamp) holding a
+        // chunk-format key whose uri points at a vanished object
+        state
+            .storage
+            .create_index(&crate::store::IndexMeta {
+                vector_bucket_name: "docs".into(),
+                index_name: "user-ix".into(),
+                index_arn: "arn".into(),
+                creation_time_rfc3339: "t".into(),
+                creation_time_epoch: 0.0,
+                data_type: "float32".into(),
+                dimension: 8,
+                distance_metric: "cosine".into(),
+                non_filterable_metadata_keys: None,
+                index_mode: None,
+                x_vf_derived: None,
+            })
+            .await
+            .unwrap();
+        let row = |key: String, uri: String| crate::store::VectorRow {
+            key,
+            vector: vec![0.5; 8],
+            metadata_json: Some(format!(r#"{{"x-vf-src-uri":"{uri}"}}"#)),
+            filterable: BTreeMap::from([(
+                "x-vf-src-uri".to_string(),
+                crate::store::MetaMirror::Str(uri),
+            )]),
+        };
+        state
+            .storage
+            .upsert_vectors(
+                "docs",
+                "user-ix",
+                8,
+                vec![row(
+                    marker::chunk_key(&ghost_uri, "text", 0),
+                    gone_uri.clone(),
+                )],
+            )
+            .await
+            .unwrap();
+        // …and a NON-derived-format key living INSIDE the managed index
+        state
+            .storage
+            .upsert_vectors(
+                "docs",
+                &spec.index_name,
+                8,
+                vec![row("user-row-1".to_string(), gone_uri.clone())],
+            )
+            .await
+            .unwrap();
+
+        // the object vanishes: its OWN chunks are reaped, the two foreign
+        // rows survive
+        std::fs::remove_file(docs.join("a.txt")).unwrap();
+        rt.scan_once().await;
+
+        let derived_rows = state
+            .storage
+            .scan_vector_metadata("docs", &spec.index_name)
+            .await
+            .unwrap();
+        assert_eq!(
+            derived_rows.len(),
+            1,
+            "only user-row-1 remains: {derived_rows:?}"
+        );
+        assert_eq!(derived_rows[0].0, "user-row-1");
+        let user_rows = state
+            .storage
+            .scan_vector_metadata("docs", "user-ix")
+            .await
+            .unwrap();
+        assert_eq!(
+            user_rows.len(),
+            1,
+            "unstamped index untouched: {user_rows:?}"
+        );
+        assert!(marker::is_chunk_key(&user_rows[0].0));
+
+        // the DELETING reap advanced the KB deleted counter
+        let stats = rt.shared.stats_of("docs");
+        assert_eq!(stats.deleted, 1, "{stats:?}");
     }
 }

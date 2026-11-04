@@ -635,7 +635,7 @@ pub async fn delete_source(
         d.chunks = None;
         state.storage.save_source(&input.bucket, &hash, &d).await?;
     }
-    handle.wake(); // the scan's vanished-path picks the marker up for GC
+    handle.wake(); // the woken scan reaps the DELETING marker in the SAME pass (T7 GC)
     Ok((StatusCode::ACCEPTED, Json(json!({ "status": "DELETING" }))).into_response())
 }
 
@@ -871,13 +871,13 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
 
 /// `POST /x-vf/Reindex` (appendix E.2) -> 202 `{jobId}`.
 ///
-/// The handler flips every marker of the bucket to PENDING and clears its
-/// completion evidence (chunks/content_hash), re-stamps the CURRENT pipeline
-/// fingerprint, registers a job, and wakes the scheduler — the daemon's
-/// scan-and-diff then re-ingests everything under the single-writer LOCK
-/// (put_vectors upsert keys make the rerun converge; T7 lands the end-to-end
-/// verification). This is the explicit remedy the startup fingerprint gate
-/// names: there is deliberately no background re-embedding engine.
+/// The FULL mechanism lives in [`crate::ingest::reindex_bucket`] (T7; the
+/// same code `vectorfs serve --reindex` runs at startup): clear every
+/// target source's old chunks across ALL of the bucket's managed indexes
+/// (old-derived ones included — a shrink reindex leaves zero residue), flip
+/// the markers to PENDING under the CURRENT fingerprint, register a job,
+/// wake. This op is the forced re-embed of a RUNNING daemon (config
+/// unchanged); config-change drift is the startup flag's business.
 pub async fn reindex(State(state): State<AppState>, body: Bytes) -> Result<Response, ApiError> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -886,31 +886,15 @@ pub async fn reindex(State(state): State<AppState>, body: Bytes) -> Result<Respo
     }
     let input: ReindexInput = parse_body(&body)?;
     let handle = require_ingest(&state, &input.bucket)?;
-    let fingerprint = handle
-        .shared()
-        .fingerprint_of(&input.bucket)
-        .expect("configured bucket");
-
-    let markers = state.storage.list_sources(&input.bucket).await?;
-    let mut flipped = 0usize;
-    for m in markers {
-        if m.status == SourceStatus::Deleting {
-            continue; // already on the GC path; nothing to re-embed
-        }
-        let mut pending = pending_marker(&m.object_key, &m.etag_sig, &fingerprint);
-        // keep the last-observed signature: an unchanged sig + PENDING marker
-        // is the scanner's Enqueue case (crash-residue recovery shape)
-        pending.etag_sig = m.etag_sig.clone();
-        state
-            .storage
-            .save_source(&input.bucket, &key_hash(&m.object_key), &pending)
-            .await?;
-        flipped += 1;
-    }
-
-    let job_id = handle.shared().register_reindex(&input.bucket, flipped);
+    let outcome = crate::ingest::reindex_bucket(&state, handle.shared(), &input.bucket)
+        .await
+        .map_err(ApiError::internal)?;
     handle.wake();
-    Ok((StatusCode::ACCEPTED, Json(json!({ "jobId": job_id }))).into_response())
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "jobId": outcome.job_id })),
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -919,12 +903,11 @@ pub async fn reindex(State(state): State<AppState>, body: Bytes) -> Result<Respo
 
 /// `POST /x-vf/GetIngestStatus` (appendix E.2): per-bucket marker counts
 /// (all six states), pendingCount (PENDING+IN_PROGRESS — the work the file
-/// layer still owes), lastScanAt, the active pipeline fingerprint, the
-/// derived-index table and the latest reindex job with live progress.
-/// Omitted bucket = every configured bucket.
-///
-/// The `numberOf*` statistics block (KB IngestionJobStatistics field names)
-/// is T7 scope — this task ships the state/marker surface it will count from.
+/// layer still owes), the `numberOf*` statistics block (KB
+/// IngestionJobStatistics field names; process-lifetime cumulative),
+/// lastScanAt, the active pipeline fingerprint, the derived-index table and
+/// the latest reindex job with live progress. Omitted bucket = every
+/// configured bucket.
 pub async fn get_ingest_status(
     State(state): State<AppState>,
     body: Bytes,
@@ -985,6 +968,15 @@ pub async fn get_ingest_status(
             "bucket": bucket,
             "counts": counts,
             "pendingCount": pending_count,
+            // KB IngestionJobStatistics field names (appendix E.2/E.5):
+            // process-lifetime cumulative counters (reset on restart).
+            "stats": {
+                "numberOfDocumentsScanned": shared.stats_of(&bucket).scanned,
+                "numberOfNewDocumentsIndexed": shared.stats_of(&bucket).new_indexed,
+                "numberOfModifiedDocumentsIndexed": shared.stats_of(&bucket).modified_indexed,
+                "numberOfDocumentsDeleted": shared.stats_of(&bucket).deleted,
+                "numberOfDocumentsFailed": shared.stats_of(&bucket).failed,
+            },
             "pipelineFingerprint": fingerprint,
             "derivedIndexes": derived,
         });
@@ -1641,12 +1633,36 @@ mod tests {
                 SourceStatus::Indexed
             );
         }
+        let spec = f
+            .handle
+            .shared()
+            .derived_specs("docs")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let count_before = f
+            .state
+            .storage
+            .count_vectors("docs", &spec.index_name)
+            .await
+            .unwrap();
 
         let (st, _, b) = call_json(&f, "/x-vf/Reindex", json!({"bucket":"docs"})).await;
         assert_eq!(st, StatusCode::ACCEPTED, "{b}");
         let job_id = b["jobId"].as_str().expect("jobId").to_string();
         assert_eq!(job_id.len(), 32, "uuid-style hex: {job_id}");
         assert!(job_id.bytes().all(|c| c.is_ascii_hexdigit()));
+
+        // T7: the old chunks were CLEARED before the rewrite started
+        assert_eq!(
+            f.state
+                .storage
+                .count_vectors("docs", &spec.index_name)
+                .await
+                .unwrap(),
+            0,
+            "清旧块: old chunks deleted at flip time"
+        );
 
         // every marker flipped: PENDING, evidence cleared, CURRENT fingerprint
         let fp = f.handle.shared().fingerprint_of("docs").unwrap();
@@ -1676,6 +1692,12 @@ mod tests {
         assert_eq!(entry["reindex"]["jobId"], json!(job_id));
         assert_eq!(entry["reindex"]["status"], json!("running"));
         assert_eq!(entry["reindex"]["progress"], json!({"done":0,"total":2}));
+        // stats block present (KB IngestionJobStatistics field names)
+        assert_eq!(entry["stats"]["numberOfNewDocumentsIndexed"], json!(2));
+        assert_eq!(
+            entry["stats"]["numberOfDocumentsScanned"].as_u64().unwrap(),
+            2
+        );
 
         // converge: the wake'd scan re-ingests everything
         drive(&f).await;
@@ -1685,6 +1707,102 @@ mod tests {
         assert_eq!(entry["counts"]["INDEXED"], json!(2));
         assert_eq!(entry["reindex"]["status"], json!("done"));
         assert_eq!(entry["reindex"]["progress"], json!({"done":2,"total":2}));
+        // rewrite converged to the SAME chunk count, zero residue
+        assert_eq!(
+            f.state
+                .storage
+                .count_vectors("docs", &spec.index_name)
+                .await
+                .unwrap(),
+            count_before
+        );
+        // reindex rewrites count as MODIFIED, not new
+        assert_eq!(entry["stats"]["numberOfModifiedDocumentsIndexed"], json!(2));
+        assert_eq!(entry["stats"]["numberOfNewDocumentsIndexed"], json!(2));
+    }
+
+    /// T7 GC over the wire: DeleteSource 202 → the woken scan reaps chunks +
+    /// marker in the SAME pass; ListSources forgets the source and the KB
+    /// deleted counter advances.
+    #[tokio::test]
+    async fn delete_source_202_converges_to_reaped() {
+        let f = fixture().await;
+        put_source_call(&f, "docs", "docs/keep.txt", b"the keeper body".to_vec()).await;
+        put_source_call(&f, "docs", "docs/gone.txt", b"the doomed body".to_vec()).await;
+        drive(&f).await;
+        let spec = f
+            .handle
+            .shared()
+            .derived_specs("docs")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let total = f
+            .state
+            .storage
+            .count_vectors("docs", &spec.index_name)
+            .await
+            .unwrap();
+        let gone_chunks = marker_of(&f, "docs/gone.txt")
+            .await
+            .unwrap()
+            .chunks
+            .unwrap()["text"] as usize;
+        assert!(total > gone_chunks);
+
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/DeleteSource",
+            json!({"bucket":"docs","key":"docs/gone.txt"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{b}");
+        assert_eq!(b["status"], json!("DELETING"));
+
+        // the handler's wake is inert on the un-spawned fixture; drive the
+        // scan it requested — the DELETING reap happens in THIS pass
+        drive(&f).await;
+
+        let (st, _, b) = call_json(&f, "/x-vf/ListSources", json!({"bucket":"docs"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let keys: Vec<&str> = b["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["key"].as_str())
+            .collect();
+        assert_eq!(keys, vec!["docs/keep.txt"], "gone.txt fully reaped: {b}");
+        assert!(
+            marker_of(&f, "docs/gone.txt").await.is_none(),
+            "marker deleted with the chunks"
+        );
+        assert_eq!(
+            f.state
+                .storage
+                .count_vectors("docs", &spec.index_name)
+                .await
+                .unwrap(),
+            total - gone_chunks,
+            "vector count reduced exactly"
+        );
+        // the 404 the poll contract converges to
+        let (st, h, _) = call_json(
+            &f,
+            "/x-vf/GetSource",
+            json!({"bucket":"docs","key":"docs/gone.txt"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(errortype(&h), Some("NotFoundException"));
+
+        let (st, _, b) = call_json(&f, "/x-vf/GetIngestStatus", json!({})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(
+            b["buckets"][0]["stats"]["numberOfDocumentsDeleted"],
+            json!(1),
+            "{}",
+            b
+        );
     }
 
     #[tokio::test]

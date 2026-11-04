@@ -34,6 +34,30 @@ pub fn chunk_key(key_hash: &str, modality: &str, index: u32) -> String {
     format!("{key_hash}-{modality}-{index}")
 }
 
+/// Does `key` carry the DERIVED chunk-key shape `{16hex}-{modality}-{seq}`?
+/// GC 判据 layer 2 (§5.10.5 anti-false-delete): the reaper only considers
+/// vectors whose key parses as (exactly three `-`-free segments) a 16-hex
+/// object-key hash, an alphanumeric modality token ("text" in M2; "image" /
+/// "audio" later), and an all-digit ordinal. Keys minted by [`chunk_key`]
+/// always satisfy this; a pure-protocol user's key must be shaped EXACTLY
+/// like ours to be eligible at all — and even then layers 1 (managed-index
+/// stamp) and 3 (`x-vf-src-uri` joins a vanished object) still gate the
+/// delete. 裸前缀删除 is what this function exists to prevent.
+pub fn is_chunk_key(key: &str) -> bool {
+    let mut parts = key.split('-');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(hash), Some(modality), Some(seq), None) => {
+            hash.len() == KEY_HASH_HEX_LEN
+                && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                && !modality.is_empty()
+                && modality.bytes().all(|b| b.is_ascii_alphanumeric())
+                && !seq.is_empty()
+                && seq.bytes().all(|b| b.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -350,6 +374,32 @@ mod tests {
         // chunk keys are the same base + modality + ordinal
         assert_eq!(chunk_key(&h, "text", 0), format!("{h}-text-0"));
         assert_eq!(chunk_key(&h, "text", 12), format!("{h}-text-12"));
+    }
+
+    #[test]
+    fn chunk_key_shape_recognition() {
+        let h = object_key_hash("docs/hello.txt");
+        // ours always match, any modality token / ordinal width
+        for k in [
+            chunk_key(&h, "text", 0),
+            chunk_key(&h, "image", 12345),
+            chunk_key(&h, "audio", 7),
+        ] {
+            assert!(is_chunk_key(&k), "{k}");
+        }
+        // lookalikes that must NOT pass (GC 判据 layer 2)
+        assert!(!is_chunk_key("custom-key-1"), "user-shaped key");
+        assert!(!is_chunk_key(&format!("{}-text-0", &h[..15])), "short hash");
+        assert!(!is_chunk_key(&format!("{h}-text-1x")), "ordinal not digits");
+        assert!(!is_chunk_key(&format!("{h}-te-xt-1")), "extra segment");
+        assert!(!is_chunk_key(&format!("{h}--1")), "empty modality");
+        assert!(!is_chunk_key(&format!("{h}-text-")), "empty ordinal");
+        assert!(
+            !is_chunk_key(&format!("{}-text-1", "z".repeat(16))),
+            "hash not hex"
+        );
+        assert!(!is_chunk_key("k1"), "plain protocol key");
+        assert!(!is_chunk_key(""), "empty");
     }
 
     #[test]
