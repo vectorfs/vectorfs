@@ -1,10 +1,14 @@
-# CI skeleton (M1 Task 1). Three jobs, all commands verified locally first:
+# CI skeleton (M1 Task 1; conformance job added in M1 Task 7). Four jobs, all
+# commands verified locally first:
 #   build-test  — cargo fmt --check / cargo build / cargo test
 #   deps-guard  — scripts/deps_guard.sh (zero AWS SDK + unified arrow/lance),
 #                 cargo-machete (unused deps), cargo-deny (licenses/bans;
 #                 advisories warn-only)
 #   size-guard  — release-prod build + binary size gate (warn >155MiB,
 #                 fail >175MiB, design.md §5.7)
+#   conformance — 32-step wire matrix through BOTH first-party SDKs (boto3 +
+#                 aws-sdk-go-v2) against a freshly `vf init`'d file-backend
+#                 daemon (M1 Task 7; steps 1:1 with conformance/boto3_check.py)
 #
 # NOTE: aws-lc-sys (via object_store "aws") needs cmake + a C toolchain — both
 # preinstalled on ubuntu-latest runners (design.md §8 risk #11).
@@ -33,6 +37,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # same key as the conformance job — share the debug-build cache
+          # instead of recompiling the dependency tree twice per run
+          shared-key: debug-workspace
+
+      # M1 T6 leftover TODO closed: bake the short commit sha into the binary
+      # (report.rs option_env!("VF_GIT_HASH")) so `vf --version` and
+      # /healthz report it; the conformance job asserts healthz.version.
+      # Per-commit value changes recompile only the leaf `vf` crate.
+      - name: export VF_GIT_HASH (short sha)
+        run: echo "VF_GIT_HASH=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
       - name: cargo fmt --check
         run: cargo fmt --all --check
@@ -95,6 +110,82 @@ jobs:
 
       - name: size check
         run: ./scripts/size_guard.sh
+
+  # M1 Task 7: full-matrix conformance — the SAME 32 steps boto3 and the Go
+  # SDK drive (conformance/boto3_check.py / conformance/go/main.go, step
+  # numbers+names 1:1). file backend on a fresh data dir (closest to real
+  # deployments); the daemon is started in-process, healthz-gated, and
+  # stopped by a trap; server stderr is dumped on failure.
+  conformance:
+    name: conformance (boto3 + go, 32 steps each)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: conformance/go/go.mod
+          cache-dependency-path: conformance/go/go.sum
+
+      - name: install protoc (lance-encoding build dep)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # same key as the build-test job — reuse its compiled dependency
+          # tree; only the leaf `vf` crate differs (VF_GIT_HASH below)
+          shared-key: debug-workspace
+
+      - name: export VF_GIT_HASH (short sha)
+        run: echo "VF_GIT_HASH=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: pip install boto3
+        run: pip install boto3
+
+      - name: cargo build (debug)
+        run: cargo build --workspace
+
+      - name: vf init + serve + conformance (boto3 then go)
+        run: |
+          set -euo pipefail
+          ./target/debug/vf init --data-dir ./ci-data
+          AK=$(python3 -c "import json; print(json.load(open('ci-data/vf.json'))['access_key_id'])")
+          SK=$(python3 -c "import json; print(json.load(open('ci-data/vf.json'))['secret_access_key'])")
+          nohup ./target/debug/vf serve --data-dir ./ci-data --port 8787 >server.log 2>&1 &
+          VF_PID=$!
+          trap 'kill "$VF_PID" 2>/dev/null || true' EXIT
+
+          # healthz poll (SigV4-exempt route) before pointing clients at it
+          ready=""
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8787/healthz >healthz.json; then ready=1; break; fi
+            sleep 1
+          done
+          test -n "$ready" || { echo "server never became healthy"; exit 1; }
+
+          # healthz.version must be non-empty AND carry the baked commit
+          # (VF_GIT_HASH wiring; "commit unknown" means the build missed it)
+          VER=$(python3 -c "import json; print(json.load(open('healthz.json'))['version'])")
+          test -n "$VER" || { echo "healthz.version is empty"; exit 1; }
+          case "$VER" in *"commit unknown"*) echo "healthz.version lacks the commit: $VER"; exit 1;; esac
+          echo "healthz ok: $VER"
+
+          python3 conformance/boto3_check.py \
+            --endpoint http://127.0.0.1:8787 \
+            --access-key "$AK" --secret-key "$SK"
+          (cd conformance/go && go run . \
+            --endpoint http://127.0.0.1:8787 \
+            --access-key "$AK" --secret-key "$SK")
+
+      - name: dump server stderr tail (last 50 lines, on failure)
+        if: failure()
+        run: tail -50 server.log
 
   # ---------------------------------------------------------------------------
   # TODO(repo public): enable once the repository turns public — arm64 + macOS
