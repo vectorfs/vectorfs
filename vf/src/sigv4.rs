@@ -358,11 +358,13 @@ pub fn verify(
 }
 
 // ---------------------------------------------------------------------------
-// Test-only signer (also the pre-Task-C self check). Written against the AWS
-// SigV4 general reference, mirroring what an SDK client does.
+// Client-side signer — written against the AWS SigV4 general reference,
+// mirroring what an SDK client does. Born as the pre-Task-C test-only self
+// check; since M2 T6 it is ALSO the `vf` client's production signer (appendix
+// E.1: "vf CLI 复用同一自研签名栈") — same canonicalization as verify(),
+// so client and gate stay byte-exact by construction.
 // ---------------------------------------------------------------------------
-#[cfg(test)]
-pub(crate) mod signer {
+pub mod signer {
     use super::*;
 
     pub struct Signed {

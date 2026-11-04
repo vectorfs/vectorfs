@@ -10,6 +10,7 @@
 //! `POST /<OperationName>`, JSON bodies; PutVectors success = 200 empty body.
 
 pub mod backends;
+pub mod client;
 pub mod config;
 pub mod doctor;
 pub mod filter;
@@ -17,6 +18,7 @@ pub mod ingest;
 pub mod lock;
 pub mod mcp;
 pub mod ops;
+pub mod ops_xvf;
 pub mod pipeline;
 pub mod report;
 pub mod sigv4;
@@ -44,6 +46,21 @@ use axum::{Json, Router};
 /// middleware's read, never a bare 413.
 pub const MAX_BODY: usize = 21 * 1024 * 1024;
 
+/// Effective body-buffer cap for one path (the gate middleware and the
+/// route-level `DefaultBodyLimit` must agree): `/x-vf/PutSource` accepts
+/// raw source bytes up to `max_file_size_mb` headroom (appendix E.1 — the
+/// 21 MiB AWS-face cap would reject legitimate files before the handler
+/// could shape the error), and a `/x-vf/GetSourceData` RESPONSE can be that
+/// large too (the gate buffers responses for tracing). Every other path —
+/// the whole AWS face — keeps the 21 MiB cap and its documented 400-on-
+/// overflow behavior.
+fn body_limit_for(path: &str) -> usize {
+    match path {
+        "/x-vf/PutSource" | "/x-vf/GetSourceData" => ops_xvf::X_VF_MAX_BODY,
+        _ => MAX_BODY,
+    }
+}
+
 /// Process-start reference for /healthz `uptimeSeconds` — initialized when
 /// the router is built (server start), read by every healthz hit.
 static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -52,6 +69,10 @@ pub fn build_router(state: ops::AppState) -> Router {
     STARTED_AT.get_or_init(std::time::Instant::now);
     let authed = Router::new()
         .route("/healthz", get(healthz))
+        .route(
+            "/health",
+            get(health).layer(axum::extract::DefaultBodyLimit::max(MAX_BODY)),
+        )
         .route("/CreateVectorBucket", post(ops::create_vector_bucket))
         .route("/CreateIndex", post(ops::create_index))
         .route("/PutVectors", post(ops::put_vectors))
@@ -96,6 +117,26 @@ pub fn build_router(state: ops::AppState) -> Router {
                 .delete(ops::untag_resource)
                 .get(ops::list_tags_for_resource),
         )
+        // ---- /x-vf file-layer superset (M2 T6, design.md 附录E) ----
+        // Same gate (SigV4 with signingName s3vectors applies verbatim),
+        // same rest-json error protocol; PutSource alone widens the body
+        // limit (see `body_limit_for`).
+        .route(
+            "/x-vf/PutSource",
+            post(ops_xvf::put_source)
+                .layer(axum::extract::DefaultBodyLimit::max(ops_xvf::X_VF_MAX_BODY)),
+        )
+        .route("/x-vf/GetSource", post(ops_xvf::get_source))
+        .route(
+            "/x-vf/GetSourceData",
+            post(ops_xvf::get_source_data)
+                .layer(axum::extract::DefaultBodyLimit::max(ops_xvf::X_VF_MAX_BODY)),
+        )
+        .route("/x-vf/ListSources", post(ops_xvf::list_sources))
+        .route("/x-vf/DeleteSource", post(ops_xvf::delete_source))
+        .route("/x-vf/Search", post(ops_xvf::search))
+        .route("/x-vf/Reindex", post(ops_xvf::reindex))
+        .route("/x-vf/GetIngestStatus", post(ops_xvf::get_ingest_status))
         .fallback(fallback_404);
     authed
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
@@ -118,6 +159,18 @@ async fn healthz() -> Json<serde_json::Value> {
         "ok": true,
         "version": report::version_string(),
         "uptimeSeconds": uptime,
+    }))
+}
+
+/// GET /health (M2 T6, appendix E): the CONTAINER healthcheck probe —
+/// no-auth (see `gate_middleware`), unauthenticated readers must never need
+/// credentials to tell "up" from "down". `{"ok":true}` plus the version; the
+/// richer uptime member stays on /healthz (kept byte-stable above), and
+/// `vf status` reads BOTH (health for up/down, GetIngestStatus for depth).
+async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "ok": true,
+        "version": report::version_string(),
     }))
 }
 
@@ -162,7 +215,8 @@ fn trace_line(event: &str, mut fields: serde_json::Map<String, serde_json::Value
 /// bytes; /healthz and 404s are traced too (they are part of the wire picture).
 async fn gate_middleware(State(state): State<ops::AppState>, req: Request, next: Next) -> Response {
     let (parts, body) = req.into_parts();
-    let bytes = match axum::body::to_bytes(body, MAX_BODY).await {
+    let request_limit = body_limit_for(parts.uri.path());
+    let bytes = match axum::body::to_bytes(body, request_limit).await {
         Ok(b) => b,
         Err(e) => {
             return ops::ApiError::validation(format!("failed to read body: {e}")).into_response();
@@ -191,6 +245,7 @@ async fn gate_middleware(State(state): State<ops::AppState>, req: Request, next:
     }
 
     if parts.uri.path() != "/healthz"
+        && parts.uri.path() != "/health"
         && let Some(creds) = &state.creds
     {
         let header_pairs: Vec<(String, String)> = parts
@@ -244,7 +299,7 @@ async fn gate_middleware(State(state): State<ops::AppState>, req: Request, next:
     let res = next.run(req).await;
 
     let (rparts, rbody) = res.into_parts();
-    let rbytes = match axum::body::to_bytes(rbody, MAX_BODY).await {
+    let rbytes = match axum::body::to_bytes(rbody, request_limit).await {
         Ok(b) => b,
         Err(e) => {
             return ops::ApiError::internal(format!("failed to read response body: {e}"))
@@ -378,6 +433,25 @@ mod tests {
             body["uptimeSeconds"].as_f64().is_some_and(|u| u >= 0.0),
             "{body}"
         );
+    }
+
+    /// /health (M2 T6, appendix E): the CONTAINER healthcheck probe —
+    /// NO-AUTH even when credentials are configured (an unsigned GET must
+    /// pass the same gate that 403s unsigned AWS-face calls), while the
+    /// signed surface stays protected. /healthz keeps its own exemption.
+    #[tokio::test]
+    async fn health_is_no_auth_under_configured_creds() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = build_router(test_state(dir.path(), Some(creds())));
+        let req = HttpRequest::get("/health").body(Body::empty()).unwrap();
+        let (status, _, body) = send(&router, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], serde_json::json!(true));
+        assert!(body["version"].is_string(), "{body}");
+        // and the control: an unsigned AWS-face call still 403s
+        let req = post_json("/PutVectors", r#"{"vectors":[]}"#, &[]);
+        let (status, _, _) = send(&router, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

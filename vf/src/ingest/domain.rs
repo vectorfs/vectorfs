@@ -256,6 +256,30 @@ pub fn user_object_key(backend: &Backend, key: &str) -> object_store::path::Path
     }
 }
 
+/// READ/DELETE key candidates of a user object, canonical form first.
+///
+/// Why two (T6 finding, file backend): `object_store::path::Path::from`
+/// CANONICALIZES (percent-encodes non-ASCII and `%{}\^]"'>~<#|*?`), and the
+/// local backend materializes that form — so objects WE write live under
+/// canonical names. But an EXTERNALLY placed file (cp/mv into the instance
+/// root — the §5.10.4 data-source model) keeps its RAW name, and
+/// `LocalFileSystem::list` reports raw names. Reads/deletes therefore try
+/// the canonical key first, then the raw form (built via `from_url_path`,
+/// which validates without re-encoding). A key containing a literal `%`
+/// stays canonical-only: the percent-decoding construction would be
+/// ambiguous there (documented limitation; such keys also cannot round-trip
+/// a listing decode).
+pub fn user_object_key_candidates(backend: &Backend, key: &str) -> Vec<object_store::path::Path> {
+    let primary = user_object_key(backend, key);
+    if key.contains('%') {
+        return vec![primary];
+    }
+    match object_store::path::Path::from_url_path(key) {
+        Ok(alt) if alt != primary => vec![primary, alt],
+        _ => vec![primary],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
@@ -444,5 +468,22 @@ mod tests {
             user_object_key(&Backend::S3(Box::new(cfg)), "docs/a.txt").as_ref(),
             "pre/docs/a.txt"
         );
+    }
+
+    /// The canonical/raw candidate pair (T6 finding): Path::from encodes
+    /// non-ASCII + AWS-discouraged ASCII, so reads must also try the raw
+    /// form; a literal '%' key stays canonical-only (decode ambiguity).
+    #[test]
+    fn user_object_key_candidates_canonical_then_raw() {
+        let plain = user_object_key_candidates(&Backend::Memory, "docs/a.txt");
+        assert_eq!(plain.len(), 1, "ASCII-plain keys have one form");
+
+        let uni = user_object_key_candidates(&Backend::Memory, "docs/汉字 文档#1.txt");
+        assert_eq!(uni.len(), 2, "canonical + raw");
+        assert!(uni[0].as_ref().contains("%E6%B1%89"), "{}", uni[0].as_ref());
+        assert_eq!(uni[1].as_ref(), "docs/汉字 文档#1.txt", "raw form second");
+
+        let pct = user_object_key_candidates(&Backend::Memory, "docs/100%done.txt");
+        assert_eq!(pct.len(), 1, "literal '%' never falls back to decoding");
     }
 }

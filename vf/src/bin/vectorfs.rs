@@ -669,14 +669,17 @@ async fn serve(args: ServeArgs) {
         )
     };
     // Ingest wiring (M2 T3): the HANDLE exists iff the runtime core was
-    // built — it goes INTO the AppState (T6's immediate-trigger surface);
-    // the scheduler + workers then spawn off that same state (single-writer
-    // LOCK held, so first-write domain creation is race-free by ownership).
+    // built — it goes INTO the AppState (T6's immediate-trigger + /x-vf
+    // surface over the SAME shared core); the scheduler + workers then
+    // spawn off that same state (single-writer LOCK held, so first-write
+    // domain creation is race-free by ownership).
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let storage = Arc::new(storage);
-    let handle = ingest_core
-        .as_ref()
-        .map(|_| Arc::new(vectorfs::ingest::IngestHandle::new()));
+    let handle = ingest_core.map(|core| {
+        Arc::new(vectorfs::ingest::IngestHandle::new(
+            vectorfs::ingest::IngestShared::new(core),
+        ))
+    });
     let state = AppState {
         storage: storage.clone(),
         creds: if cfg.no_auth { None } else { cfg.creds.clone() },
@@ -686,9 +689,9 @@ async fn serve(args: ServeArgs) {
         ingest: handle.clone(),
     };
     let ingest_drain = handle.clone();
-    if let (Some(core), Some(handle)) = (ingest_core, handle) {
+    if let Some(handle) = handle {
         let runtime = vectorfs::ingest::IngestRuntime::new(
-            core,
+            Arc::clone(handle.shared()),
             Arc::new(state.clone()),
             handle.notify(),
             shutdown_rx.clone(),

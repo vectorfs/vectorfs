@@ -46,10 +46,12 @@ use crate::report::SCHEMA_VERSION;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lowercase")]
 pub enum ToolsMode {
-    /// list_vector_buckets / list_indexes / query_vectors / get_vectors only.
+    /// search / list_sources / list_vector_buckets / list_indexes /
+    /// query_vectors / get_vectors only.
     Ro,
-    /// read-only set + put_vectors / delete_vectors (the default — the whole
-    /// point of the single-agent mode is that the agent can ingest).
+    /// read-only set + put_source / put_vectors / delete_vectors (the
+    /// default — the whole point of the single-agent mode is that the agent
+    /// can ingest).
     Rw,
 }
 
@@ -148,6 +150,60 @@ pub struct DeleteVectorsParams {
     pub keys: Vec<String>,
 }
 
+// ---- file-layer tools (M2 T6, appendix E.3) ----
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchParams {
+    /// Vector bucket (must have an [ingest.<bucket>] section — the file
+    /// layer fans the query out over its embedders).
+    pub bucket: String,
+    /// Query text (M2: text only).
+    pub text: String,
+    /// Results to return, 1..=1000.
+    #[serde(default = "default_top_k")]
+    pub top_k: i64,
+    /// Optional metadata filter ($-operator syntax, same as query_vectors).
+    #[serde(default)]
+    pub filter: Option<serde_json::Value>,
+    /// Include each hit's stored chunk text (default true).
+    #[serde(default = "default_true")]
+    pub return_text: bool,
+}
+
+fn default_top_k() -> i64 {
+    10
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PutSourceParams {
+    /// LOCAL file path (this process reads it and uploads the bytes).
+    pub path: String,
+    /// Vector bucket (must have an [ingest.<bucket>] section).
+    pub bucket: String,
+    /// Object key (default: the file's name).
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSourcesParams {
+    /// Vector bucket.
+    pub bucket: String,
+    /// Only this status (PENDING / IN_PROGRESS / PARTIALLY_INDEXED / INDEXED
+    /// / FAILED / DELETING).
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Max rows of this page, 1..=1000 (default 500); pass nextToken for more.
+    #[serde(default)]
+    pub max_results: Option<i64>,
+    /// Pagination token from a previous list_sources response.
+    #[serde(default)]
+    pub next_token: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // AWS wire shapes for the ops handlers (camelCase == botocore members)
 // ---------------------------------------------------------------------------
@@ -232,7 +288,10 @@ fn error_json(e: &ApiError) -> String {
     let (code, hint) = match e.shape {
         "ValidationException" => (
             "Validation",
-            "fix the arguments (check limits in the tool description: topK<=10000, batch<=500, keys<=100/500, dimension must match the index — see list_indexes)",
+            "fix the arguments (check limits in the tool descriptions: topK<=10000, batch<=500, \
+             keys<=100/500, dimension must match the index — see list_indexes); the file-layer \
+             tools (search/put_source/list_sources) need an [ingest.<bucket>] section \
+             (see `vectorfs pipelines check`)",
         ),
         "NotFoundException" => (
             "NotFound",
@@ -279,6 +338,7 @@ impl VfMcp {
         if mode == ToolsMode::Ro {
             router.disable_route("put_vectors");
             router.disable_route("delete_vectors");
+            router.disable_route("put_source");
         }
         VfMcp {
             state,
@@ -350,6 +410,39 @@ impl VfMcp {
     )]
     async fn delete_vectors(&self, p: Parameters<DeleteVectorsParams>) -> CallToolResult {
         match self.call_delete_vectors(p.0).await {
+            Ok(v) => ok_result(v),
+            Err(e) => tool_error(error_json(&e)),
+        }
+    }
+
+    /// Hybrid file-layer search (M2 T6).
+    #[tool(
+        description = "Search an ingest-configured bucket's files: the query text is embedded once per configured embedder, each derived index is queried (topK 1..=1000, optional $-operator filter), and the per-index rankings are merged (rrf). Every hit carries content{text,type}, score, index, key, location{type:'source',key} (the source file to read with get) and metadata. M2: text queries only. Errors are {code,message,hint} (Validation when the bucket lacks an [ingest.<bucket>] section)."
+    )]
+    async fn search(&self, p: Parameters<SearchParams>) -> CallToolResult {
+        match self.call_search(p.0).await {
+            Ok(v) => ok_result(v),
+            Err(e) => tool_error(error_json(&e)),
+        }
+    }
+
+    /// Upload a local file as a Source (rw only).
+    #[tool(
+        description = "Upload a local file into an ingest-configured bucket (write tool — only present with --tools rw). Lands the object + a PENDING marker; indexing itself is the file layer's scan (run by `vectorfs serve` — this MCP process deliberately runs no ingest worker, so a later serve picks the file up on its next scan). Returns {schema_version, bucket, key, status}. Errors are {code,message,hint}."
+    )]
+    async fn put_source(&self, p: Parameters<PutSourceParams>) -> CallToolResult {
+        match self.call_put_source(p.0).await {
+            Ok(v) => ok_result(v),
+            Err(e) => tool_error(error_json(&e)),
+        }
+    }
+
+    /// List ingested files of a bucket.
+    #[tool(
+        description = "List the ingested files (Sources) of an ingest-configured bucket: key, status (PENDING/IN_PROGRESS/PARTIALLY_INDEXED/INDEXED/FAILED/DELETING), statusReason, chunk counts, live etag/mime/size. Optional status filter; paginated (>500 rows return a nextToken — pass it back). Errors are {code,message,hint}."
+    )]
+    async fn list_sources(&self, p: Parameters<ListSourcesParams>) -> CallToolResult {
+        match self.call_list_sources(p.0).await {
             Ok(v) => ok_result(v),
             Err(e) => tool_error(error_json(&e)),
         }
@@ -534,6 +627,106 @@ impl VfMcp {
             "keysRequested": p.keys.len(),
         }))
     }
+
+    // ---- file-layer tools: thin adapters onto the /x-vf handlers ----
+
+    async fn call_search(&self, p: SearchParams) -> Result<serde_json::Value, ApiError> {
+        let body = json!({
+            "bucket": p.bucket,
+            "query": { "text": p.text },
+            "topK": p.top_k,
+            "returnText": p.return_text,
+            "filter": p.filter.clone().filter(|f| !f.is_null()),
+        });
+        let resp = crate::ops_xvf::search(
+            self.ops_state(),
+            Bytes::from(serde_json::to_vec(&body).expect("serializes")),
+        )
+        .await?;
+        let v = response_json(resp).await.map_err(ops::ApiError::internal)?;
+        Ok(json!({
+            "schema_version": SCHEMA_VERSION,
+            "bucket": p.bucket,
+            "hits": v["hits"],
+        }))
+    }
+
+    /// put_source, MCP semantics (decision, aligned with T3's ruling that
+    /// the file layer's WRITER is `vectorfs serve`): this process holds the
+    /// same LOCK but runs no ingest scheduler/workers — the tool lands the
+    /// object + the PENDING marker PutSource seeds and RETURNS; the scan of
+    /// a later `vectorfs serve` does the extraction/embedding. (No marker
+    /// of its own beyond PutSource's pre-seed: an existing marker's history
+    /// belongs to the scanner's diff.)
+    async fn call_put_source(&self, p: PutSourceParams) -> Result<serde_json::Value, ApiError> {
+        let path = std::path::PathBuf::from(&p.path);
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(ApiError::validation_field(
+                    "path",
+                    format!("cannot read {}: {e}", path.display()),
+                ));
+            }
+        };
+        let key = p.key.clone().unwrap_or_else(|| {
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string())
+        });
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in [
+            ("x-vf-bucket", p.bucket.clone()),
+            // ASCII-safe transport: non-ASCII keys ride percent-encoding
+            // (client.rs owns the matching encoder; same wire as `vf put`)
+            ("x-vf-file-name", crate::client::encode_header_value(&key)),
+        ] {
+            headers.insert(
+                axum::http::HeaderName::from_static(name),
+                axum::http::HeaderValue::from_str(&value).map_err(|_| {
+                    ApiError::validation_field(name, format!("{name} must be ASCII"))
+                })?,
+            );
+        }
+        let resp =
+            crate::ops_xvf::put_source(self.ops_state(), headers, Bytes::from(bytes)).await?;
+        let v = response_json(resp).await.map_err(ops::ApiError::internal)?;
+        Ok(json!({
+            "schema_version": SCHEMA_VERSION,
+            "bucket": p.bucket,
+            "key": v["key"],
+            "status": v["status"],
+            "note": "indexed by the next `vectorfs serve` scan (this MCP process runs no ingest worker); poll list_sources",
+        }))
+    }
+
+    async fn call_list_sources(&self, p: ListSourcesParams) -> Result<serde_json::Value, ApiError> {
+        let mut body = json!({
+            "bucket": p.bucket,
+            "maxResults": p.max_results.unwrap_or(500),
+        });
+        if let Some(s) = &p.status {
+            body["status"] = json!(s);
+        }
+        if let Some(t) = &p.next_token {
+            body["nextToken"] = json!(t);
+        }
+        let resp = crate::ops_xvf::list_sources(
+            self.ops_state(),
+            Bytes::from(serde_json::to_vec(&body).expect("serializes")),
+        )
+        .await?;
+        let v = response_json(resp).await.map_err(ops::ApiError::internal)?;
+        let mut out = json!({
+            "schema_version": SCHEMA_VERSION,
+            "bucket": p.bucket,
+            "sources": v["sources"],
+        });
+        if let Some(t) = v.get("nextToken").and_then(|t| t.as_str()) {
+            out["nextToken"] = json!(t);
+        }
+        Ok(out)
+    }
 }
 
 fn tool_error(text: String) -> CallToolResult {
@@ -546,7 +739,7 @@ fn tool_error(text: String) -> CallToolResult {
 #[tool_handler(
     router = self.tool_router,
     name = "vectorfs",
-    instructions = "vectorfs single-agent mode: this MCP process is the ONLY writer of its data root (it holds the same single-writer LOCK as `vectorfs serve`). Locate indexes with list_vector_buckets + list_indexes (they carry dimension/metric), then query_vectors / get_vectors; with --tools rw also put_vectors / delete_vectors. Results are deterministic (queries: distance asc then key asc; get_vectors: key asc). Every result is a JSON string with schema_version; failures are tool errors shaped {code, message, hint}."
+    instructions = "vectorfs single-agent mode: this MCP process is the ONLY writer of its data root (it holds the same single-writer LOCK as `vectorfs serve`). Locate indexes with list_vector_buckets + list_indexes (they carry dimension/metric), then query_vectors / get_vectors; for ingest-configured buckets also search (hybrid file search with merged, source-attributed hits) and list_sources; with --tools rw also put_source / put_vectors / delete_vectors. Results are deterministic (queries: distance asc then key asc; get_vectors: key asc). Every result is a JSON string with schema_version; failures are tool errors shaped {code, message, hint}."
 )]
 impl ServerHandler for VfMcp {}
 
@@ -609,6 +802,52 @@ pub async fn run(cfg: &crate::config::StorageConfig, mode: ToolsMode) -> McpExit
     // vectorfs.toml is present (keeps list output ARNs identical across
     // serve/mcp).
     let file_cfg = crate::config::read_config(&cfg.data_dir).ok().flatten();
+
+    // File-layer query side (M2 T6): when the config has [ingest.*]
+    // sections, LOAD the embedder set (same startup gates as serve — dim
+    // probes, offline-model availability) so `search` can embed queries and
+    // `put_source` can validate buckets + seed markers. The ingest SCHEDULER
+    // is deliberately NOT run (T3 ruling: the file layer's writer is
+    // `vectorfs serve` — wake() on this handle is a harmless no-op).
+    let mut ingest = None;
+    match std::fs::read_to_string(crate::config::config_path(&cfg.data_dir)) {
+        Ok(text) => match crate::pipeline::config::load_pipeline_config(&text) {
+            Err(e) => {
+                return McpExit::Failed(format!("pipeline config invalid: {e}"));
+            }
+            Ok(pcfg) if !pcfg.ingest.is_empty() => {
+                let models_dir = pcfg
+                    .models_dir
+                    .clone()
+                    .unwrap_or_else(|| crate::pipeline::models::default_models_dir(&cfg.data_dir));
+                match crate::ingest::IngestCore::load(&pcfg, &models_dir).await {
+                    Ok(core) => {
+                        for (vb, embedders, scan) in core.describe_buckets() {
+                            eprintln!(
+                                "vectorfs mcp: ingest {vb}: {embedders} embedder(s) loaded \
+                                 (query-side only; serve every {scan}s scans)"
+                            );
+                        }
+                        ingest = Some(Arc::new(crate::ingest::IngestHandle::new(
+                            crate::ingest::IngestShared::new(core),
+                        )));
+                    }
+                    Err(e) => {
+                        return McpExit::Failed(format!("ingest pipeline failed to load: {e}"));
+                    }
+                }
+            }
+            Ok(_) => {}
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return McpExit::Failed(format!(
+                "cannot read {}: {e}",
+                crate::config::config_path(&cfg.data_dir).display()
+            ));
+        }
+    }
+
     let state = Arc::new(AppState {
         storage: Arc::new(storage),
         creds: None, // no wire auth on stdio — the transport is the boundary
@@ -621,9 +860,8 @@ pub async fn run(cfg: &crate::config::StorageConfig, mode: ToolsMode) -> McpExit
             .map(|c| c.account_id.clone())
             .unwrap_or_else(|| crate::config::DEFAULT_ACCOUNT.to_string()),
         trace: false,
-        // MCP single-agent mode does not run the ingest scheduler (M2: the
-        // file layer's writer is `vectorfs serve`).
-        ingest: None,
+        // query-side embedders (search/put_source) — never the scheduler.
+        ingest,
     });
 
     // heartbeat (TTL/3): losing ownership (taken over after our TTL expired)
@@ -923,12 +1161,14 @@ mod tests {
             vec![
                 "get_vectors",
                 "list_indexes",
+                "list_sources",
                 "list_vector_buckets",
-                "query_vectors"
+                "query_vectors",
+                "search"
             ],
             "{names:?}"
         );
-        // rw advertises all six
+        // rw advertises all nine
         let vf = VfMcp::new(state(dir.path()), ToolsMode::Rw);
         let tools = vf.tool_router.list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
@@ -938,12 +1178,241 @@ mod tests {
                 "delete_vectors",
                 "get_vectors",
                 "list_indexes",
+                "list_sources",
                 "list_vector_buckets",
+                "put_source",
                 "put_vectors",
-                "query_vectors"
+                "query_vectors",
+                "search"
             ],
             "{names:?}"
         );
+    }
+
+    // ---- file-layer tools (M2 T6): search / put_source / list_sources ----
+
+    fn fixture_dir() -> std::path::PathBuf {
+        for p in [
+            "vf/tests/fixtures/tiny-embedder",
+            "tests/fixtures/tiny-embedder",
+        ] {
+            let d = std::path::PathBuf::from(p);
+            if d.join("model.onnx").is_file() {
+                return d;
+            }
+        }
+        panic!("tiny-embedder fixture not found under vf/tests/fixtures/");
+    }
+
+    /// An AppState with the tiny-fixture ingest runtime wired (the same
+    /// hermetic shape ops_xvf's wire tests use) + a file-layer object
+    /// indexed through the real scan path.
+    async fn ingest_state(dir: &std::path::Path) -> Arc<AppState> {
+        let text = format!(
+            "[extractor.plain]\nkind = \"txt\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = true\n\n\
+             [ingest.docs]\nscope = \"docs/**\"\nextract = {{ txt = \"plain\" }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"tiny\"]\nscan_interval_secs = 1\n",
+            fixture_dir().display().to_string()
+        );
+        let cfg = crate::pipeline::config::load_pipeline_config(&text).unwrap();
+        let core =
+            crate::ingest::IngestCore::load(&cfg, std::path::Path::new("/nonexistent-models"))
+                .await
+                .unwrap();
+        let handle = Arc::new(crate::ingest::IngestHandle::new(
+            crate::ingest::IngestShared::new(core),
+        ));
+        let state = Arc::new(AppState {
+            storage: Arc::new(crate::store::Storage::file(dir)),
+            creds: None,
+            region: "us-east-1".into(),
+            account: "000000000000".into(),
+            trace: false,
+            ingest: Some(handle.clone()),
+        });
+        // one indexed source through the REAL scan (deterministic, no spawn)
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let rt = crate::ingest::IngestRuntime::new(
+            Arc::clone(handle.shared()),
+            state.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+            rx,
+        );
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(
+            dir.join("docs").join("a.txt"),
+            "the quick brown fox jumps over the lazy dog",
+        )
+        .unwrap();
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        state
+    }
+
+    #[tokio::test]
+    async fn file_layer_tools_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ingest_state(dir.path()).await;
+        let vf = VfMcp::new(s, ToolsMode::Rw);
+
+        // list_sources: the scanned file is INDEXED with live join fields
+        let ls = vf
+            .list_sources(Parameters(ListSourcesParams {
+                bucket: "docs".into(),
+                status: None,
+                max_results: None,
+                next_token: None,
+            }))
+            .await;
+        let (is_err, v) = text_of(ls);
+        assert!(!is_err, "{v}");
+        assert_eq!(v["schema_version"], SCHEMA_VERSION);
+        let rows = v["sources"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["key"], "docs/a.txt");
+        assert_eq!(rows[0]["status"], "INDEXED");
+        assert!(rows[0]["etag"].is_string(), "live join");
+
+        // search: hit shape carries the source location (回源 join)
+        let se = vf
+            .search(Parameters(SearchParams {
+                bucket: "docs".into(),
+                text: "fox".into(),
+                top_k: 5,
+                filter: None,
+                return_text: true,
+            }))
+            .await;
+        let (is_err, v) = text_of(se);
+        assert!(!is_err, "{v}");
+        let hits = v["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "{v}");
+        assert_eq!(hits[0]["location"]["key"], "docs/a.txt");
+        assert!(hits[0]["content"]["text"].is_string(), "{v}");
+
+        // put_source (rw): local file -> object + PENDING marker
+        let upload = dir.path().join("upload.txt");
+        std::fs::write(&upload, "uploaded via mcp put_source").unwrap();
+        let ps = vf
+            .put_source(Parameters(PutSourceParams {
+                path: upload.display().to_string(),
+                bucket: "docs".into(),
+                key: Some("docs/uploaded.txt".into()),
+            }))
+            .await;
+        let (is_err, v) = text_of(ps);
+        assert!(!is_err, "{v}");
+        assert_eq!(v["key"], "docs/uploaded.txt");
+        assert_eq!(v["status"], "PENDING");
+        assert!(
+            dir.path().join("docs/uploaded.txt").is_file(),
+            "object landed in the instance root"
+        );
+
+        // search on a bucket without an ingest section: structured guidance
+        let se = vf
+            .search(Parameters(SearchParams {
+                bucket: "other".into(),
+                text: "x".into(),
+                top_k: 1,
+                filter: None,
+                return_text: false,
+            }))
+            .await;
+        let (is_err, v) = text_of(se);
+        assert!(is_err, "{v}");
+        assert_eq!(v["code"], "Validation");
+        assert!(
+            v["message"].as_str().unwrap().contains("[ingest.other]"),
+            "{v}"
+        );
+    }
+
+    /// ro mode over REAL JSON-RPC (duplex stdio pair, same harness as the
+    /// e2e smoke): `tools/call put_source` is refused by the router while
+    /// `tools/call search` / `list_sources` answer normally.
+    #[tokio::test]
+    async fn ro_mode_rejects_put_source_over_jsonrpc() {
+        use rmcp::ServiceExt as _;
+        use rmcp::transport::{IntoTransport, Transport as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = ingest_state(dir.path()).await;
+
+        let (server_io, client_io) = tokio::io::duplex(8192);
+        let handle = {
+            let server = VfMcp::new(s, ToolsMode::Ro);
+            tokio::spawn(async move { server.serve(server_io).await })
+        };
+        let mut client =
+            IntoTransport::<rmcp::RoleClient, std::io::Error, _>::into_transport(client_io);
+
+        client
+            .send(
+                serde_json::from_str::<ClientJsonRpcMessage>(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":"2025-11-25","capabilities":{},
+                    "clientInfo":{"name":"vf-test","version":"0"}}}"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = expect_response(&mut client).await;
+        client
+            .send(
+                serde_json::from_str::<ClientJsonRpcMessage>(
+                    r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // put_source -> JSON-RPC error (router-level refusal)
+        client
+            .send(
+                serde_json::from_str::<ClientJsonRpcMessage>(
+                    r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                    "name":"put_source","arguments":{"path":"/tmp/x","bucket":"docs"}}}"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        match client.receive().await.unwrap() {
+            ServerJsonRpcMessage::Error(e) => {
+                assert!(e.error.message.contains("not found"), "{:?}", e.error);
+            }
+            other => panic!("expected a JSON-RPC error for put_source, got {other:?}"),
+        }
+
+        // search -> normal tool result with hits
+        client
+            .send(
+                serde_json::from_str::<ClientJsonRpcMessage>(
+                    r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                    "name":"search","arguments":{"bucket":"docs","text":"fox","topK":3}}}"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ServerResult::CallToolResult(call) = expect_response(&mut client).await else {
+            panic!("expected CallToolResult");
+        };
+        assert!(!call.is_error.unwrap_or(false));
+        let text = match call.content.into_iter().next() {
+            Some(rmcp::model::ContentBlock::Text(t)) => t.text,
+            other => panic!("expected text content, got {other:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(!v["hits"].as_array().unwrap().is_empty(), "{v}");
+
+        client.close().await.unwrap();
+        handle.abort();
     }
 
     /// End-to-end stdio smoke (task T6): initialize handshake -> tools/list
@@ -996,7 +1465,7 @@ mod tests {
             .await
             .unwrap();
 
-        // 2. tools/list — all six, with descriptions and input schemas
+        // 2. tools/list — all nine, with descriptions and input schemas
         client
             .send(
                 serde_json::from_str::<ClientJsonRpcMessage>(
@@ -1010,7 +1479,7 @@ mod tests {
             panic!("expected ListToolsResult");
         };
         let names: Vec<&str> = list.tools.iter().map(|t| t.name.as_ref()).collect();
-        assert_eq!(names.len(), 6, "{names:?}");
+        assert_eq!(names.len(), 9, "{names:?}");
         for tool in &list.tools {
             assert!(
                 tool.description.as_deref().is_some_and(|d| !d.is_empty()),

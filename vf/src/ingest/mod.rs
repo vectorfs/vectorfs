@@ -58,7 +58,7 @@ use crate::pipeline::extract::{
     pdf_text::{PdfTextConfig, PdfTextTag},
     txt::{TxtConfig, TxtTag},
 };
-use crate::pipeline::{Chunk, Chunker, Embedder, Extractor, Modality, PipelineError};
+use crate::pipeline::{Chunk, Chunker, Embedder, Extractor, Merge, Modality, PipelineError};
 use crate::store::{SourceMarker, SourceStatus, Storage};
 
 use domain::DerivedSpec;
@@ -127,9 +127,13 @@ pub(crate) struct BucketPlan {
     extractors: BTreeMap<String, ExtractorKind>,
     chunker: ChunkerKind,
     /// fan-out list, config order.
-    embedders: Vec<String>,
+    pub(crate) embedders: Vec<String>,
     /// embedder name -> derived index spec.
     pub derived: BTreeMap<String, DerivedSpec>,
+    /// Query-side merge strategy for the `/x-vf/Search` fan-out (T6): the
+    /// plan carries it so the protocol face can merge with the SAME policy
+    /// the bucket was configured with (§5.10.4 `merge`).
+    pub(crate) merge: Merge,
     max_file_size_bytes: u64,
     retries: u32,
     extract_timeout: Duration,
@@ -182,7 +186,9 @@ fn builtin_extractor(short_key: &str) -> Option<ExtractorKind> {
 }
 
 /// Canonical mime for the routing table (extractors compare against these).
-fn mime_for(object_key: &str) -> &'static str {
+/// `pub(crate)`: the `/x-vf` face reports the same mime a source would be
+/// routed under (GetSource/GetSourceData — T6).
+pub(crate) fn mime_for(object_key: &str) -> &'static str {
     short_key_of(object_key)
         .and_then(crate::pipeline::extract::mime_for_short_key)
         .unwrap_or("application/octet-stream")
@@ -245,6 +251,7 @@ impl IngestCore {
                     chunker: icfg.chunk.clone(),
                     embedders: icfg.embedders.clone(),
                     derived,
+                    merge: icfg.merge,
                     max_file_size_bytes: icfg.max_file_size_mb * 1024 * 1024,
                     retries: icfg.retries,
                     extract_timeout: Duration::from_secs(icfg.extract_timeout_secs),
@@ -309,7 +316,11 @@ enum AttemptErr {
 /// `Arc` clones, so dropping the outer value does not stop them (drain via
 /// [`IngestHandle::shutdown`]).
 pub struct IngestRuntime {
-    core: IngestCore,
+    /// The SAME shared core the protocol face sees through
+    /// [`IngestHandle::shared`] (one `Arc<IngestCore>` for the whole process:
+    /// embedders are loaded exactly once, serve's handlers and this
+    /// runtime's workers call the same sessions).
+    shared: Arc<IngestShared>,
     state: Arc<AppState>,
     notify: Arc<Notify>,
     shutdown: tokio::sync::watch::Receiver<bool>,
@@ -332,14 +343,14 @@ pub struct IngestRuntime {
 
 impl IngestRuntime {
     pub fn new(
-        core: IngestCore,
+        shared: Arc<IngestShared>,
         state: Arc<AppState>,
         notify: Arc<Notify>,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Arc<IngestRuntime> {
         let (tx, rx) = mpsc::channel(QUEUE_DEPTH);
         Arc::new(IngestRuntime {
-            core,
+            shared,
             state,
             notify,
             shutdown,
@@ -359,7 +370,8 @@ impl IngestRuntime {
         // bucket off ONE shared root listing, so the cheapest schedule is a
         // single ticker at the fastest configured period.
         let scan_interval = Duration::from_secs(
-            self.core
+            self.shared
+                .core
                 .buckets
                 .values()
                 .map(|p| p.scan_interval_secs)
@@ -435,9 +447,14 @@ impl IngestRuntime {
                 return;
             }
         };
-        for (vb, plan) in &self.core.buckets {
-            if let Err(e) = self.scan_bucket(vb, plan, &listing).await {
-                eprintln!("ingest: scan of bucket {vb} failed: {e}");
+        for (vb, plan) in &self.shared.core.buckets {
+            match self.scan_bucket(vb, plan, &listing).await {
+                Ok(()) => {
+                    // lastScanAt for GetIngestStatus (appendix E.2): stamp on
+                    // COMPLETION — a half-failed scan must not claim freshness.
+                    self.shared.record_scan(vb);
+                }
+                Err(e) => eprintln!("ingest: scan of bucket {vb} failed: {e}"),
             }
         }
     }
@@ -564,7 +581,7 @@ impl IngestRuntime {
     }
 
     async fn process_job(&self, job: &Job) {
-        let Some(plan) = self.core.buckets.get(&job.vb) else {
+        let Some(plan) = self.shared.core.buckets.get(&job.vb) else {
             return;
         };
         let storage = &self.state.storage;
@@ -600,24 +617,41 @@ impl IngestRuntime {
         }
 
         // ---- read the object (size-gated) ----
+        // candidate keys: canonical first, raw second — externally placed
+        // files keep their raw name on the file backend (T6 finding, see
+        // domain::user_object_key_candidates)
         let backend = storage.backend().clone();
-        let okey = domain::user_object_key(&backend, &job.object_key);
-        let get = match storage.catalog().get(&okey).await {
-            Ok(g) => g,
-            Err(object_store::Error::NotFound { .. }) => {
+        let mut get = None;
+        let mut hard_err = None;
+        for okey in domain::user_object_key_candidates(&backend, &job.object_key) {
+            match storage.catalog().get(&okey).await {
+                Ok(g) => {
+                    get = Some(g);
+                    break;
+                }
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(e) => {
+                    hard_err = Some(e);
+                    break;
+                }
+            }
+        }
+        let get = match get {
+            Some(g) => g,
+            None => {
+                if let Some(e) = hard_err {
+                    eprintln!(
+                        "ingest: {}: read failed: {e} (next scan retries)",
+                        job.object_key
+                    );
+                    return;
+                }
                 // vanished between scan and job — same as the scanner's
                 // vanished path
                 if let Some(d) = marker::plan_vanished(prev.clone(), &marker::now_rfc3339()) {
                     let _ = storage.save_source(&job.vb, &job.key_hash, &d).await;
                     eprintln!("ingest: {} -> DELETING (object gone)", job.object_key);
                 }
-                return;
-            }
-            Err(e) => {
-                eprintln!(
-                    "ingest: {}: read failed: {e} (next scan retries)",
-                    job.object_key
-                );
                 return;
             }
         };
@@ -755,6 +789,7 @@ impl IngestRuntime {
                 let mime = mime_for(&job.object_key).to_string();
                 let bytes = bytes.clone();
                 let permit = self
+                    .shared
                     .core
                     .cpu
                     .clone()
@@ -800,6 +835,7 @@ impl IngestRuntime {
                 continue;
             }
             let loaded = self
+                .shared
                 .core
                 .embedder(name)
                 .ok_or_else(|| AttemptErr::Fail(format!("embedder '{name}' not loaded")))?;
@@ -857,6 +893,7 @@ impl IngestRuntime {
         match loaded {
             LoadedEmbedder::Ort(_) => {
                 let permit = self
+                    .shared
                     .core
                     .cpu
                     .clone()
@@ -920,7 +957,7 @@ impl IngestRuntime {
                 m.retries = retries;
                 m.retries_exhausted = false;
                 m.status_reason = None;
-                m.pipeline_fingerprint = self.core.buckets[&job.vb].fingerprint.clone();
+                m.pipeline_fingerprint = self.shared.core.buckets[&job.vb].fingerprint.clone();
                 eprintln!(
                     "ingest: {} -> INDEXED (chunks={})",
                     job.object_key,
@@ -942,7 +979,7 @@ impl IngestRuntime {
                 m.chunks = chunks;
                 m.retries_exhausted = true; // the retry budget IS spent
                 m.status_reason = Some(reason.clone());
-                m.pipeline_fingerprint = self.core.buckets[&job.vb].fingerprint.clone();
+                m.pipeline_fingerprint = self.shared.core.buckets[&job.vb].fingerprint.clone();
                 eprintln!("ingest: {} -> PARTIALLY_INDEXED ({reason})", job.object_key);
             }
             Outcome::Failed(reason) => {
@@ -1083,8 +1120,29 @@ fn split_batches(rows: Vec<BatchRow>, dim: usize) -> Vec<Vec<BatchRow>> {
 /// mirror) — model caches live under it too, so the exclusion is what keeps
 /// scans off them (§5.10.4 "`.vectorfs/` 恒排除").
 async fn list_root(storage: &Storage) -> Result<Vec<(String, object_store::ObjectMeta)>, String> {
+    list_root_at(storage.catalog(), storage.backend()).await
+}
+
+/// The backend-parameterized half of [`list_root`] — the `/x-vf` face
+/// (ListSources' marker x live join, T6) reuses it against the same catalog.
+///
+/// Key canonicalization (a T6-found latent bug of the T3 scanner):
+/// `object_store::path::Path` percent-encodes non-ASCII and AWS-discouraged
+/// characters (`%{}\^]"'>~<#|*?` + controls) at construction, and the LOCAL
+/// backend materializes that canonical form on disk — so a listed location's
+/// string is CANONICAL, while every human-facing key (marker `object_key`,
+/// PutSource's decoded `x-vf-file-name`, GetSource lookups through
+/// [`domain::user_object_key`], which re-canonicalizes symmetrically) is the
+/// RAW key. The listing is therefore DECODED back here; without it, any key
+/// with such characters would phantom-appear (encoded twin) and
+/// vanish-flip (raw twin) on every scan. Decode is the exact inverse of
+/// `Path`'s encoding (which escapes `%` itself), so the round trip is
+/// bijective.
+pub(crate) async fn list_root_at(
+    catalog: &Arc<dyn object_store::ObjectStore>,
+    backend: &crate::backends::Backend,
+) -> Result<Vec<(String, object_store::ObjectMeta)>, String> {
     use futures_util::StreamExt;
-    let catalog = storage.catalog();
     let mut stream = catalog.list(None);
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
@@ -1093,7 +1151,7 @@ async fn list_root(storage: &Storage) -> Result<Vec<(String, object_store::Objec
         // S3: the catalog store is rooted at the BUCKET, so keys carry the
         // configured prefix; strip it and skip anything outside it (other
         // tenants of the same bucket are not this instance root).
-        let key = match storage.backend() {
+        let key = match backend {
             crate::backends::Backend::S3(cfg) => {
                 let Some(k) = raw.strip_prefix(&format!("{}/", cfg.prefix.trim_matches('/')))
                 else {
@@ -1103,6 +1161,9 @@ async fn list_root(storage: &Storage) -> Result<Vec<(String, object_store::Objec
             }
             _ => raw,
         };
+        let key = percent_encoding::percent_decode_str(&key)
+            .decode_utf8_lossy()
+            .into_owned();
         if key.starts_with(crate::backends::SYSTEM_PREFIX)
             || key.starts_with(&format!(
                 "{}/{}",
@@ -1120,27 +1181,168 @@ async fn list_root(storage: &Storage) -> Result<Vec<(String, object_store::Objec
 }
 
 // ---------------------------------------------------------------------------
-// handle (wake + drain; AppState carries it for T6's PutSource)
+// shared state (runtime <-> protocol face) + handle (wake + drain)
 // ---------------------------------------------------------------------------
 
-/// The piece of the ingest runtime the PROTOCOL face holds: `wake()` for the
-/// immediate trigger (T6 `vf put` / PutSource) and `shutdown()` for the
-/// SIGTERM drain. Cheap and inert until tasks are registered.
-pub struct IngestHandle {
-    notify: Arc<Notify>,
-    tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+/// One reindex job (appendix E.2 GetIngestStatus `reindex{jobId,status,
+/// progress}`): the registry keeps the LATEST job per bucket — a re-reindex
+/// while one is outstanding simply replaces the entry (the marker flip is
+/// idempotent; progress is recomputed from the markers either way).
+#[derive(Debug, Clone)]
+pub struct ReindexJob {
+    pub job_id: String,
+    /// `queued` -> `running` -> `done`; advanced lazily by GetIngestStatus
+    /// reads (single-process, single-writer — a read is a safe checkpoint).
+    pub status: &'static str,
+    pub total: usize,
+    pub done: usize,
 }
 
-impl Default for IngestHandle {
-    fn default() -> Self {
-        Self::new()
+/// The piece of the ingest runtime the PROTOCOL face (`AppState.ingest` ->
+/// [`IngestHandle`]) holds: the loaded core (one `Arc` shared with the
+/// runtime's workers), the last-scan clock and the reindex job registry,
+/// plus `wake()` for the immediate trigger and `shutdown()` for the drain.
+pub struct IngestShared {
+    core: Arc<IngestCore>,
+    /// bucket -> RFC3339 of the last COMPLETED scan (GetIngestStatus).
+    last_scan: std::sync::Mutex<BTreeMap<String, String>>,
+    /// bucket -> latest reindex job.
+    jobs: std::sync::Mutex<BTreeMap<String, ReindexJob>>,
+}
+
+impl IngestShared {
+    pub fn new(core: IngestCore) -> Arc<IngestShared> {
+        Arc::new(IngestShared {
+            core: Arc::new(core),
+            last_scan: std::sync::Mutex::new(BTreeMap::new()),
+            jobs: std::sync::Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// The configured ingest buckets, name-sorted (BTreeMap order).
+    pub fn bucket_names(&self) -> Vec<String> {
+        self.core.buckets.keys().cloned().collect()
+    }
+
+    pub fn has_bucket(&self, bucket: &str) -> bool {
+        self.core.buckets.contains_key(bucket)
+    }
+
+    /// Current pipeline fingerprint of one bucket (`None` = unconfigured).
+    pub fn fingerprint_of(&self, bucket: &str) -> Option<String> {
+        self.core.buckets.get(bucket).map(|p| p.fingerprint.clone())
+    }
+
+    /// Fan-out list (config order) of one bucket's embedder instance names.
+    pub fn embedder_names(&self, bucket: &str) -> Option<Vec<String>> {
+        self.core.buckets.get(bucket).map(|p| p.embedders.clone())
+    }
+
+    /// Query-side merge strategy of one bucket (`/x-vf/Search`).
+    pub fn merge_of(&self, bucket: &str) -> Option<Merge> {
+        self.core.buckets.get(bucket).map(|p| p.merge)
+    }
+
+    /// Derived-index specs of one bucket, config embedder order.
+    pub fn derived_specs(&self, bucket: &str) -> Option<Vec<domain::DerivedSpec>> {
+        let plan = self.core.buckets.get(bucket)?;
+        Some(
+            plan.embedders
+                .iter()
+                .map(|n| plan.derived[n].clone())
+                .collect(),
+        )
+    }
+
+    /// A loaded embedder instance by name (the query side of `/x-vf/Search`).
+    pub fn embedder(&self, name: &str) -> Option<&LoadedEmbedder> {
+        self.core.embedder(name)
+    }
+
+    /// Is `object_key` a SOURCE of this bucket's pipeline (scope match AND a
+    /// routed extractor)? PutSource refuses keys outside it — a marker for an
+    /// unscoped key would never be touched by the scanner again.
+    pub fn claims_key(&self, bucket: &str, object_key: &str) -> bool {
+        self.core
+            .buckets
+            .get(bucket)
+            .is_some_and(|p| p.scope.matches(object_key) && p.extractor_for(object_key).is_some())
+    }
+
+    /// Stamp a completed scan (scheduler -> GetIngestStatus).
+    pub(crate) fn record_scan(&self, bucket: &str) {
+        self.last_scan
+            .lock()
+            .unwrap()
+            .insert(bucket.to_string(), marker::now_rfc3339());
+    }
+
+    /// lastScanAt of one bucket (RFC3339), if a scan ever completed.
+    pub fn last_scan_at(&self, bucket: &str) -> Option<String> {
+        self.last_scan.lock().unwrap().get(bucket).cloned()
+    }
+
+    /// Register a fresh reindex job for `bucket` (Reindex handler): returns
+    /// the generated jobId (uuid-style hex).
+    pub fn register_reindex(&self, bucket: &str, total: usize) -> String {
+        let job_id = random_hex(16);
+        self.jobs.lock().unwrap().insert(
+            bucket.to_string(),
+            ReindexJob {
+                job_id: job_id.clone(),
+                status: "queued",
+                total,
+                done: 0,
+            },
+        );
+        job_id
+    }
+
+    /// Snapshot the latest job of one bucket.
+    pub fn reindex_job(&self, bucket: &str) -> Option<ReindexJob> {
+        self.jobs.lock().unwrap().get(bucket).cloned()
+    }
+
+    /// Advance the latest job of one bucket from live marker counts
+    /// (GetIngestStatus is the single reader/checkpointer): `done` = markers
+    /// in a terminal state (INDEXED / PARTIALLY_INDEXED / FAILED). A
+    /// zero-marker job (empty/deleting-only bucket) is trivially done.
+    pub fn refresh_reindex(&self, bucket: &str, done: usize) {
+        if let Some(job) = self.jobs.lock().unwrap().get_mut(bucket) {
+            job.done = done;
+            job.status = if done >= job.total { "done" } else { "running" };
+        }
     }
 }
 
+/// 32 hex chars from the OS RNG (getrandom is already a direct dep; the same
+/// entropy source the LOCK owner id uses). Job ids are opaque handles, not
+/// secrets — collision odds at 128 bits are irrelevant here.
+fn random_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    getrandom::fill(&mut buf).expect("OS randomness unavailable");
+    let mut out = String::with_capacity(bytes * 2);
+    for b in buf {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// The piece of the ingest runtime the PROTOCOL face holds: `wake()` for the
+/// immediate trigger (T6 `vf put` / PutSource) and `shutdown()` for the
+/// SIGTERM drain, over the shared [`IngestShared`]. Cheap and inert until
+/// tasks are registered.
+pub struct IngestHandle {
+    notify: Arc<Notify>,
+    shared: Arc<IngestShared>,
+    tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
 impl IngestHandle {
-    pub fn new() -> IngestHandle {
+    pub fn new(shared: Arc<IngestShared>) -> IngestHandle {
         IngestHandle {
             notify: Arc::new(Notify::new()),
+            shared,
             tasks: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -1148,6 +1350,11 @@ impl IngestHandle {
     /// The scheduler's wake channel (shared with the runtime).
     pub fn notify(&self) -> Arc<Notify> {
         Arc::clone(&self.notify)
+    }
+
+    /// The shared core/registry face (`/x-vf/*` handlers).
+    pub fn shared(&self) -> &Arc<IngestShared> {
+        &self.shared
     }
 
     /// Immediate scan trigger: the scheduler wakes and runs one
@@ -1248,16 +1455,26 @@ pub(crate) mod tests {
     }
 
     /// Runtime in test mode: no spawned tasks; the test drives
-    /// scan_once + drain_queue deterministically.
-    async fn test_runtime(dir: &Path, extra: &str) -> (Arc<IngestRuntime>, Arc<AppState>) {
+    /// scan_once + drain_queue deterministically. The handle over the same
+    /// shared core is returned for the /x-vf face (T6).
+    async fn test_runtime(
+        dir: &Path,
+        extra: &str,
+    ) -> (Arc<IngestRuntime>, Arc<IngestHandle>, Arc<AppState>) {
         let (_, cfg) = tiny_config(extra);
         let core = IngestCore::load(&cfg, Path::new("/nonexistent-models"))
             .await
             .expect("fixture embedder loads");
         let state = test_state(dir);
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let rt = IngestRuntime::new(core, state.clone(), Arc::new(Notify::new()), shutdown_rx);
-        (rt, state)
+        let handle = Arc::new(IngestHandle::new(IngestShared::new(core)));
+        let rt = IngestRuntime::new(
+            Arc::clone(handle.shared()),
+            state.clone(),
+            Arc::new(Notify::new()),
+            shutdown_rx,
+        );
+        (rt, handle, state)
     }
 
     async fn markers(state: &AppState, vb: &str) -> Vec<SourceMarker> {
@@ -1276,7 +1493,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn full_chain_indexed_queryable_and_side_effect_free() {
         let dir = tempfile::tempdir().unwrap();
-        let (rt, state) = test_runtime(dir.path(), "").await;
+        let (rt, _h, state) = test_runtime(dir.path(), "").await;
         // user objects land in the instance root, inside the scope
         let docs = dir.path().join("docs");
         std::fs::create_dir_all(&docs).unwrap();
@@ -1312,7 +1529,7 @@ pub(crate) mod tests {
 
         // derived index meta is correct and stamped
         let core_cfg = tiny_config("").1;
-        let plan = &rt.core.buckets["docs"];
+        let plan = &rt.shared.core.buckets["docs"];
         let spec = &plan.derived["tiny"];
         assert_eq!(spec.dim, 8, "tiny fixture");
         let meta = state
@@ -1424,8 +1641,13 @@ pub(crate) mod tests {
             .unwrap();
         let state = test_state(dir.path());
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let handle = Arc::new(IngestHandle::new());
-        let rt = IngestRuntime::new(core, state.clone(), handle.notify(), shutdown_rx);
+        let handle = Arc::new(IngestHandle::new(IngestShared::new(core)));
+        let rt = IngestRuntime::new(
+            Arc::clone(handle.shared()),
+            state.clone(),
+            handle.notify(),
+            shutdown_rx,
+        );
         rt.spawn(&handle);
 
         let docs = dir.path().join("docs");
@@ -1467,7 +1689,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn non_utf8_file_fails_with_reason_and_no_retry() {
         let dir = tempfile::tempdir().unwrap();
-        let (rt, state) = test_runtime(dir.path(), "retries = 0\n").await;
+        let (rt, _h, state) = test_runtime(dir.path(), "retries = 0\n").await;
         let docs = dir.path().join("docs");
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("bad.txt"), b"\xff\xfe\xfa not utf8 \xff").unwrap();
@@ -1509,7 +1731,12 @@ pub(crate) mod tests {
             .unwrap();
         let state = test_state(dir.path());
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        let rt = IngestRuntime::new(core, state.clone(), Arc::new(Notify::new()), rx);
+        let rt = IngestRuntime::new(
+            IngestShared::new(core),
+            state.clone(),
+            Arc::new(Notify::new()),
+            rx,
+        );
 
         let docs = dir.path().join("docs");
         std::fs::create_dir_all(&docs).unwrap();
@@ -1525,7 +1752,7 @@ pub(crate) mod tests {
         assert!(m.chunks.is_some(), "the succeeded half is recorded");
 
         // the tiny embedder's index DID get its vectors
-        let spec = &rt.core.buckets["docs"].derived["tiny"];
+        let spec = &rt.shared.core.buckets["docs"].derived["tiny"];
         let count = state
             .storage
             .count_vectors("docs", &spec.index_name)
@@ -1544,7 +1771,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn content_hash_skip_beats_metadata_only_rewrite() {
         let dir = tempfile::tempdir().unwrap();
-        let (rt, state) = test_runtime(dir.path(), "").await;
+        let (rt, _h, state) = test_runtime(dir.path(), "").await;
         let docs = dir.path().join("docs");
         std::fs::create_dir_all(&docs).unwrap();
         let file = docs.join("a.txt");
@@ -1553,7 +1780,7 @@ pub(crate) mod tests {
         rt.drain_queue().await;
         let m1 = status_of(&state, "docs", "docs/a.txt").await;
         assert_eq!(m1.status, SourceStatus::Indexed);
-        let spec = &rt.core.buckets["docs"].derived["tiny"];
+        let spec = &rt.shared.core.buckets["docs"].derived["tiny"];
         let count1 = state
             .storage
             .count_vectors("docs", &spec.index_name)
@@ -1587,7 +1814,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn changed_content_reingests_and_deletion_flips_deleting() {
         let dir = tempfile::tempdir().unwrap();
-        let (rt, state) = test_runtime(dir.path(), "").await;
+        let (rt, _h, state) = test_runtime(dir.path(), "").await;
         let docs = dir.path().join("docs");
         std::fs::create_dir_all(&docs).unwrap();
         let file = docs.join("a.txt");
@@ -1604,7 +1831,7 @@ pub(crate) mod tests {
         let m2 = status_of(&state, "docs", "docs/a.txt").await;
         assert_eq!(m2.status, SourceStatus::Indexed);
         assert_ne!(m2.content_hash, m1.content_hash);
-        let spec = &rt.core.buckets["docs"].derived["tiny"];
+        let spec = &rt.shared.core.buckets["docs"].derived["tiny"];
         let count = state
             .storage
             .count_vectors("docs", &spec.index_name)
@@ -1624,9 +1851,35 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn unicode_and_special_char_keys_scan_without_phantoms() {
+        // T6-found latent bug: object_store's Path canonical form percent-
+        // encodes non-ASCII (and `%#*?` etc.) — the scanner must compare
+        // DECODED keys against markers, or every such key phantom-creates an
+        // encoded-twin marker and vanish-flips its real one each scan.
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _h, state) = test_runtime(dir.path(), "").await;
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("汉字 文档#1.txt"), "unicode content here").unwrap();
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let m = status_of(&state, "docs", "docs/汉字 文档#1.txt").await;
+        assert_eq!(m.status, SourceStatus::Indexed);
+
+        // rescan: exactly ONE marker, still INDEXED (no encoded twin, no
+        // DELETING flip)
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let ms = markers(&state, "docs").await;
+        assert_eq!(ms.len(), 1, "phantom marker appeared: {ms:?}");
+        assert_eq!(ms[0].object_key, "docs/汉字 文档#1.txt");
+        assert_eq!(ms[0].status, SourceStatus::Indexed);
+    }
+
+    #[tokio::test]
     async fn oversize_file_parks_without_reading() {
         let dir = tempfile::tempdir().unwrap();
-        let (rt, state) = test_runtime(dir.path(), "max_file_size_mb = 1\n").await;
+        let (rt, _h, state) = test_runtime(dir.path(), "max_file_size_mb = 1\n").await;
         let docs = dir.path().join("docs");
         std::fs::create_dir_all(&docs).unwrap();
         // a sparse file reports > 1 MiB without materializing it
@@ -1696,7 +1949,7 @@ pub(crate) mod tests {
         // an IN_PROGRESS marker whose object is UNCHANGED (the kill -9 shape)
         // is re-enqueued by the next scan and converges
         let dir = tempfile::tempdir().unwrap();
-        let (rt, state) = test_runtime(dir.path(), "").await;
+        let (rt, _h, state) = test_runtime(dir.path(), "").await;
         let docs = dir.path().join("docs");
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(
@@ -1754,7 +2007,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn store_chunk_text_false_omits_the_key() {
         let dir = tempfile::tempdir().unwrap();
-        let (rt, state) = test_runtime(dir.path(), "store_chunk_text = false\n").await;
+        let (rt, _h, state) = test_runtime(dir.path(), "store_chunk_text = false\n").await;
         let docs = dir.path().join("docs");
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("a.txt"), "no chunk text should be stored for me").unwrap();
@@ -1764,7 +2017,7 @@ pub(crate) mod tests {
             status_of(&state, "docs", "docs/a.txt").await.status,
             SourceStatus::Indexed
         );
-        let spec = &rt.core.buckets["docs"].derived["tiny"];
+        let spec = &rt.shared.core.buckets["docs"].derived["tiny"];
         // scan the table for any x-vf-chunk-text metadata
         let found = state
             .storage
