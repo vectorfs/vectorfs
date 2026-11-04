@@ -23,15 +23,25 @@ use bytes::Bytes;
 use http_body_util::Full;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::connect::proxy::Tunnel;
 use hyper_util::rt::TokioExecutor;
 
 /// The shared client shape: https-or-http, http1, no pooling knobs (process
 /// default pool; embedding traffic is low-volume and keep-alive reuse comes
-/// free with the legacy client).
-pub type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
+/// free with the legacy client). The connector is [`ProxyAwareConnector`] —
+/// direct TCP unless the standard proxy env vars apply.
+pub type HttpClient = Client<hyper_rustls::HttpsConnector<ProxyAwareConnector>, Full<Bytes>>;
 
 /// Build a client. One client per embedder instance keeps the connection pool
 /// scoped to its endpoint; constructing is cheap.
+///
+/// Proxy: standard `HTTPS_PROXY`/`https_proxy` (https targets) and
+/// `HTTP_PROXY`/`http_proxy` (http targets) env vars are honored via a CONNECT
+/// [`Tunnel`], with `NO_PROXY`/`no_proxy` host exclusions — the same semantics
+/// curl uses, resolved per destination inside [`ProxyAwareConnector`]. No env
+/// vars set (the common deployment) = direct connection, byte-for-byte the
+/// pre-proxy behavior. Proxy AUTH (`user:pass@host`) is not supported in M2;
+/// such an env value is a hard construction error, never a silent proxy skip.
 pub fn client() -> HttpClient {
     // EXPLICIT provider, never the feature-default selection: this tree's
     // rustls carries BOTH `aws-lc-rs` (hyper-rustls/object_store) and `ring`
@@ -43,8 +53,162 @@ pub fn client() -> HttpClient {
         .expect("building the aws-lc-rs rustls ClientConfig cannot fail")
         .https_or_http()
         .enable_http1()
-        .build();
+        .wrap_connector(ProxyAwareConnector::from_env());
     Client::builder(TokioExecutor::new()).build(https)
+}
+
+// ---------------------------------------------------------------------------
+// proxy-aware transport connector
+// ---------------------------------------------------------------------------
+
+/// Transport connector (the layer UNDER TLS): plain TCP to the target, or a
+/// CONNECT tunnel through an HTTP proxy when the env says so for this target.
+///
+/// hyper-rustls wraps this connector and does TLS itself — so for an https
+/// destination through a proxy, TLS runs END-TO-END over the tunnel (the
+/// proxy never sees plaintext). `http://` destinations (loopback test fakes
+/// and in-process gateways only — the openai kind separately enforces https
+/// off-loopback) tunnel without TLS, which is what CONNECT means for them.
+#[derive(Clone, Debug)]
+pub struct ProxyAwareConnector {
+    http: HttpConnector,
+    /// (proxy authority, no_proxy entries). `None` = env unset: zero proxy
+    /// logic, the connector is a plain HttpConnector with a boxed future.
+    proxy: Option<(http::uri::Authority, Vec<String>)>,
+}
+
+type BoxIoFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    hyper_util::rt::TokioIo<tokio::net::TcpStream>,
+                    Box<dyn std::error::Error + Send + Sync>,
+                >,
+            > + Send,
+    >,
+>;
+
+impl tower_service::Service<http::Uri> for ProxyAwareConnector {
+    type Response = hyper_util::rt::TokioIo<tokio::net::TcpStream>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    // The boxed future is what makes this connector legal for hyper-util's
+    // legacy client (its Connect blanket impl requires Unpin futures; both
+    // HttpConnector's and Tunnel's own futures are not).
+    type Future = BoxIoFuture;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.http
+            .poll_ready(cx)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
+    fn call(&mut self, dst: http::Uri) -> Self::Future {
+        // The boxed future is 'static: every branch dials through a CLONED
+        // connector (HttpConnector is cheap-clone; it only carries DNS
+        // resolver + knobs) instead of borrowing `self`.
+        let mut direct = self.http.clone();
+        let direct = move |_dst: http::Uri| {
+            Box::pin(async move {
+                direct
+                    .call(_dst)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            }) as BoxIoFuture
+        };
+        match &self.proxy {
+            // direct: same dial HttpConnector would do, error type erased
+            None => direct(dst),
+            // tunneled: TCP to the proxy, then CONNECT with the target
+            // authority; NO_PROXY-excluded hosts fall back to direct
+            Some((proxy_authority, exclusions)) => {
+                let host = dst.host().unwrap_or_default().to_string();
+                if no_proxy_matches(&host, exclusions) {
+                    return direct(dst);
+                }
+                let proxy_uri = http::Uri::builder()
+                    .scheme("http")
+                    .authority(proxy_authority.clone())
+                    .path_and_query("/")
+                    .build()
+                    .expect("proxy authority round-trips into a Uri");
+                let mut tunnel = Tunnel::new(proxy_uri, self.http.clone());
+                Box::pin(async move {
+                    tunnel
+                        .call(dst)
+                        .await
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+                })
+            }
+        }
+    }
+}
+
+impl ProxyAwareConnector {
+    /// Test seam: build with an explicit proxy + exclusions (from_env reads
+    /// the process environment, which is global and racy under the parallel
+    /// test runner).
+    #[cfg(test)]
+    pub(crate) fn proxied(authority: http::uri::Authority, exclusions: Vec<String>) -> Self {
+        Self {
+            http: HttpConnector::new(),
+            proxy: Some((authority, exclusions)),
+        }
+    }
+
+    /// Pick up `HTTPS_PROXY`/`https_proxy` (for https targets) or
+    /// `HTTP_PROXY`/`http_proxy` (for plain-http targets) plus
+    /// `NO_PROXY`/`no_proxy` exclusions. One proxy for both schemes: the
+    /// http-target proxy only matters for non-loopback plain http, which this
+    /// leaf never makes (see module doc), so honoring it would be dead code —
+    /// the https entry wins and the http entry is only read when https is
+    /// absent.
+    pub fn from_env() -> Self {
+        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let proxy = env("HTTPS_PROXY")
+            .or_else(|| env("https_proxy"))
+            .or_else(|| env("HTTP_PROXY"))
+            .or_else(|| env("http_proxy"))
+            .map(|raw| {
+                let cleaned = raw.trim_start_matches("http://").trim_end_matches('/');
+                let authority = cleaned.parse::<http::uri::Authority>().unwrap_or_else(|_| {
+                    panic!(
+                        "invalid proxy {raw:?}: expected host:port (http scheme; proxy \
+                             auth is not supported in M2)"
+                    )
+                });
+                if authority.as_str().contains('@') {
+                    panic!(
+                        "proxy {raw:?} carries credentials (user:pass@) — proxy auth is not \
+                         supported in M2; use an unauthenticated proxy or a mirror (HF_ENDPOINT)"
+                    );
+                }
+                let exclusions = env("NO_PROXY")
+                    .or_else(|| env("no_proxy"))
+                    .map(|list| list.split(',').map(|s| s.trim().to_lowercase()).collect())
+                    .unwrap_or_default();
+                (authority, exclusions)
+            });
+        Self {
+            http: HttpConnector::new(),
+            proxy,
+        }
+    }
+}
+
+/// curl's NO_PROXY semantics, subset: exact host match, dot-suffix match
+/// (`.corp.net` or `corp.net` both cover `a.b.corp.net`), and the `*`
+/// wildcard. Leading-dot entries match host suffixes without the dot.
+fn no_proxy_matches(host: &str, exclusions: &[String]) -> bool {
+    let host = host.to_lowercase();
+    exclusions.iter().any(|e| {
+        e == "*" || host == *e || {
+            let bare = e.strip_prefix('.').unwrap_or(e);
+            host.ends_with(bare) && host.as_bytes().get(host.len() - bare.len()) == Some(&b'.')
+        }
+    })
 }
 
 /// Erased response body: models.rs streams file bytes from it without naming
@@ -118,6 +282,97 @@ fn resolve_relative(base: &str, location: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_proxy_semantics_subset() {
+        let ex = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let list = ex(&["localhost", ".corp.net", "10.0.0.0/8", "*"]);
+        // exact
+        assert!(no_proxy_matches("LOCALHOST", &list));
+        // dot-suffix (leading dot optional)
+        assert!(no_proxy_matches("a.b.corp.net", &list));
+        assert!(no_proxy_matches("corp.net", &list));
+        // plain suffix WITHOUT a dot boundary must NOT match (xcorp.net != corp.net)
+        assert!(!no_proxy_matches("xcorp.net", &ex(&["corp.net"])));
+        // non-matching entries are just strings (cidr blocks included — we do
+        // not parse them, documented subset)
+        assert!(!no_proxy_matches("example.com", &ex(&["10.0.0.0/8"])));
+    }
+
+    /// End-to-end through a fake HTTP proxy: the client must CONNECT through
+    /// it for a non-excluded host and the request must ride the tunnel. The
+    /// proxy double-roles as the origin (it answers the tunneled GET itself),
+    /// which is exactly what CONNECT means for a plain-http target.
+    #[tokio::test]
+    async fn connector_tunnels_through_http_proxy_and_honors_no_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // fake proxy: read the CONNECT line, 200, then read one HTTP request
+        // line and answer it on the same connection
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let connect_line = head.lines().next().unwrap_or_default().to_string();
+            sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            // the tunneled GET arrives on the same socket
+            let mut buf2 = [0u8; 4096];
+            let n2 = sock.read(&mut buf2).await.unwrap();
+            let get_line = String::from_utf8_lossy(&buf2[..n2]).into_owned();
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            (connect_line, get_line)
+        });
+
+        let authority: http::uri::Authority =
+            format!("127.0.0.1:{}", proxy_addr.port()).parse().unwrap();
+        // "example.test" is NOT excluded -> tunneled
+        let connector = ProxyAwareConnector::proxied(authority, vec!["localhost".into()]);
+        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_provider_and_webpki_roots(provider)
+            .unwrap()
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(connector);
+        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+        // the "target" host need not resolve: the proxy answers everything.
+        // Explicit port: hyper-util's Tunnel defaults an UNSPECIFIED CONNECT
+        // port to 443 (it assumes https through the proxy); real plain-http
+        // targets in this leaf are loopback-only and never tunneled, so the
+        // explicit port keeps the assertion deterministic.
+        let resp = client
+            .get(
+                "http://files.example.test:80/data.bin"
+                    .parse::<http::Uri>()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp)
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&body[..], b"ok");
+        let (connect, get) = proxy_task.await.unwrap();
+        assert!(
+            connect.starts_with("CONNECT files.example.test:80 "),
+            "proxy saw {connect:?}"
+        );
+        assert!(
+            get.starts_with("GET /data.bin "),
+            "tunneled request {get:?}"
+        );
+    }
 
     #[test]
     fn relative_locations_resolve() {

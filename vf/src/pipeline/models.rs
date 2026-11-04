@@ -274,7 +274,10 @@ pub async fn prefetch_model(
             );
             continue;
         }
-        let url = format!("{}/{}/resolve/{}", base, model.hf_repo, file.remote);
+        // HF blob URL shape: /<repo>/resolve/<ref>/<path>. The ref is pinned
+        // `main` (the only branch the built-in table's sha256s are taken
+        // against; a moving tag would detach the pin).
+        let url = format!("{}/{}/resolve/main/{}", base, model.hf_repo, file.remote);
         let (status, total, resp) = super::embed::http::get_following_redirects(&client, &url, 5)
             .await
             .map_err(PipelineError::io)?;
@@ -424,7 +427,7 @@ pub(crate) mod tests {
         hex(&h.finalize())
     }
 
-    /// Fake HF serving [fake_file] bytes at `/<repo>/resolve/<path>`.
+    /// Fake HF serving [fake_file] bytes at `/<repo>/resolve/<ref>/<path>`.
     /// `hits` counts download requests (idempotence assertions).
     pub(crate) async fn fake_hf() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         async fn serve_file(
@@ -434,8 +437,10 @@ pub(crate) mod tests {
             AxPath(path): AxPath<String>,
         ) -> (AxStatus, Vec<u8>) {
             hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            // the wire path is /<repo>/resolve/<file> — serve by <file>
-            let file = path.rsplit("/resolve/").next().unwrap_or(&path);
+            // the wire path is /<repo>/resolve/<ref>/<file> — drop the ref
+            // segment and serve by <file>
+            let after = path.rsplit("/resolve/").next().unwrap_or(&path);
+            let file = after.split_once('/').map(|(_, f)| f).unwrap_or(after);
             (AxStatus::OK, fake_file(file))
         }
         let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));

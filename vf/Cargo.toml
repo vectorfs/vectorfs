@@ -136,11 +136,20 @@ rmcp = { version = "3.8", default-features = false, features = [
 hyper-util = { version = "0.1", default-features = false, features = [
   "client",
   "client-legacy",
+  # client-proxy: the CONNECT `Tunnel` connector (model prefetch / openai
+  # egress through corporate proxies — standard *_PROXY env semantics, see
+  # pipeline/embed/http.rs). A feature of an existing dep: zero new crates.
+  "client-proxy",
   "http1",
   "tokio",
 ] }
 http-body-util = "0.1"
 http = "1"
+# tower-service trait ONLY (implementing the proxy-aware transport connector
+# in pipeline/embed/http.rs — hyper-util's legacy client takes any
+# tower Service<Uri> as its connector). Same version already locked via
+# hyper-util: declaring it directly adds zero new crates.
+tower-service = "0.3"
 
 # ---- M2 T4 pipeline kinds (design.md §5.7 "文件层" row, §5.10.2 kind table) ----
 

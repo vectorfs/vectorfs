@@ -6421,6 +6421,7 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
+ "tower-service",
  "url",
 ]
 
