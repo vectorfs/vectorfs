@@ -104,6 +104,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # dedicated key: release-prod artifacts differ from the debug
+          # builds of build-test/conformance — sharing would thrash.
+          # Warm rebuilds keep this job short enough to survive the
+          # observed ~30min hosted-runner reclaim window (4 kills in a
+          # row on this, the only >25min job).
+          shared-key: release-prod-workspace
 
       - name: cargo build --profile release-prod
         run: cargo build --profile release-prod --workspace

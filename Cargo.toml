@@ -11,11 +11,15 @@ edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
 
-# Product profile (design.md §5.7): lto=fat + codegen-units=1 + strip.
-# M0-measured effect on the equivalent dependency set: 379 -> 164.5 MiB.
-# Enforced by CI size-guard (warn > 155 MiB, fail > 175 MiB).
+# Product profile (design.md §5.7): lto=thin + codegen-units=1 + strip.
+# 2026-11-04 ruling: fat LTO's cold link (~25-35 min) was killed 4/4 by the
+# hosted-runner ~30min reclaim window; thin builds cold in ~12 min. Size cost:
+# 137 -> 155 MiB (sits exactly on the CI warn line, still 20 MiB under the
+# hard cap). Self-builders wanting the smaller binary can override:
+#   CARGO_PROFILE_RELEASE_PROD_LTO=fat cargo build --profile release-prod
+# (fat is also what the aarch64/x86_64 release binaries used before this.)
 [profile.release-prod]
 inherits = "release"
-lto = "fat"
+lto = "thin"
 codegen-units = 1
 strip = true

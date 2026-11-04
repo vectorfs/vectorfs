@@ -211,7 +211,7 @@ AWS SDK / CLI(vf) / MCP 客户端
 | ~~tantivy~~ | **推迟到 M2** | v1 过滤由 Lance 标量谓词承担；全文只在超集需要；顺带推迟 arrow 去重风险 |
 | CLI/MCP | clap + rmcp(3.x stable) | |
 | 出网 | 无（server 不发起出网请求；S3 后端除外） | |
-| 其余 | cargo-deny（拒 GPL/AGPL/CC-BY-NC）+ cargo-machete + `cargo tree -d` 进 CI；release-prod profile 强制 lto=fat+cgu=1+strip（M0 实测 379→164.5MiB，datafusion 为不可裁剪的引擎固定成本）；体积 **≤155MB 警戒 / 175MB 硬顶**（S3 客户端 +67.7MiB 已含；内嵌 .so 白名单仅 v2 客户端的 ort/pdfium） | CI：ubuntu x64+arm64 + macos check + size-guard；发布冒烟在 ubuntu:20.04 容器跑全链路 |
+| 其余 | cargo-deny（拒 GPL/AGPL/CC-BY-NC）+ cargo-machete + `cargo tree -d` 进 CI；release-prod profile 强制 lto=**thin**+cgu=1+strip（2026-11-04 裁决：fat 冷链 ~25-35min 被 CI 托管 runner ~30min 回收窗口四连杀；thin 冷构建 ~12min，体积 137→155MiB——踩 155 警戒线、仍低于硬顶 20MiB；fat 可由自建者以 `CARGO_PROFILE_RELEASE_PROD_LTO=fat` 覆盖）；datafusion 为不可裁剪的引擎固定成本；体积 **≤155MB 警戒 / 175MB 硬顶**（S3 客户端 +67.7MiB 已含；内嵌 .so 白名单仅 v2 客户端的 ort/pdfium） | CI：ubuntu x64+arm64 + macos check + size-guard；发布冒烟在 ubuntu:20.04 容器跑全链路 |
 
 ### 5.8 客户端面（薄，v1）
 
