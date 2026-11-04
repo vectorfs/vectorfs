@@ -31,3 +31,8 @@ conformance/go/*.out
 
 # --- IDE ---
 .idea/
+
+# --- dynamic-load runtime libraries (scripts/fetch_runtime_libs.sh, §5.10.7) ---
+# pinned .so/.dylib downloads (pdfium now, onnxruntime in T5) never enter the
+# tree; the fetch script + CI cache restore them deterministically.
+runtime-libs/

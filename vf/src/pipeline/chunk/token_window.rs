@@ -1,12 +1,62 @@
-//! `token-window` chunker kind: fixed-size sliding window with overlap.
+//! `token-window` chunker kind: fixed-size sliding window with overlap,
+//! M2-T4 edition — `text-splitter` under the hood.
 //!
-//! M2 implementation = **char-count window** (UTF-8 safe by construction:
-//! windows are cut on `char` boundaries, so a CJK glyph is never halved).
-//! T4 swaps the counter for `text-splitter` (real tokenization); the
-//! [`Chunker`] interface and the overlap contract below are unchanged —
-//! that is the whole point of the axis.
+//! # What text-splitter provides, and what it must NOT provide
+//!
+//! `text-splitter` (0.33, featureless = pure char counting, no tokenizer
+//! models — §5.7 "char 计数, 禁 tiktoken 联网特性") recursively splits text at
+//! the LARGEST semantic unit that fits a char budget: paragraphs, then
+//! sentences, words, graphemes, characters. We use it as a **semantic
+//! cut-point oracle**: given the part text, its chunk ends are
+//! human-sensible places to end a window.
+//!
+//! We deliberately do NOT use its `with_overlap`: text-splitter's overlap is
+//! separator-level APPROXIMATE (it shrinks or drops the overlap when no
+//! valid boundary exists, and trims whitespace), so its raw output violates
+//! the T2 chunker contract — exact per-character overlap alignment and the
+//! lossless concatenation invariant. The contract is the hard gate
+//! (§5.10.2: "拼接不变量(块串接 ≡ 原文, overlap 计入)"), so the overlap itself
+//! is implemented HERE, exactly, by slicing the ORIGINAL text:
+//!
+//! ```text
+//! windows are text[s_0..e_0], text[s_1..e_1], … with
+//!   s_0 = 0,  e_last = len (full coverage),
+//!   s_i = e_(i-1) - overlap  (exact char overlap with the previous window),
+//!   e_i = the largest semantic cut in (s_i + overlap, s_i + size]
+//!         or the arithmetic fallback s_i + size (T2 behavior).
+//! ```
+//!
+//! Given those definitions, with all windows being slices of one original
+//! `char` sequence:
+//!
+//! * **overlap alignment**: the last `overlap` chars of window i-1 are
+//!   `text[e_(i-1)-overlap .. e_(i-1)]`, which IS the first `overlap` chars
+//!   of window i — byte-for-byte, by construction;
+//! * **reconstruction**: `window_0 + Σ chars(overlap..) of window_i`
+//!   = `text[0..e_0] + Σ text[e_(i-1)..e_i]` = the original text — chunking
+//!   is lossless w.r.t. the extractor's output, whitespace included
+//!   (text-splitter's trimming never touches us: we only borrow its cut
+//!   positions, then slice the original);
+//! * **CJK safety**: slices are taken on `char` boundaries of the original
+//!   `String` (the contract's String-equality reconstruction doubles as the
+//!   no-mid-glyph proof);
+//! * **size budget**: every window ≤ `size` chars (semantic ends are only
+//!   accepted within the budget; the tail window is emitted when the
+//!   remaining text fits one window);
+//! * **termination/progress**: every non-final end satisfies
+//!   `e > s + overlap` (semantic ends are only accepted above
+//!   `s + overlap`, the arithmetic fallback is `s + size > s + overlap` —
+//!   `overlap < size` is startup-validated), so the next start
+//!   `s' = e - overlap > s` strictly advances.
+//!
+//! What changed vs the T2 arithmetic windows: windows may now end EARLIER
+//! than `s + size` (at a paragraph/sentence/word boundary) and therefore
+//! can be shorter than `size`; `size` stays the ceiling and `overlap` stays
+//! the exact char overlap — the contract semantics are unchanged, the
+//! boundaries are just less likely to tear a sentence in half.
 
 use super::{Chunk, Chunker, Part, PipelineError};
+use text_splitter::TextSplitter;
 
 /// Runtime instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,9 +94,9 @@ impl From<&TokenWindowChunker> for TokenWindowConfig {
 
 impl TokenWindowChunker {
     /// Programmatic constructor with the same startup validation as the
-    /// config path (`0 < overlap < size`, `size >= 1` — a window with no
-    /// forward stride would loop forever, one that never overlaps is legal
-    /// but almost never intended, so both are loud config errors).
+    /// config path (`0 < overlap < size`, `size >= 2` implied — a window
+    /// with no forward stride would loop forever, one that never overlaps is
+    /// legal but almost never intended, so both are loud config errors).
     pub fn new(size: usize, overlap: usize) -> Result<Self, PipelineError> {
         if size < 1 {
             return Err(PipelineError::config(
@@ -66,23 +116,46 @@ impl TokenWindowChunker {
         Ok(TokenWindowChunker { size, overlap })
     }
 
-    /// Window starts: `0, stride, 2*stride, …` stopping after a window has
-    /// covered the text tail (the final window may be short, but is ALWAYS
-    /// longer than `overlap` — see the reconstruction proof in the tests).
-    fn windows(&self, text: &str) -> Vec<String> {
-        let chars: Vec<char> = text.chars().collect();
-        let stride = self.size - self.overlap;
+    /// Semantic cut candidates for one part's text: the CHAR indices where
+    /// text-splitter (char-budgeted to `size`) ends a chunk, ascending.
+    /// `chunk_char_indices` reports the chunk's own char offset + length, so
+    /// a cut is `char_offset + char_len` — a char boundary of the original
+    /// by construction, with no byte→char conversion table needed.
+    fn semantic_cuts(text: &str, size: usize) -> Vec<usize> {
+        TextSplitter::new(size)
+            .chunk_char_indices(text)
+            .map(|c| c.char_offset + c.chunk.chars().count())
+            .collect()
+    }
+
+    /// Window the text per the module-doc recurrence. Returns char-index
+    /// ranges; `chunk()` materializes them into `String`s.
+    fn window_ranges(&self, char_len: usize, cuts: &[usize]) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
-        let mut start = 0usize;
+        let mut s = 0usize;
         loop {
-            let end = (start + self.size).min(chars.len());
-            out.push(chars[start..end].iter().collect());
-            if start + self.size >= chars.len() {
-                break;
+            if char_len - s <= self.size {
+                // everything left fits one window — the tail window. Its
+                // length is > overlap whenever a window preceded it (the
+                // previous end left >= 1 char uncovered), satisfying the
+                // contract's last-window rule.
+                out.push((s, char_len));
+                return out;
             }
-            start += stride;
+            // Non-final end: prefer the largest SEMANTIC cut inside the
+            // budget that still leaves more than `overlap` chars of fresh
+            // content (see module docs for why each bound matters).
+            let hi = s + self.size;
+            let lo = s + self.overlap + 1;
+            let end = cuts
+                .iter()
+                .rev()
+                .find(|&&c| c >= lo && c <= hi)
+                .copied()
+                .unwrap_or(hi);
+            out.push((s, end));
+            s = end - self.overlap;
         }
-        out
     }
 }
 
@@ -101,8 +174,16 @@ impl Chunker for TokenWindowChunker {
             if part.text.is_empty() {
                 continue;
             }
-            for text in self.windows(&part.text) {
-                out.push(Chunk { index, text });
+            // Materialize the char sequence ONCE per part: window slicing is
+            // then pure indexing — every window is a whole number of chars,
+            // CJK glyphs can never be halved.
+            let chars: Vec<char> = part.text.chars().collect();
+            let cuts = Self::semantic_cuts(&part.text, self.size);
+            for (s, e) in self.window_ranges(chars.len(), &cuts) {
+                out.push(Chunk {
+                    index,
+                    text: chars[s..e].iter().collect(),
+                });
                 index += 1;
             }
         }
@@ -153,29 +234,71 @@ mod tests {
 
     #[test]
     fn edge_shorter_exactly_multiple_longer() {
+        // On whitespace-free text the semantic cuts ARE the char-level
+        // fallbacks, so the T2 arithmetic edge behavior carries over exactly.
         let c = TokenWindowChunker::new(4, 2).unwrap();
-        // shorter than one window -> single chunk
         assert_eq!(chunks_of(&c, "ab"), ["ab"]);
-        // exactly one window
         assert_eq!(chunks_of(&c, "abcd"), ["abcd"]);
-        // one past a window
         assert_eq!(chunks_of(&c, "abcde"), ["abcd", "cde"]);
-        // exact multiple of the stride from a full window (len 8)
         assert_eq!(chunks_of(&c, "abcdefgh"), ["abcd", "cdef", "efgh"]);
-        // len 7: tail window is short but > overlap
         assert_eq!(chunks_of(&c, "abcdefg"), ["abcd", "cdef", "efg"]);
-        // reconstruction holds on every edge
         for text in ["ab", "abcd", "abcde", "abcdefgh", "abcdefg"] {
             let w = chunks_of(&c, text);
             assert_eq!(&reconstruct(&w, 2), text, "text={text:?} windows={w:?}");
         }
     }
 
+    /// Semantic-end preference, demonstrated deterministically: paragraphs
+    /// of 34 chars (+ "\n\n") under size 40 make text-splitter cut at every
+    /// paragraph end (two paragraphs never fit one 40-char chunk), so window
+    /// 0 ends at char 34 — NOT at the arithmetic fallback 40. Later windows
+    /// mix semantic ends with arithmetic fallbacks (cuts are 36 apart, so
+    /// some (s+overlap, s+size] ranges contain none); every window still
+    /// obeys the invariant and the budget.
+    #[test]
+    fn semantic_ends_preferred_and_invariant_holds_on_prose() {
+        let overlap = 8usize;
+        let c = TokenWindowChunker::new(40, overlap).unwrap();
+        let para = |i: usize| format!("paragraph number {i:02} body text ends");
+        let mut text = String::new();
+        for i in 0..6 {
+            text.push_str(&para(i));
+            text.push_str("\n\n");
+        }
+        assert_eq!(para(0).chars().count(), 34, "fixture self-check");
+        let w = chunks_of(&c, &text);
+        assert!(w.len() > 1, "sample must span several windows: {w:?}");
+        // window 0 ends at the first paragraph boundary, not at char 40
+        assert_eq!(
+            w[0].chars().count(),
+            34,
+            "semantic cut must beat the arithmetic fallback: {w:?}"
+        );
+        assert_eq!(&reconstruct(&w, overlap), &text);
+        let mut e = 0usize;
+        for (i, win) in w.iter().enumerate() {
+            let s = if i == 0 { 0 } else { e - overlap };
+            e = s + win.chars().count();
+            assert!(win.chars().count() <= 40, "window {i} over budget: {win:?}");
+            if i > 0 {
+                let prev = &w[i - 1];
+                let k = overlap.min(win.chars().count());
+                let suffix: String = prev.chars().skip(prev.chars().count() - k).collect();
+                let prefix: String = win.chars().take(k).collect();
+                assert_eq!(suffix, prefix, "pair {}/{}/", i - 1, i);
+                assert!(
+                    win.chars().count() > overlap,
+                    "window {i} too short: {win:?}"
+                );
+            }
+        }
+    }
+
+    /// Property sweep across sizes/overlaps/lengths (superset of the T2
+    /// sweep): reconstruction + alignment + budgets on char-only text, and
+    /// determinism by double-run.
     #[test]
     fn overlap_zero_forward_stride_impossible() {
-        // stride = size - overlap > 0 always => windows advance; and every
-        // window except the first-full ones ends at size. Quick property
-        // sweep: reconstruction holds for many lengths/params.
         for size in [2usize, 3, 5, 8] {
             for overlap in 1..size {
                 let c = TokenWindowChunker::new(size, overlap).unwrap();
@@ -187,22 +310,35 @@ mod tests {
                         continue;
                     }
                     assert_eq!(&reconstruct(&w, overlap), &text);
-                    // suffix/prefix alignment (the overlap actually
-                    // overlaps), in chars not bytes
                     for pair in w.windows(2) {
                         let (prev, cur) = (&pair[0], &pair[1]);
                         let k = overlap.min(cur.chars().count());
                         let suffix: String = prev.chars().skip(prev.chars().count() - k).collect();
                         let prefix: String = cur.chars().take(k).collect();
                         assert_eq!(suffix, prefix, "prev={prev:?} cur={cur:?} k={k}");
-                        // final window is always > overlap long (proof in
-                        // mod docs: len - start > size - stride = overlap)
+                        // every window is strictly longer than the overlap
+                        // (the contract's prev-suffix and last-window rules)
                         assert!(cur.chars().count() > overlap, "{cur:?}");
                     }
                     assert!(w[0].chars().count() <= size);
+                    // determinism
+                    assert_eq!(chunks_of(&c, &text), w);
                 }
             }
         }
+    }
+
+    /// The whitespace-trimming trap that ruled out text-splitter's native
+    /// overlap: prose with spaces/newlines between words must still
+    /// reconstruct EXACTLY (text-splitter's own chunk output trims those).
+    #[test]
+    fn whitespace_survives_reconstruction() {
+        let c = TokenWindowChunker::new(16, 4).unwrap();
+        let text = "word word word\n\npara two here\nitem one\nitem two\nend";
+        let w = chunks_of(&c, text);
+        assert_eq!(&reconstruct(&w, 4), text);
+        // determinism on prose too
+        assert_eq!(chunks_of(&c, text), w);
     }
 
     #[test]
@@ -242,5 +378,18 @@ mod tests {
         let c = TokenWindowChunker::new(4, 2).unwrap();
         assert!(c.chunk(&[]).unwrap().is_empty());
         assert!(c.chunk(&[Part::text("")]).unwrap().is_empty());
+    }
+
+    /// Large-input sanity (the golden corpus pushes this to 5 MiB): the
+    /// cut-oracle + slice loop stays linear and the invariant holds end to
+    /// end.
+    #[test]
+    fn large_prose_text_reconstructs() {
+        let c = TokenWindowChunker::new(512, 64).unwrap();
+        let para = "the quick brown fox jumps over the lazy dog. ".repeat(24); // ~1 KiB
+        let text = para.repeat(64); // ~64 KiB
+        let w = chunks_of(&c, &text);
+        assert!(w.len() > 64);
+        assert_eq!(&reconstruct(&w, 64), &text);
     }
 }

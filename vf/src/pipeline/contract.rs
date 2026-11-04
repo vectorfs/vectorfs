@@ -4,8 +4,9 @@
 //! These are PUBlic assertion suites, not just our own tests: any future
 //! implementation (community kind, wasm plugin in v2) runs the SAME suite to
 //! be admitted — `#[cfg(test)]` below runs it against the built-ins
-//! (`txt`, `token-window`) and a local mock embedder. The real embedder
-//! kinds (ort / openai) each run `embedder_contract` once they land in T5.
+//! (`txt`, `pdf-text`, `md`, `token-window`) and a local mock embedder. The
+//! real embedder kinds (ort / openai) each run `embedder_contract` once they
+//! land in T5.
 //!
 //! Assertions panic on violation (assertion-suite convention); callers wrap
 //! them in whatever test harness they use.
@@ -377,6 +378,8 @@ fn assert_total_order(hits: &[Hit]) {
 #[cfg(test)]
 mod tests {
     use super::super::chunk::token_window::TokenWindowChunker;
+    use super::super::extract::md::MdExtractor;
+    use super::super::extract::pdf_text;
     use super::super::extract::txt::TxtExtractor;
     use super::super::{Chunk, PipelineError};
     use super::*;
@@ -388,6 +391,22 @@ mod tests {
         // truncation is then detectable and must Err (see contract docs)
         let good = "hello wörld — truncated cut lands mid-glyph hére";
         extractor_contract(&TxtExtractor, (good.as_bytes(), "text/plain"));
+    }
+
+    #[test]
+    fn pdf_text_passes_extractor_contract() {
+        // real .so required: the locator panics with fetch guidance rather
+        // than skipping (honest failure, M2-T4 rule)
+        let x = pdf_text::tests::extractor_or_panic();
+        extractor_contract(&x, (pdf_text::tests::HELLO_PDF_MINIMAL, "application/pdf"));
+    }
+
+    #[test]
+    fn md_passes_extractor_contract() {
+        // CJK-dense so the byte-half cut is guaranteed to split a multibyte
+        // char -> non-UTF-8 -> detectable truncation -> must Err
+        let good = "# 标题\n\n汉字汉字汉字汉字汉字汉字汉字汉字";
+        extractor_contract(&MdExtractor, (good.as_bytes(), "text/markdown"));
     }
 
     #[test]

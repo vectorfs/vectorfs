@@ -142,6 +142,39 @@ hyper-util = { version = "0.1", default-features = false, features = [
 http-body-util = "0.1"
 http = "1"
 
+# ---- M2 T4 pipeline kinds (design.md §5.7 "文件层" row, §5.10.2 kind table) ----
+
+# pdf-text extractor: high-level pdfium bindings, DYNAMIC loading only.
+# default-features = false drops the default [pdfium_latest, image_latest,
+# thread_safe] set: image_latest would drag `image` 0.25 in (M3 pdf-pages
+# territory, dead weight today). Kept features:
+#   - thread_safe: pdfium is not thread-safe; this wraps every FFI call in a
+#     mutex so the Extractor (Send + Sync by trait) is sound across the
+#     spawn_blocking ingest pool (§5.10.5). The `static` feature is NOT set —
+#     dynamic .so binding is the §5.7 ruling.
+#   - pdfium_7881: newest bindings gate at-or-below our pinned binary
+#     (bblanchon/pdfium-binaries chromium/8066 via scripts/fetch_runtime_libs.sh);
+#     using pdfium_latest (= 8125) could bind symbols the 8066 .so lacks.
+# MIT OR Apache-2.0; pdfium itself is BSD-3 / Apache-2.0 (allowed binary dep).
+pdfium-render = { version = "0.9", default-features = false, features = [
+  "thread_safe",
+  "pdfium_7881",
+] }
+
+# md extractor: CommonMark pull parser. default-features = false drops the
+# `html` push renderer and `getopts` (binary-only) — we consume the event
+# stream directly, so both are dead weight. MIT.
+pulldown-cmark = { version = "0.13", default-features = false }
+
+# token-window chunker: semantic text splitting with CHARACTER counting (the
+# §5.7 line: "text-splitter char 计数, 禁 tiktoken 联网特性"). text-splitter
+# 0.33 has NO default features — the tokenizers/tiktoken-rs/code/markdown
+# features are all opt-in and all stay OFF, so nothing model-shaped or
+# network-capable enters the tree. We consume its semantic split points and
+# enforce the exact char-overlap window invariant locally (token_window.rs
+# has the rationale). MIT.
+text-splitter = { version = "0.33", default-features = false }
+
 [dev-dependencies]
 # tower::oneshot for in-process integration tests (no network port).
 tower = { version = "0.5", features = ["util"] }

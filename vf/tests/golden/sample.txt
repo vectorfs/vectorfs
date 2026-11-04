@@ -1,0 +1,7 @@
+VectorFS golden plain-text sample.
+
+This file exercises the txt extractor: plain UTF-8, CJK 汉字, accented chars
+(héllo wörld), and an em-dash — nothing exotic beyond UTF-8.
+
+It is intentionally small: the "huge" corpus class is generated in-test and
+never committed (M2-T4 golden-corpus policy).

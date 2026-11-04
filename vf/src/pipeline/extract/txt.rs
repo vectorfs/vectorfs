@@ -10,7 +10,12 @@
 //!   lossy-decoding would corrupt embeddings silently.
 //! * **mime gate**: accepts `text/*` and an EMPTY mime (unknown — the
 //!   Source metadata may not carry one; T3's sniffing fills it in later);
-//!   anything else is a routing bug and must fail loudly, not guess.
+//!   anything else is a routing bug and must fail loudly, not guess. This
+//!   is deliberately a FAMILY gate, broader than txt's own row in
+//!   [`super::MIME_TO_SHORT_KEY`]: text subtypes without a dedicated kind
+//!   (`text/csv`, …) fall through to txt at routing time; the canonical
+//!   mime↔short-key mapping that ingest's `auto` resolves through lives in
+//!   that one table.
 
 use super::{Extractor, Modality, Part, PipelineError};
 

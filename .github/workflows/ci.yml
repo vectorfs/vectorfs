@@ -50,6 +50,17 @@ jobs:
       - name: export VF_GIT_HASH (short sha)
         run: echo "VF_GIT_HASH=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
+      # M2 T4: pinned pdfium .so for the pdf-text extractor tests. The cache
+      # key embeds the SAME pin as scripts/fetch_runtime_libs.sh (chromium/
+      # 8066) — bump both together or the cache serves a stale library (the
+      # script's stamp check would then re-download, so it self-heals).
+      - name: fetch pinned runtime libs (pdfium)
+        run: ./scripts/fetch_runtime_libs.sh pdfium
+      - uses: actions/cache@v4
+        with:
+          path: runtime-libs
+          key: runtime-libs-${{ runner.os }}-${{ runner.arch }}-pdfium-chromium-8066
+
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
@@ -208,6 +219,14 @@ jobs:
       - name: install protoc (lance-encoding build dep)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
       - uses: Swatinem/rust-cache@v2
+      # same pinned-pdfium rationale as build-test: the arm job also runs the
+      # pdf tests, and they refuse to skip without the real .so (M2 T4)
+      - name: fetch pinned runtime libs (pdfium, arm64)
+        run: ./scripts/fetch_runtime_libs.sh pdfium
+      - uses: actions/cache@v4
+        with:
+          path: runtime-libs
+          key: runtime-libs-${{ runner.os }}-${{ runner.arch }}-pdfium-chromium-8066
       - run: cargo fmt --all --check
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
@@ -235,6 +254,14 @@ jobs:
       - name: install protoc (lance-encoding build dep)
         run: brew install protobuf
       - uses: Swatinem/rust-cache@v2
+      # same pinned-pdfium rationale as build-test (macOS arm64 asset;
+      # runtime-libs/libpdfium.dylib)
+      - name: fetch pinned runtime libs (pdfium, mac)
+        run: ./scripts/fetch_runtime_libs.sh pdfium
+      - uses: actions/cache@v4
+        with:
+          path: runtime-libs
+          key: runtime-libs-${{ runner.os }}-${{ runner.arch }}-pdfium-chromium-8066
       - run: cargo fmt --all --check
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace

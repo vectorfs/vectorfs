@@ -1,13 +1,57 @@
-//! Extractor axis: closed-enum registration + dispatch (M2 T2).
+//! Extractor axis: closed-enum registration + dispatch (M2 T2 skeleton,
+//! kinds landed through M2 T4).
 //!
 //! `dyn`-free by design (§5.10.2 v2.1): the enum below is the registry.
 //! Adding a kind = adding a variant + a `from_config` arm; the compiler then
-//! walks every match site in this tree. Available kinds (M2): `txt`.
+//! walks every match site in this tree. Available kinds (M2): `txt`,
+//! `pdf-text`, `md`.
+//!
+//! # mime <-> short-key table (T4)
+//!
+//! Ingest sections route by mime SHORT KEY (`extract = { pdf = "pdf" }`,
+//! §5.10.4); the `auto` mapping T3 installs resolves real mime types through
+//! the one table below so kind names, config keys and mime gates can never
+//! drift apart (single source of truth, pub for the T3 ingest worker).
 
+pub mod md;
+pub mod pdf_text;
 pub mod txt;
 
 use super::{Extractor, Modality, Part, PipelineError};
+use md::{MdConfig, MdExtractor};
+use pdf_text::{PdfTextConfig, PdfTextExtractor};
 use txt::{TxtConfig, TxtExtractor};
+
+/// Canonical mime -> config short key, one row per M2 kind. ORDER MATTERS
+/// only for human eyes (lookups are exact); the table is the single mapping
+/// both directions consult.
+pub const MIME_TO_SHORT_KEY: &[(&str, &str)] = &[
+    ("application/pdf", "pdf"),
+    ("text/markdown", "md"),
+    ("text/plain", "txt"),
+];
+
+/// The available-kind list embedded in unknown-kind errors (kept next to the
+/// enum so a new variant and its error line land in the same diff).
+pub const EXTRACTOR_KINDS: &str = "txt, pdf-text, md";
+
+/// mime (parameters like `; charset=utf-8` tolerated) -> short key.
+pub fn short_key_for_mime(mime: &str) -> Option<&'static str> {
+    let base = mime.split(';').next().unwrap_or("").trim();
+    MIME_TO_SHORT_KEY
+        .iter()
+        .find(|(m, _)| *m == base)
+        .map(|(_, key)| *key)
+}
+
+/// short key -> canonical mime (the inverse; `default`/`auto` are ingest
+/// RESERVED words, never kind keys, and are absent here on purpose).
+pub fn mime_for_short_key(key: &str) -> Option<&'static str> {
+    MIME_TO_SHORT_KEY
+        .iter()
+        .find(|(_, k)| *k == key)
+        .map(|(mime, _)| *mime)
+}
 
 /// Registered extractor kinds. Exhaustive match everywhere = zero vtable;
 /// `dyn` stays reserved for the v2 wasm slot and the contract tests.
@@ -15,6 +59,10 @@ use txt::{TxtConfig, TxtExtractor};
 pub enum ExtractorKind {
     /// UTF-8 text passthrough (`extract/txt.rs`).
     Txt(TxtConfig),
+    /// pdfium whole-document text (`extract/pdf_text.rs`).
+    PdfText(PdfTextConfig),
+    /// CommonMark to plain text (`extract/md.rs`).
+    Md(MdConfig),
 }
 
 impl ExtractorKind {
@@ -36,8 +84,23 @@ impl ExtractorKind {
                 })?;
                 Ok(ExtractorKind::Txt(cfg))
             }
+            "pdf-text" => {
+                let cfg: PdfTextConfig = raw.clone().try_into().map_err(|e: toml::de::Error| {
+                    super::config::stage2_error(section, Some(&kind), e.message(), line)
+                })?;
+                Ok(ExtractorKind::PdfText(cfg))
+            }
+            "md" => {
+                let cfg: MdConfig = raw.clone().try_into().map_err(|e: toml::de::Error| {
+                    super::config::stage2_error(section, Some(&kind), e.message(), line)
+                })?;
+                Ok(ExtractorKind::Md(cfg))
+            }
             other => Err(PipelineError::config(
-                format!("[{section}]: unknown extractor kind '{other}' (available kinds: txt)"),
+                format!(
+                    "[{section}]: unknown extractor kind '{other}' (available kinds: \
+                     {EXTRACTOR_KINDS})"
+                ),
                 line,
             )),
         }
@@ -49,7 +112,10 @@ impl ExtractorKind {
     /// and its modality declaration land in the same diff.
     pub fn output_modalities(&self) -> &'static [Modality] {
         match self {
-            ExtractorKind::Txt(_) => &[Modality::Text],
+            // M2: every built-in kind emits Text only (§5.10.1).
+            ExtractorKind::Txt(_) | ExtractorKind::PdfText(_) | ExtractorKind::Md(_) => {
+                &[Modality::Text]
+            }
         }
     }
 
@@ -57,15 +123,21 @@ impl ExtractorKind {
     pub fn describe(&self) -> String {
         match self {
             ExtractorKind::Txt(_) => "txt".to_string(),
+            ExtractorKind::PdfText(_) => "pdf-text".to_string(),
+            ExtractorKind::Md(_) => "md".to_string(),
         }
     }
 }
 
-/// Dispatch: the enum IS the extractor (no Box, no vtable).
+/// Dispatch: the enum IS the extractor (no Box, no vtable). The pdf-text arm
+/// snapshots the library resolution per call (cheap path checks); the
+/// process-global pdfium bind happens at most once regardless (pdf_text.rs).
 impl Extractor for ExtractorKind {
     fn extract(&self, bytes: &[u8], mime: &str) -> Result<Vec<Part>, PipelineError> {
         match self {
             ExtractorKind::Txt(_) => TxtExtractor.extract(bytes, mime),
+            ExtractorKind::PdfText(_) => PdfTextExtractor::new().extract(bytes, mime),
+            ExtractorKind::Md(_) => MdExtractor.extract(bytes, mime),
         }
     }
 }
@@ -77,6 +149,8 @@ impl serde::Serialize for ExtractorKind {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             ExtractorKind::Txt(c) => c.serialize(serializer),
+            ExtractorKind::PdfText(c) => c.serialize(serializer),
+            ExtractorKind::Md(c) => c.serialize(serializer),
         }
     }
 }
@@ -85,33 +159,65 @@ impl serde::Serialize for ExtractorKind {
 mod tests {
     use super::*;
 
-    fn txt_value() -> toml::Value {
-        toml::from_str("kind = \"txt\"").unwrap()
+    #[test]
+    fn mime_short_key_table_round_trips() {
+        for (mime, key) in MIME_TO_SHORT_KEY {
+            assert_eq!(short_key_for_mime(mime), Some(*key), "{mime}");
+            assert_eq!(mime_for_short_key(key), Some(*mime), "{key}");
+        }
+        // parameters tolerated; unknown mimes have no short key; the ingest
+        // reserved words are NOT kind keys
+        assert_eq!(short_key_for_mime("text/plain; charset=utf-8"), Some("txt"));
+        assert_eq!(short_key_for_mime("application/octet-stream"), None);
+        assert_eq!(mime_for_short_key("default"), None);
+        assert_eq!(mime_for_short_key("auto"), None);
     }
 
     #[test]
-    fn from_config_accepts_txt() {
-        let k = ExtractorKind::from_config("extractor.t", &txt_value(), Some(1)).unwrap();
-        assert!(matches!(k, ExtractorKind::Txt(_)));
-        assert_eq!(k.output_modalities(), &[Modality::Text]);
-        assert_eq!(k.describe(), "txt");
-        // the enum itself dispatches (zero vtable)
-        assert_eq!(
-            Extractor::extract(&k, b"hi", "text/plain").unwrap().len(),
-            1
-        );
+    fn from_config_accepts_all_three_kinds() {
+        // (kind string, good sample bytes, good sample mime) — pdf runs the
+        // real .so (missing library fails the test honestly, pdf_text.rs)
+        let cases: &[(&str, &[u8], &str)] = &[
+            ("txt", b"hi", "text/plain"),
+            (
+                "pdf-text",
+                pdf_text::tests::HELLO_PDF_MINIMAL,
+                "application/pdf",
+            ),
+            ("md", b"# hi", "text/markdown"),
+        ];
+        for (kind_str, bytes, mime) in cases {
+            let raw: toml::Value = toml::from_str(&format!("kind = \"{kind_str}\"")).unwrap();
+            let k = ExtractorKind::from_config("extractor.x", &raw, Some(1)).unwrap();
+            assert_eq!(k.describe(), *kind_str);
+            assert_eq!(k.output_modalities(), &[Modality::Text]);
+            // the enum itself dispatches (zero vtable), through the mime the
+            // short-key table maps for this kind
+            let kind_mime = mime_for_short_key(short_key_for_mime(mime).unwrap()).unwrap();
+            let parts = Extractor::extract(&k, bytes, kind_mime)
+                .unwrap_or_else(|e| panic!("{kind_str} must dispatch through the enum: {e}"));
+            assert_eq!(parts.len(), 1);
+            // fingerprints serialize flat: inner config only
+            assert_eq!(
+                toml::to_string(&k).unwrap().trim(),
+                format!("kind = \"{kind_str}\"")
+            );
+        }
     }
 
     #[test]
     fn from_config_unknown_kind_lists_available() {
-        let raw: toml::Value = toml::from_str("kind = \"pdf-text\"").unwrap();
-        let err = ExtractorKind::from_config("extractor.pdf", &raw, Some(3)).unwrap_err();
+        let raw: toml::Value = toml::from_str("kind = \"docx\"").unwrap();
+        let err = ExtractorKind::from_config("extractor.d", &raw, Some(3)).unwrap_err();
         assert!(
-            err.to_string()
-                .contains("unknown extractor kind 'pdf-text'"),
+            err.to_string().contains("unknown extractor kind 'docx'"),
             "{err}"
         );
-        assert!(err.to_string().contains("available kinds: txt"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("available kinds: txt, pdf-text, md"),
+            "{err}"
+        );
         assert!(err.to_string().contains("at line 3"), "{err}");
     }
 
@@ -127,9 +233,20 @@ mod tests {
     }
 
     #[test]
-    fn serialize_is_inner_config() {
-        let k = ExtractorKind::from_config("e", &txt_value(), None).unwrap();
-        let s = toml::to_string(&k).unwrap();
-        assert_eq!(s.trim(), "kind = \"txt\"");
+    fn unknown_fields_rejected_per_kind() {
+        for (kind_str, extra) in [
+            ("txt", "dpi = 1"),
+            ("pdf-text", "dpi = 300"),
+            ("md", "gfm = true"),
+        ] {
+            let raw: toml::Value =
+                toml::from_str(&format!("kind = \"{kind_str}\"\n{extra}")).unwrap();
+            let err = ExtractorKind::from_config("extractor.x", &raw, Some(1)).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown field 'dpi'")
+                    || err.to_string().contains("unknown field 'gfm'"),
+                "{kind_str}: {err}"
+            );
+        }
     }
 }
