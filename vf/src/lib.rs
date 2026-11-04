@@ -4,7 +4,7 @@
 //! operations (CreateVectorBucket / CreateIndex / PutVectors / QueryVectors),
 //! hand-rolled SigV4 verification, file + memory + S3-compatible backends
 //! (lancedb + object_store, zero AWS SDK). The full 21-operation surface and
-//! `vf doctor` land across M1 (design.md §4 / §5.8 / §7 M1).
+//! `vectorfs doctor` land across M1 (design.md §4 / §5.8 / §7 M1).
 //!
 //! Wire protocol per botocore `s3vectors/2025-07-15` model: rest-json,
 //! `POST /<OperationName>`, JSON bodies; PutVectors success = 200 empty body.
@@ -106,7 +106,7 @@ pub fn build_router(state: ops::AppState) -> Router {
 
 /// /healthz (M1 T6 upgrade): `{"ok": true}` is kept verbatim — liveness
 /// probes keyed on it stay compatible — with `version` and `uptimeSeconds`
-/// added for `vf status --endpoint` (see STARTED_AT above).
+/// added for `vf status --endpoint` (client probe; see STARTED_AT above).
 async fn healthz() -> Json<serde_json::Value> {
     let uptime = STARTED_AT
         .get()

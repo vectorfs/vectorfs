@@ -1,11 +1,15 @@
-//! `vf` CLI (M1: serve + init + status + doctor + mcp, design.md §5.8).
+//! `vectorfs` — the SERVER CLI (design.md §0 command ruling + 附录E.4:
+//! init/serve/status/doctor/mcp; optimize/pipelines land with later tasks —
+//! no empty stubs).
 //!
-//! `vf serve` is the fully functional s3vectors server harvested from the M0
-//! spike, now on the unified backend (file/memory/S3), the flag > env >
-//! vf.json > default config chain (config.rs), and the single-writer lock
-//! (lock.rs). `vf status` / `vf doctor` are the read-only inspection pair
-//! (status.rs / doctor.rs) and `vf mcp` is the stdio MCP server for the
-//! agent single-user mode (mcp.rs).
+//! `vectorfs serve` is the fully functional s3vectors server harvested from
+//! the M0 spike, now on the unified backend (file/memory/S3), the flag > env
+//! > `.vectorfs/vectorfs.toml` > default config chain (config.rs), and the
+//! single-writer lock (lock.rs). `vectorfs status` / `vectorfs doctor` are
+//! the read-only inspection pair (status.rs / doctor.rs) and
+//! `vectorfs mcp` is the stdio MCP server for the agent single-user mode
+//! (mcp.rs). The thin HTTP CLIENT lives in the separate `vf` binary
+//! (src/bin/vf.rs) — engine/server modules stay unlinked there.
 //!
 //! Output contract everywhere (report.rs, §5.8): stdout = results, stderr =
 //! progress, exit codes grep-compatible, abnormal exits print
@@ -28,9 +32,9 @@ fn version_str() -> &'static str {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "vf",
+    name = "vectorfs",
     version = version_str(),
-    about = "vectorfs — turn any S3 into S3 Vectors. Single binary.",
+    about = "vectorfs — turn any S3 into S3 Vectors. Server binary (the thin client is `vf`).",
     arg_required_else_help = true
 )]
 struct Cli {
@@ -43,7 +47,7 @@ enum Command {
     /// Run the s3vectors-compatible HTTP server
     Serve(ServeArgs),
 
-    /// Generate static credentials and write <data-dir>/vf.json
+    /// Generate static credentials and write <data-dir>/.vectorfs/vectorfs.toml
     Init(InitArgs),
 
     /// Read-only data-root overview: LOCK holder, backend, buckets/indexes,
@@ -52,57 +56,57 @@ enum Command {
     ///
     /// Examples (copy-paste ready):
     ///
-    ///   vf status --data-dir ./vectorfs-data
+    ///   vectorfs status --data-dir ./vectorfs-data
     ///
-    ///   vf status --data-dir ./vectorfs-data --json | jq .
+    ///   vectorfs status --data-dir ./vectorfs-data --json | jq .
     ///
-    ///   vf status --endpoint http://127.0.0.1:8787
+    ///   vectorfs status --endpoint http://127.0.0.1:8787
     Status(StatusArgs),
 
-    /// Diagnose a data root: writable/conditional-write probe, vf.json,
-    /// LOCK state, per-index dataset health, disk headroom
+    /// Diagnose a data root: writable/conditional-write probe,
+    /// vectorfs.toml, LOCK state, per-index dataset health, disk headroom
     ///
     /// Examples:
     ///
-    ///   vf doctor --data-dir ./vectorfs-data
+    ///   vectorfs doctor --data-dir ./vectorfs-data
     ///
-    ///   vf doctor --data-dir ./vectorfs-data --json | jq '.overall'
+    ///   vectorfs doctor --data-dir ./vectorfs-data --json | jq '.overall'
     Doctor(DoctorArgs),
 
     /// Run the stdio MCP server (agent single-user mode: this process is
-    /// the ONLY writer — it takes the same LOCK as `vf serve`)
+    /// the ONLY writer — it takes the same LOCK as `vectorfs serve`)
     ///
     /// Examples (for an MCP client config):
     ///
-    ///   vf mcp --data-dir ./vectorfs-data
+    ///   vectorfs mcp --data-dir ./vectorfs-data
     ///
-    ///   vf mcp --data-dir ./vectorfs-data --tools ro
+    ///   vectorfs mcp --data-dir ./vectorfs-data --tools ro
     Mcp(McpArgs),
 }
 
-/// `vf init` arguments.
+/// `vectorfs init` arguments.
 #[derive(Parser, Debug)]
 struct InitArgs {
     /// Data directory to initialize (default ./vectorfs-data)
     #[arg(long)]
     data_dir: Option<String>,
 
-    /// Regenerate credentials even if vf.json already exists
+    /// Regenerate credentials even if vectorfs.toml already exists
     #[arg(long)]
     force: bool,
 }
 
-/// `vf serve` arguments. Every option here feeds the flag layer of the
-/// resolution chain (flag > VF_* env > <data-dir>/vf.json > default); see
-/// config.rs for the full precedence and the exact env names.
+/// `vectorfs serve` arguments. Every option here feeds the flag layer of the
+/// resolution chain (flag > VF_* env > <data-dir>/.vectorfs/vectorfs.toml >
+/// default); see config.rs for the full precedence and the exact env names.
 #[derive(Parser, Debug)]
 struct ServeArgs {
     /// TCP port to listen on [env: VF_PORT] [default: 8787]
     #[arg(long)]
     port: Option<u16>,
 
-    /// Data directory (file backend root + where vf.json is read from)
-    /// [env: VF_DATA_DIR] [default: ./vectorfs-data]
+    /// Data directory (file backend root + where .vectorfs/vectorfs.toml is
+    /// read from) [env: VF_DATA_DIR] [default: ./vectorfs-data]
     #[arg(long)]
     data_dir: Option<String>,
 
@@ -133,16 +137,16 @@ struct ServeArgs {
     #[arg(long)]
     no_auth: bool,
 
-    /// Static access key for SigV4 [env: VF_ACCESS_KEY or <data-dir>/vf.json]
+    /// Static access key for SigV4 [env: VF_ACCESS_KEY or <data-dir>/.vectorfs/vectorfs.toml]
     #[arg(long)]
     access_key: Option<String>,
 
-    /// Static secret key for SigV4 [env: VF_SECRET_KEY or <data-dir>/vf.json]
+    /// Static secret key for SigV4 [env: VF_SECRET_KEY or <data-dir>/.vectorfs/vectorfs.toml]
     #[arg(long)]
     secret_key: Option<String>,
 
     /// Region clients must sign for; enters the credential scope and ARNs
-    /// [env: VF_REGION or <data-dir>/vf.json] [default: us-east-1]
+    /// [env: VF_REGION or <data-dir>/.vectorfs/vectorfs.toml] [default: us-east-1]
     #[arg(long)]
     region: Option<String>,
 
@@ -151,7 +155,7 @@ struct ServeArgs {
     trace: bool,
 }
 
-/// `vf status` arguments (data-dir mode resolves exactly like serve's
+/// `vectorfs status` arguments (data-dir mode resolves exactly like serve's
 /// storage slice; see config::resolve_storage).
 #[derive(Parser, Debug)]
 struct StatusArgs {
@@ -174,7 +178,7 @@ struct StatusArgs {
     json: bool,
 }
 
-/// `vf doctor` arguments.
+/// `vectorfs doctor` arguments.
 #[derive(Parser, Debug)]
 struct DoctorArgs {
     /// Data directory to diagnose [env: VF_DATA_DIR] [default: ./vectorfs-data]
@@ -191,7 +195,7 @@ struct DoctorArgs {
     json: bool,
 }
 
-/// `vf mcp` arguments.
+/// `vectorfs mcp` arguments.
 #[derive(Parser, Debug)]
 struct McpArgs {
     /// Data directory to serve exclusively [env: VF_DATA_DIR]
@@ -214,8 +218,8 @@ async fn main() {
         Some(Command::Status(args)) => status_cmd(args).await,
         Some(Command::Doctor(args)) => doctor_cmd(args).await,
         Some(Command::Mcp(args)) => mcp_cmd(args).await,
-        // Bare `vf` already gets help from arg_required_else_help; this arm is
-        // the explicit fallback for a None subcommand.
+        // Bare `vectorfs` already gets help from arg_required_else_help; this
+        // arm is the explicit fallback for a None subcommand.
         None => {
             Cli::command().print_help().expect("print help");
         }
@@ -254,7 +258,10 @@ async fn status_cmd(args: StatusArgs) {
     let cfg = config::resolve_storage(&flags).unwrap_or_else(|e| {
         Failure::new("CONFIG", e, "fix the data dir / backend flags").fail(args.json, 2)
     });
-    eprintln!("vf: inspecting data root at {} …", cfg.data_dir.display());
+    eprintln!(
+        "vectorfs: inspecting data root at {} …",
+        cfg.data_dir.display()
+    );
     match status::gather(&cfg).await {
         Ok(report) => {
             if args.json {
@@ -275,7 +282,10 @@ async fn doctor_cmd(args: DoctorArgs) {
     let cfg = config::resolve_storage(&flags).unwrap_or_else(|e| {
         Failure::new("CONFIG", e, "fix the data dir / backend flags").fail(args.json, 2)
     });
-    eprintln!("vf: probing data root at {} …", cfg.data_dir.display());
+    eprintln!(
+        "vectorfs: probing data root at {} …",
+        cfg.data_dir.display()
+    );
     match vectorfs::doctor::run(&cfg).await {
         Ok(report) => {
             if args.json {
@@ -309,7 +319,7 @@ async fn mcp_cmd(args: McpArgs) {
         mcp::McpExit::Failed(msg) => Failure::new(
             "MCP_START_FAILED",
             msg,
-            "check the data root (vf doctor) and that stdin/stdout are a pipe pair",
+            "check the data root (vectorfs doctor) and that stdin/stdout are a pipe pair",
         )
         .fail(false, 2),
     }
@@ -328,7 +338,7 @@ fn init(args: InitArgs) {
         .unwrap_or_else(|| std::path::PathBuf::from(config::DEFAULT_DATA_DIR));
     if args.force {
         eprintln!(
-            "vf: WARNING --force regenerates credentials; clients still using the \
+            "vectorfs: WARNING --force regenerates credentials; clients still using the \
              previous access key will stop authenticating."
         );
     }
@@ -337,7 +347,7 @@ fn init(args: InitArgs) {
             println!("{}", config::init_report(&outcome));
         }
         Err(e) => {
-            eprintln!("vf init: {e}");
+            eprintln!("vectorfs init: {e}");
             std::process::exit(1);
         }
     }
@@ -360,7 +370,7 @@ async fn serve(args: ServeArgs) {
     let cfg = match config::resolve(&flags) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("vf: {e}");
+            eprintln!("vectorfs: {e}");
             std::process::exit(2);
         }
     };
@@ -372,20 +382,20 @@ async fn serve(args: ServeArgs) {
     let backend = match cfg.backend() {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("vf: {e}");
+            eprintln!("vectorfs: {e}");
             std::process::exit(2);
         }
     };
     if matches!(backend, backends::Backend::Memory) {
         eprintln!(
-            "vf: *** WARNING: --backend memory is VOLATILE — all buckets, indexes and \
+            "vectorfs: *** WARNING: --backend memory is VOLATILE — all buckets, indexes and \
              vectors are LOST when the process exits (CI / emulator mode). ***"
         );
     }
     let storage = match store::Storage::new(backend) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("vf: backend init failed: {e}");
+            eprintln!("vectorfs: backend init failed: {e}");
             std::process::exit(2);
         }
     };
@@ -396,7 +406,7 @@ async fn serve(args: ServeArgs) {
         Ok(g) => g,
         Err(lock::LockError::Held(who)) => {
             eprintln!(
-                "vf: refusing to start: another writer owns this data root ({who}).\n\
+                "vectorfs: refusing to start: another writer owns this data root ({who}).\n\
                  \x20 If that daemon is really gone, wait for its lock heartbeat to expire \
                  ({}s) and restart, or remove the stale LOCK object.",
                 lock::LOCK_TTL.as_secs()
@@ -404,7 +414,7 @@ async fn serve(args: ServeArgs) {
             std::process::exit(3);
         }
         Err(lock::LockError::Backend(e)) => {
-            eprintln!("vf: lock acquisition failed: {e}");
+            eprintln!("vectorfs: lock acquisition failed: {e}");
             std::process::exit(3);
         }
     };
@@ -430,7 +440,7 @@ async fn serve(args: ServeArgs) {
         trace: cfg.trace,
     };
     eprintln!(
-        "vf: starting on 127.0.0.1:{} backend={backend} auth={auth_desc} \
+        "vectorfs: starting on 127.0.0.1:{} backend={backend} auth={auth_desc} \
          region={} account={} owner={} trace={}",
         cfg.port,
         cfg.region,
@@ -443,7 +453,7 @@ async fn serve(args: ServeArgs) {
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", cfg.port)).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("vf: bind 127.0.0.1:{} failed: {e}", cfg.port);
+            eprintln!("vectorfs: bind 127.0.0.1:{} failed: {e}", cfg.port);
             lock_guard.release().await;
             std::process::exit(2);
         }
@@ -469,13 +479,13 @@ async fn serve(args: ServeArgs) {
                     Ok(true) => {}
                     Ok(false) => {
                         eprintln!(
-                            "vf: LOCK lost (taken over by another writer after heartbeat \
+                            "vectorfs: LOCK lost (taken over by another writer after heartbeat \
                              expiry) — shutting down."
                         );
                         let _ = shutdown_tx.send(true);
                         break;
                     }
-                    Err(e) => eprintln!("vf: LOCK heartbeat error: {e} (will retry)"),
+                    Err(e) => eprintln!("vectorfs: LOCK heartbeat error: {e} (will retry)"),
                 }
             }
         }
@@ -487,7 +497,7 @@ async fn serve(args: ServeArgs) {
         .expect("server exited");
 
     // graceful shutdown: release the LOCK (only if still ours), drop the flock.
-    eprintln!("vf: shutting down, releasing lock…");
+    eprintln!("vectorfs: shutting down, releasing lock…");
     heartbeat_lock.lock().await.release().await;
 }
 

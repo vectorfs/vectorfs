@@ -1,9 +1,10 @@
 //! Shared CLI output contract (design.md §5.8, "agent 一等契约"), pinned for
-//! the M1 T6 commands (`vf status` / `vf doctor` / `vf mcp`):
+//! the M1 T6 commands (`vectorfs status` / `vectorfs doctor` /
+//! `vectorfs mcp`):
 //!
 //! - **stdout = results** — a human-readable report; `--json` emits the same
 //!   information as a structured object carrying `schema_version`.
-//! - **stderr = progress** ("vf: reading catalog…"), never results.
+//! - **stderr = progress** ("vectorfs: reading catalog…"), never results.
 //! - **exit codes are grep-compatible**: 0 = healthy/normal, non-zero =
 //!   abnormal, and every abnormal exit prints a structured
 //!   `{code, message, hint}` triple (human line on stderr without `--json`,
@@ -47,8 +48,8 @@ impl Failure {
                 serde_json::to_string(&self).expect("Failure serializes")
             );
         } else {
-            eprintln!("vf: error [{}]: {}", self.code, self.message);
-            eprintln!("vf: hint: {}", self.hint);
+            eprintln!("vectorfs: error [{}]: {}", self.code, self.message);
+            eprintln!("vectorfs: hint: {}", self.hint);
         }
         std::process::exit(exit_code);
     }
@@ -70,7 +71,7 @@ pub fn human_bytes(n: u64) -> String {
     }
 }
 
-/// Package version + commit for `vf --version` and /healthz. The commit is
+/// Package version + commit for `--version` and /healthz. The commit is
 /// baked in at compile time via `VF_GIT_HASH` (the SIMPLE option over a
 /// build.rs: zero build-script machinery, CI exports the hash from its
 /// checkout — `VF_GIT_HASH=$(git rev-parse --short HEAD) cargo build`).

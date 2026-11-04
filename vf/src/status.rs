@@ -1,4 +1,4 @@
-//! `vf status` (M1 T6, design.md §5.8): read-only inspection of a data root —
+//! `vectorfs status` (M1 T6, design.md §5.8): read-only inspection of a data root —
 //! NO daemon parameters required, NO lock taken, NO writes performed.
 //!
 //! Two modes:
@@ -132,7 +132,7 @@ pub struct StatusReport {
     pub mode: &'static str,
     /// {"kind": "file"|"memory"|"s3", "spec": "<display form>"}
     pub backend: BackendSummary,
-    /// Local data dir (where vf.json / the file root live).
+    /// Local data dir (where .vectorfs/ and the file root live).
     pub data_root: String,
     pub lock: LockProbe,
     pub buckets: usize,
@@ -154,12 +154,12 @@ pub struct BackendSummary {
 /// never taken; per-index counts go through lance's read path.
 pub async fn gather(cfg: &StorageConfig) -> Result<StatusReport, Failure> {
     // Existence BEFORE Backend::parse: parse creates + canonicalizes the file
-    // root, and `vf status` must not materialize a data dir that isn't there.
+    // root, and `vectorfs status` must not materialize a data dir that isn't there.
     if cfg.is_file_backend() && !cfg.data_dir.exists() {
         return Err(Failure::new(
             "NO_DATA_ROOT",
             format!("no data root at {}", cfg.data_dir.display()),
-            format!("run: vf init --data-dir {}", cfg.data_dir.display()),
+            format!("run: vectorfs init --data-dir {}", cfg.data_dir.display()),
         ));
     }
     let backend = cfg.backend().map_err(|e| {
@@ -237,7 +237,7 @@ pub async fn gather(cfg: &StorageConfig) -> Result<StatusReport, Failure> {
     if !failures.is_empty() {
         // stderr = progress/diagnostics; the rows themselves carry the error.
         eprintln!(
-            "vf: warning: {} dataset(s) could not be counted: {}",
+            "vectorfs: warning: {} dataset(s) could not be counted: {}",
             failures.len(),
             failures.join("; ")
         );
@@ -255,7 +255,7 @@ pub async fn gather(cfg: &StorageConfig) -> Result<StatusReport, Failure> {
             Failure::new(
                 "BACKEND_LIST",
                 format!("cannot enumerate the data root: {e}"),
-                "check backend reachability (vf doctor probes it in depth)",
+                "check backend reachability (vectorfs doctor probes it in depth)",
             )
         })?;
 
@@ -287,7 +287,7 @@ fn store_failure(what: &'static str) -> impl Fn(crate::store::StoreError) -> Fai
         Failure::new(
             "CATALOG_READ",
             format!("cannot {what}: {e}"),
-            "check backend health with: vf doctor",
+            "check backend health with: vectorfs doctor",
         )
     }
 }
@@ -320,7 +320,7 @@ pub fn render_human(r: &StatusReport) -> String {
                     if matches!(state, LockState::Held) {
                         let _ = writeln!(
                             out,
-                            "              port unknown — probe with: vf status --endpoint http://127.0.0.1:8787"
+                            "              port unknown — probe with: vectorfs status --endpoint http://127.0.0.1:8787"
                         );
                     } else {
                         let _ = writeln!(
@@ -440,14 +440,14 @@ pub async fn endpoint_probe(url: &str) -> Result<EndpointReport, Failure> {
             Failure::new(
                 "ENDPOINT_TIMEOUT",
                 format!("GET {url}/healthz timed out after 5s"),
-                "is a vf daemon listening there? try: vf status --data-dir …",
+                "is a vectorfs daemon listening there? try: vectorfs status --data-dir …",
             )
         })?
         .map_err(|e| {
             Failure::new(
                 "ENDPOINT_UNREACHABLE",
                 format!("GET {url}/healthz failed: {e}"),
-                "is `vf serve` running? start it with: vf serve --data-dir …",
+                "is `vectorfs serve` running? start it with: vectorfs serve --data-dir …",
             )
         })?;
     let status = resp.status();
@@ -585,7 +585,7 @@ mod tests {
         let cfg = storage_cfg(std::path::Path::new("/nonexistent/vf-status-tmp"));
         let err = gather(&cfg).await.unwrap_err();
         assert_eq!(err.code, "NO_DATA_ROOT");
-        assert!(err.hint.contains("vf init"), "{}", err.hint);
+        assert!(err.hint.contains("vectorfs init"), "{}", err.hint);
     }
 
     #[tokio::test]

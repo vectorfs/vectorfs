@@ -1,6 +1,6 @@
-//! `vf doctor` (M1 T6, design.md §5.8): environment diagnostics for one data
+//! `vectorfs doctor` (M1 T6, design.md §5.8): environment diagnostics for one data
 //! root. Every check reports PASS / WARN / FAIL, and every non-PASS carries
-//! an **executable** hint ("run: vf init …", "restart the writer …") per the
+//! an **executable** hint ("run: vectorfs init …", "restart the writer …") per the
 //! agent-first output contract (report.rs). Any FAIL exits 1.
 //!
 //! Checks (in run order):
@@ -9,8 +9,8 @@
 //!    of a uniquely-named probe object, then delete. On the file backend
 //!    `PutMode::Create` is O_EXCL — the exact primitive bucket/index/LOCK
 //!    creation uses; on S3 it is If-None-Match:* (design.md §5.2).
-//! 2. `config` — `<data-dir>/vf.json` exists and its credential fields are
-//!    complete.
+//! 2. `config` — `<data-dir>/.vectorfs/vectorfs.toml` exists and its
+//!    credential fields are complete.
 //! 3. `lock` — who holds the LOCK (live daemon), stale debris, or nobody.
 //!    A live holder is healthy (it IS the writer); stale debris is a WARN —
 //!    the next writer takes over automatically after the TTL.
@@ -19,7 +19,7 @@
 //!    warns. Not applicable to s3/memory (reported as such).
 //!
 //! A MISSING data root (file backend) is not a check row: it short-circuits
-//! to `{code: NO_DATA_ROOT, hint: run: vf init …}` + exit 1 — there is
+//! to `{code: NO_DATA_ROOT, hint: run: vectorfs init …}` + exit 1 — there is
 //! nothing else to probe.
 
 use serde::Serialize;
@@ -96,7 +96,7 @@ pub async fn run(cfg: &StorageConfig) -> Result<DoctorReport, Failure> {
         return Err(Failure::new(
             "NO_DATA_ROOT",
             format!("no data root at {}", cfg.data_dir.display()),
-            format!("run: vf init --data-dir {}", cfg.data_dir.display()),
+            format!("run: vectorfs init --data-dir {}", cfg.data_dir.display()),
         ));
     }
     let backend = cfg.backend().map_err(|e| {
@@ -155,7 +155,7 @@ async fn check_backend_write(backend: &crate::backends::Backend, storage: &Stora
                     "backend-write",
                     CheckStatus::Warn,
                     format!("probe object created but not deletable: {e}"),
-                    "remove the .vf-doctor-probe-* object at the data root manually",
+                    "remove the .vectorfs/.vf-doctor-probe-* object at the data root manually",
                 );
             }
             let what = match backend {
@@ -175,7 +175,7 @@ async fn check_backend_write(backend: &crate::backends::Backend, storage: &Stora
             "backend-write",
             CheckStatus::Fail,
             "conditional create reported the probe object as already existing (impossible for a fresh random name)",
-            "retry vf doctor; if it persists the backend's conditional writes are broken",
+            "retry vectorfs doctor; if it persists the backend's conditional writes are broken",
         ),
         Err(e) => {
             let hint = match backend {
@@ -206,31 +206,34 @@ fn cfg_dir_of(backend: &crate::backends::Backend) -> std::path::PathBuf {
 }
 
 async fn check_config(cfg: &StorageConfig) -> Check {
-    match crate::config::read_vf_json(&cfg.data_dir) {
+    match crate::config::read_config(&cfg.data_dir) {
         Err(e) => Check::not_pass(
             "config",
             CheckStatus::Fail,
-            format!("vf.json unreadable: {e}"),
+            format!("vectorfs.toml unreadable: {e}"),
             format!(
-                "fix or regenerate it (regenerating rotates credentials): mv {}/vf.json /tmp && vf init --data-dir {}",
-                cfg.data_dir.display(),
+                "fix or regenerate it (regenerating rotates credentials): mv {} /tmp && vectorfs init --data-dir {}",
+                crate::config::config_path(&cfg.data_dir).display(),
                 cfg.data_dir.display()
             ),
         ),
         Ok(None) => Check::not_pass(
             "config",
             CheckStatus::Fail,
-            format!("no {} found", cfg.data_dir.join("vf.json").display()),
-            format!("run: vf init --data-dir {}", cfg.data_dir.display()),
+            format!(
+                "no {} found",
+                crate::config::config_path(&cfg.data_dir).display()
+            ),
+            format!("run: vectorfs init --data-dir {}", cfg.data_dir.display()),
         ),
         Ok(Some(c)) => {
             if c.access_key_id.is_empty() || c.secret_access_key.is_empty() {
                 return Check::not_pass(
                     "config",
                     CheckStatus::Fail,
-                    "vf.json has empty access_key_id / secret_access_key".to_string(),
+                    "vectorfs.toml has empty access_key_id / secret_access_key".to_string(),
                     format!(
-                        "regenerate credentials: vf init --force --data-dir {} (rotates the key)",
+                        "regenerate credentials: vectorfs init --force --data-dir {} (rotates the key)",
                         cfg.data_dir.display()
                     ),
                 );
@@ -247,7 +250,7 @@ async fn check_config(cfg: &StorageConfig) -> Check {
             Check::pass(
                 "config",
                 format!(
-                    "vf.json present (region {}, account {}, access key {masked})",
+                    "vectorfs.toml present (region {}, account {}, access key {masked})",
                     c.region, c.account_id
                 ),
             )
@@ -279,7 +282,7 @@ async fn check_lock(backend: &crate::backends::Backend, storage: &Storage) -> Ch
                     "stale LOCK: heartbeat {}s old (owner pid {}, host {}) — its writer is gone",
                     d.heartbeat_age_s, d.pid, d.host
                 ),
-                "restart takes over after TTL automatically: vf serve / vf mcp (or remove the LOCK object while nothing runs)",
+                "restart takes over after TTL automatically: vectorfs serve / vectorfs mcp (or remove the LOCK object while nothing runs)",
             ),
             (_, None) => Check::not_pass(
                 "lock",
@@ -299,7 +302,7 @@ async fn check_indexes(storage: &Storage) -> Check {
                 "indexes",
                 CheckStatus::Fail,
                 format!("cannot enumerate buckets: {e}"),
-                "check backend health (vf doctor's backend-write row)",
+                "check backend health (vectorfs doctor's backend-write row)",
             );
         }
     };
@@ -448,7 +451,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, "NO_DATA_ROOT");
-        assert!(err.hint.contains("vf init"), "{}", err.hint);
+        assert!(err.hint.contains("vectorfs init"), "{}", err.hint);
     }
 
     #[tokio::test]
@@ -497,20 +500,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_vf_json_fails_with_run_vf_init_hint() {
+    async fn missing_config_fails_with_run_init_hint() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path()).unwrap(); // data root, no vf.json
+        std::fs::create_dir_all(dir.path()).unwrap(); // data root, no vectorfs.toml
         let report = run(&cfg(dir.path())).await.unwrap();
         assert!(report.any_fail());
         let config = report.checks.iter().find(|c| c.name == "config").unwrap();
         assert_eq!(config.status, CheckStatus::Fail);
         assert!(
-            config.hint.as_deref().unwrap().contains("vf init"),
+            config.hint.as_deref().unwrap().contains("vectorfs init"),
             "{config:?}"
         );
         let text = render_human(&report);
         assert!(text.contains("[FAIL] config"), "{text}");
-        assert!(text.contains("hint: run: vf init"), "{text}");
+        assert!(text.contains("hint: run: vectorfs init"), "{text}");
         assert!(text.contains("overall: FAIL"), "{text}");
     }
 
@@ -597,7 +600,7 @@ mod tests {
         // corrupt the dataset: wipe the lance dataset dir, keep index.json
         // (lance keeps the table under data/<table>/ — remove the whole data
         // path so reopening the index cannot succeed)
-        let data = dir.path().join("buckets/vb/indexes/ix/data");
+        let data = dir.path().join(".vectorfs/buckets/vb/indexes/ix/data");
         std::fs::remove_dir_all(&data).unwrap();
         std::fs::write(&data, b"not a dataset").unwrap();
 

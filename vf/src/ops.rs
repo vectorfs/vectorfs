@@ -214,7 +214,7 @@ fn now() -> (f64, String) {
     (secs, epoch_to_rfc3339(secs))
 }
 
-/// days->civil (Howard Hinnant); no chrono dependency. `vf status` reuses
+/// days->civil (Howard Hinnant); no chrono dependency. `vectorfs status` reuses
 /// this for LOCK start times (M1 T6).
 pub(crate) fn epoch_to_rfc3339(secs: f64) -> String {
     let millis = (secs.fract() * 1000.0).round().rem_euclid(1000.0) as u32;
@@ -1523,7 +1523,8 @@ pub async fn delete_vector_bucket(
         )));
     }
     // bucket.json + optional policy.json/tags.json (index metadata dirs are
-    // empty by the check above — nothing else may live under buckets/<name>/).
+    // empty by the check above — nothing else may live under
+    // .vectorfs/buckets/<name>/).
     state.storage.delete_bucket(&name).await?;
     Ok(empty_ok())
 }

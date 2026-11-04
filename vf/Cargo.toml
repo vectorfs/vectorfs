@@ -7,9 +7,20 @@ license.workspace = true
 description = "Single-binary, self-hosted AWS S3 Vectors compatible gateway"
 publish = false
 
+# Dual thin bins (design.md §0 command ruling + 附录E.4):
+# - `vectorfs`: the SERVER (init/serve/status/doctor/mcp) — links the engine
+#   (lancedb) and the axum router; this is the binary size_guard.sh gates on.
+# - `vf`: the CLIENT skeleton over HTTP (status --endpoint; T6 grows the
+#   put/search/get/... verbs). References only the probe/render slice of the
+#   lib, so the linker drops the engine/server code — it stays a small
+#   binary, not a second copy of the daemon.
+[[bin]]
+name = "vectorfs"
+path = "src/bin/vectorfs.rs"
+
 [[bin]]
 name = "vf"
-path = "src/main.rs"
+path = "src/bin/vf.rs"
 
 # Dependencies carried over from the verified M0 spike (spike/Cargo.toml,
 # spike/REPORT.md 2026-11-03): same versions, same feature convergence.
@@ -39,6 +50,13 @@ tokio = { version = "1", features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
+
+# <data-dir>/.vectorfs/vectorfs.toml (design.md §0 config ruling, §5.3
+# layout): parse + serialize the server config file. `deny_unknown_fields`
+# gives the fail-fast surface (typo'd key = startup error with the TOML
+# span, see config.rs). MIT/Apache-2.0 dual license; not previously in the
+# tree, so zero duplicate-version risk (verified via cargo tree -d).
+toml = "1"
 
 # /tags/{resourceArn} path + query decoding (M1 T3) and list nextToken
 # cursors. Both already in the lock via `url`/`lancedb` transitive copies —

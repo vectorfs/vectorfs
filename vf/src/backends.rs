@@ -36,8 +36,14 @@
 //!   dropped between operations, silently losing datasets. We therefore
 //!   register `SharedMemoryProvider`, which returns ONE `Arc<InMemory>`
 //!   owned by this `Backend` for the whole daemon lifetime. The same instance
-//!   also serves the catalog, so `vf status`-style tooling sees one coherent
+//!   also serves the catalog, so `vectorfs status`-style tooling sees one coherent
 //!   store. The `memory` backend is volatile by definition (CI/emulator mode).
+//!
+//! Layout (design.md §5.3 v2.2): every backend keeps ALL vectorfs-owned data
+//! under the reserved `.vectorfs/` prefix (see [`SYSTEM_PREFIX`]) — catalog
+//! JSON and the LOCK at `.vectorfs/…`, Lance datasets at
+//! `.vectorfs/buckets/…` — so the instance root (S3 bucket[/prefix] or local
+//! dir) holds nothing but user data.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -50,6 +56,14 @@ use url::Url;
 
 /// Cloud block size lance's own s3 provider uses (64KB; const is private there).
 const CLOUD_BLOCK_SIZE: usize = 64 * 1024;
+
+/// Reserved system prefix (design.md §5.3 v2.2 git-mental-model layout): ALL
+/// vectorfs-owned data — catalog JSON, LOCK, flock, vectorfs.toml, Lance
+/// datasets — lives under `<root>/.vectorfs/`, so the instance root stays a
+/// clean user file namespace (any S3 tool can read/write the rest directly).
+/// object_key()/lance_uri()/flock_path() below apply it centrally; callers
+/// keep passing system-RELATIVE keys ("LOCK", "buckets/<vb>/bucket.json").
+pub const SYSTEM_PREFIX: &str = ".vectorfs";
 
 // ---------------------------------------------------------------------------
 // S3 provider (from the M0 spike, unchanged in substance)
@@ -184,13 +198,17 @@ impl S3BackendConfig {
         m
     }
 
-    /// Lance dataset URI for an index's data dir.
+    /// Lance dataset URI for an index's data dir (under the system prefix;
+    /// see [`SYSTEM_PREFIX`]).
     pub fn lance_uri(&self, vb: &str, ix: &str) -> String {
         match self.prefix.is_empty() {
-            true => format!("s3://{}/buckets/{}/indexes/{}/data", self.bucket, vb, ix),
+            true => format!(
+                "s3://{}/{SYSTEM_PREFIX}/buckets/{vb}/indexes/{ix}/data",
+                self.bucket
+            ),
             false => format!(
-                "s3://{}/{}/buckets/{}/indexes/{}/data",
-                self.bucket, self.prefix, vb, ix
+                "s3://{}/{}/{SYSTEM_PREFIX}/buckets/{vb}/indexes/{ix}/data",
+                self.bucket, self.prefix
             ),
         }
     }
@@ -285,8 +303,10 @@ impl ObjectStoreProvider for SharedMemoryProvider {
 }
 
 /// Domain component of memory:// dataset URIs. Constant so every URI spells
-/// the same namespace (`memory://vf/buckets/<vb>/indexes/<ix>/data`).
-const MEMORY_HOST: &str = "vf";
+/// the same namespace (`memory://vf/<SYSTEM_PREFIX>/buckets/<vb>/…`). Store
+/// keys derived from it (`vf/.vectorfs/…`) are swept by delete_index —
+/// visible to that module, hence pub(crate).
+pub(crate) const MEMORY_HOST: &str = "vf";
 
 // ---------------------------------------------------------------------------
 // Backend enum
@@ -349,24 +369,41 @@ impl Backend {
         }
     }
 
-    /// Lance dataset URI for one index's data dir (§5.3 layout).
+    /// Lance dataset URI for one index's data dir (§5.3 layout: everything
+    /// under the reserved system prefix).
     pub fn lance_uri(&self, vb: &str, ix: &str) -> String {
         match self {
-            Backend::File { root } => {
-                format!("file://{}/buckets/{vb}/indexes/{ix}/data", root.display())
+            Backend::File { root } => format!(
+                "file://{}/{SYSTEM_PREFIX}/buckets/{vb}/indexes/{ix}/data",
+                root.display()
+            ),
+            Backend::Memory => {
+                format!("memory://{MEMORY_HOST}/{SYSTEM_PREFIX}/buckets/{vb}/indexes/{ix}/data")
             }
-            Backend::Memory => format!("memory://{MEMORY_HOST}/buckets/{vb}/indexes/{ix}/data"),
             Backend::S3(cfg) => cfg.lance_uri(vb, ix),
         }
     }
 
     /// Object-store key for a catalog/LOCK object relative to the backend root.
+    /// The system prefix is applied HERE (the single funnel): callers pass
+    /// system-relative keys ("LOCK", "buckets/<vb>/bucket.json") and never
+    /// spell `.vectorfs/` themselves. S3 additionally prepends the configured
+    /// bucket prefix via `catalog_key` — exactly once each.
     pub fn object_key(&self, rel: &str) -> object_store::path::Path {
+        // rel == "" scopes to the whole system prefix (status volume
+        // accounting on S3); trailing separators would collapse anyway, but
+        // being explicit keeps the empty case from producing a dangling '/'.
+        let system_rel = match rel.trim_matches('/') {
+            "" => SYSTEM_PREFIX.to_string(),
+            rel => format!("{SYSTEM_PREFIX}/{rel}"),
+        };
         match self {
             // The file catalog store is prefix-rooted at `root`; memory keys
-            // are plain relative paths on the shared map.
-            Backend::File { .. } | Backend::Memory => object_store::path::Path::from(rel),
-            Backend::S3(cfg) => cfg.catalog_key(rel),
+            // are plain relative paths on the shared map. A leading dot
+            // segment is a legal object_store Path (only bare "." / ".."
+            // segments are special — pinned by the tests below).
+            Backend::File { .. } | Backend::Memory => object_store::path::Path::from(system_rel),
+            Backend::S3(cfg) => cfg.catalog_key(&system_rel),
         }
     }
 
@@ -392,12 +429,12 @@ impl Backend {
     }
 
     /// Local flock file path (file backend only — same-machine double-start
-    /// guard; see lock.rs). A separate dotfile, NOT the LOCK object: the LOCK
-    /// object is rewritten by put/delete, which would swap the inode out from
-    /// under the flock.
+    /// guard; see lock.rs): `<root>/.vectorfs/flock`. A separate file, NOT the
+    /// LOCK object: the LOCK object is rewritten by put/delete, which would
+    /// swap the inode out from under the flock.
     pub fn flock_path(&self) -> Option<std::path::PathBuf> {
         match self {
-            Backend::File { root } => Some(root.join(".vf.flock")),
+            Backend::File { root } => Some(root.join(SYSTEM_PREFIX).join("flock")),
             _ => None,
         }
     }
@@ -603,7 +640,7 @@ pub async fn list_prefix(
     Ok(out)
 }
 
-/// (object count, total byte size) under a prefix — `vf status` data-root
+/// (object count, total byte size) under a prefix — `vectorfs status` data-root
 /// volume accounting (M1 T6). Sizes come from list metadata only; no object
 /// body is ever fetched. `None` = the whole store root (on the file backend
 /// that is everything in the data dir; on S3 it is the entire bucket, so S3
@@ -670,20 +707,66 @@ mod tests {
         let abs = format!("{}", dd.path().canonicalize().unwrap().display());
         assert_eq!(
             f.lance_uri("vb", "ix"),
-            format!("file://{abs}/buckets/vb/indexes/ix/data")
+            format!("file://{abs}/.vectorfs/buckets/vb/indexes/ix/data")
         );
-        assert_eq!(f.object_key("LOCK").as_ref(), "LOCK");
+        assert_eq!(f.object_key("Lock").as_ref(), ".vectorfs/Lock");
+        assert_eq!(f.object_key("").as_ref(), ".vectorfs");
+        assert_eq!(
+            f.flock_path().unwrap(),
+            dd.path().canonicalize().unwrap().join(".vectorfs/flock")
+        );
         let m = Backend::parse("memory", dd.path()).unwrap();
         assert_eq!(
             m.lance_uri("vb", "ix"),
-            "memory://vf/buckets/vb/indexes/ix/data"
+            "memory://vf/.vectorfs/buckets/vb/indexes/ix/data"
+        );
+        assert_eq!(
+            m.object_key("buckets/x/bucket.json").as_ref(),
+            ".vectorfs/buckets/x/bucket.json"
         );
         let s = Backend::parse("s3+http://h:9000/b/pre", dd.path()).unwrap();
         assert_eq!(
             s.lance_uri("vb", "ix"),
-            "s3://b/pre/buckets/vb/indexes/ix/data"
+            "s3://b/pre/.vectorfs/buckets/vb/indexes/ix/data"
         );
-        assert_eq!(s.object_key("LOCK").as_ref(), "pre/LOCK");
+        // system prefix + configured bucket prefix, each applied exactly once
+        assert_eq!(s.object_key("Lock").as_ref(), "pre/.vectorfs/Lock");
+        let s_no_prefix = Backend::parse("s3+http://h:9000/b", dd.path()).unwrap();
+        assert_eq!(s_no_prefix.object_key("Lock").as_ref(), ".vectorfs/Lock");
+    }
+
+    /// The system prefix is a LEADING DOT segment — legal for object_store
+    /// (only bare "." / ".." segments are special) — and file-backend objects
+    /// physically land under `<root>/.vectorfs/`, leaving the rest of the
+    /// root free for user data (design.md §5.3).
+    #[tokio::test]
+    async fn dot_segment_objects_roundtrip_under_system_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let handles = Backend::File { root: root.clone() }.build().unwrap();
+        let key = object_store::path::Path::from(".vectorfs/LOCK");
+
+        assert!(
+            put_json_create(&*handles.catalog, &key, b"{\"owner\":1}")
+                .await
+                .unwrap(),
+            "leading-dot key must be creatable"
+        );
+        let v: serde_json::Value = read_json(&*handles.catalog, &key).await.unwrap().unwrap();
+        assert_eq!(v["owner"], 1);
+        // physical location: INSIDE .vectorfs/ — LocalFileSystem's put
+        // creates parent dirs itself, no manual mkdir needed
+        assert!(
+            root.join(".vectorfs/LOCK").is_file(),
+            "LOCK must live at {}/.vectorfs/LOCK",
+            root.display()
+        );
+        // and nothing leaked into the root itself
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            1,
+            "instance root must contain only .vectorfs/"
+        );
     }
 
     #[tokio::test]

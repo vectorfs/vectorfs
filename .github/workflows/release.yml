@@ -6,13 +6,16 @@
 #   release (matrix)   — release-prod builds for x86_64 (native) and
 #                        aarch64 (cross-rs in Docker), VF_GIT_HASH baked in;
 #                        size_guard.sh runs PER TARGET on the parameterized
-#                        binary path; artifacts vf-<version>-<target>.tar.gz
-#                        (binary + README copy) uploaded per target.
+#                        `vectorfs` binary path (the big server bin; the thin
+#                        `vf` client is printed but not gated); artifacts
+#                        vectorfs-<version>-<target>.tar.gz (both binaries +
+#                        README copy) uploaded per target.
 #   smoke-ubuntu-20-04 — unpacks the x86_64 tarball inside `docker run
-#                        ubuntu:20.04`, `vf init && vf serve`, apt-installs
-#                        python3+boto3 and drives a 5-step roundtrip
-#                        (create/put/query/get/delete+cleanup). This is the
-#                        glibc-compatibility gate for the release binary.
+#                        ubuntu:20.04`, `vectorfs init && vectorfs serve`,
+#                        apt-installs python3+boto3 and drives a 5-step
+#                        roundtrip (create/put/query/get/delete+cleanup).
+#                        This is the glibc-compatibility gate for the release
+#                        binary.
 #   publish            — needs BOTH green: merges artifacts, writes
 #                        sha256sums.txt, attaches everything via
 #                        softprops/action-gh-release.
@@ -102,23 +105,30 @@ jobs:
             cargo build --profile release-prod --workspace --target "${{ matrix.target }}"
           fi
 
-      # size_guard.sh takes the binary path as $1 (default target/release-prod/vf)
+      # size_guard.sh takes the binary path as $1 (default
+      # target/release-prod/vectorfs). The gate covers the SERVER binary;
+      # the thin `vf` client is orders of magnitude smaller — printed for
+      # the log, not gated.
       - name: size guard (per target)
-        run: ./scripts/size_guard.sh "target/${{ matrix.target }}/release-prod/vf"
+        run: |
+          ./scripts/size_guard.sh "target/${{ matrix.target }}/release-prod/vectorfs"
+          ls -la "target/${{ matrix.target }}/release-prod/vf" \
+            || echo "WARN: client bin vf missing"
 
-      - name: package (binary + README copy)
+      - name: package (both binaries + README copy)
         run: |
           set -euo pipefail
           mkdir -p package
+          cp "target/${{ matrix.target }}/release-prod/vectorfs" package/vectorfs
           cp "target/${{ matrix.target }}/release-prod/vf" package/vf
           cp README.md package/
-          tar -czf "vf-${VERSION}-${{ matrix.target }}.tar.gz" -C package vf README.md
-          ls -la "vf-${VERSION}-${{ matrix.target }}.tar.gz"
+          tar -czf "vectorfs-${VERSION}-${{ matrix.target }}.tar.gz" -C package vectorfs vf README.md
+          ls -la "vectorfs-${VERSION}-${{ matrix.target }}.tar.gz"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: vf-${{ matrix.target }}
-          path: vf-*.tar.gz
+          name: vectorfs-${{ matrix.target }}
+          path: vectorfs-*.tar.gz
           if-no-files-found: error
 
   smoke-ubuntu-20-04:
@@ -128,7 +138,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: vf-x86_64-unknown-linux-gnu
+          name: vectorfs-x86_64-unknown-linux-gnu
 
       # The smoke script is written into dist/ so the ubuntu:20.04 container
       # sees it through the /work mount. It polls /healthz itself (curl is not
@@ -138,7 +148,7 @@ jobs:
       - name: docker run ubuntu:20.04 smoke
         run: |
           set -euo pipefail
-          mkdir -p dist && tar -xzf vf-*-x86_64-unknown-linux-gnu.tar.gz -C dist
+          mkdir -p dist && tar -xzf vectorfs-*-x86_64-unknown-linux-gnu.tar.gz -C dist
           cat > dist/smoke_check.py <<'PYEOF'
           import argparse, time, urllib.request
           import boto3
@@ -184,14 +194,17 @@ jobs:
             apt-get update && apt-get install -y --no-install-recommends python3 python3-pip
             pip3 install --no-cache-dir boto3
             cd /work/dist
-            ./vf init --data-dir /tmp/vfdata
-            AK=$(python3 -c "import json; print(json.load(open(\"/tmp/vfdata/vf.json\"))[\"access_key_id\"])")
-            SK=$(python3 -c "import json; print(json.load(open(\"/tmp/vfdata/vf.json\"))[\"secret_access_key\"])")
-            ./vf serve --data-dir /tmp/vfdata >/tmp/vf.log 2>&1 &
+            ./vectorfs init --data-dir /tmp/vfdata
+            # ubuntu:20.04 ships python3.8 (no tomllib) — pull the credential
+            # fields with awk from the toml written by init
+            AK=$(awk -F"\"" "/^access_key_id/{print \$2}" /tmp/vfdata/.vectorfs/vectorfs.toml)
+            SK=$(awk -F"\"" "/^secret_access_key/{print \$2}" /tmp/vfdata/.vectorfs/vectorfs.toml)
+            ./vectorfs serve --data-dir /tmp/vfdata >/tmp/vf.log 2>&1 &
             VF_PID=$!
             trap "kill $VF_PID 2>/dev/null; tail -20 /tmp/vf.log" EXIT
             python3 smoke_check.py --endpoint http://127.0.0.1:8787 \
               --access-key "$AK" --secret-key "$SK"
+            ./vf status --endpoint http://127.0.0.1:8787
           '
 
   publish:
@@ -209,12 +222,12 @@ jobs:
           set -euo pipefail
           cd dist-out
           ls -la
-          sha256sum vf-*.tar.gz > sha256sums.txt
+          sha256sum vectorfs-*.tar.gz > sha256sums.txt
           cat sha256sums.txt
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist-out/vf-*.tar.gz
+            dist-out/vectorfs-*.tar.gz
             dist-out/sha256sums.txt
           generate_release_notes: true

@@ -4,7 +4,9 @@
 //! - catalog: `buckets/<name>/bucket.json`,
 //!   `buckets/<vb>/indexes/<ix>/index.json` — ALL via object_store
 //!   (`get` → NotFound → 404; create = `put_opts(PutMode::Create)`, race-free
-//!   on file/memory/S3). The file backend no longer touches std::fs for
+//!   on file/memory/S3). The `.vectorfs/` system prefix is applied centrally
+//!   by `Backend::object_key` (backends.rs), so the keys below are
+//!   system-relative. The file backend no longer touches std::fs for
 //!   catalog objects (only backend setup in backends.rs creates/canonicalizes
 //!   the data dir itself). M1 T3 adds the management-plane half of the
 //!   catalog: enumeration (list), removal (bucket/index delete incl. the
@@ -13,8 +15,9 @@
 //!   echo-only indexMode/defaultIndexMode knobs.
 //! - engine: lancedb (the ONLY module that touches lancedb API, design.md
 //!   §5.7). One Lance table per index at `<index>/data` (file:
-//!   `file://<root>/buckets/<vb>/indexes/<ix>/data`, memory:
-//!   `memory://vf/…`, S3: `s3://<bucket>[/<prefix>]/…`), opened through the
+//!   `file://<root>/.vectorfs/buckets/<vb>/indexes/<ix>/data`, memory:
+//!   `memory://vf/.vectorfs/…`, S3:
+//!   `s3://<bucket>[/<prefix>]/.vectorfs/…`), opened through the
 //!   backend's shared `Session` (per-registry object stores). A fresh
 //!   `Connection` per operation remains a spike simplification — no connection
 //!   cache; M0 REPORT 遗留 3, TODO for a later M1 task. M1 T4 adds the
@@ -375,18 +378,20 @@ impl Storage {
         Ok(())
     }
 
-    /// Remove an index: every object under `buckets/<vb>/indexes/<ix>/`
-    /// (index.json, tags.json AND the Lance dataset under `data/` — they share
-    /// the catalog object store on file/s3 backends). The memory backend's
-    /// engine datasets live under a `vf/` prefix on the same shared map (see
-    /// backends.rs SharedMemoryProvider), so that mirror prefix is swept too —
-    /// a no-op on file/s3 where it never exists.
+    /// Remove an index: every object under the index's system-prefix dir
+    /// (`.vectorfs/buckets/<vb>/indexes/<ix>/` — index.json, tags.json AND
+    /// the Lance dataset under `data/`, which shares the catalog object store
+    /// on file/s3 backends). The memory backend's engine datasets live under
+    /// the `vf/` URL-host prefix on the same shared map (backends.rs
+    /// SharedMemoryProvider), i.e. at `vf/.vectorfs/…` — a key shape the
+    /// object_key funnel cannot express, so that mirror prefix is swept
+    /// explicitly; a no-op on file/s3 where it never exists.
     pub async fn delete_index(&self, vb: &str, ix: &str) -> Result<(), StoreError> {
-        for base in [
-            format!("buckets/{vb}/indexes/{ix}"),
-            format!("vf/buckets/{vb}/indexes/{ix}"),
-        ] {
-            for key in backends::list_prefix(&*self.catalog, &self.key(&base))
+        let catalog_base = self.key(&format!("buckets/{vb}/indexes/{ix}"));
+        let memory_base =
+            object_store::path::Path::from(format!("{}/{catalog_base}", backends::MEMORY_HOST));
+        for base in [catalog_base, memory_base] {
+            for key in backends::list_prefix(&*self.catalog, &base)
                 .await
                 .map_err(internal)?
             {
@@ -665,8 +670,8 @@ impl Storage {
         Ok(())
     }
 
-    /// Read-only row count of one index's dataset — the `vf status` /
-    /// `vf doctor` inspection path (M1 T6). Never opens a write path.
+    /// Read-only row count of one index's dataset — the `vectorfs status` /
+    /// `vectorfs doctor` inspection path (M1 T6). Never opens a write path.
     pub async fn count_vectors(&self, vb: &str, ix: &str) -> Result<usize, StoreError> {
         let table = self.open_table(vb, ix).await?;
         table.count_rows(None).await.map_err(internal)

@@ -1,15 +1,15 @@
-//! `vf mcp` (M1 T6, design.md §5.8): a stdio MCP server for the "agent
+//! `vectorfs mcp` (M1 T6, design.md §5.8): a stdio MCP server for the "agent
 //! single-user" mode — NO daemon, the MCP process IS the only writer.
 //!
-//! Relationship to `vf serve`: same storage layer, same wire semantics.
+//! Relationship to `vectorfs serve`: same storage layer, same wire semantics.
 //! Every tool is a thin, MCP-shaped call into the exact operation handlers
 //! (`crate::ops`) the HTTP server runs — so limits (topK ≤ 10000, batch
 //! ≤ 500, GetVectors keys ≤ 100), validation, filter semantics and
 //! deterministic ordering are the SDK path verbatim, with zero duplication.
 //! What differs is the transport (stdio JSON-RPC instead of HTTP+SigV4) and
-//! the exclusivity model: `vf mcp` **takes the single-writer LOCK with the
-//! same protocol as `vf serve`** (lock.rs) and holds it for its whole
-//! lifetime — while it runs, neither another `vf mcp` nor a `vf serve` may
+//! the exclusivity model: `vectorfs mcp` **takes the single-writer LOCK with the
+//! same protocol as `vectorfs serve`** (lock.rs) and holds it for its whole
+//! lifetime — while it runs, neither another `vectorfs mcp` nor a `vectorfs serve` may
 //! write the same data root (a holder is reported as a structured
 //! `{code, message, hint}` error, never a hang). Read-only (`--tools ro`)
 //! still takes the LOCK: one simple rule — one writer process per data root
@@ -42,7 +42,7 @@ use serde_json::json;
 use crate::ops::{self, ApiError, AppState};
 use crate::report::SCHEMA_VERSION;
 
-/// Tool access modes for `vf mcp --tools`.
+/// Tool access modes for `vectorfs mcp --tools`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lowercase")]
 pub enum ToolsMode {
@@ -244,7 +244,7 @@ fn error_json(e: &ApiError) -> String {
         ),
         _ => (
             "Internal",
-            "this is a vectorfs bug or a corrupt dataset — run vf doctor; if healthy, please report it",
+            "this is a vectorfs bug or a corrupt dataset — run vectorfs doctor; if healthy, please report it",
         ),
     };
     json!({
@@ -546,15 +546,15 @@ fn tool_error(text: String) -> CallToolResult {
 #[tool_handler(
     router = self.tool_router,
     name = "vectorfs",
-    instructions = "vectorfs single-agent mode: this MCP process is the ONLY writer of its data root (it holds the same single-writer LOCK as `vf serve`). Locate indexes with list_vector_buckets + list_indexes (they carry dimension/metric), then query_vectors / get_vectors; with --tools rw also put_vectors / delete_vectors. Results are deterministic (queries: distance asc then key asc; get_vectors: key asc). Every result is a JSON string with schema_version; failures are tool errors shaped {code, message, hint}."
+    instructions = "vectorfs single-agent mode: this MCP process is the ONLY writer of its data root (it holds the same single-writer LOCK as `vectorfs serve`). Locate indexes with list_vector_buckets + list_indexes (they carry dimension/metric), then query_vectors / get_vectors; with --tools rw also put_vectors / delete_vectors. Results are deterministic (queries: distance asc then key asc; get_vectors: key asc). Every result is a JSON string with schema_version; failures are tool errors shaped {code, message, hint}."
 )]
 impl ServerHandler for VfMcp {}
 
 // ---------------------------------------------------------------------------
-// process entry (`vf mcp`): LOCK, heartbeat, serve over stdio
+// process entry (`vectorfs mcp`): LOCK, heartbeat, serve over stdio
 // ---------------------------------------------------------------------------
 
-/// Outcome of a `vf mcp` run for the CLI to turn into an exit code.
+/// Outcome of a `vectorfs mcp` run for the CLI to turn into an exit code.
 #[derive(Debug)]
 pub enum McpExit {
     Ok,
@@ -580,12 +580,12 @@ pub async fn run(cfg: &crate::config::StorageConfig, mode: ToolsMode) -> McpExit
     };
     if matches!(backend, crate::backends::Backend::Memory) {
         eprintln!(
-            "vf mcp: *** WARNING: memory backend is VOLATILE — everything is LOST when this \
+            "vectorfs mcp: *** WARNING: memory backend is VOLATILE — everything is LOST when this \
              process exits (CI / emulator mode). ***"
         );
     }
 
-    // single-writer LOCK — same protocol as `vf serve` (lock.rs): this MCP
+    // single-writer LOCK — same protocol as `vectorfs serve` (lock.rs): this MCP
     // process is the exclusive writer for its whole lifetime.
     let lock_guard = match crate::lock::acquire(&backend, storage.catalog().clone()).await {
         Ok(g) => g,
@@ -605,9 +605,10 @@ pub async fn run(cfg: &crate::config::StorageConfig, mode: ToolsMode) -> McpExit
     };
 
     // region/account only mint ARNs / parse ARN locators; the tool surface
-    // uses names, but resolve them the same way serve would when vf.json is
-    // present (keeps list output ARNs identical across serve/mcp).
-    let file_cfg = crate::config::read_vf_json(&cfg.data_dir).ok().flatten();
+    // uses names, but resolve them the same way serve would when
+    // vectorfs.toml is present (keeps list output ARNs identical across
+    // serve/mcp).
+    let file_cfg = crate::config::read_config(&cfg.data_dir).ok().flatten();
     let state = Arc::new(AppState {
         storage: Arc::new(storage),
         creds: None, // no wire auth on stdio — the transport is the boundary
@@ -640,13 +641,13 @@ pub async fn run(cfg: &crate::config::StorageConfig, mode: ToolsMode) -> McpExit
                     Ok(true) => {}
                     Ok(false) => {
                         eprintln!(
-                            "vf mcp: LOCK lost (taken over by another writer after heartbeat \
+                            "vectorfs mcp: LOCK lost (taken over by another writer after heartbeat \
                              expiry) — shutting down."
                         );
                         let _ = loss_tx.send(true);
                         break;
                     }
-                    Err(e) => eprintln!("vf mcp: LOCK heartbeat error: {e} (will retry)"),
+                    Err(e) => eprintln!("vectorfs mcp: LOCK heartbeat error: {e} (will retry)"),
                 }
             }
         }
@@ -654,7 +655,7 @@ pub async fn run(cfg: &crate::config::StorageConfig, mode: ToolsMode) -> McpExit
 
     let mode_name = if mode == ToolsMode::Rw { "rw" } else { "ro" };
     eprintln!(
-        "vf mcp: serving stdio MCP (tools={mode_name}, backend {}, owner {}) — this process \
+        "vectorfs mcp: serving stdio MCP (tools={mode_name}, backend {}, owner {}) — this process \
          is the single writer of the data root",
         state.storage.backend(),
         heartbeat_lock.lock().await.info().owner_uuid
@@ -675,20 +676,20 @@ pub async fn run(cfg: &crate::config::StorageConfig, mode: ToolsMode) -> McpExit
         r = service.waiting() => {
             match r {
                 Ok(reason) => {
-                    eprintln!("vf mcp: session ended ({reason:?})");
+                    eprintln!("vectorfs mcp: session ended ({reason:?})");
                 }
-                Err(e) => eprintln!("vf mcp: session error: {e}"),
+                Err(e) => eprintln!("vectorfs mcp: session error: {e}"),
             }
         }
         _ = loss_rx.changed() => {
             if *loss_rx.borrow() {
-                eprintln!("vf mcp: cancelling the MCP session…");
+                eprintln!("vectorfs mcp: cancelling the MCP session…");
                 token.cancel();
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
         }
     }
-    eprintln!("vf mcp: shutting down, releasing lock…");
+    eprintln!("vectorfs mcp: shutting down, releasing lock…");
     heartbeat_lock.lock().await.release().await;
     McpExit::Ok
 }

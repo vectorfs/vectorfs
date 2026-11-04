@@ -7,14 +7,15 @@
 # $GITHUB_STEP_SUMMARY when running in Actions). Exit 0 = within hard cap.
 #
 # Usage: size_guard.sh [binary]
-#   binary defaults to target/release-prod/vf (the CI size-guard job). The
-#   release pipeline passes the cross-compiled artifact path per target —
-#   the argument is resolved AFTER the repo-root cd, so both absolute and
-#   repo-relative paths work.
+#   binary defaults to target/release-prod/vectorfs (the big SERVER binary;
+#   the CI size-guard job). The release pipeline passes the cross-compiled
+#   artifact path per target — the argument is resolved AFTER the repo-root
+#   cd, so both absolute and repo-relative paths work. The thin `vf` client
+#   bin is far smaller and intentionally not gated.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BIN="${1:-target/release-prod/vf}"
+BIN="${1:-target/release-prod/vectorfs}"
 if [[ ! -f "$BIN" ]]; then
     echo "FAIL: $BIN not built; run: cargo build --profile release-prod --workspace" >&2
     exit 1
@@ -25,7 +26,7 @@ mib=$((bytes / (1024 * 1024)))
 WARN=155   # MiB
 FAIL=175   # MiB
 
-line="vf binary size [${BIN}]: ${bytes} bytes (${mib} MiB) — warn >${WARN}MiB, fail >${FAIL}MiB"
+line="vectorfs binary size [${BIN}]: ${bytes} bytes (${mib} MiB) — warn >${WARN}MiB, fail >${FAIL}MiB"
 echo "$line"
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     echo "$line" >>"$GITHUB_STEP_SUMMARY"

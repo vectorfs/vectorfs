@@ -24,17 +24,17 @@ Download a release tarball for Linux x86_64/aarch64 from
 `sha256sums.txt`), or build from source (Rust 1.94+, C toolchain, cmake, protoc):
 
 ```bash
-cargo build --profile release-prod --workspace   # -> target/release-prod/vf
+cargo build --profile release-prod --workspace   # -> target/release-prod/vectorfs (+ the thin `vf` client)
 ```
 
 Initialize a data root and start the server:
 
 ```bash
-vf init --data-dir ./vectorfs-data     # generates + prints the access key / secret
-vf serve --data-dir ./vectorfs-data    # listens on http://127.0.0.1:8787
+vectorfs init --data-dir ./vectorfs-data     # generates + prints the access key / secret
+vectorfs serve --data-dir ./vectorfs-data    # listens on http://127.0.0.1:8787
 ```
 
-Point boto3 at it (credentials from `vf init`; every command here was executed against a fresh `vf init`):
+Point boto3 at it (credentials from `vectorfs init`; every command here was executed against a fresh `vectorfs init`):
 
 ```python
 import boto3
@@ -73,9 +73,9 @@ res, err := client.QueryVectors(ctx, &s3vectors.QueryVectorsInput{
 ## Backends
 
 - `file` (default) — data root is a local directory; zero configuration.
-- `memory` — volatile, for CI and emulator use: `vf serve --backend memory --no-auth`
+- `memory` — volatile, for CI and emulator use: `vectorfs serve --backend memory --no-auth`
   (no SigV4 verification, no persistence; start/stop in seconds, deterministic).
-- `s3` — any S3-compatible endpoint: `vf serve --backend 's3+http://host:8333/bucket[/prefix]'`
+- `s3` — any S3-compatible endpoint: `vectorfs serve --backend 's3+http://host:8333/bucket[/prefix]'`
   with `--s3-access-key/--s3-secret-key/--s3-region` (or `VF_S3_*`/`AWS_*` env).
   Verified end-to-end on SeaweedFS 4.52 and Cloudflare R2 (dual-SDK conformance,
   conditional writes; R2 `auto` region and constant-size upload parts are
@@ -117,10 +117,10 @@ multi-tenant quotas are not enforced locally.
 
 ## MCP
 
-`vf mcp` is a stdio MCP server for agent single-user mode — the only writer of its data root (same lock as `vf serve`):
+`vectorfs mcp` is a stdio MCP server for agent single-user mode — the only writer of its data root (same lock as `vectorfs serve`):
 
 ```json
-{"vectorfs": {"command": "vf", "args": ["mcp", "--data-dir", "/path/to/vectorfs-data"]}}
+{"vectorfs": {"command": "vectorfs", "args": ["mcp", "--data-dir", "/path/to/vectorfs-data"]}}
 ```
 
 Add `"--tools", "ro"` for a read-only toolset. Tools: `list_vector_buckets`,

@@ -2,12 +2,12 @@
 //! writer daemon.
 //!
 //! Two layers:
-//! 1. **Local flock** (file backend only): `<root>/.vf.flock`, exclusive +
-//!    non-blocking — same-machine double starts fail instantly with a pids
+//! 1. **Local flock** (file backend only): `<root>/.vectorfs/flock`, exclusive
+//!    + non-blocking — same-machine double starts fail instantly with a pids
 //!    level error. The flock file is separate from the LOCK object because
 //!    the LOCK object is rewritten via put/delete, which swaps the inode out
 //!    from under an flock held on it.
-//! 2. **LOCK object** `<root>/LOCK` (all backends): JSON
+//! 2. **LOCK object** `<root>/.vectorfs/LOCK` (all backends): JSON
 //!    `{owner_uuid, pid, hostname, started_at, heartbeat_at}`.
 //!
 //! Acquire: not present -> conditional create (`PutMode::Create`, the same
@@ -123,6 +123,12 @@ struct FlockGuard {
 /// this machine holds it.
 fn take_flock(path: &std::path::Path) -> Result<FlockGuard, LockError> {
     use std::os::unix::io::AsFd as _;
+    // The flock lives inside `.vectorfs/` now; open(2) creates files, not
+    // directories — materialize the system dir before the first-ever lock.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| LockError::Backend(format!("create {}: {e}", parent.display())))?;
+    }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -135,7 +141,7 @@ fn take_flock(path: &std::path::Path) -> Result<FlockGuard, LockError> {
     ) {
         Ok(()) => Ok(FlockGuard { _file: file }),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(LockError::Held(format!(
-            "another vf daemon on this machine holds the local lock {} (flock)",
+            "another vectorfs daemon on this machine holds the local lock {} (flock)",
             path.display()
         ))),
         Err(e) => Err(LockError::Backend(format!("flock {}: {e}", path.display()))),
