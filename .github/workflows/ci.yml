@@ -66,12 +66,14 @@ jobs:
           args: vf
 
       # c) license whitelist + bans (deny.toml). Advisory classes that
-      #    cargo-deny 0.20 can downgrade are warn/non-fatal in deny.toml;
+      #    cargo-deny can downgrade are warn/non-fatal in deny.toml;
       #    actual vulnerabilities still gate (see deny.toml header).
+      #    NOTE: cargo-deny ≥0.3 dropped the `check` subcommand — the check
+      #    names go straight into [WHICH] positionals.
       - name: cargo-deny (licenses / bans / advisories)
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          arguments: check licenses bans advisories
+          arguments: licenses bans advisories
 
   size-guard:
     name: release-prod binary size (warn >155MiB / fail >175MiB)
