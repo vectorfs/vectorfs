@@ -687,6 +687,68 @@ mod tests {
         }
     }
 
+    /// `--backend memory` state: volatile store, no filesystem at all.
+    fn memory_state() -> AppState {
+        AppState {
+            storage: std::sync::Arc::new(store::Storage::memory()),
+            creds: None,
+            region: "us-east-1".into(),
+            account: "000000000000".into(),
+            trace: false,
+        }
+    }
+
+    /// The memory backend must run the four operations end to end (it is the
+    /// T7 CI mode — no external dependencies, design.md §3/§5.2). This also
+    /// proves the shared-InMemory provider keeps datasets alive across the
+    /// per-operation lancedb Connections.
+    #[tokio::test]
+    async fn memory_backend_four_op_roundtrip() {
+        let r = crate::build_router(memory_state());
+
+        let (st, _, b) = call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"memvb"}"#).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let (st, _, b) = call(
+            &r,
+            "/CreateIndex",
+            r#"{"vectorBucketName":"memvb","indexName":"memix","dataType":"float32",
+                "dimension":2,"distanceMetric":"cosine"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+
+        let (st, _, b) = call(
+            &r,
+            "/PutVectors",
+            r#"{"vectorBucketName":"memvb","indexName":"memix","vectors":[
+                {"key":"a","data":{"float32":[1,0]},"metadata":{"t":"x"}},
+                {"key":"b","data":{"float32":[0,1]}}
+            ]}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+
+        let (st, _, b) = call(
+            &r,
+            "/QueryVectors",
+            r#"{"vectorBucketName":"memvb","indexName":"memix","topK":2,
+                "queryVector":{"float32":[1,0]},"returnDistance":true,"returnMetadata":true}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let vs = b["vectors"].as_array().unwrap();
+        assert_eq!(vs.len(), 2);
+        assert_eq!(vs[0]["key"], json!("a"));
+        assert!((vs[0]["distance"].as_f64().unwrap()).abs() < 1e-6);
+        assert_eq!(vs[0]["metadata"]["t"], json!("x"));
+        assert_eq!(vs[1]["key"], json!("b"));
+
+        // duplicate create still conflicts through the conditional put
+        let (st, h, _) = call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"memvb"}"#).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert_eq!(errortype(&h), Some("ConflictException"));
+    }
+
     async fn call(
         router: &axum::Router,
         path: &str,

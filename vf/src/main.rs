@@ -1,12 +1,16 @@
-//! `vf` CLI — subcommand skeleton (M1 Task 1).
+//! `vf` CLI (M1: serve + init; status/doctor land in M1 T6, design.md §5.8).
 //!
-//! `vf serve` is the fully functional server harvested from the M0 spike
-//! (all serve flags carried over 1:1). `vf init` / `vf status` / `vf doctor`
-//! are placeholders, implemented in M1 T2 / T6 (design.md §5.8).
+//! `vf serve` is the fully functional s3vectors server harvested from the M0
+//! spike, now on the unified backend (file/memory/S3), the flag > env >
+//! vf.json > default config chain (config.rs), and the single-writer lock
+//! (lock.rs).
+
+use std::sync::Arc;
 
 use clap::{CommandFactory, Parser, Subcommand};
+use vectorfs::config::{self, ServeFlags};
 use vectorfs::ops::AppState;
-use vectorfs::{s3, sigv4, store};
+use vectorfs::{backends, lock, store};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -25,59 +29,79 @@ enum Command {
     /// Run the s3vectors-compatible HTTP server
     Serve(ServeArgs),
 
-    /// Generate static credentials / write local config (TODO: M1 T2)
-    Init,
+    /// Generate static credentials and write <data-dir>/vf.json
+    Init(InitArgs),
     /// Show daemon / backend / bucket+index overview (TODO: M1 T6)
     Status,
     /// Probe backend connectivity & conditional-write capability (TODO: M1 T6)
     Doctor,
 }
 
-/// `vf serve` arguments — carried over 1:1 from the M0 spike server.
+/// `vf init` arguments.
+#[derive(Parser, Debug)]
+struct InitArgs {
+    /// Data directory to initialize (default ./vectorfs-data)
+    #[arg(long)]
+    data_dir: Option<String>,
+
+    /// Regenerate credentials even if vf.json already exists
+    #[arg(long)]
+    force: bool,
+}
+
+/// `vf serve` arguments. Every option here feeds the flag layer of the
+/// resolution chain (flag > VF_* env > <data-dir>/vf.json > default); see
+/// config.rs for the full precedence and the exact env names.
 #[derive(Parser, Debug)]
 struct ServeArgs {
-    /// TCP port to listen on (env override: VF_PORT)
-    #[arg(long, env = "VF_PORT", default_value_t = 8787)]
-    port: u16,
+    /// TCP port to listen on [env: VF_PORT] [default: 8787]
+    #[arg(long)]
+    port: Option<u16>,
 
-    /// Data directory for the file backend
-    // TODO(M1 T2): `vf init` will own config/data-dir defaults; revisit this
-    // spike-era default then (kept as-is for flag compatibility).
-    #[arg(long, default_value = "./spike-data")]
-    data_dir: String,
+    /// Data directory (file backend root + where vf.json is read from)
+    /// [env: VF_DATA_DIR] [default: ./vectorfs-data]
+    #[arg(long)]
+    data_dir: Option<String>,
 
-    /// Backend URI: `file:<dir>` (default, --data-dir shorthand) or
-    /// `s3+http://host:port/bucket[/prefix]` (S3-compatible).
+    /// Backend: `file` (uses --data-dir), `memory` (volatile — CI/emulator
+    /// mode, DATA IS NOT PERSISTED), or
+    /// `s3+http(s)://host:port/bucket[/prefix]` (S3-compatible remote;
+    /// credentials from --s3-access-key/--s3-secret-key/--s3-region or
+    /// VF_S3_ACCESS_KEY/VF_S3_SECRET_KEY/VF_S3_REGION, falling back to
+    /// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_REGION)
+    /// [env: VF_BACKEND] [default: file]
     #[arg(long)]
     backend: Option<String>,
 
-    /// S3 region (default us-east-1; MinIO/seaweedfs convention)
-    #[arg(long, default_value = "us-east-1")]
-    s3_region: String,
+    /// S3 backend region (MinIO/seaweedfs convention: us-east-1)
+    #[arg(long)]
+    s3_region: Option<String>,
 
-    /// S3 static access key (env override: VF_S3_ACCESS_KEY / AWS_ACCESS_KEY_ID)
-    #[arg(long, env = "VF_S3_ACCESS_KEY")]
+    /// S3 backend static access key [env: VF_S3_ACCESS_KEY or AWS_ACCESS_KEY_ID]
+    #[arg(long)]
     s3_access_key: Option<String>,
 
-    /// S3 static secret key (env override: VF_S3_SECRET_KEY / AWS_SECRET_ACCESS_KEY)
-    #[arg(long, env = "VF_S3_SECRET_KEY")]
+    /// S3 backend static secret key [env: VF_S3_SECRET_KEY or AWS_SECRET_ACCESS_KEY]
+    #[arg(long)]
     s3_secret_key: Option<String>,
 
-    /// Disable SigV4 verification entirely (CI mode)
+    /// Disable SigV4 verification entirely (CI mode; also skips the
+    /// credential requirement — anyone reachable can read/write)
     #[arg(long)]
     no_auth: bool,
 
-    /// Static access key for SigV4 (env override: VF_ACCESS_KEY)
-    #[arg(long, env = "VF_ACCESS_KEY")]
+    /// Static access key for SigV4 [env: VF_ACCESS_KEY or <data-dir>/vf.json]
+    #[arg(long)]
     access_key: Option<String>,
 
-    /// Static secret key for SigV4 (env override: VF_SECRET_KEY)
-    #[arg(long, env = "VF_SECRET_KEY")]
+    /// Static secret key for SigV4 [env: VF_SECRET_KEY or <data-dir>/vf.json]
+    #[arg(long)]
     secret_key: Option<String>,
 
-    /// Region clients must sign for (enters credential scope + ARNs)
-    #[arg(long, default_value = "us-east-1")]
-    region: String,
+    /// Region clients must sign for; enters the credential scope and ARNs
+    /// [env: VF_REGION or <data-dir>/vf.json] [default: us-east-1]
+    #[arg(long)]
+    region: Option<String>,
 
     /// One-line-JSON request/response tracing to stderr
     #[arg(long)]
@@ -94,88 +118,207 @@ async fn main() {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Serve(args)) => serve(args).await,
+        Some(Command::Init(args)) => init(args),
         // Bare `vf` already gets help from arg_required_else_help; this arm is
         // the explicit fallback for a None subcommand.
         None => {
             Cli::command().print_help().expect("print help");
         }
-        Some(Command::Init) => placeholder("init", "M1 T2"),
         Some(Command::Status) => placeholder("status", "M1 T6"),
         Some(Command::Doctor) => placeholder("doctor", "M1 T6"),
     }
 }
 
-async fn serve(args: ServeArgs) {
-    let creds = match (args.access_key.as_deref(), args.secret_key.as_deref()) {
-        (Some(ak), Some(sk)) if !ak.is_empty() && !sk.is_empty() => Some(sigv4::Credentials {
-            access_key: ak.to_string(),
-            secret_key: sk.to_string(),
-        }),
-        _ => None,
-    };
-    if args.no_auth {
-        // explicit opt-out
-    } else if creds.is_none() {
+fn init(args: InitArgs) {
+    let data_dir = args
+        .data_dir
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("VF_DATA_DIR")
+                .ok()
+                .map(std::path::PathBuf::from)
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from(config::DEFAULT_DATA_DIR));
+    if args.force {
         eprintln!(
-            "vf: WARNING no credentials configured (--access-key/--secret-key or \
-             VF_ACCESS_KEY/VF_SECRET_KEY) and --no-auth not given; running WITHOUT auth"
+            "vf: WARNING --force regenerates credentials; clients still using the \
+             previous access key will stop authenticating."
         );
     }
-
-    let auth_desc = if args.no_auth || creds.is_none() {
-        "none".to_string()
-    } else {
-        format!(
-            "sigv4(access_key={})",
-            args.access_key.as_deref().unwrap_or("")
-        )
-    };
-
-    let backend_spec = args
-        .backend
-        .clone()
-        .unwrap_or_else(|| format!("file:{}", args.data_dir));
-    let storage = if let Some(dir) = backend_spec.strip_prefix("file:") {
-        store::Storage::file(std::path::PathBuf::from(dir))
-    } else if let Some(mut cfg) = s3::S3BackendConfig::parse(&backend_spec) {
-        cfg.region = args.s3_region.clone();
-        cfg.access_key = args
-            .s3_access_key
-            .clone()
-            .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok());
-        cfg.secret_key = args
-            .s3_secret_key
-            .clone()
-            .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok());
-        match store::Storage::s3(cfg) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("vf: S3 backend init failed: {e}");
-                std::process::exit(2);
-            }
+    match config::init(&data_dir, args.force) {
+        Ok(outcome) => {
+            println!("{}", config::init_report(&outcome));
         }
-    } else {
-        eprintln!(
-            "vf: cannot parse --backend {backend_spec:?} (expected file:<dir> or s3+http://host:port/bucket[/prefix])"
-        );
-        std::process::exit(2);
-    };
-    let state = AppState {
-        storage: std::sync::Arc::new(storage),
-        creds: if args.no_auth { None } else { creds },
-        region: args.region.clone(),
-        account: "000000000000".to_string(),
+        Err(e) => {
+            eprintln!("vf init: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn serve(args: ServeArgs) {
+    let flags = ServeFlags {
+        port: args.port,
+        data_dir: args.data_dir.map(std::path::PathBuf::from),
+        backend: args.backend,
+        no_auth: args.no_auth,
+        access_key: args.access_key,
+        secret_key: args.secret_key,
+        region: args.region,
+        s3_region: args.s3_region,
+        s3_access_key: args.s3_access_key,
+        s3_secret_key: args.s3_secret_key,
         trace: args.trace,
     };
+    let cfg = match config::resolve(&flags) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("vf: {e}");
+            std::process::exit(2);
+        }
+    };
 
+    // ---- backend ----
+    let backend = match backends::Backend::parse(&cfg.backend_spec, &cfg.data_dir) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("vf: {e}");
+            std::process::exit(2);
+        }
+    };
+    if matches!(backend, backends::Backend::Memory) {
+        eprintln!(
+            "vf: *** WARNING: --backend memory is VOLATILE — all buckets, indexes and \
+             vectors are LOST when the process exits (CI / emulator mode). ***"
+        );
+    }
+    let storage = match store::Storage::new(backend) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("vf: backend init failed: {e}");
+            std::process::exit(2);
+        }
+    };
+    let backend = storage.backend().clone();
+
+    // ---- single-writer lock (§5.1): acquired BEFORE the listener binds ----
+    let lock_guard = match lock::acquire(&backend, storage.catalog().clone()).await {
+        Ok(g) => g,
+        Err(lock::LockError::Held(who)) => {
+            eprintln!(
+                "vf: refusing to start: another writer owns this data root ({who}).\n\
+                 \x20 If that daemon is really gone, wait for its lock heartbeat to expire \
+                 ({}s) and restart, or remove the stale LOCK object.",
+                lock::LOCK_TTL.as_secs()
+            );
+            std::process::exit(3);
+        }
+        Err(lock::LockError::Backend(e)) => {
+            eprintln!("vf: lock acquisition failed: {e}");
+            std::process::exit(3);
+        }
+    };
+
+    // ---- HTTP ----
+    let auth_desc = if cfg.no_auth {
+        "none (--no-auth)".to_string()
+    } else {
+        // resolve() guarantees creds exist unless --no-auth
+        format!(
+            "sigv4(access_key={})",
+            cfg.creds
+                .as_ref()
+                .map(|c| c.access_key.as_str())
+                .unwrap_or("")
+        )
+    };
+    let state = AppState {
+        storage: Arc::new(storage),
+        creds: if cfg.no_auth { None } else { cfg.creds.clone() },
+        region: cfg.region.clone(),
+        account: cfg.account.clone(),
+        trace: cfg.trace,
+    };
     eprintln!(
-        "vf: starting on 127.0.0.1:{} backend={:?} auth={} region={} account={} trace={}",
-        args.port, state.storage, auth_desc, args.region, state.account, args.trace
+        "vf: starting on 127.0.0.1:{} backend={backend} auth={auth_desc} \
+         region={} account={} owner={} trace={}",
+        cfg.port,
+        cfg.region,
+        cfg.account,
+        lock_guard.info().owner_uuid,
+        cfg.trace
     );
 
     let app = vectorfs::build_router(state);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", args.port))
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", cfg.port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("vf: bind 127.0.0.1:{} failed: {e}", cfg.port);
+            lock_guard.release().await;
+            std::process::exit(2);
+        }
+    };
+
+    // Heartbeat: TTL/3 rewrite; loss of ownership (taken over after our TTL
+    // expired) must stop the daemon — wired into graceful shutdown.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let heartbeat_lock = Arc::new(tokio::sync::Mutex::new(lock_guard));
+    tokio::spawn({
+        let mut shutdown_rx = shutdown_rx.clone();
+        let lock = heartbeat_lock.clone();
+        async move {
+            let mut ticker = tokio::time::interval(lock::HEARTBEAT_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = shutdown_rx.changed() => break,
+                }
+                let mut guard = lock.lock().await;
+                match guard.heartbeat().await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        eprintln!(
+                            "vf: LOCK lost (taken over by another writer after heartbeat \
+                             expiry) — shutting down."
+                        );
+                        let _ = shutdown_tx.send(true);
+                        break;
+                    }
+                    Err(e) => eprintln!("vf: LOCK heartbeat error: {e} (will retry)"),
+                }
+            }
+        }
+    });
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
         .await
-        .expect("bind 127.0.0.1 failed");
-    axum::serve(listener, app).await.expect("server exited");
+        .expect("server exited");
+
+    // graceful shutdown: release the LOCK (only if still ours), drop the flock.
+    eprintln!("vf: shutting down, releasing lock…");
+    heartbeat_lock.lock().await.release().await;
+}
+
+/// ctrl-c / SIGTERM, or the heartbeat task signalling lock loss.
+#[cfg(unix)]
+async fn shutdown_signal(mut lost_lock: tokio::sync::watch::Receiver<bool>) {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = sigterm.recv() => {},
+        _ = lost_lock.changed() => {},
+    }
+}
+
+/// ctrl-c only (non-unix fallback).
+#[cfg(not(unix))]
+async fn shutdown_signal(mut lost_lock: tokio::sync::watch::Receiver<bool>) {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = lost_lock.changed() => {},
+    }
 }

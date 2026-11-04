@@ -2,15 +2,17 @@
 //!
 //! Harvested from the verified M0 spike (spike/REPORT.md, 2026-11-03): four
 //! operations (CreateVectorBucket / CreateIndex / PutVectors / QueryVectors),
-//! hand-rolled SigV4 verification, file + S3-compatible backends (lancedb +
-//! object_store, zero AWS SDK). The full 21-operation surface, `vf init` and
+//! hand-rolled SigV4 verification, file + memory + S3-compatible backends
+//! (lancedb + object_store, zero AWS SDK). The full 21-operation surface and
 //! `vf doctor` land across M1 (design.md §4 / §5.8 / §7 M1).
 //!
 //! Wire protocol per botocore `s3vectors/2025-07-15` model: rest-json,
 //! `POST /<OperationName>`, JSON bodies; PutVectors success = 200 empty body.
 
+pub mod backends;
+pub mod config;
+pub mod lock;
 pub mod ops;
-pub mod s3;
 pub mod sigv4;
 pub mod store;
 

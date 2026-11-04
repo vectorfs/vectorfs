@@ -74,8 +74,8 @@ async fn conditional_put_local() {
 async fn conditional_put_s3() {
     let uri =
         std::env::var("VF_S3CP_URI").expect("VF_S3CP_URI=s3+http://host:port/bucket[/prefix]");
-    let cfg = crate::s3::S3BackendConfig::parse(&uri).expect("parse s3+ uri");
-    let cfg = crate::s3::S3BackendConfig {
+    let cfg = crate::backends::S3BackendConfig::parse(&uri).expect("parse s3+ uri");
+    let cfg = crate::backends::S3BackendConfig {
         access_key: std::env::var("VF_S3_ACCESS_KEY").ok().or(cfg.access_key),
         secret_key: std::env::var("VF_S3_SECRET_KEY").ok().or(cfg.secret_key),
         ..cfg

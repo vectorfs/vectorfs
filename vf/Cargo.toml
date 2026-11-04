@@ -23,8 +23,9 @@ path = "src/main.rs"
 # HTTP: converged features (no default catch-all). http1 + json + tokio runtime glue only.
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 
-# Runtime: deliberately narrow.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }
+# Runtime: deliberately narrow ("signal" for the SIGTERM half of graceful
+# shutdown, design.md §5.1).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -39,8 +40,9 @@ sha2 = "0.10"
 hmac = "0.12"
 futures-util = { version = "0.3", default-features = false }
 
-# CLI args (env override needs clap "env" feature).
-clap = { version = "4", features = ["derive", "env"] }
+# CLI args. Env precedence (flag > env > vf.json > default) is resolved
+# manually in config.rs, so the clap "env" feature is not needed.
+clap = { version = "4", features = ["derive"] }
 
 # Engine. Minor locked to 0.41. Default features of lancedb are empty (fs object_store only).
 # DELIBERATELY NOT enabling lancedb "aws" feature: it pulls the full AWS SDK chain
@@ -66,6 +68,15 @@ lance = { version = "14.0.2", default-features = false }
 
 url = "2"
 async-trait = "0.1"
+
+# Credential / UUID randomness for `vf init` and the LOCK owner id
+# (design.md §4.2 / §5.1). getrandom only (no rand): it is already in the
+# dependency tree, so this adds zero new crates.
+getrandom = "0.3"
+
+# Local flock for the same-machine single-writer guard (design.md §5.1).
+# Same version already in the tree via datafusion; only the fs module is used.
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 
 [dev-dependencies]
 # tower::oneshot for in-process integration tests (no network port).
