@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""boto3 conformance check against an s3vectors-compatible server (M0 Task C).
+"""boto3 conformance check against an s3vectors-compatible server (M0 Task C
+core 9 steps + M1 T3 management 10 steps = 19 steps).
 
 Talks to an ALREADY-RUNNING server (default http://127.0.0.1:8787) — this script
-owns no server lifecycle. 9 steps, each printing PASS/FAIL; exit code 1 on any
-FAIL. Works unchanged against real AWS by pointing --endpoint elsewhere (that
-is the point of the prefix arg: no cleanup needed, spike has no delete ops).
+owns no server lifecycle. Each step prints PASS/FAIL; exit code 1 on any FAIL.
+Works against real AWS too by pointing --endpoint elsewhere (the management
+section cleans up after itself via the delete operations).
 
 Wire-observation notes are printed alongside (parsed field sets, error-code
 mappings) — they feed NOTES.md 线格式观察 / 附录B对拍.
@@ -24,16 +25,23 @@ from botocore.exceptions import ClientError
 
 FAILED = []
 OBS = []  # wire observations, printed in the summary
+STEPS = []  # (num, name, fn) — registered in definition order, run at the end
 
 
 def step(num, name, fn):
-    print(f"[{num}/9] {name} ... ", end="", flush=True)
-    try:
-        details = fn() or ""
-        print(f"PASS {details}".rstrip())
-    except Exception as e:  # noqa: BLE001 — report any failure and continue
-        FAILED.append((num, name, repr(e)))
-        print(f"FAIL {e!r}")
+    STEPS.append((num, name, fn))
+
+
+def run_steps():
+    total = len(STEPS)
+    for num, name, fn in STEPS:
+        print(f"[{num}/{total}] {name} ... ", end="", flush=True)
+        try:
+            details = fn() or ""
+            print(f"PASS {details}".rstrip())
+        except Exception as e:  # noqa: BLE001 — report any failure and continue
+            FAILED.append((num, name, repr(e)))
+            print(f"FAIL {e!r}")
 
 
 def expect_client_error(client, exc_cls, fn):
@@ -81,6 +89,7 @@ def main() -> int:
         OBS.append(f"create_vector_bucket parsed fields: {sorted(fields)}")
         assert "vectorBucketArn" in resp, f"missing vectorBucketArn, got {sorted(fields)}"
         assert resp["vectorBucketArn"].endswith(f"bucket/{bucket}"), resp["vectorBucketArn"]
+        state["bucket_arn"] = resp["vectorBucketArn"]
         # spike double-emits a `vectorBucket` object (AWS CLI docs shape); boto3
         # (botocore 1.43 model knows only vectorBucketArn) drops unknown members
         # on the floor — record whether we saw it at all.
@@ -118,6 +127,7 @@ def main() -> int:
         fields = {k: v for k, v in resp.items() if k != "ResponseMetadata"}
         OBS.append(f"create_index parsed fields: {sorted(fields)}")
         assert "indexArn" in resp, f"missing indexArn, got {sorted(fields)}"
+        state["index_arn"] = resp["indexArn"]
         ix = resp.get("index")
         if ix is not None:
             ct = ix.get("creationTime")
@@ -251,14 +261,212 @@ def main() -> int:
 
     step(9, "wrong secret key -> AccessDeniedException", s9)
 
+    # ------------------------------------------------------------------
+    # M1 T3 management section (steps 10-19): the 14 management-plane
+    # operations over the SAME bucket/index the core section created —
+    # get/list bucket+index, policy roundtrip, tags (put/list/untag, bucket
+    # AND index ARN), indexMode knobs, and full cleanup at the end.
+    # Note: invalid-enum / maxResults-range ValidationException paths cannot
+    # be driven through boto3 (botocore validates enums & ranges client-side
+    # and raises ParamValidationError before sending) — those live in the
+    # tower oneshot unit tests (vf/src/ops.rs).
+    # ------------------------------------------------------------------
+
+    def m10():
+        resp = client.get_vector_bucket(vectorBucketName=bucket)
+        vb = resp["vectorBucket"]
+        assert vb["vectorBucketName"] == bucket, vb
+        assert vb["vectorBucketArn"] == state["bucket_arn"], vb
+        assert isinstance(vb["creationTime"], datetime.datetime), vb["creationTime"]
+        OBS.append(f"get_vector_bucket fields: {sorted(k for k in vb)}")
+        # same lookup via the ARN locator
+        resp2 = client.get_vector_bucket(vectorBucketArn=state["bucket_arn"])
+        assert resp2["vectorBucket"]["vectorBucketName"] == bucket
+        return f"fields={sorted(vb)} byName+byArn"
+
+    step(10, "get_vector_bucket (name + ARN) -> VectorBucket", m10)
+
+    def m11():
+        # 3 buckets under the prefix -> paginate maxResults=2 to the end
+        x1, x2 = f"{prefix}-x1", f"{prefix}-x2"
+        client.create_vector_bucket(vectorBucketName=x1)
+        client.create_vector_bucket(vectorBucketName=x2)
+        state["extra_buckets"] = [x1, x2]
+        seen, token, pages = [], None, 0
+        while True:
+            kw = {"maxResults": 2, "prefix": f"{prefix}-"}
+            if token:
+                kw["nextToken"] = token
+            resp = client.list_vector_buckets(**kw)
+            names = [b["vectorBucketName"] for b in resp.get("vectorBuckets", [])]
+            assert names == sorted(names), f"page not name-sorted: {names}"
+            seen.extend(names)
+            token = resp.get("nextToken")
+            pages += 1
+            if not token:
+                break
+            assert pages < 10, "pagination did not terminate"
+        # bucket names under the prefix: {prefix}-b, {prefix}-x1, {prefix}-x2
+        # ({prefix}-i is an index, not a bucket)
+        want = sorted([bucket, x1, x2])
+        assert seen == want, f"pagination seen={seen} want={want} pages={pages}"
+        # summary shape: no dimension/indexMode on bucket summaries
+        b0 = client.list_vector_buckets(maxResults=500)["vectorBuckets"][0]
+        OBS.append(f"list_vector_buckets summary fields: {sorted(b0)}")
+        return f"pages={pages} names={seen}"
+
+    step(11, "list_vector_buckets paginate (3 buckets, maxResults=2)", m11)
+
+    def m12():
+        resp = client.get_index(vectorBucketName=bucket, indexName=index)
+        ix = resp["index"]
+        assert ix["indexName"] == index and ix["vectorBucketName"] == bucket, ix
+        assert ix["dataType"] == "float32" and ix["dimension"] == 4, ix
+        assert ix["distanceMetric"] == "cosine", ix
+        assert isinstance(ix["creationTime"], datetime.datetime), ix["creationTime"]
+        OBS.append(f"get_index fields: {sorted(ix)}")
+        resp2 = client.get_index(indexArn=state["index_arn"])
+        assert resp2["index"]["indexArn"] == state["index_arn"]
+        ls = client.list_indexes(vectorBucketArn=state["bucket_arn"])
+        names = [i["indexName"] for i in ls["indexes"]]
+        assert names == [index], names
+        s0 = ls["indexes"][0]
+        assert set(s0) == {"vectorBucketName", "indexName", "indexArn", "creationTime"}, s0
+        return f"index fields={sorted(ix)}; summary fields={sorted(s0)}"
+
+    step(12, "get_index + list_indexes (summary shape)", m12)
+
+    def m13():
+        doc = '{ "Version": "2012-10-17", "Statement": [ {"Effect": "Allow"} ] }'
+        client.put_vector_bucket_policy(vectorBucketName=bucket, policy=doc)
+        resp = client.get_vector_bucket_policy(vectorBucketArn=state["bucket_arn"])
+        assert isinstance(resp["policy"], str), type(resp["policy"])
+        assert resp["policy"] == doc, f"policy not byte-faithful: {resp['policy']!r}"
+        return f"policy roundtrip {len(doc)}B byte-exact"
+
+    step(13, "put/get vector bucket policy (byte-faithful echo)", m13)
+
+    def m14():
+        client.delete_vector_bucket_policy(vectorBucketName=bucket)
+        err = expect_client_error(
+            client, client.exceptions.NotFoundException,
+            lambda: client.get_vector_bucket_policy(vectorBucketName=bucket),
+        )
+        assert err.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+        # idempotent: deleting an absent policy is NOT an error
+        client.delete_vector_bucket_policy(vectorBucketName=bucket)
+        return "delete -> get 404; re-delete 200 (idempotent)"
+
+    step(14, "delete policy -> get 404; delete idempotent", m14)
+
+    def m15():
+        client.tag_resource(resourceArn=state["bucket_arn"],
+                            tags={"env": "dev", "team": "infra"})
+        client.tag_resource(resourceArn=state["index_arn"],
+                            tags={"idx": "1", "sp ace+x/y:z": "punct"})
+        bt = client.list_tags_for_resource(resourceArn=state["bucket_arn"])["tags"]
+        it = client.list_tags_for_resource(resourceArn=state["index_arn"])["tags"]
+        assert bt == {"env": "dev", "team": "infra"}, bt
+        assert it == {"idx": "1", "sp ace+x/y:z": "punct"}, it
+        # merge semantics: second put keeps unrelated keys
+        client.tag_resource(resourceArn=state["bucket_arn"], tags={"env": "prod"})
+        bt2 = client.list_tags_for_resource(resourceArn=state["bucket_arn"])["tags"]
+        assert bt2 == {"env": "prod", "team": "infra"}, bt2
+        return f"bucket tags={sorted(bt2)} index tags={sorted(it)}"
+
+    step(15, "tag_resource (bucket + index ARN) -> list_tags_for_resource", m15)
+
+    def m16():
+        # untag: plain key + punctuation-heavy key (boto3 percent-encodes the
+        # query values — space/%2B/%2F/%3A forms all round-trip)
+        client.untag_resource(resourceArn=state["index_arn"],
+                              tagKeys=["idx", "sp ace+x/y:z"])
+        it = client.list_tags_for_resource(resourceArn=state["index_arn"])["tags"]
+        assert it == {}, f"untag leftover: {it}"
+        # untagging absent keys again is idempotent (200)
+        client.untag_resource(resourceArn=state["index_arn"], tagKeys=["idx"])
+        # bucket tags untouched by index untagging
+        bt = client.list_tags_for_resource(resourceArn=state["bucket_arn"])["tags"]
+        assert bt == {"env": "prod", "team": "infra"}, bt
+        return "untag plain + punctuation keys (idempotent); bucket scope isolated"
+
+    step(16, "untag_resource (repeated tagKeys query, encoded values)", m16)
+
+    def m17():
+        client.put_vector_bucket_default_index_mode(
+            vectorBucketName=bucket, defaultIndexMode="CLASSIC")
+        vb = client.get_vector_bucket(vectorBucketName=bucket)["vectorBucket"]
+        assert vb.get("defaultIndexMode") == "CLASSIC", vb
+        # NEW index inherits the (echo-only) mode; existing one is untouched
+        idx2 = f"{prefix}-i2"
+        client.create_index(vectorBucketName=bucket, indexName=idx2, dataType="float32",
+                            dimension=2, distanceMetric="euclidean")
+        state["index2"] = idx2
+        ix2 = client.get_index(vectorBucketName=bucket, indexName=idx2)["index"]
+        assert ix2.get("indexMode") == "CLASSIC", ix2
+        client.update_index_mode(
+            indexArn=f"{state['bucket_arn']}/index/{idx2}", indexMode="ENHANCED")
+        ix2b = client.get_index(vectorBucketName=bucket, indexName=idx2)["index"]
+        assert ix2b.get("indexMode") == "ENHANCED", ix2b
+        # queries still work identically under both stored modes (§4.4 echo-only)
+        resp = client.query_vectors(
+            vectorBucketName=bucket, indexName=index, topK=1,
+            queryVector={"float32": [1.0, 0.0, 0.0, 0.0]})
+        assert len(resp["vectors"]) == 1
+        return "default CLASSIC -> inherited; UpdateIndexMode -> ENHANCED; query unaffected"
+
+    step(17, "put_default_index_mode + update_index_mode (echo-only)", m17)
+
+    def m18():
+        err = expect_client_error(
+            client, client.exceptions.NotFoundException,
+            lambda: client.get_vector_bucket(vectorBucketName=f"{prefix}-ghost"),
+        )
+        assert err.response["Error"]["Code"] == "NotFoundException"
+        # non-empty bucket refuses to delete (409, S3 convention)
+        err = expect_client_error(
+            client, client.exceptions.ConflictException,
+            lambda: client.delete_vector_bucket(vectorBucketName=bucket),
+        )
+        code = err.response["Error"]["Code"]
+        status = err.response["ResponseMetadata"]["HTTPStatusCode"]
+        OBS.append(f"delete-nonempty: botocore Error.Code={code!r} http={status}")
+        assert code == "ConflictException" and status == 409, (code, status)
+        err = expect_client_error(
+            client, client.exceptions.NotFoundException,
+            lambda: client.delete_index(vectorBucketName=bucket, indexName=f"{prefix}-nope"),
+        )
+        assert err.response["Error"]["Code"] == "NotFoundException"
+        return "ghost bucket 404; non-empty delete 409; ghost index delete 404"
+
+    step(18, "errors: 404 gets, 409 delete-non-empty", m18)
+
+    def m19():
+        client.delete_index(vectorBucketName=bucket, indexName=index)
+        client.delete_index(vectorBucketName=bucket, indexName=state["index2"])
+        client.delete_vector_bucket(vectorBucketName=bucket)
+        for extra in state.get("extra_buckets", []):
+            client.delete_vector_bucket(vectorBucketName=extra)
+        err = expect_client_error(
+            client, client.exceptions.NotFoundException,
+            lambda: client.get_vector_bucket(vectorBucketName=bucket),
+        )
+        assert err.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+        rest = client.list_vector_buckets(maxResults=500, prefix=f"{prefix}-")["vectorBuckets"]
+        assert rest == [], f"cleanup left buckets: {[b['vectorBucketName'] for b in rest]}"
+        return "index x2 + bucket x3 deleted; prefix drained"
+
+    step(19, "cleanup: delete indexes, buckets; verify prefix drained", m19)
+
+    run_steps()
+
     print("\n# wire observations (boto3-side):")
     for o in OBS:
         print(f"#   - {o}")
-    # step 10: no cleanup — spike implements no delete operations.
     if FAILED:
         print(f"\nRESULT: {len(FAILED)} step(s) FAILED", file=sys.stderr)
         return 1
-    print("\nRESULT: all 9 steps PASS")
+    print(f"\nRESULT: all {len(STEPS)} steps PASS")
     return 0
 
 

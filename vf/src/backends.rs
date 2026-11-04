@@ -559,17 +559,37 @@ pub async fn put_json_cas(
     }
 }
 
-/// Best-effort delete.
+/// Best-effort delete; a missing object is success (idempotent delete —
+/// LocalFileSystem's raw `delete` errors on ENOENT, S3/InMemory do not).
 pub async fn delete_object(
     store: &dyn object_store::ObjectStore,
     key: &object_store::path::Path,
 ) -> Result<(), String> {
     use object_store::ObjectStoreExt as _;
-    store
-        .delete(key)
-        .await
-        .map(|_| ())
-        .map_err(|e| format!("delete {}: {e}", key.as_ref()))
+    match store.delete(key).await {
+        Ok(()) => Ok(()),
+        Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(e) => Err(format!("delete {}: {e}", key.as_ref())),
+    }
+}
+
+/// List all object keys under a prefix (M1 T3: ListVectorBuckets /
+/// ListIndexes enumeration + DeleteIndex/DeleteVectorBucket removal).
+/// Works on every backend (LocalFileSystem / InMemory / S3 all implement
+/// `list`; on S3 this is a ListObjectsV2 prefix scan).
+pub async fn list_prefix(
+    store: &dyn object_store::ObjectStore,
+    prefix: &object_store::path::Path,
+) -> Result<Vec<object_store::path::Path>, String> {
+    use futures_util::StreamExt;
+    let mut stream = store.list(Some(prefix));
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        let meta = item.map_err(|e| format!("list {}: {e}", prefix.as_ref()))?;
+        out.push(meta.location);
+    }
+    out.sort();
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

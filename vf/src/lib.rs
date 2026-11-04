@@ -39,6 +39,41 @@ pub fn build_router(state: ops::AppState) -> Router {
         .route("/CreateIndex", post(ops::create_index))
         .route("/PutVectors", post(ops::put_vectors))
         .route("/QueryVectors", post(ops::query_vectors))
+        // M1 T3 management plane (design.md §4 / 附录A): all POST /<Op> …
+        .route("/GetVectorBucket", post(ops::get_vector_bucket))
+        .route("/DeleteVectorBucket", post(ops::delete_vector_bucket))
+        .route("/ListVectorBuckets", post(ops::list_vector_buckets))
+        .route("/GetIndex", post(ops::get_index))
+        .route("/DeleteIndex", post(ops::delete_index))
+        .route("/ListIndexes", post(ops::list_indexes))
+        .route(
+            "/PutVectorBucketPolicy",
+            post(ops::put_vector_bucket_policy),
+        )
+        .route(
+            "/GetVectorBucketPolicy",
+            post(ops::get_vector_bucket_policy),
+        )
+        .route(
+            "/DeleteVectorBucketPolicy",
+            post(ops::delete_vector_bucket_policy),
+        )
+        .route(
+            "/PutVectorBucketDefaultIndexMode",
+            post(ops::put_vector_bucket_default_index_mode),
+        )
+        .route("/UpdateIndexMode", post(ops::update_index_mode))
+        // … except the three /tags/{resourceArn} operations (model URIs:
+        // POST/DELETE/GET /tags/{resourceArn}). Wildcard tail + manual
+        // percent-decode in the handlers: boto3 sends the whole ARN as one
+        // fully-encoded label (':'->%3A, '/'->%2F), other clients may send
+        // the literal multi-segment form — both must route (ops.rs module doc).
+        .route(
+            "/tags/{*resource_arn}",
+            post(ops::tag_resource)
+                .delete(ops::untag_resource)
+                .get(ops::list_tags_for_resource),
+        )
         .fallback(fallback_404);
     authed
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))

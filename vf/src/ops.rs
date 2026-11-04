@@ -1,13 +1,32 @@
-//! S3 Vectors operation handlers (wire layer) for the four operations
-//! implemented so far (21-operation surface completes across M1, design.md §4).
-//! Carried over from the M0 spike, adapted to the product crate.
-//! Field names are verbatim from the botocore `s3vectors/2025-07-15` model
-//! (service-2.json, develop branch, synced 2026-09-30 — NOTES.md has the extraction).
+//! S3 Vectors operation handlers (wire layer). M1 T3 grows the surface from
+//! the spike's four operations to eighteen: the four originals plus the
+//! fourteen bucket/index management-plane operations (GetVectorBucket,
+//! DeleteVectorBucket, ListVectorBuckets, GetIndex, DeleteIndex, ListIndexes,
+//! policy×3, tags×3, PutVectorBucketDefaultIndexMode, UpdateIndexMode). The
+//! remaining three (GetVectors / ListVectors / DeleteVectors) land in a later
+//! M1 task. Field names are verbatim from the botocore `s3vectors/2025-07-15`
+//! model (service-2.json, develop branch, synced 2026-09-30 — NOTES.md has
+//! the extraction).
+//!
+//! Locators: every management/vector operation accepts name or ARN
+//! (model members vectorBucketName|vectorBucketArn, indexName+vectorBucketName
+//! |indexArn). Name+ARN both given and inconsistent -> ValidationException.
+//! TODO(AWS semantics): the both-given behavior is unverified against real
+//! AWS (it may silently prefer one); flagged at each check site.
+//!
+//! /tags/{resourceArn} wire form (empirically captured against boto3
+//! 1.43.123, 2026-11-04): boto3 percent-encodes the WHOLE ARN into one URI
+//! label (`:`->%3A, `/`->%2F), so the route accepts a wildcard tail and
+//! percent-decodes; the literal multi-segment form
+//! (`/tags/arn:aws:...:bucket/vb`) is accepted too for other clients.
+//! `tagKeys` serializes as repeated query params (`tagKeys=a&tagKeys=b`).
 //!
 //! Error wire protocol (design.md §4.3): HTTP status +
 //! `X-Amzn-Errortype: <Shape>` header + body `{"__type":"<Shape>","message":"..."}`
 //! (both emitted). Shapes: ValidationException=400, NotFoundException=404,
 //! ConflictException=409, AccessDeniedException=403, InternalServerException=500.
+//! ValidationException carries an optional `fieldList[{path,message}]`
+//! (model member) for field-addressable failures (maxResults, enums).
 //!
 //! TODO(AWS semantics, unverified — see spike/NOTES.md「遗留 TODO」):
 //! - exact AWS error message texts (we use descriptive stand-ins);
@@ -15,17 +34,23 @@
 //!   we map it to ValidationException;
 //! - CreateVectorBucket/CreateIndex response: model says {vectorBucketArn}/{indexArn}
 //!   only; AWS CLI docs show {vectorBucket}/{index}; we double-emit (SDKs
-//!   ignore unknown members).
+//!   ignore unknown members);
+//! - DeleteVectorBucket on a non-empty bucket: we return 409 ConflictException
+//!   (S3 semantic convention; the model admits it) — exact AWS text unverified;
+//! - GetVectorBucket never emits `encryptionConfiguration`: CreateVectorBucket
+//!   does not store one yet (M1 T-scope), the member stays absent when unset.
 
 use std::sync::Arc;
 
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
+use base64::Engine as _;
 use bytes::Bytes;
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::store::{self, BucketMeta, IndexMeta, StoreError, VectorRow};
 
@@ -47,6 +72,15 @@ pub struct ApiError {
     pub status: StatusCode,
     pub shape: &'static str,
     pub message: String,
+    /// ValidationException.fieldList[{path,message}] (model member): set for
+    /// field-addressable failures (maxResults range, enum values, ...).
+    pub field_list: Option<Vec<FieldError>>,
+}
+
+#[derive(serde::Serialize)]
+pub struct FieldError {
+    pub path: String,
+    pub message: String,
 }
 
 impl ApiError {
@@ -55,6 +89,20 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             shape: "ValidationException",
             message: msg.into(),
+            field_list: None,
+        }
+    }
+    /// ValidationException carrying a single fieldList entry pointing at `path`.
+    pub fn validation_field(path: &str, msg: impl Into<String>) -> Self {
+        let msg = msg.into();
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            shape: "ValidationException",
+            message: msg.clone(),
+            field_list: Some(vec![FieldError {
+                path: path.to_string(),
+                message: msg,
+            }]),
         }
     }
     pub fn not_found(msg: impl Into<String>) -> Self {
@@ -62,6 +110,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             shape: "NotFoundException",
             message: msg.into(),
+            field_list: None,
         }
     }
     pub fn conflict(msg: impl Into<String>) -> Self {
@@ -69,6 +118,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             shape: "ConflictException",
             message: msg.into(),
+            field_list: None,
         }
     }
     pub fn access_denied(msg: impl Into<String>) -> Self {
@@ -76,6 +126,7 @@ impl ApiError {
             status: StatusCode::FORBIDDEN,
             shape: "AccessDeniedException",
             message: msg.into(),
+            field_list: None,
         }
     }
     pub fn internal(msg: impl Into<String>) -> Self {
@@ -83,16 +134,20 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             shape: "InternalServerException",
             message: msg.into(),
+            field_list: None,
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = serde_json::json!({
+        let mut body = json!({
             "__type": self.shape,
             "message": self.message,
         });
+        if let Some(fields) = &self.field_list {
+            body["fieldList"] = json!(fields);
+        }
         (
             self.status,
             [(
@@ -194,7 +249,8 @@ struct NonFilterableKeys {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateIndexInput {
-    vector_bucket_name: String,
+    vector_bucket_name: Option<String>,
+    vector_bucket_arn: Option<String>,
     index_name: String,
     data_type: String,
     dimension: i64,
@@ -219,21 +275,91 @@ struct PutInputVector {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PutVectorsInput {
-    vector_bucket_name: String,
-    index_name: String,
+    vector_bucket_name: Option<String>,
+    index_name: Option<String>,
+    index_arn: Option<String>,
     vectors: Vec<PutInputVector>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QueryVectorsInput {
-    vector_bucket_name: String,
-    index_name: String,
+    vector_bucket_name: Option<String>,
+    index_name: Option<String>,
+    index_arn: Option<String>,
     top_k: Option<i64>,
     query_vector: VectorDataInput,
     filter: Option<serde_json::Value>,
     return_distance: Option<bool>,
     return_metadata: Option<bool>,
+    // `queryMode` (model member, IndexMode enum) is accepted and ignored:
+    // runtime behavior is always pre-filter/ENHANCED (design.md §4.4).
+    #[allow(dead_code)]
+    query_mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BucketLocatorInput {
+    vector_bucket_name: Option<String>,
+    vector_bucket_arn: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListVectorBucketsInput {
+    max_results: Option<i64>,
+    next_token: Option<String>,
+    prefix: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListIndexesInput {
+    vector_bucket_name: Option<String>,
+    vector_bucket_arn: Option<String>,
+    max_results: Option<i64>,
+    next_token: Option<String>,
+    prefix: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexLocatorInput {
+    vector_bucket_name: Option<String>,
+    index_name: Option<String>,
+    index_arn: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PutVectorBucketPolicyInput {
+    vector_bucket_name: Option<String>,
+    vector_bucket_arn: Option<String>,
+    policy: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PutVectorBucketDefaultIndexModeInput {
+    vector_bucket_name: Option<String>,
+    vector_bucket_arn: Option<String>,
+    default_index_mode: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateIndexModeInput {
+    vector_bucket_name: Option<String>,
+    index_name: Option<String>,
+    index_arn: Option<String>,
+    index_mode: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TagResourceInput {
+    tags: serde_json::Map<String, serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +440,224 @@ async fn resolve_index(state: &AppState, vb: &str, ix: &str) -> Result<IndexMeta
 }
 
 // ---------------------------------------------------------------------------
+// ARN parsing & locators (M1 T3)
+// ---------------------------------------------------------------------------
+
+/// Parsed `arn:aws[-partition]:s3vectors:{region}:{account}:bucket/{vb}[/index/{ix}]`.
+struct ParsedArn {
+    bucket: String,
+    index: Option<String>,
+}
+
+/// Parse and validate an s3vectors ARN against the server configuration.
+///
+/// Strictness (deliberate, M1 T3): service MUST be `s3vectors` and region /
+/// account MUST equal the server config — every ARN a client holds was minted
+/// by this server (or by real AWS), so a mismatch means the client is pointed
+/// at the wrong endpoint and failing early beats a confusing 404. The
+/// partition accepts any `aws*` form (`aws`, `aws-cn`, `aws-us-gov`).
+/// Names are NOT run through [`validate_name`]: the model's ARN pattern is
+/// wider than the name pattern (dots allowed), so ARN names go straight to
+/// catalog lookup -> 404 when unknown.
+/// TODO(AWS 对拍): real AWS behavior on region-mismatched ARNs (404 vs 400)
+/// is unverified.
+fn parse_arn(state: &AppState, arn: &str) -> Result<ParsedArn, ApiError> {
+    let parts: Vec<&str> = arn.splitn(6, ':').collect();
+    let invalid = || ApiError::validation(format!("malformed s3vectors ARN {arn:?}"));
+    if parts.len() != 6
+        || parts[0] != "arn"
+        || !parts[1].starts_with("aws")
+        || parts[2] != "s3vectors"
+        || parts[3].is_empty()
+        || parts[4].is_empty()
+    {
+        return Err(invalid());
+    }
+    if parts[3] != state.region {
+        return Err(ApiError::validation(format!(
+            "ARN region {:?} does not match this server's region {:?} — is the client \
+             pointed at the wrong endpoint?",
+            parts[3], state.region
+        )));
+    }
+    if parts[4] != state.account {
+        return Err(ApiError::validation(format!(
+            "ARN account {:?} does not match this server's account {:?}",
+            parts[4], state.account
+        )));
+    }
+    let rsegs: Vec<&str> = parts[5].split('/').collect();
+    match rsegs.as_slice() {
+        ["bucket", vb] if !vb.is_empty() => Ok(ParsedArn {
+            bucket: (*vb).to_string(),
+            index: None,
+        }),
+        ["bucket", vb, "index", ix] if !vb.is_empty() && !ix.is_empty() => Ok(ParsedArn {
+            bucket: (*vb).to_string(),
+            index: Some((*ix).to_string()),
+        }),
+        _ => Err(invalid()),
+    }
+}
+
+/// Bucket locator: `vectorBucketName` and/or `vectorBucketArn` -> bucket name.
+/// Neither given -> ValidationException; both given and disagreeing ->
+/// ValidationException.
+/// TODO(AWS 对拍): real AWS may prefer one locator over erroring; unverified.
+fn resolve_bucket_locator(
+    state: &AppState,
+    name: Option<&str>,
+    arn: Option<&str>,
+) -> Result<String, ApiError> {
+    match (name, arn) {
+        (None, None) => Err(ApiError::validation(
+            "one of vectorBucketName or vectorBucketArn is required",
+        )),
+        (Some(n), Some(a)) => {
+            let parsed = parse_arn(state, a)?;
+            if parsed.bucket != n {
+                Err(ApiError::validation(format!(
+                    "vectorBucketName {n:?} does not match vectorBucketArn {a:?}"
+                )))
+            } else {
+                Ok(n.to_string())
+            }
+        }
+        (Some(n), None) => Ok(n.to_string()),
+        (None, Some(a)) => Ok(parse_arn(state, a)?.bucket),
+    }
+}
+
+/// Index locator: `vectorBucketName`+`indexName` or `indexArn` ->
+/// (bucket, index). Cross-checks any redundant members for consistency.
+/// TODO(AWS 对拍): same both-given caveat as [`resolve_bucket_locator`].
+fn resolve_index_locator(
+    state: &AppState,
+    vb: Option<&str>,
+    ix: Option<&str>,
+    ix_arn: Option<&str>,
+) -> Result<(String, String), ApiError> {
+    match ix_arn {
+        None => match (vb, ix) {
+            (Some(v), Some(i)) => Ok((v.to_string(), i.to_string())),
+            _ => Err(ApiError::validation(
+                "either indexArn or vectorBucketName+indexName is required",
+            )),
+        },
+        Some(a) => {
+            let parsed = parse_arn(state, a)?;
+            let Some(a_ix) = parsed.index else {
+                return Err(ApiError::validation(format!(
+                    "indexArn {a:?} does not address an index (missing /index/<name>)"
+                )));
+            };
+            if let Some(v) = vb
+                && *v != parsed.bucket
+            {
+                return Err(ApiError::validation(format!(
+                    "vectorBucketName {v:?} does not match indexArn {a:?}"
+                )));
+            }
+            if let Some(i) = ix
+                && *i != a_ix
+            {
+                return Err(ApiError::validation(format!(
+                    "indexName {i:?} does not match indexArn {a:?}"
+                )));
+            }
+            Ok((parsed.bucket, a_ix))
+        }
+    }
+}
+
+/// Load a bucket meta or 404 (post-locator).
+async fn require_bucket(state: &AppState, name: &str) -> Result<BucketMeta, ApiError> {
+    state
+        .storage
+        .load_bucket(name)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("vector bucket {name} does not exist")))
+}
+
+// ---------------------------------------------------------------------------
+// pagination (M1 T3: ListVectorBuckets / ListIndexes)
+// ---------------------------------------------------------------------------
+
+/// Opaque base64 cursor `{\"l\": <last emitted name>}`. The page semantics it
+/// encodes: "all items with name > l" — stable across pages for inserts made
+/// behind the cursor, and cheap to recompute because listing re-enumerates the
+/// catalog each call (single-writer, design.md §5.1 — no snapshot needed for
+/// management objects; AWS itself documents list calls as eventually
+/// consistent anyway).
+fn encode_page_token(last_name: &str) -> String {
+    base64::engine::general_purpose::STANDARD.encode(json!({ "l": last_name }).to_string())
+}
+
+fn decode_page_token(token: &str) -> Result<String, ApiError> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .map_err(|_| ApiError::validation_field("nextToken", "invalid nextToken"))?;
+    let v: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|_| ApiError::validation_field("nextToken", "invalid nextToken"))?;
+    v.get("l")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| ApiError::validation_field("nextToken", "invalid nextToken"))
+}
+
+/// Shared list-page logic: validate maxResults (1-500, default 500) +
+/// nextToken, filter by prefix + cursor, sort order comes from the caller
+/// (store lists are name-sorted), emit a follow-on token iff items remain.
+fn paginate<T, F>(
+    items: Vec<T>,
+    max_results: Option<i64>,
+    next_token: Option<&str>,
+    name_of: F,
+) -> Result<(Vec<T>, Option<String>), ApiError>
+where
+    F: Fn(&T) -> &str,
+{
+    let max = match max_results {
+        None => 500,
+        Some(n) if (1..=500).contains(&n) => n as usize,
+        Some(n) => {
+            return Err(ApiError::validation_field(
+                "maxResults",
+                format!("maxResults must be between 1 and 500, got {n}"),
+            ));
+        }
+    };
+    let after = match next_token {
+        None | Some("") => None,
+        Some(t) => Some(decode_page_token(t)?),
+    };
+    let mut page: Vec<T> = items
+        .into_iter()
+        .filter(|i| after.as_deref().is_none_or(|a| name_of(i) > a))
+        .take(max + 1) // one lookahead decides whether a next page exists
+        .collect();
+    let has_more = page.len() > max;
+    page.truncate(max);
+    let token = match (has_more, page.last()) {
+        (true, Some(last)) => Some(encode_page_token(name_of(last))),
+        _ => None,
+    };
+    Ok((page, token))
+}
+
+/// Validate a list `prefix` (model: 1-63 chars when present; "" = absent).
+fn validate_prefix(prefix: Option<&str>) -> Result<Option<&str>, ApiError> {
+    match prefix {
+        None | Some("") => Ok(None),
+        Some(p) if p.len() <= 63 => Ok(Some(p)),
+        Some(p) => Err(ApiError::validation_field(
+            "prefix",
+            format!("prefix must be 1-63 characters, got {}", p.len()),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // handlers
 // ---------------------------------------------------------------------------
 
@@ -329,6 +673,7 @@ pub async fn create_vector_bucket(
         vector_bucket_name: input.vector_bucket_name.clone(),
         creation_time_rfc3339: rfc3339,
         creation_time_epoch: epoch,
+        default_index_mode: None,
     };
     state.storage.create_bucket(&meta).await?;
 
@@ -385,23 +730,18 @@ pub async fn create_index(
         }
     }
 
-    if state
-        .storage
-        .load_bucket(&input.vector_bucket_name)
-        .await?
-        .is_none()
-    {
-        return Err(ApiError::not_found(format!(
-            "vector bucket {} does not exist",
-            input.vector_bucket_name
-        )));
-    }
+    let vb = resolve_bucket_locator(
+        &state,
+        input.vector_bucket_name.as_deref(),
+        input.vector_bucket_arn.as_deref(),
+    )?;
+    let bucket_meta = require_bucket(&state, &vb).await?;
 
     let (epoch, rfc3339) = now();
     let meta = IndexMeta {
-        vector_bucket_name: input.vector_bucket_name.clone(),
+        vector_bucket_name: vb.clone(),
         index_name: input.index_name.clone(),
-        index_arn: arn_index(&state, &input.vector_bucket_name, &input.index_name),
+        index_arn: arn_index(&state, &vb, &input.index_name),
         creation_time_rfc3339: rfc3339,
         creation_time_epoch: epoch,
         data_type: "float32".into(),
@@ -410,33 +750,55 @@ pub async fn create_index(
         non_filterable_metadata_keys: input
             .metadata_configuration
             .map(|c| c.non_filterable_metadata_keys),
+        // Echo-only knob (§4.4): inherits the bucket default; ENHANCED when
+        // unset (matches AWS's post-2026-09-30 default and our always-prefilter
+        // runtime). Runtime behavior is identical for both values.
+        index_mode: Some(
+            bucket_meta
+                .default_index_mode
+                .clone()
+                .unwrap_or_else(|| "ENHANCED".into()),
+        ),
     };
     state.storage.create_index(&meta).await?;
 
-    let mut index_json = serde_json::json!({
-        "vectorBucketName": meta.vector_bucket_name,
-        "indexName": meta.index_name,
-        "indexArn": meta.index_arn,
-        "creationTime": epoch,
-        "dataType": "float32",
-        "dimension": meta.dimension,
-        "distanceMetric": meta.distance_metric,
-    });
-    if let Some(ks) = &meta.non_filterable_metadata_keys {
-        index_json["metadataConfiguration"] = serde_json::json!({
-            "nonFilterableMetadataKeys": ks,
-        });
-    }
     let resp = serde_json::json!({
-        "indexArn": meta.index_arn, // model-required member
-        "index": index_json,        // documented shape; SDKs ignore extras
+        "indexArn": meta.index_arn,          // model-required member
+        "index": index_full_json(&meta),     // documented shape; SDKs ignore extras
     });
     Ok(Json(resp).into_response())
 }
 
+/// Full `Index` shape (model: name/arn/creationTime/dataType/dimension/
+/// distanceMetric required + metadataConfiguration/indexMode when set).
+fn index_full_json(meta: &IndexMeta) -> serde_json::Value {
+    let mut o = json!({
+        "vectorBucketName": meta.vector_bucket_name,
+        "indexName": meta.index_name,
+        "indexArn": meta.index_arn,
+        "creationTime": meta.creation_time_epoch,
+        "dataType": meta.data_type,
+        "dimension": meta.dimension,
+        "distanceMetric": meta.distance_metric,
+    });
+    if let Some(ks) = &meta.non_filterable_metadata_keys {
+        o["metadataConfiguration"] = json!({ "nonFilterableMetadataKeys": ks });
+    }
+    if let Some(mode) = &meta.index_mode {
+        o["indexMode"] = json!(mode);
+    }
+    o
+}
+
 pub async fn put_vectors(State(state): State<AppState>, body: Bytes) -> Result<Response, ApiError> {
     let input: PutVectorsInput = parse_body(&body)?;
-    let meta = resolve_index(&state, &input.vector_bucket_name, &input.index_name).await?;
+    let (vb, ix) = resolve_index_locator(
+        &state,
+        input.vector_bucket_name.as_deref(),
+        input.index_name.as_deref(),
+        input.index_arn.as_deref(),
+    )?;
+    let meta = resolve_index(&state, &vb, &ix).await?;
 
     if input.vectors.is_empty() || input.vectors.len() > 500 {
         return Err(ApiError::validation(format!(
@@ -475,12 +837,7 @@ pub async fn put_vectors(State(state): State<AppState>, body: Bytes) -> Result<R
 
     state
         .storage
-        .upsert_vectors(
-            &input.vector_bucket_name,
-            &input.index_name,
-            meta.dimension,
-            rows,
-        )
+        .upsert_vectors(&vb, &ix, meta.dimension, rows)
         .await?;
     Ok(empty_ok())
 }
@@ -490,7 +847,13 @@ pub async fn query_vectors(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let input: QueryVectorsInput = parse_body(&body)?;
-    let meta = resolve_index(&state, &input.vector_bucket_name, &input.index_name).await?;
+    let (vb, ix) = resolve_index_locator(
+        &state,
+        input.vector_bucket_name.as_deref(),
+        input.index_name.as_deref(),
+        input.index_arn.as_deref(),
+    )?;
+    let meta = resolve_index(&state, &vb, &ix).await?;
 
     let Some(top_k) = input.top_k else {
         return Err(ApiError::validation("topK is required"));
@@ -528,8 +891,8 @@ pub async fn query_vectors(
     let hits = state
         .storage
         .query_vectors(
-            &input.vector_bucket_name,
-            &input.index_name,
+            &vb,
+            &ix,
             meta.dimension,
             &meta.distance_metric,
             &q,
@@ -560,6 +923,480 @@ pub async fn query_vectors(
         "distanceMetric": meta.distance_metric,
     });
     Ok(Json(resp).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// management plane (M1 T3): buckets
+// ---------------------------------------------------------------------------
+
+/// GetVectorBucket -> {vectorBucket: VectorBucket} (model-required member).
+pub async fn get_vector_bucket(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let input: BucketLocatorInput = parse_body(&body)?;
+    let name = resolve_bucket_locator(
+        &state,
+        input.vector_bucket_name.as_deref(),
+        input.vector_bucket_arn.as_deref(),
+    )?;
+    let meta = require_bucket(&state, &name).await?;
+    Ok(Json(json!({ "vectorBucket": bucket_full_json(&meta) })).into_response())
+}
+
+/// Full `VectorBucket` shape (model: name/arn/creationTime required +
+/// defaultIndexMode when set; encryptionConfiguration is never emitted —
+/// CreateVectorBucket does not store one yet, see module TODO).
+fn bucket_full_json(meta: &BucketMeta) -> serde_json::Value {
+    let mut o = json!({
+        "vectorBucketName": meta.vector_bucket_name,
+        "vectorBucketArn": meta.vector_bucket_arn,
+        "creationTime": meta.creation_time_epoch,
+    });
+    if let Some(mode) = &meta.default_index_mode {
+        o["defaultIndexMode"] = json!(mode);
+    }
+    o
+}
+
+/// DeleteVectorBucket -> 200 empty. Non-empty bucket (any index objects)
+/// -> 409 ConflictException (S3 semantic convention for delete-non-empty;
+/// the model admits ConflictException). TODO(AWS 对拍): exact AWS text +
+/// whether AWS cleans up or refuses; unverified against the real service.
+pub async fn delete_vector_bucket(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let input: BucketLocatorInput = parse_body(&body)?;
+    let name = resolve_bucket_locator(
+        &state,
+        input.vector_bucket_name.as_deref(),
+        input.vector_bucket_arn.as_deref(),
+    )?;
+    require_bucket(&state, &name).await?;
+    if state.storage.bucket_has_indexes(&name).await? {
+        return Err(ApiError::conflict(format!(
+            "vector bucket {name} still contains vector indexes; delete them first"
+        )));
+    }
+    // bucket.json + optional policy.json/tags.json (index metadata dirs are
+    // empty by the check above — nothing else may live under buckets/<name>/).
+    state.storage.delete_bucket(&name).await?;
+    Ok(empty_ok())
+}
+
+/// ListVectorBuckets -> {vectorBuckets: [VectorBucketSummary], nextToken?}.
+pub async fn list_vector_buckets(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let input: ListVectorBucketsInput = parse_body(&body)?;
+    let prefix = validate_prefix(input.prefix.as_deref())?;
+    let all = state.storage.list_buckets().await?;
+    let filtered: Vec<BucketMeta> = match prefix {
+        Some(p) => all
+            .into_iter()
+            .filter(|m| m.vector_bucket_name.starts_with(p))
+            .collect(),
+        None => all,
+    };
+    let (page, next) = paginate(
+        filtered,
+        input.max_results,
+        input.next_token.as_deref(),
+        |m| &m.vector_bucket_name,
+    )?;
+    let buckets: Vec<serde_json::Value> = page
+        .iter()
+        .map(|m| {
+            // VectorBucketSummary: name/arn/creationTime only (model).
+            json!({
+                "vectorBucketName": m.vector_bucket_name,
+                "vectorBucketArn": m.vector_bucket_arn,
+                "creationTime": m.creation_time_epoch,
+            })
+        })
+        .collect();
+    let mut resp = json!({ "vectorBuckets": buckets });
+    if let Some(t) = next {
+        resp["nextToken"] = json!(t);
+    }
+    Ok(Json(resp).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// management plane (M1 T3): indexes
+// ---------------------------------------------------------------------------
+
+/// GetIndex -> {index: Index} (model-required member), full Index shape.
+pub async fn get_index(State(state): State<AppState>, body: Bytes) -> Result<Response, ApiError> {
+    let input: IndexLocatorInput = parse_body(&body)?;
+    let (vb, ix) = resolve_index_locator(
+        &state,
+        input.vector_bucket_name.as_deref(),
+        input.index_name.as_deref(),
+        input.index_arn.as_deref(),
+    )?;
+    let meta = resolve_index(&state, &vb, &ix).await?;
+    Ok(Json(json!({ "index": index_full_json(&meta) })).into_response())
+}
+
+/// DeleteIndex -> 200 empty: index.json + tags.json + every Lance dataset
+/// object under `indexes/<ix>/data/` (§5.3). Idempotent-404 on missing.
+pub async fn delete_index(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let input: IndexLocatorInput = parse_body(&body)?;
+    let (vb, ix) = resolve_index_locator(
+        &state,
+        input.vector_bucket_name.as_deref(),
+        input.index_name.as_deref(),
+        input.index_arn.as_deref(),
+    )?;
+    resolve_index(&state, &vb, &ix).await?;
+    state.storage.delete_index(&vb, &ix).await?;
+    Ok(empty_ok())
+}
+
+/// ListIndexes -> {indexes: [IndexSummary], nextToken?}, by bucket locator.
+pub async fn list_indexes(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let input: ListIndexesInput = parse_body(&body)?;
+    let vb = resolve_bucket_locator(
+        &state,
+        input.vector_bucket_name.as_deref(),
+        input.vector_bucket_arn.as_deref(),
+    )?;
+    require_bucket(&state, &vb).await?;
+    let prefix = validate_prefix(input.prefix.as_deref())?;
+    let all = state.storage.list_indexes(&vb).await?;
+    let filtered: Vec<IndexMeta> = match prefix {
+        Some(p) => all
+            .into_iter()
+            .filter(|m| m.index_name.starts_with(p))
+            .collect(),
+        None => all,
+    };
+    let (page, next) = paginate(
+        filtered,
+        input.max_results,
+        input.next_token.as_deref(),
+        |m| &m.index_name,
+    )?;
+    let indexes: Vec<serde_json::Value> = page
+        .iter()
+        .map(|m| {
+            // IndexSummary: bucketName/indexName/arn/creationTime only (model).
+            json!({
+                "vectorBucketName": m.vector_bucket_name,
+                "indexName": m.index_name,
+                "indexArn": m.index_arn,
+                "creationTime": m.creation_time_epoch,
+            })
+        })
+        .collect();
+    let mut resp = json!({ "indexes": indexes });
+    if let Some(t) = next {
+        resp["nextToken"] = json!(t);
+    }
+    Ok(Json(resp).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// management plane (M1 T3): bucket policy (§4.4: store & echo, NEVER enforce)
+// ---------------------------------------------------------------------------
+
+/// PutVectorBucketPolicy: idempotent overwrite, policy stored as the raw
+/// bytes received. boto3 sends `policy` as a JSON *string* (model shape
+/// VectorBucketPolicy is `string`); a JSON object is accepted too for bare
+/// HTTP clients (canonicalized to compact JSON). Byte-faithful echo on Get.
+pub async fn put_vector_bucket_policy(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let input: PutVectorBucketPolicyInput = parse_body(&body)?;
+    let name = resolve_bucket_locator(
+        &state,
+        input.vector_bucket_name.as_deref(),
+        input.vector_bucket_arn.as_deref(),
+    )?;
+    require_bucket(&state, &name).await?;
+    let raw = match input.policy {
+        serde_json::Value::String(s) => {
+            // must be a JSON document (AWS validates policy syntax; we check
+            // parseability only — no structural or enforcement validation)
+            serde_json::from_str::<serde_json::Value>(&s).map_err(|e| {
+                ApiError::validation_field("policy", format!("policy is not valid JSON: {e}"))
+            })?;
+            s
+        }
+        serde_json::Value::Object(_) => input.policy.to_string(),
+        other => {
+            return Err(ApiError::validation_field(
+                "policy",
+                format!("policy must be a JSON document (string or object), got {other:?}"),
+            ));
+        }
+    };
+    state.storage.put_policy(&name, &raw).await?;
+    Ok(empty_ok())
+}
+
+/// GetVectorBucketPolicy -> {policy: <string>} (model: policy is a string).
+/// No policy stored -> 404 NotFoundException (model lists it).
+pub async fn get_vector_bucket_policy(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let input: BucketLocatorInput = parse_body(&body)?;
+    let name = resolve_bucket_locator(
+        &state,
+        input.vector_bucket_name.as_deref(),
+        input.vector_bucket_arn.as_deref(),
+    )?;
+    require_bucket(&state, &name).await?;
+    match state.storage.load_policy(&name).await? {
+        Some(policy) => Ok(Json(json!({ "policy": policy })).into_response()),
+        None => Err(ApiError::not_found(format!(
+            "vector bucket {name} has no policy"
+        ))),
+    }
+}
+
+/// DeleteVectorBucketPolicy -> 200 empty; idempotent (missing policy on an
+/// existing bucket is NOT an error — S3 DeleteBucketPolicy convention).
+pub async fn delete_vector_bucket_policy(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let input: BucketLocatorInput = parse_body(&body)?;
+    let name = resolve_bucket_locator(
+        &state,
+        input.vector_bucket_name.as_deref(),
+        input.vector_bucket_arn.as_deref(),
+    )?;
+    require_bucket(&state, &name).await?;
+    state.storage.delete_policy(&name).await?;
+    Ok(empty_ok())
+}
+
+// ---------------------------------------------------------------------------
+// management plane (M1 T3): tags — POST/DELETE/GET /tags/{resourceArn}
+// ---------------------------------------------------------------------------
+
+/// Extract the resourceArn from `/tags/{arn}`. The tail is percent-decoded
+/// RFC3986-style ('+' stays literal — path, not form). Two wire forms are
+/// accepted (route is a wildcard):
+/// - boto3: one fully-encoded label `/tags/arn%3Aaws%3A…%2Fvb` (captured
+///   empirically, see module doc);
+/// - literal multi-segment `/tags/arn:aws:…:bucket/vb`.
+fn resource_arn_from_uri(uri: &Uri) -> Result<String, ApiError> {
+    let tail = uri
+        .path()
+        .strip_prefix("/tags/")
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| ApiError::validation("resourceArn is required in the /tags/ path"))?;
+    percent_encoding::percent_decode_str(tail)
+        .decode_utf8()
+        .map(|c| c.into_owned())
+        .map_err(|_| ApiError::validation("resourceArn is not valid UTF-8"))
+}
+
+/// Decode one query pair component: form convention ('+' = space — what the
+/// Go SDK's QueryEscape emits; boto3 always sends %20 so both agree there)
+/// plus %XX otherwise.
+fn query_decode(s: &str) -> String {
+    percent_encoding::percent_decode_str(&s.replace('+', " "))
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+/// All values of a repeated query key (`tagKeys=a&tagKeys=b` — the form
+/// boto3 emits; a single `tagKeys=a,b` also splits on commas for tolerance).
+fn query_values(raw: Option<&str>, want: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(q) = raw else {
+        return out;
+    };
+    for pair in q.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if query_decode(k) == want {
+            out.extend(query_decode(v).split(',').map(str::to_string));
+        }
+    }
+    out
+}
+
+/// Validate a tags map (TagKey 1-128, TagValue 0-256, values must be strings;
+/// charset pattern in the model is NOT enforced — TODO(AWS 对拍)).
+fn validate_tags(tags: &serde_json::Map<String, serde_json::Value>) -> Result<(), ApiError> {
+    for (k, v) in tags {
+        if k.is_empty() || k.len() > 128 {
+            return Err(ApiError::validation_field(
+                "tags",
+                format!("tag key {k:?} must be 1-128 characters"),
+            ));
+        }
+        let serde_json::Value::String(v) = v else {
+            return Err(ApiError::validation_field(
+                "tags",
+                format!("tag {k:?} value must be a string"),
+            ));
+        };
+        if v.len() > 256 {
+            return Err(ApiError::validation_field(
+                "tags",
+                format!("tag {k:?} value must be 0-256 characters"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// ARN -> existing (bucket, Option<index>), 404 on either miss.
+async fn require_tag_target(
+    state: &AppState,
+    arn: &str,
+) -> Result<(String, Option<String>), ApiError> {
+    let parsed = parse_arn(state, arn)?;
+    require_bucket(state, &parsed.bucket).await?;
+    if let Some(ix) = &parsed.index
+        && state
+            .storage
+            .load_index(&parsed.bucket, ix)
+            .await?
+            .is_none()
+    {
+        return Err(ApiError::not_found(format!(
+            "index {ix} does not exist in vector bucket {}",
+            parsed.bucket
+        )));
+    }
+    Ok((parsed.bucket, parsed.index))
+}
+
+/// TagResource `POST /tags/{resourceArn}`: merge tags (existing keys
+/// overwritten, others kept), cap 10 pairs total per resource.
+pub async fn tag_resource(
+    State(state): State<AppState>,
+    uri: Uri,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let arn = resource_arn_from_uri(&uri)?;
+    let input: TagResourceInput = parse_body(&body)?;
+    let (vb, ix) = require_tag_target(&state, &arn).await?;
+    validate_tags(&input.tags)?;
+    let mut tags = state.storage.load_tags(&vb, ix.as_deref()).await?;
+    for (k, v) in input.tags {
+        tags.insert(k, v);
+    }
+    if tags.len() > 10 {
+        return Err(ApiError::validation_field(
+            "tags",
+            format!("a resource supports at most 10 tags, got {}", tags.len()),
+        ));
+    }
+    state.storage.put_tags(&vb, ix.as_deref(), &tags).await?;
+    Ok(empty_ok())
+}
+
+/// UntagResource `DELETE /tags/{resourceArn}?tagKeys=k1&k2…` (tagKeys in
+/// query). Removing absent keys is a no-op (idempotent).
+pub async fn untag_resource(State(state): State<AppState>, uri: Uri) -> Result<Response, ApiError> {
+    let arn = resource_arn_from_uri(&uri)?;
+    let keys = query_values(uri.query(), "tagKeys");
+    if keys.is_empty() {
+        return Err(ApiError::validation_field(
+            "tagKeys",
+            "tagKeys is required (repeated query parameters)",
+        ));
+    }
+    let (vb, ix) = require_tag_target(&state, &arn).await?;
+    let mut tags = state.storage.load_tags(&vb, ix.as_deref()).await?;
+    for k in keys {
+        tags.remove(&k);
+    }
+    state.storage.put_tags(&vb, ix.as_deref(), &tags).await?;
+    Ok(empty_ok())
+}
+
+/// ListTagsForResource `GET /tags/{resourceArn}` -> {tags: {...}}; {} when
+/// none stored (tags is a model-required member).
+pub async fn list_tags_for_resource(
+    State(state): State<AppState>,
+    uri: Uri,
+) -> Result<Response, ApiError> {
+    let arn = resource_arn_from_uri(&uri)?;
+    let (vb, ix) = require_tag_target(&state, &arn).await?;
+    let tags = state.storage.load_tags(&vb, ix.as_deref()).await?;
+    Ok(Json(json!({ "tags": tags })).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// management plane (M1 T3): indexMode knobs (echo-only, §4.4 — runtime is
+// always pre-filter/ENHANCED regardless of the stored value)
+// ---------------------------------------------------------------------------
+
+/// PutVectorBucketDefaultIndexMode: write bucket.json defaultIndexMode;
+/// affects only the indexMode echoed for indexes created afterwards.
+pub async fn put_vector_bucket_default_index_mode(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let input: PutVectorBucketDefaultIndexModeInput = parse_body(&body)?;
+    if !matches!(input.default_index_mode.as_str(), "CLASSIC" | "ENHANCED") {
+        return Err(ApiError::validation_field(
+            "defaultIndexMode",
+            format!(
+                "defaultIndexMode must be CLASSIC or ENHANCED, got {:?}",
+                input.default_index_mode
+            ),
+        ));
+    }
+    let name = resolve_bucket_locator(
+        &state,
+        input.vector_bucket_name.as_deref(),
+        input.vector_bucket_arn.as_deref(),
+    )?;
+    require_bucket(&state, &name).await?;
+    state
+        .storage
+        .set_default_index_mode(&name, &input.default_index_mode)
+        .await?;
+    Ok(empty_ok())
+}
+
+/// UpdateIndexMode: write index.json indexMode. Query behavior is unchanged
+/// (always pre-filter); only the echoed value moves.
+pub async fn update_index_mode(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let input: UpdateIndexModeInput = parse_body(&body)?;
+    if !matches!(input.index_mode.as_str(), "CLASSIC" | "ENHANCED") {
+        return Err(ApiError::validation_field(
+            "indexMode",
+            format!(
+                "indexMode must be CLASSIC or ENHANCED, got {:?}",
+                input.index_mode
+            ),
+        ));
+    }
+    let (vb, ix) = resolve_index_locator(
+        &state,
+        input.vector_bucket_name.as_deref(),
+        input.index_name.as_deref(),
+        input.index_arn.as_deref(),
+    )?;
+    resolve_index(&state, &vb, &ix).await?;
+    state
+        .storage
+        .set_index_mode(&vb, &ix, &input.index_mode)
+        .await?;
+    Ok(empty_ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -754,7 +1591,20 @@ mod tests {
         path: &str,
         body: &str,
     ) -> (StatusCode, Vec<(String, String)>, serde_json::Value) {
-        let req = Request::post(path)
+        call_meth(router, "POST", path, body).await
+    }
+
+    /// Method-general call (GET/DELETE for /tags/…, POST for the rest).
+    #[allow(clippy::similar_names)] // req builder + result tuple
+    async fn call_meth(
+        router: &axum::Router,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (StatusCode, Vec<(String, String)>, serde_json::Value) {
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
             .header("content-type", "application/json")
             .header("host", "127.0.0.1:8787")
             .body(Body::from(body.to_string()))
@@ -1187,5 +2037,834 @@ mod tests {
         let vs = b["vectors"].as_array().unwrap();
         assert_eq!(vs.len(), 1);
         assert_eq!(vs[0]["key"], json!("b")); // b dist 1.0 < c dist 2.0
+    }
+
+    // ------------------------------------------------------------------
+    // M1 T3: management plane
+    // ------------------------------------------------------------------
+
+    /// Percent-encode an ARN the way boto3 does (':'->%3A, '/'->%2F — the
+    /// empirically captured single-label form).
+    fn enc_arn(arn: &str) -> String {
+        arn.replace(':', "%3A").replace('/', "%2F")
+    }
+
+    #[tokio::test]
+    async fn get_and_delete_vector_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"mgvb"}"#).await;
+
+        // happy: by name — full VectorBucket shape, defaultIndexMode absent
+        let (st, _, b) = call(&r, "/GetVectorBucket", r#"{"vectorBucketName":"mgvb"}"#).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let vb = &b["vectorBucket"];
+        assert_eq!(vb["vectorBucketName"], json!("mgvb"));
+        assert_eq!(
+            vb["vectorBucketArn"],
+            json!("arn:aws:s3vectors:us-east-1:000000000000:bucket/mgvb")
+        );
+        assert!(vb["creationTime"].is_f64());
+        assert!(vb.get("defaultIndexMode").is_none(), "{vb}");
+        assert!(vb.get("encryptionConfiguration").is_none());
+
+        // happy: by ARN
+        let (st, _, b2) = call(
+            &r,
+            "/GetVectorBucket",
+            r#"{"vectorBucketArn":"arn:aws:s3vectors:us-east-1:000000000000:bucket/mgvb"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(b2["vectorBucket"]["vectorBucketName"], json!("mgvb"));
+
+        // missing -> 404
+        let (st, h, _) = call(&r, "/GetVectorBucket", r#"{"vectorBucketName":"nope"}"#).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(errortype(&h), Some("NotFoundException"));
+
+        // name+ARN disagree -> ValidationException (TODO(AWS 对拍) semantics)
+        let (st, h, _) = call(
+            &r,
+            "/GetVectorBucket",
+            r#"{"vectorBucketName":"other",
+                "vectorBucketArn":"arn:aws:s3vectors:us-east-1:000000000000:bucket/mgvb"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(errortype(&h), Some("ValidationException"));
+
+        // no locator -> ValidationException
+        let (st, _, _) = call(&r, "/GetVectorBucket", "{}").await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // malformed ARN -> ValidationException
+        let (st, _, _) = call(
+            &r,
+            "/GetVectorBucket",
+            r#"{"vectorBucketArn":"arn:aws:s3:vb"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // ARN with foreign region/account -> ValidationException (strict check)
+        let (st, _, _) = call(
+            &r,
+            "/GetVectorBucket",
+            r#"{"vectorBucketArn":"arn:aws:s3vectors:eu-west-1:000000000000:bucket/mgvb"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // delete non-empty bucket -> 409 (S3 convention; TODO(AWS 对拍))
+        call(
+            &r,
+            "/CreateIndex",
+            r#"{"vectorBucketName":"mgvb","indexName":"mgix","dataType":"float32",
+                "dimension":2,"distanceMetric":"euclidean"}"#,
+        )
+        .await;
+        let (st, h, b) = call(&r, "/DeleteVectorBucket", r#"{"vectorBucketName":"mgvb"}"#).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{b}");
+        assert_eq!(errortype(&h), Some("ConflictException"));
+
+        // index removed -> bucket deletes; 200 empty body
+        call(
+            &r,
+            "/DeleteIndex",
+            r#"{"vectorBucketName":"mgvb","indexName":"mgix"}"#,
+        )
+        .await;
+        let (st, _, b) = call(&r, "/DeleteVectorBucket", r#"{"vectorBucketName":"mgvb"}"#).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b, serde_json::Value::Null);
+
+        // gone -> 404; delete missing -> 404
+        let (st, _, _) = call(&r, "/GetVectorBucket", r#"{"vectorBucketName":"mgvb"}"#).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, h, _) = call(&r, "/DeleteVectorBucket", r#"{"vectorBucketName":"mgvb"}"#).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(errortype(&h), Some("NotFoundException"));
+    }
+
+    #[tokio::test]
+    async fn list_vector_buckets_pagination() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        for n in ["mgl-a", "mgl-b", "mgl-c"] {
+            call(
+                &r,
+                "/CreateVectorBucket",
+                &format!(r#"{{"vectorBucketName":"{n}"}}"#),
+            )
+            .await;
+        }
+        call(
+            &r,
+            "/CreateVectorBucket",
+            r#"{"vectorBucketName":"mglz-d"}"#,
+        )
+        .await; // prefix decoy
+
+        // page 1: prefix filter + maxResults=2 -> a, b + nextToken
+        let (st, _, b) = call(
+            &r,
+            "/ListVectorBuckets",
+            r#"{"maxResults":2,"prefix":"mgl-"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let names: Vec<&str> = b["vectorBuckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["vectorBucketName"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["mgl-a", "mgl-b"], "sorted by name");
+        assert!(b["vectorBuckets"][0].get("dimension").is_none()); // summary shape
+        let token = b["nextToken"]
+            .as_str()
+            .expect("nextToken on partial page")
+            .to_string();
+
+        // page 2: -> c, no nextToken (termination)
+        let (st, _, b) = call(
+            &r,
+            "/ListVectorBuckets",
+            &format!(r#"{{"maxResults":2,"prefix":"mgl-","nextToken":"{token}"}}"#),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let names: Vec<&str> = b["vectorBuckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["vectorBucketName"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["mgl-c"]);
+        assert!(b.get("nextToken").is_none(), "no nextToken on last page");
+
+        // full list without prefix (default maxResults=500): 4 buckets, sorted
+        let (st, _, b) = call(&r, "/ListVectorBuckets", "{}").await;
+        assert_eq!(st, StatusCode::OK);
+        let names: Vec<&str> = b["vectorBuckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["vectorBucketName"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["mgl-a", "mgl-b", "mgl-c", "mglz-d"]);
+
+        // maxResults out of range -> ValidationException with fieldList
+        for bad in [0, 501, -1] {
+            let (st, h, b) = call(
+                &r,
+                "/ListVectorBuckets",
+                &format!(r#"{{"maxResults":{bad}}}"#),
+            )
+            .await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+            assert_eq!(errortype(&h), Some("ValidationException"));
+            assert_eq!(b["fieldList"][0]["path"], json!("maxResults"), "{b}");
+        }
+
+        // garbage nextToken -> ValidationException
+        let (st, h, _) = call(
+            &r,
+            "/ListVectorBuckets",
+            r#"{"nextToken":"!!not-base64!!"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(errortype(&h), Some("ValidationException"));
+
+        // prefix over 63 chars -> ValidationException (model max)
+        let long = "x".repeat(64);
+        let (st, _, _) = call(
+            &r,
+            "/ListVectorBuckets",
+            &format!(r#"{{"prefix":"{long}"}}"#),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_delete_list_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"ixvb"}"#).await;
+        call(
+            &r,
+            "/CreateIndex",
+            r#"{"vectorBucketName":"ixvb","indexName":"ix-a","dataType":"float32",
+                "dimension":3,"distanceMetric":"cosine",
+                "metadataConfiguration":{"nonFilterableMetadataKeys":["blob"]}}"#,
+        )
+        .await;
+        call(
+            &r,
+            "/CreateIndex",
+            r#"{"vectorBucketName":"ixvb","indexName":"ix-b","dataType":"float32",
+                "dimension":2,"distanceMetric":"euclidean"}"#,
+        )
+        .await;
+
+        // GetIndex: full Index shape incl metadataConfiguration + indexMode
+        let (st, _, b) = call(
+            &r,
+            "/GetIndex",
+            r#"{"vectorBucketName":"ixvb","indexName":"ix-a"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let ix = &b["index"];
+        assert_eq!(ix["vectorBucketName"], json!("ixvb"));
+        assert_eq!(ix["indexName"], json!("ix-a"));
+        assert_eq!(
+            ix["indexArn"],
+            json!("arn:aws:s3vectors:us-east-1:000000000000:bucket/ixvb/index/ix-a")
+        );
+        assert!(ix["creationTime"].is_f64());
+        assert_eq!(ix["dataType"], json!("float32"));
+        assert_eq!(ix["dimension"], json!(3));
+        assert_eq!(ix["distanceMetric"], json!("cosine"));
+        assert_eq!(ix["indexMode"], json!("ENHANCED")); // create-time default
+        assert_eq!(
+            ix["metadataConfiguration"]["nonFilterableMetadataKeys"],
+            json!(["blob"])
+        );
+
+        // GetIndex by indexArn
+        let (st, _, b) = call(
+            &r,
+            "/GetIndex",
+            r#"{"indexArn":"arn:aws:s3vectors:us-east-1:000000000000:bucket/ixvb/index/ix-b"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(b["index"]["indexName"], json!("ix-b"));
+        assert!(b["index"].get("metadataConfiguration").is_none());
+
+        // GetIndex missing -> 404
+        let (st, h, _) = call(
+            &r,
+            "/GetIndex",
+            r#"{"vectorBucketName":"ixvb","indexName":"zz"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(errortype(&h), Some("NotFoundException"));
+
+        // ListIndexes (by name and by ARN): summaries, name-sorted
+        let (st, _, b) = call(&r, "/ListIndexes", r#"{"vectorBucketName":"ixvb"}"#).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let names: Vec<&str> = b["indexes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["indexName"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["ix-a", "ix-b"]);
+        assert!(b["indexes"][0].get("dimension").is_none()); // summary shape
+
+        let (st, _, b) = call(
+            &r,
+            "/ListIndexes",
+            r#"{"vectorBucketArn":"arn:aws:s3vectors:us-east-1:000000000000:bucket/ixvb",
+                "prefix":"ix-b"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let names: Vec<&str> = b["indexes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["indexName"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["ix-b"]);
+
+        // ListIndexes on missing bucket -> 404
+        let (st, h, _) = call(&r, "/ListIndexes", r#"{"vectorBucketName":"nope"}"#).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(errortype(&h), Some("NotFoundException"));
+
+        // DeleteIndex -> 200 empty; GetIndex -> 404; re-create same name OK
+        // (proves index.json AND the lance dataset were both removed)
+        let (st, _, b) = call(
+            &r,
+            "/DeleteIndex",
+            r#"{"indexArn":"arn:aws:s3vectors:us-east-1:000000000000:bucket/ixvb/index/ix-a"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b, serde_json::Value::Null);
+        let (st, _, _) = call(
+            &r,
+            "/GetIndex",
+            r#"{"vectorBucketName":"ixvb","indexName":"ix-a"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, _, _) = call(
+            &r,
+            "/CreateIndex",
+            r#"{"vectorBucketName":"ixvb","indexName":"ix-a","dataType":"float32",
+                "dimension":3,"distanceMetric":"cosine"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        // DeleteIndex missing -> 404
+        let (st, h, _) = call(
+            &r,
+            "/DeleteIndex",
+            r#"{"vectorBucketName":"ixvb","indexName":"zz"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(errortype(&h), Some("NotFoundException"));
+    }
+
+    /// DeleteIndex must also remove the engine dataset on the memory backend,
+    /// where lance objects live under a `vf/` prefix on the shared map — the
+    /// recreate-same-name round trip fails with 409 if any object survives.
+    #[tokio::test]
+    async fn memory_backend_delete_index_and_recreate() {
+        let r = crate::build_router(memory_state());
+        call(
+            &r,
+            "/CreateVectorBucket",
+            r#"{"vectorBucketName":"memvb2"}"#,
+        )
+        .await;
+        let mk = r#"{"vectorBucketName":"memvb2","indexName":"memix2","dataType":"float32",
+            "dimension":2,"distanceMetric":"cosine"}"#;
+        call(&r, "/CreateIndex", mk).await;
+        call(
+            &r,
+            "/PutVectors",
+            r#"{"vectorBucketName":"memvb2","indexName":"memix2","vectors":[
+                {"key":"a","data":{"float32":[1,0]}}]}"#,
+        )
+        .await;
+        let (st, _, _) = call(
+            &r,
+            "/DeleteIndex",
+            r#"{"vectorBucketName":"memvb2","indexName":"memix2"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, b) = call(&r, "/CreateIndex", mk).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let (st, _, b) = call(
+            &r,
+            "/QueryVectors",
+            r#"{"vectorBucketName":"memvb2","indexName":"memix2","topK":1,
+                "queryVector":{"float32":[1,0]}}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["vectors"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_store_and_echo_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"pvb"}"#).await;
+
+        // no policy yet -> 404
+        let (st, h, _) = call(
+            &r,
+            "/GetVectorBucketPolicy",
+            r#"{"vectorBucketName":"pvb"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(errortype(&h), Some("NotFoundException"));
+
+        // put (string form, non-canonical spacing) -> byte-faithful echo
+        let doc = r#"{"Version": "2012-10-17", "Statement": [ {"Effect": "Allow"} ]}"#;
+        let (st, _, b) = call(
+            &r,
+            "/PutVectorBucketPolicy",
+            &format!(
+                r#"{{"vectorBucketName":"pvb","policy":{}}}"#,
+                serde_json::json!(doc)
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b, serde_json::Value::Null);
+        let (st, _, b) = call(
+            &r,
+            "/GetVectorBucketPolicy",
+            r#"{"vectorBucketName":"pvb"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["policy"], json!(doc), "policy echoed byte-faithfully");
+
+        // put (object form) -> canonicalized string echo, same JSON document
+        let (st, _, _) = call(
+            &r,
+            "/PutVectorBucketPolicy",
+            r#"{"vectorBucketArn":"arn:aws:s3vectors:us-east-1:000000000000:bucket/pvb",
+                "policy":{"Version":"2012-10-17","Statement":[]}}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, b) = call(
+            &r,
+            "/GetVectorBucketPolicy",
+            r#"{"vectorBucketName":"pvb"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(b["policy"].as_str().unwrap()).unwrap(),
+            json!({"Version":"2012-10-17","Statement":[]})
+        );
+
+        // policy not valid JSON -> ValidationException (fieldList path policy)
+        let (st, h, b) = call(
+            &r,
+            "/PutVectorBucketPolicy",
+            r#"{"vectorBucketName":"pvb","policy":"not json"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(errortype(&h), Some("ValidationException"));
+        assert_eq!(b["fieldList"][0]["path"], json!("policy"));
+
+        // policy wrong type -> ValidationException
+        let (st, _, _) = call(
+            &r,
+            "/PutVectorBucketPolicy",
+            r#"{"vectorBucketName":"pvb","policy":42}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // policy on missing bucket -> 404
+        let (st, h, _) = call(
+            &r,
+            "/PutVectorBucketPolicy",
+            r#"{"vectorBucketName":"nope","policy":"{}"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(errortype(&h), Some("NotFoundException"));
+
+        // delete -> 200; get -> 404; delete again -> 200 (idempotent)
+        let (st, _, _) = call(
+            &r,
+            "/DeleteVectorBucketPolicy",
+            r#"{"vectorBucketName":"pvb"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, _) = call(
+            &r,
+            "/GetVectorBucketPolicy",
+            r#"{"vectorBucketName":"pvb"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, _, _) = call(
+            &r,
+            "/DeleteVectorBucketPolicy",
+            r#"{"vectorBucketName":"pvb"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tags_resource_both_path_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"tvb"}"#).await;
+        call(
+            &r,
+            "/CreateIndex",
+            r#"{"vectorBucketName":"tvb","indexName":"tix","dataType":"float32",
+                "dimension":2,"distanceMetric":"euclidean"}"#,
+        )
+        .await;
+        let arn_b = "arn:aws:s3vectors:us-east-1:000000000000:bucket/tvb";
+        let arn_i = "arn:aws:s3vectors:us-east-1:000000000000:bucket/tvb/index/tix";
+
+        // TagResource: boto3 form (whole ARN percent-encoded as one label)
+        let (st, _, b) = call_meth(
+            &r,
+            "POST",
+            &format!("/tags/{}", enc_arn(arn_b)),
+            r#"{"tags":{"env":"dev"}}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b, serde_json::Value::Null);
+
+        // TagResource: literal multi-segment form (other clients)
+        let (st, _, _) = call_meth(
+            &r,
+            "POST",
+            &format!("/tags/{arn_b}"),
+            r#"{"tags":{"team":"infra"}}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        // ListTagsForResource: encoded path sees the MERGE of both writes
+        let (st, _, b) = call_meth(&r, "GET", &format!("/tags/{}", enc_arn(arn_b)), "").await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["tags"], json!({"env": "dev", "team": "infra"}));
+
+        // ListTagsForResource: literal path, same state
+        let (st, _, b) = call_meth(&r, "GET", &format!("/tags/{arn_b}"), "").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(b["tags"], json!({"env": "dev", "team": "infra"}));
+
+        // index ARN tags (independent of bucket tags), with a punctuation-heavy key
+        call_meth(
+            &r,
+            "POST",
+            &format!("/tags/{}", enc_arn(arn_i)),
+            r#"{"tags":{"a":"1","b":"2","sp ace+x/y:z":"kept"}}"#,
+        )
+        .await;
+        let (st, _, b) = call_meth(&r, "GET", &format!("/tags/{}", enc_arn(arn_i)), "").await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["tags"], json!({"a":"1","b":"2","sp ace+x/y:z":"kept"}));
+        // bucket tags unaffected by index tags
+        let (_, _, b) = call_meth(&r, "GET", &format!("/tags/{}", enc_arn(arn_b)), "").await;
+        assert_eq!(b["tags"].as_object().unwrap().len(), 2);
+
+        // UntagResource: tagKeys as repeated query params, values encoded
+        // (boto3 form: `tagKeys=a&tagKeys=sp%20ace%2Bx%2Fy%3Az`)
+        let (st, _, b) = call_meth(
+            &r,
+            "DELETE",
+            &format!(
+                "/tags/{}?tagKeys=a&tagKeys=sp%20ace%2Bx%2Fy%3Az",
+                enc_arn(arn_i)
+            ),
+            "",
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b, serde_json::Value::Null);
+        let (_, _, b) = call_meth(&r, "GET", &format!("/tags/{}", enc_arn(arn_i)), "").await;
+        assert_eq!(
+            b["tags"],
+            json!({"b": "2"}),
+            "untag removed a + punct key, kept b"
+        );
+
+        // untag without tagKeys -> ValidationException
+        let (st, h, _) = call_meth(&r, "DELETE", &format!("/tags/{}", enc_arn(arn_i)), "").await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(errortype(&h), Some("ValidationException"));
+
+        // tags on unknown resources -> 404 (bucket and index forms)
+        let ghost_b = enc_arn("arn:aws:s3vectors:us-east-1:000000000000:bucket/ghost");
+        let (st, h, _) = call_meth(
+            &r,
+            "POST",
+            &format!("/tags/{ghost_b}"),
+            r#"{"tags":{"a":"b"}}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(errortype(&h), Some("NotFoundException"));
+        let ghost_i = enc_arn("arn:aws:s3vectors:us-east-1:000000000000:bucket/tvb/index/ghost");
+        let (st, _, _) = call_meth(&r, "GET", &format!("/tags/{ghost_i}"), "").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // >10 pairs -> ValidationException (fill bucket to 10 first)
+        let mut full = serde_json::Map::new();
+        for i in 0..8 {
+            full.insert(format!("k{i}"), json!(format!("v{i}")));
+        }
+        let body = format!(r#"{{"tags":{}}}"#, serde_json::Value::Object(full));
+        let (st, _, _) = call_meth(&r, "POST", &format!("/tags/{}", enc_arn(arn_b)), &body).await;
+        assert_eq!(st, StatusCode::OK); // 2 existing + 8 = 10
+        let (st, h, b) = call_meth(
+            &r,
+            "POST",
+            &format!("/tags/{}", enc_arn(arn_b)),
+            r#"{"tags":{"overflow":"x"}}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(errortype(&h), Some("ValidationException"));
+        assert_eq!(b["fieldList"][0]["path"], json!("tags"));
+
+        // key 129 chars / value 257 chars / non-string value -> ValidationException
+        let long_key = "k".repeat(129);
+        let (st, _, _) = call_meth(
+            &r,
+            "POST",
+            &format!("/tags/{}", enc_arn(arn_i)),
+            &format!(r#"{{"tags":{{"{long_key}":"v"}}}}"#),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let long_val = "v".repeat(257);
+        let (st, _, _) = call_meth(
+            &r,
+            "POST",
+            &format!("/tags/{}", enc_arn(arn_i)),
+            &format!(r#"{{"tags":{{"k":"{long_val}"}}}}"#),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let (st, _, _) = call_meth(
+            &r,
+            "POST",
+            &format!("/tags/{}", enc_arn(arn_i)),
+            r#"{"tags":{"k":42}}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // bare /tags/ (no ARN at all) falls through to the 404 fallback —
+        // axum's wildcard needs a non-empty tail; nothing is addressed.
+        let (st, h, _) = call_meth(&r, "GET", "/tags/", "").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(errortype(&h), None, "plain fallback 404, no error shape");
+    }
+
+    #[tokio::test]
+    async fn index_mode_knobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"mvb"}"#).await;
+
+        // invalid enum -> ValidationException with fieldList path (both ops)
+        let (st, h, b) = call(
+            &r,
+            "/PutVectorBucketDefaultIndexMode",
+            r#"{"vectorBucketName":"mvb","defaultIndexMode":"TURBO"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(errortype(&h), Some("ValidationException"));
+        assert_eq!(b["fieldList"][0]["path"], json!("defaultIndexMode"));
+        let (st, h, b) = call(
+            &r,
+            "/UpdateIndexMode",
+            r#"{"vectorBucketName":"mvb","indexName":"zz","indexMode":"TURBO"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(errortype(&h), Some("ValidationException"));
+        assert_eq!(b["fieldList"][0]["path"], json!("indexMode"));
+
+        // missing bucket / index -> 404 (enum validated first? bucket check after)
+        let (st, _, _) = call(
+            &r,
+            "/PutVectorBucketDefaultIndexMode",
+            r#"{"vectorBucketName":"nope","defaultIndexMode":"CLASSIC"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // set CLASSIC -> GetVectorBucket echoes it
+        let (st, _, b) = call(
+            &r,
+            "/PutVectorBucketDefaultIndexMode",
+            r#"{"vectorBucketName":"mvb","defaultIndexMode":"CLASSIC"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b, serde_json::Value::Null);
+        let (_, _, b) = call(&r, "/GetVectorBucket", r#"{"vectorBucketName":"mvb"}"#).await;
+        assert_eq!(b["vectorBucket"]["defaultIndexMode"], json!("CLASSIC"));
+
+        // new index inherits CLASSIC (echo-only; runtime stays pre-filter)
+        call(
+            &r,
+            "/CreateIndex",
+            r#"{"vectorBucketName":"mvb","indexName":"mix","dataType":"float32",
+                "dimension":2,"distanceMetric":"euclidean"}"#,
+        )
+        .await;
+        let (_, _, b) = call(
+            &r,
+            "/GetIndex",
+            r#"{"vectorBucketName":"mvb","indexName":"mix"}"#,
+        )
+        .await;
+        assert_eq!(b["index"]["indexMode"], json!("CLASSIC"));
+
+        // UpdateIndexMode by indexArn -> ENHANCED; GetIndex echoes
+        let (st, _, b) = call(
+            &r,
+            "/UpdateIndexMode",
+            r#"{"indexArn":"arn:aws:s3vectors:us-east-1:000000000000:bucket/mvb/index/mix",
+                "indexMode":"ENHANCED"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let (_, _, b) = call(
+            &r,
+            "/GetIndex",
+            r#"{"vectorBucketName":"mvb","indexName":"mix"}"#,
+        )
+        .await;
+        assert_eq!(b["index"]["indexMode"], json!("ENHANCED"));
+
+        // UpdateIndexMode on missing index -> 404
+        let (st, _, _) = call(
+            &r,
+            "/UpdateIndexMode",
+            r#"{"vectorBucketName":"mvb","indexName":"zz","indexMode":"CLASSIC"}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // bucket default does NOT rewrite existing indexes
+        call(
+            &r,
+            "/PutVectorBucketDefaultIndexMode",
+            r#"{"vectorBucketName":"mvb","defaultIndexMode":"CLASSIC"}"#,
+        )
+        .await;
+        let (_, _, b) = call(
+            &r,
+            "/GetIndex",
+            r#"{"vectorBucketName":"mvb","indexName":"mix"}"#,
+        )
+        .await;
+        assert_eq!(b["index"]["indexMode"], json!("ENHANCED"));
+    }
+
+    /// Vector ops accept the indexArn locator too (model member): PutVectors
+    /// by ARN + QueryVectors by name must meet; name/ARN mismatch -> 400.
+    #[tokio::test]
+    async fn vector_ops_accept_index_arn_locator() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = crate::build_router(state(dir.path()));
+        call(&r, "/CreateVectorBucket", r#"{"vectorBucketName":"avb"}"#).await;
+        call(
+            &r,
+            "/CreateIndex",
+            r#"{"vectorBucketName":"avb","indexName":"aix","dataType":"float32",
+                "dimension":2,"distanceMetric":"euclidean"}"#,
+        )
+        .await;
+
+        let (st, _, b) = call(
+            &r,
+            "/PutVectors",
+            r#"{"indexArn":"arn:aws:s3vectors:us-east-1:000000000000:bucket/avb/index/aix",
+                "vectors":[{"key":"k","data":{"float32":[1,2]}}]}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let (st, _, b) = call(
+            &r,
+            "/QueryVectors",
+            r#"{"vectorBucketName":"avb","indexName":"aix","topK":1,
+                "queryVector":{"float32":[1,2]}}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["vectors"][0]["key"], json!("k"));
+
+        // consistent name+ARN pair works
+        let (st, _, _) = call(
+            &r,
+            "/QueryVectors",
+            r#"{"vectorBucketName":"avb","indexName":"aix",
+                "indexArn":"arn:aws:s3vectors:us-east-1:000000000000:bucket/avb/index/aix",
+                "topK":1,"queryVector":{"float32":[1,2]}}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        // disagreeing pair -> ValidationException (TODO(AWS 对拍))
+        let (st, h, _) = call(
+            &r,
+            "/QueryVectors",
+            r#"{"vectorBucketName":"avb","indexName":"other",
+                "indexArn":"arn:aws:s3vectors:us-east-1:000000000000:bucket/avb/index/aix",
+                "topK":1,"queryVector":{"float32":[1,2]}}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(errortype(&h), Some("ValidationException"));
+
+        // neither locator -> ValidationException
+        let (st, _, _) = call(
+            &r,
+            "/PutVectors",
+            r#"{"vectors":[{"key":"k","data":{"float32":[1,2]}}]}"#,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
     }
 }

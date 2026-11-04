@@ -31,6 +31,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
 
+# /tags/{resourceArn} path + query decoding (M1 T3) and list nextToken
+# cursors. Both already in the lock via `url`/`lancedb` transitive copies —
+# declaring them directly adds zero new crates.
+percent-encoding = "2"
+base64 = "0.22"
+
 # SigV4 (hand-rolled verify, design.md §5.7: no aws-* SDK crates).
 # Versions chosen to match already-locked transitive copies (zero new subgraph).
 # NOTE: the spike also declared `hex` here, but nothing ever imported it

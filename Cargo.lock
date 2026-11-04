@@ -5882,6 +5882,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "futures-util",
@@ -5891,6 +5892,7 @@ dependencies = [
  "lance-io",
  "lancedb",
  "object_store 0.14.2",
+ "percent-encoding",
  "rustix",
  "serde",
  "serde_json",

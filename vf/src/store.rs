@@ -6,7 +6,11 @@
 //!   (`get` → NotFound → 404; create = `put_opts(PutMode::Create)`, race-free
 //!   on file/memory/S3). The file backend no longer touches std::fs for
 //!   catalog objects (only backend setup in backends.rs creates/canonicalizes
-//!   the data dir itself).
+//!   the data dir itself). M1 T3 adds the management-plane half of the
+//!   catalog: enumeration (list), removal (bucket/index delete incl. the
+//!   Lance dataset objects), policy.json (raw bytes, store & echo only,
+//!   design.md §4.4), tags.json (bucket and index ARN scopes) and the
+//!   echo-only indexMode/defaultIndexMode knobs.
 //! - engine: lancedb (the ONLY module that touches lancedb API, design.md
 //!   §5.7). One Lance table per index at `<index>/data` (file:
 //!   `file://<root>/buckets/<vb>/indexes/<ix>/data`, memory:
@@ -43,6 +47,11 @@ pub struct BucketMeta {
     pub creation_time_rfc3339: String,
     /// Unix epoch seconds (fractional) — wire format for rest-json timestamps.
     pub creation_time_epoch: f64,
+    /// `defaultIndexMode` (M1 T3): stored & echoed by PutVectorBucketDefault-
+    /// IndexMode; consumed at CreateIndex time. Echo-only — runtime query
+    /// behavior is always pre-filter/ENHANCED (design.md §4.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_index_mode: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
@@ -58,6 +67,11 @@ pub struct IndexMeta {
     pub distance_metric: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub non_filterable_metadata_keys: Option<Vec<String>>,
+    /// `indexMode` (M1 T3): copied from the bucket's defaultIndexMode at
+    /// create time (ENHANCED when unset), rewritten by UpdateIndexMode.
+    /// Echo-only — see BucketMeta::default_index_mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_mode: Option<String>,
 }
 
 #[derive(Debug)]
@@ -213,6 +227,219 @@ impl Storage {
 
     fn key(&self, rel: &str) -> object_store::path::Path {
         self.backend.object_key(rel)
+    }
+
+    // ---- catalog: management-plane enumeration & removal (M1 T3, design.md §5.3) ----
+
+    /// All bucket metas, sorted by name (ListVectorBuckets ordering).
+    /// Key parsing is suffix-based: on the s3 backend every key additionally
+    /// carries the configured bucket prefix, so fixed positions would drift.
+    pub async fn list_buckets(&self) -> Result<Vec<BucketMeta>, StoreError> {
+        let mut out = Vec::new();
+        for key in backends::list_prefix(&*self.catalog, &self.key("buckets"))
+            .await
+            .map_err(internal)?
+        {
+            // …/buckets/<vb>/bucket.json — ignore everything else (indexes/, tags…)
+            let segs = key.as_ref().split('/').collect::<Vec<_>>();
+            if segs.len() >= 2 && segs.last() == Some(&"bucket.json") {
+                let name = segs[segs.len() - 2];
+                if let Some(meta) = backends::read_json::<BucketMeta>(
+                    &*self.catalog,
+                    &self.key(&format!("buckets/{name}/bucket.json")),
+                )
+                .await
+                .map_err(internal)?
+                {
+                    out.push(meta);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.vector_bucket_name.cmp(&b.vector_bucket_name));
+        Ok(out)
+    }
+
+    /// All index metas of one bucket, sorted by name (ListIndexes ordering).
+    pub async fn list_indexes(&self, vb: &str) -> Result<Vec<IndexMeta>, StoreError> {
+        let mut out = Vec::new();
+        for key in
+            backends::list_prefix(&*self.catalog, &self.key(&format!("buckets/{vb}/indexes")))
+                .await
+                .map_err(internal)?
+        {
+            // …/indexes/<ix>/index.json (see list_buckets for the suffix parse)
+            let segs = key.as_ref().split('/').collect::<Vec<_>>();
+            if segs.len() >= 3
+                && segs.last() == Some(&"index.json")
+                && segs[segs.len() - 3] == "indexes"
+            {
+                let ix = segs[segs.len() - 2];
+                let rel = format!("buckets/{vb}/indexes/{ix}/index.json");
+                if let Some(meta) =
+                    backends::read_json::<IndexMeta>(&*self.catalog, &self.key(&rel))
+                        .await
+                        .map_err(internal)?
+                {
+                    out.push(meta);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.index_name.cmp(&b.index_name));
+        Ok(out)
+    }
+
+    /// True if ANY object lives under `buckets/<vb>/indexes/` — the
+    /// DeleteVectorBucket non-empty guard. (Single-writer lock makes the
+    /// list-then-delete sequence race-free, design.md §5.1.)
+    pub async fn bucket_has_indexes(&self, vb: &str) -> Result<bool, StoreError> {
+        Ok(
+            !backends::list_prefix(&*self.catalog, &self.key(&format!("buckets/{vb}/indexes")))
+                .await
+                .map_err(internal)?
+                .is_empty(),
+        )
+    }
+
+    /// Remove a bucket's catalog objects (bucket.json + optional policy.json /
+    /// tags.json). Caller must have verified the bucket has no indexes.
+    pub async fn delete_bucket(&self, name: &str) -> Result<(), StoreError> {
+        for rel in [
+            format!("buckets/{name}/bucket.json"),
+            format!("buckets/{name}/policy.json"),
+            format!("buckets/{name}/tags.json"),
+        ] {
+            backends::delete_object(&*self.catalog, &self.key(&rel))
+                .await
+                .map_err(internal)?;
+        }
+        Ok(())
+    }
+
+    /// Remove an index: every object under `buckets/<vb>/indexes/<ix>/`
+    /// (index.json, tags.json AND the Lance dataset under `data/` — they share
+    /// the catalog object store on file/s3 backends). The memory backend's
+    /// engine datasets live under a `vf/` prefix on the same shared map (see
+    /// backends.rs SharedMemoryProvider), so that mirror prefix is swept too —
+    /// a no-op on file/s3 where it never exists.
+    pub async fn delete_index(&self, vb: &str, ix: &str) -> Result<(), StoreError> {
+        for base in [
+            format!("buckets/{vb}/indexes/{ix}"),
+            format!("vf/buckets/{vb}/indexes/{ix}"),
+        ] {
+            for key in backends::list_prefix(&*self.catalog, &self.key(&base))
+                .await
+                .map_err(internal)?
+            {
+                backends::delete_object(&*self.catalog, &key)
+                    .await
+                    .map_err(internal)?;
+            }
+        }
+        Ok(())
+    }
+
+    // ---- policy (§4.4: store & echo, never enforce) ----
+
+    pub async fn load_policy(&self, vb: &str) -> Result<Option<String>, StoreError> {
+        match backends::get_with_etag(
+            &*self.catalog,
+            &self.key(&format!("buckets/{vb}/policy.json")),
+        )
+        .await
+        .map_err(internal)?
+        {
+            None => Ok(None),
+            Some((bytes, _etag)) => Ok(Some(
+                String::from_utf8(bytes.to_vec()).map_err(|e| internal(format!("policy: {e}")))?,
+            )),
+        }
+    }
+
+    /// Idempotent overwrite; raw bytes as received (byte-faithful echo).
+    pub async fn put_policy(&self, vb: &str, raw: &str) -> Result<(), StoreError> {
+        backends::put_json_overwrite(
+            &*self.catalog,
+            &self.key(&format!("buckets/{vb}/policy.json")),
+            raw.as_bytes(),
+        )
+        .await
+        .map_err(internal)
+    }
+
+    pub async fn delete_policy(&self, vb: &str) -> Result<(), StoreError> {
+        backends::delete_object(
+            &*self.catalog,
+            &self.key(&format!("buckets/{vb}/policy.json")),
+        )
+        .await
+        .map_err(internal)
+    }
+
+    // ---- tags (bucket ARN and index ARN both address tags.json, §5.3) ----
+
+    fn tags_key(&self, vb: &str, ix: Option<&str>) -> object_store::path::Path {
+        self.key(&match ix {
+            None => format!("buckets/{vb}/tags.json"),
+            Some(ix) => format!("buckets/{vb}/indexes/{ix}/tags.json"),
+        })
+    }
+
+    pub async fn load_tags(
+        &self,
+        vb: &str,
+        ix: Option<&str>,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, StoreError> {
+        Ok(backends::read_json(&*self.catalog, &self.tags_key(vb, ix))
+            .await
+            .map_err(internal)?
+            .unwrap_or_else(serde_json::Map::new))
+    }
+
+    pub async fn put_tags(
+        &self,
+        vb: &str,
+        ix: Option<&str>,
+        tags: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), StoreError> {
+        let json =
+            serde_json::to_vec(&serde_json::Value::Object(tags.clone())).map_err(internal)?;
+        backends::put_json_overwrite(&*self.catalog, &self.tags_key(vb, ix), &json)
+            .await
+            .map_err(internal)
+    }
+
+    // ---- indexMode / defaultIndexMode (echo-only knobs, §4.4) ----
+
+    pub async fn set_default_index_mode(&self, name: &str, mode: &str) -> Result<(), StoreError> {
+        let mut meta = self
+            .load_bucket(name)
+            .await?
+            .ok_or_else(|| StoreError::Internal(format!("bucket {name} vanished mid-write")))?;
+        meta.default_index_mode = Some(mode.to_string());
+        let json = serde_json::to_vec_pretty(&meta).map_err(internal)?;
+        backends::put_json_overwrite(
+            &*self.catalog,
+            &self.key(&format!("buckets/{name}/bucket.json")),
+            &json,
+        )
+        .await
+        .map_err(internal)
+    }
+
+    pub async fn set_index_mode(&self, vb: &str, ix: &str, mode: &str) -> Result<(), StoreError> {
+        let mut meta = self
+            .load_index(vb, ix)
+            .await?
+            .ok_or_else(|| StoreError::Internal(format!("index {vb}/{ix} vanished mid-write")))?;
+        meta.index_mode = Some(mode.to_string());
+        let json = serde_json::to_vec_pretty(&meta).map_err(internal)?;
+        backends::put_json_overwrite(
+            &*self.catalog,
+            &self.key(&format!("buckets/{vb}/indexes/{ix}/index.json")),
+            &json,
+        )
+        .await
+        .map_err(internal)
     }
 
     // ---- engine ----
