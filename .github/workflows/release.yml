@@ -151,17 +151,21 @@ jobs:
         with:
           name: vectorfs-x86_64-unknown-linux-gnu
 
-      # The smoke script is written into dist/ so the ubuntu:20.04 container
-      # sees it through the /work mount. It polls /healthz itself (curl is not
-      # assumed in the base image), then drives the 5 steps: create bucket+
-      # index / put / query / get / delete + cleanup. Green = the release
-      # binary runs on 20.04-era glibc and satisfies the README promise.
+      # Split smoke (2026-11-05 rework, after both halves failed a LOCAL
+      # dry-run of the never-yet-triggered job):
+      #   inside the container (glibc gate): vectorfs init/serve + healthz
+      #     poll + `vf status` — both release binaries exercising 20.04-era
+      #     glibc end to end;
+      #   on the host (SDK gate): the 5-step boto3 roundtrip against the
+      #     container's published port — 20.04's python3.8 cannot pip-resolve
+      #     a boto3 that knows `s3vectors` (botocore added the service after
+      #     dropping py3.8), so the SDK half MUST run from a newer python.
       - name: docker run ubuntu:20.04 smoke
         run: |
           set -euo pipefail
           mkdir -p dist && tar -xzf vectorfs-*-x86_64-unknown-linux-gnu.tar.gz -C dist
           cat > dist/smoke_check.py <<'PYEOF'
-          import argparse, time, urllib.request
+          import argparse, sys, urllib.request
           import boto3
 
           p = argparse.ArgumentParser()
@@ -169,15 +173,6 @@ jobs:
           p.add_argument("--access-key", required=True)
           p.add_argument("--secret-key", required=True)
           a = p.parse_args()
-          for _ in range(30):
-              try:
-                  urllib.request.urlopen(a.endpoint + "/healthz", timeout=1)
-                  print("healthz ok")
-                  break
-              except Exception:
-                  time.sleep(1)
-          else:
-              raise SystemExit("server never became healthy")
           c = boto3.client("s3vectors", endpoint_url=a.endpoint,
                            aws_access_key_id=a.access_key,
                            aws_secret_access_key=a.secret_key,
@@ -200,23 +195,37 @@ jobs:
           c.delete_vector_bucket(vectorBucketName=b)
           print("smoke: 5 steps PASS")
           PYEOF
-          docker run --rm -v "$PWD:/work" -w /work ubuntu:20.04 bash -euo pipefail -c '
+          # container half: healthz poll via stdlib (curl not assumed), then
+          # serve for the host half. Credentials land in the mounted dist/
+          # dir for the host to read.
+          # VF_LISTEN=0.0.0.0: serve must bind the container's eth0 for the
+          # published port (the -p forward) to reach it — the default
+          # 127.0.0.1 bind resets host connections.
+          docker run -d --rm --name vf-smoke -p 127.0.0.1:18787:8787 \
+            -e VF_LISTEN=0.0.0.0 \
+            -v "$PWD:/work" -w /work/dist ubuntu:20.04 bash -euo pipefail -c '
             set -euo pipefail
-            apt-get update && apt-get install -y --no-install-recommends python3 python3-pip
-            pip3 install --no-cache-dir boto3
-            cd /work/dist
+            apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 >/dev/null
             ./vectorfs init --data-dir /tmp/vfdata
-            # ubuntu:20.04 ships python3.8 (no tomllib) — pull the credential
-            # fields with awk from the toml written by init
-            AK=$(awk -F"\"" "/^access_key_id/{print \$2}" /tmp/vfdata/.vectorfs/vectorfs.toml)
-            SK=$(awk -F"\"" "/^secret_access_key/{print \$2}" /tmp/vfdata/.vectorfs/vectorfs.toml)
             ./vectorfs serve --data-dir /tmp/vfdata >/tmp/vf.log 2>&1 &
             VF_PID=$!
-            trap "kill $VF_PID 2>/dev/null; tail -20 /tmp/vf.log" EXIT
-            python3 smoke_check.py --endpoint http://127.0.0.1:8787 \
-              --access-key "$AK" --secret-key "$SK"
+            for i in $(seq 1 30); do
+              python3 -c "import urllib.request;urllib.request.urlopen(\"http://127.0.0.1:8787/healthz\",timeout=1)" \
+                && break || sleep 1
+            done
             ./vf status --endpoint http://127.0.0.1:8787
+            cp /tmp/vfdata/.vectorfs/vectorfs.toml ./smoke-creds.toml
+            tail -5 /tmp/vf.log
+            wait $VF_PID
           '
+          trap 'docker kill vf-smoke >/dev/null 2>&1 || true' EXIT
+          sleep 2
+          AK=$(awk -F"\"" "/^access_key_id/{print \$2}" dist/smoke-creds.toml)
+          SK=$(awk -F"\"" "/^secret_access_key/{print \$2}" dist/smoke-creds.toml)
+          pip install --quiet --user boto3
+          python3 dist/smoke_check.py --endpoint http://127.0.0.1:18787 \
+            --access-key "$AK" --secret-key "$SK"
+          docker kill vf-smoke
 
   publish:
     name: attach artifacts + sha256sums to the release

@@ -37,3 +37,4 @@ conformance/go/*.out
 # tree; the fetch script + CI cache restore them deterministically.
 runtime-libs/
 target-docker/
+target-bullseye/
