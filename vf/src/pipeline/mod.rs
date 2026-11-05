@@ -17,6 +17,27 @@
 //! the remaining members), while mis-ORDERED chains can no longer put a
 //! quality-inferior member first for content a later member serves exactly.
 //!
+//! # Container unpacking (M2.1 step 3)
+//!
+//! A kind is either a LEAF or a CONTAINER ([`Extractor::unpack`], default
+//! `Ok(None)` = leaf). A container's children ([`ChildDoc`]) re-enter the
+//! USER-CONFIGURED routing — each child's mime resolves to a chain in the
+//! same ingest config — so a container kind never digests its own children
+//! (the operator's per-mime chains apply inside archives automatically).
+//! The production kinds are all leaves in M2.1 (epub/docx/eml land in M3
+//! with the zip dependency); the ingest worker owns the mechanism and its
+//! bomb guards.
+//!
+//! # Normalize preprocessing (M2.1 step 3, [`normalize`])
+//!
+//! BEFORE routing, every document and every container child runs through
+//! one fixed, ordered table of built-in byte-level transforms
+//! ([`normalize::normalize`]; M2: gunzip). The placement criterion and the
+//! not-an-axis ruling live in that module's docs: mechanically-always-
+//! correct ⇒ normalizer; format knowledge or a user choice ⇒ kind (the
+//! container role above). Probe and routing always see the POST-normalize
+//! state, and the stage contributes nothing to the pipeline fingerprint.
+//!
 //! # Registration model (§5.10.2, Rust form, v2.1)
 //!
 //! * **Config layer, two-stage**: first read the `kind` STRING from an
@@ -56,6 +77,7 @@ pub mod contract;
 pub mod embed;
 pub mod extract;
 pub mod models;
+pub mod normalize;
 pub mod probe;
 
 use std::collections::BTreeMap;
@@ -141,6 +163,43 @@ pub enum Fit {
 pub struct Part {
     pub modality: Modality,
     pub text: String,
+}
+
+/// A child document unpacked from a container (zip/mime-multipart/tar…): the
+/// container kind's ONE product (M2.1 step 3). Children do not stay inside
+/// the kind — the ingest worker re-routes each one through the USER-CONFIGURED
+/// extract chain its mime resolves to, so configuration coherence is
+/// automatic (an operator's html-chain config applies to epub chapters
+/// without the epub kind knowing anything about it — the Tika
+/// CompositeParser/PackageParser shape, deliberately stronger than
+/// unstructured's hardcoded delegation).
+///
+/// * `bytes` — the entry's raw payload (`bytes::Bytes`: children are handed
+///   around by reference inside one CPU segment, never re-read).
+/// * `mime` — the entry's OWN mime; routing key for the child chain.
+/// * `name` — the chapter/entry path (e.g. `OEBPS/ch1.xhtml`): provenance
+///   and logs only, never routing input (a child has no filename to guess
+///   from — the mime IS its identity).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChildDoc {
+    pub bytes: bytes::Bytes,
+    pub mime: String,
+    pub name: String,
+}
+
+impl ChildDoc {
+    /// Convenience constructor (tests and future M3 kinds).
+    pub fn new(
+        name: impl Into<String>,
+        mime: impl Into<String>,
+        bytes: impl Into<bytes::Bytes>,
+    ) -> Self {
+        ChildDoc {
+            bytes: bytes.into(),
+            mime: mime.into(),
+            name: name.into(),
+        }
+    }
 }
 
 impl Part {
@@ -284,6 +343,37 @@ pub trait Extractor: Send + Sync {
         // on the class.
         let _ = class;
         Fit::Capable
+    }
+
+    /// Container role (§5.10.3): unpack the bytes into child documents that
+    /// RE-ENTER the user-configured extractor routing (the mime short key of
+    /// each child resolves to a chain in the SAME ingest config), instead of
+    /// this kind extracting them itself. A kind is either a LEAF
+    /// ([`extract`](Extractor::extract)) or a CONTAINER (`unpack`) — never
+    /// both; containers never digest children themselves (configuration
+    /// coherence: the user's html-chain config applies to epub chapters
+    /// automatically, which a self-digesting container would silently break).
+    ///
+    /// * **Default `Ok(None)` = leaf**: every existing kind keeps its exact
+    ///   semantics with zero changes — the worker treats `None` as "run
+    ///   `extract`", the pre-container path byte-for-byte.
+    /// * **`Ok(Some(children))` = container**: the worker routes each child
+    ///   by ITS mime through the user's chains (full probe → affinity →
+    ///   yield semantics per child) and aggregates the winning Parts in
+    ///   child order; bomb guards (nesting depth, child count, per-child
+    ///   size) are mechanism constants in the worker, not kind policy.
+    /// * **mime gate semantics carry over**: a container reached with a mime
+    ///   that is not its own ⇒ `Err` — the member yields and the chain falls
+    ///   to the next member, exactly like a leaf's extract-time refusal.
+    /// * **Determinism**: children order is the kind's return order (e.g.
+    ///   spine order for epub); the worker walks it sequentially, no
+    ///   concurrency (§5.10.5).
+    fn unpack(&self, _bytes: &[u8], _mime: &str) -> Result<Option<Vec<ChildDoc>>, PipelineError> {
+        // deliberately silence the unused-parameter lint IN the default (a
+        // kind that does not override unpack is a leaf); overriding kinds
+        // parse the bytes.
+        let _ = (_bytes, _mime);
+        Ok(None)
     }
 }
 
@@ -518,6 +608,15 @@ mod tests {
         for (c, _) in all {
             assert_eq!(Undeclared.affinity(c), Fit::Capable, "{c}");
         }
+        // the unpack DEFAULT is the LEAF verdict (M2.1 step 3): a kind that
+        // does not override unpack never produces children, so every
+        // pre-container implementation keeps its exact semantics. The four
+        // production kinds are pinned again at the ExtractorKind dispatch
+        // (extract/mod.rs tests).
+        assert_eq!(
+            Undeclared.unpack(b"anything", "application/octet-stream"),
+            Ok(None)
+        );
     }
 
     #[test]

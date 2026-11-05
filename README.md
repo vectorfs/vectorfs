@@ -129,12 +129,16 @@ res, err := client.QueryVectors(ctx, &s3vectors.QueryVectorsInput{
   `air-gapped` (local model path, `offline = true`, nothing ever leaves the network).
   `vectorfs init --preset X` materializes `.vectorfs/vectorfs.toml` and prefetches
   models when needed (`HF_ENDPOINT` mirror respected; sha256-verified, atomic).
-- Pipeline = extractor (pdf-text via pdfium / `pdf-inspector` [pure-Rust, scans
-  fail loud with an OCR-needed reason, optional position-aware Markdown] / md /
-  txt; per-mime values may be an **ordered fallback chain**, and multi-member
-  chains are **content-routed** — PDFs are classified first and the member that
-  declares the best fit for the content class runs, e.g. scanned → an
-  OCR-capable extractor rather than trial-and-error) → chunker
+- Pipeline = **normalize** (built-in ordered transforms before routing — gzip
+  files are decompressed in place today; charset recoding / email & archive
+  container splitting land with v0.3) → extractor (pdf-text via pdfium /
+  `pdf-inspector` [pure-Rust, scans fail loud with an OCR-needed reason,
+  optional position-aware Markdown] / md / txt; per-mime values may be an
+  **ordered fallback chain**, and multi-member chains are **content-routed** —
+  PDFs are classified first and the member that declares the best fit for the
+  content class runs, e.g. scanned → an OCR-capable extractor rather than
+  trial-and-error; container kinds unpack into child documents that re-enter
+  the same routing — EPUB lands on this mechanism in v0.3) → chunker
   (token-window, char-counted, CJK-safe) → embedder (local `ort`
   [onnxruntime, load-dynamic] or any OpenAI-compatible `/embeddings` endpoint).
   Config in `.vectorfs/vectorfs.toml`; `vectorfs pipelines check` validates it

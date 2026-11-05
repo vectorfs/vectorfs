@@ -24,7 +24,7 @@ pub mod pdf_inspector;
 pub mod pdf_text;
 pub mod txt;
 
-use super::{ContentClass, Extractor, Fit, Modality, Part, PipelineError};
+use super::{ChildDoc, ContentClass, Extractor, Fit, Modality, Part, PipelineError};
 use md::{MdConfig, MdExtractor};
 use pdf_inspector::{PdfInspectorConfig, PdfInspectorExtractor};
 use pdf_text::{PdfTextConfig, PdfTextExtractor};
@@ -61,6 +61,26 @@ pub fn mime_for_short_key(key: &str) -> Option<&'static str> {
         .map(|(mime, _)| *mime)
 }
 
+/// file-name EXTENSION -> short key, the extension-side view of the same
+/// one table. Two consumers must never drift apart, which is why this
+/// lives HERE and not in each caller: the ingest scanner routes an object
+/// key by its extension (after the normalize stage's
+/// [`unwrap_compression`](crate::pipeline::normalize::unwrap_compression)
+/// sees through one compression wrapper), and the gzip normalizer infers
+/// the POST-decompression mime from the wrapper-stripped hint name —
+/// `x.txt.gz` must claim and route as the same text/plain source it
+/// decompresses into. Extension ALIASES live beside their canonical key
+/// (`markdown`/`text`); test scaffolding keys (the cfg(test) `ctn`) stay
+/// in the scanner, which owns claiming.
+pub fn short_key_for_extension(ext: &str) -> Option<&'static str> {
+    match ext {
+        "pdf" => Some("pdf"),
+        "md" | "markdown" => Some("md"),
+        "txt" | "text" => Some("txt"),
+        _ => None,
+    }
+}
+
 /// Registered extractor kinds. Exhaustive match everywhere = zero vtable;
 /// `dyn` stays reserved for the v2 wasm slot and the contract tests.
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +94,72 @@ pub enum ExtractorKind {
     /// lopdf-based classify-then-extract PDF kind, no native library
     /// (`extract/pdf_inspector.rs`).
     PdfInspector(PdfInspectorConfig),
+    /// Scripted CONTAINER kind for the M2.1 step 3 mechanism tests — see
+    /// [`TestContainerSpec`]. `cfg(test)` only: the PRODUCTION enum stays at
+    /// four leaf kinds (epub/docx/eml and the zip dependency are M3), and
+    /// no test kind is parseable from config (`from_config` has no arm —
+    /// tests inject the variant into a loaded plan directly).
+    #[cfg(test)]
+    TestContainer(TestContainerSpec),
+}
+
+/// The programmable proof kind for the container-unpacking mechanism
+/// (cfg(test) only, the T2/T3 mock-in-crate discipline): `unpack` runs a
+/// scripted table of exact payload bytes → programmed children, so tests
+/// can hand the GENERIC worker path whatever shape they need to prove —
+/// txt children, an md child routed by ITS mime, a nested container, an
+/// over-limit child count, oversize children…
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestContainerSpec {
+    /// The mime this container accepts; any other mime ⇒ Err (the shared
+    /// mime-gate semantics: a container reached with foreign content yields
+    /// the chain to the next member).
+    pub mime: String,
+    /// payload bytes → children, first match wins; a payload with no
+    /// matching entry ⇒ Err (unknown container bytes).
+    pub script: Vec<(Vec<u8>, Vec<ChildDoc>)>,
+}
+
+#[cfg(test)]
+impl TestContainerSpec {
+    /// One-entry script: `payload` unpacks to `children` (nesting tests use
+    /// [`TestContainerSpec::scripted`] — distinct payloads must unpack to
+    /// distinct children).
+    pub fn one(mime: &str, payload: &[u8], children: Vec<ChildDoc>) -> Self {
+        TestContainerSpec::scripted(mime, vec![(payload.to_vec(), children)])
+    }
+
+    /// Multi-entry script: `(payload, children)` pairs matched by exact
+    /// bytes (the nesting fixture: outer payload → container child whose
+    /// bytes are the inner payload).
+    pub fn scripted(mime: &str, script: Vec<(Vec<u8>, Vec<ChildDoc>)>) -> Self {
+        TestContainerSpec {
+            mime: mime.to_string(),
+            script,
+        }
+    }
+
+    /// The kind's whole behavior: mime gate, then the script lookup.
+    fn unpack(&self, bytes: &[u8], mime: &str) -> Result<Option<Vec<ChildDoc>>, PipelineError> {
+        if mime != self.mime {
+            return Err(PipelineError::extract(format!(
+                "test-container cannot handle mime '{mime}' (accepts only '{}'); this is an \
+                 extract-routing bug, not a bad file",
+                self.mime
+            )));
+        }
+        match self
+            .script
+            .iter()
+            .find(|(payload, _)| payload.as_slice() == bytes)
+        {
+            Some((_, children)) => Ok(Some(children.clone())),
+            None => Err(PipelineError::extract(
+                "test-container: payload matches no script entry (unknown container bytes)",
+            )),
+        }
+    }
 }
 
 impl ExtractorKind {
@@ -135,6 +221,10 @@ impl ExtractorKind {
             | ExtractorKind::PdfText(_)
             | ExtractorKind::Md(_)
             | ExtractorKind::PdfInspector(_) => &[Modality::Text],
+            // its children re-enter user routing; the tests' children are
+            // text (txt/md chains)
+            #[cfg(test)]
+            ExtractorKind::TestContainer(_) => &[Modality::Text],
         }
     }
 
@@ -153,6 +243,8 @@ impl ExtractorKind {
                     "pdf-inspector".to_string()
                 }
             }
+            #[cfg(test)]
+            ExtractorKind::TestContainer(_) => "test-container".to_string(),
         }
     }
 }
@@ -174,6 +266,15 @@ impl Extractor for ExtractorKind {
                 };
                 x.extract(bytes, mime)
             }
+            // role separation made loud: a container NEVER extracts — the
+            // worker short-circuits extract for kinds whose unpack yields
+            // children, so reaching this arm is a mechanism bug, and it
+            // must fail visibly instead of guessing.
+            #[cfg(test)]
+            ExtractorKind::TestContainer(_) => Err(PipelineError::extract(
+                "test-container is a container kind: it unpacks, never extracts — the worker \
+                 re-routes its children; extract() here is a routing bug",
+            )),
         }
     }
 
@@ -191,6 +292,29 @@ impl Extractor for ExtractorKind {
             ExtractorKind::PdfText(_) => pdf_text::affinity(class),
             ExtractorKind::Md(_) => md::affinity(class),
             ExtractorKind::PdfInspector(_) => pdf_inspector::affinity(class),
+            // undeclared (the trait default, spelled out): a container that
+            // declares no fit is Capable everywhere — routing degenerates to
+            // config order around it, exactly like any undeclared leaf.
+            #[cfg(test)]
+            ExtractorKind::TestContainer(_) => Fit::Capable,
+        }
+    }
+
+    /// Container-role dispatch (M2.1 step 3): the four PRODUCTION kinds are
+    /// leaves (the trait default, spelled out at the dispatch site so the
+    /// closed set stays honest — a new production kind lands here with the
+    /// compiler walking it); the test container runs its script. (The
+    /// underscore names silence the unused-parameter lint that the leaf-only
+    /// production build would otherwise raise — only the cfg(test) arm reads
+    /// them.)
+    fn unpack(&self, _bytes: &[u8], _mime: &str) -> Result<Option<Vec<ChildDoc>>, PipelineError> {
+        match self {
+            ExtractorKind::Txt(_)
+            | ExtractorKind::PdfText(_)
+            | ExtractorKind::Md(_)
+            | ExtractorKind::PdfInspector(_) => Ok(None),
+            #[cfg(test)]
+            ExtractorKind::TestContainer(spec) => spec.unpack(_bytes, _mime),
         }
     }
 }
@@ -206,6 +330,12 @@ impl ExtractorKind {
             ExtractorKind::PdfText(_) => pdf_text::refusal_note(class),
             ExtractorKind::Md(_) => md::refusal_note(class),
             ExtractorKind::PdfInspector(_) => pdf_inspector::refusal_note(class),
+            // unreachable in practice (the test container is Capable for
+            // every class, so the router never quotes a refusal)
+            #[cfg(test)]
+            ExtractorKind::TestContainer(_) => {
+                "a scripted test container (no affinity declaration)".to_string()
+            }
         }
     }
 }
@@ -220,6 +350,11 @@ impl serde::Serialize for ExtractorKind {
             ExtractorKind::PdfText(c) => c.serialize(serializer),
             ExtractorKind::Md(c) => c.serialize(serializer),
             ExtractorKind::PdfInspector(c) => c.serialize(serializer),
+            // fingerprints serialize CONFIG-loaded kinds only; the test kind
+            // never enters a PipelineConfig (from_config has no arm), so this
+            // arm exists purely to keep the closed set exhaustive.
+            #[cfg(test)]
+            ExtractorKind::TestContainer(_) => serializer.serialize_str("test-container"),
         }
     }
 }
@@ -333,6 +468,38 @@ mod tests {
             insp.refusal_note(ContentClass::ScanDominant)
                 .contains("classification gate")
         );
+    }
+
+    #[test]
+    fn production_kinds_are_leaves_unpack_none() {
+        // M2.1 step 3 zero-impact pin: every PRODUCTION kind's unpack is the
+        // trait-default leaf verdict `Ok(None)` — the dispatch spells the
+        // default out for the closed set, and this test is what keeps a
+        // future kind from silently landing as a container (a container
+        // variant must update this list DELIBERATELY, with its own unpack).
+        let cases: &[(&str, &[u8], &str)] = &[
+            ("txt", b"plain text", "text/plain"),
+            (
+                "pdf-text",
+                pdf_text::tests::HELLO_PDF_MINIMAL,
+                "application/pdf",
+            ),
+            ("md", b"# heading", "text/markdown"),
+            (
+                "pdf-inspector",
+                pdf_inspector::tests::HELLO_PDF_MINIMAL,
+                "application/pdf",
+            ),
+        ];
+        for (kind_str, bytes, mime) in cases {
+            let raw: toml::Value = toml::from_str(&format!("kind = \"{kind_str}\"")).unwrap();
+            let k = ExtractorKind::from_config("extractor.x", &raw, None).unwrap();
+            assert_eq!(
+                Extractor::unpack(&k, bytes, mime),
+                Ok(None),
+                "{kind_str} must be a leaf"
+            );
+        }
     }
 
     #[test]

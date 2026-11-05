@@ -53,6 +53,64 @@
 //!    §5.10.5's existing stance), and single-member chains skip the probe
 //!    entirely (`members.len() > 1` is the zero-cost gate).
 //!
+//! ## Normalize preprocessing (M2.1 step 3, generalized ruling)
+//!
+//! Preprocessing is more than decompression — it is a STAGE: one fixed,
+//! ORDERED table of built-in byte-level transforms
+//! ([`pipeline::normalize::normalize`]; M2: gunzip) that every document —
+//! and every container child, recursively — runs through BEFORE extractor
+//! routing. The layering inside one CPU segment:
+//!
+//! ```text
+//! normalize(bytes) → terminal state
+//!   → short key from the POST-normalize mime → chain
+//!   → probe → affinity → route (step 2, unchanged)
+//!   → member: unpack? container children re-enter THIS flow (depth-guarded)
+//!             : else extract (leaf, bytes unchanged since normalize)
+//! ```
+//!
+//! * **Err is hard, and parks**: the chain's members yield on Err; the
+//!   normalize stage has NO fallback — a corrupt gzip is a deterministic
+//!   dead end (retrying cannot uncorrupt it), so the document parks with
+//!   the reason. At CHILD level the same Err is a reason on the container's
+//!   aggregate — the container keeps walking its remaining children.
+//! * **Amplification gate**: the SAME `max_file_size_mb` is enforced on the
+//!   POST-normalize bytes (document: park; child: skip with reason) — a
+//!   decompression bomb may not smuggle past the file-size guard what the
+//!   scanner would have refused outright.
+//! * **Claiming cooperates**: a `.gz`/`.gzip` suffix is a compression
+//!   WRAPPER, not a content type — the scan-time extension guess sees
+//!   through one wrapper layer, so `notes.txt.gz` is claimed as the
+//!   text/plain source it decompresses into, under the user's existing
+//!   route, zero configuration.
+//! * **Fingerprint: zero impact** — the stage is mechanism, not
+//!   configuration (the same §5.10.5 stance that keeps probe/route out).
+//!
+//! ## Container unpacking (M2.1 step 3)
+//!
+//! A kind is either a LEAF or a CONTAINER
+//! ([`Extractor::unpack`](crate::pipeline::Extractor::unpack); default
+//! `Ok(None)` = leaf — the four M2.1 production kinds are all leaves, and
+//! their path is byte-identical to before). After routing picks the member
+//! order, each member first UNPACKS: `Some(children)` ⇒ every child
+//! re-enters the USER-CONFIGURED routing — the child's POST-NORMALIZE mime
+//! resolves to a chain in this SAME ingest config ([`BucketPlan::child_routes`]),
+//! which then runs with the full probe → affinity → yield semantics — and
+//! the winning Parts aggregate in child order (a container never digests
+//! its own children; the operator's per-mime chains apply inside archives
+//! automatically — the Tika CompositeParser/PackageParser shape, stronger
+//! than unstructured's hardcoded delegation). `None` ⇒ the ordinary
+//! `extract` leaf path. Unpack semantics mirror the chain's: an unpack Err
+//! (mime gate, bad archive) is the member's YIELD signal. Children that
+//! find no chain, or whose chain yields, contribute ZERO Parts and their
+//! reason rides the aggregate; if NO child produces content the container
+//! member itself yields with that aggregate (fail-loud survives verbatim).
+//! Deterministic by construction: child order is the kind's return order
+//! (e.g. spine order), the whole segment is sequential. Bomb guards are
+//! MECHANISM CONSTANTS ([`MAX_CONTAINER_DEPTH`], [`MAX_CHILDREN`], and the
+//! existing per-file size cap applied per child, raw AND post-normalize) —
+//! a guardrail is not policy, so none of them is a knob (§5.10.8's spirit).
+//!
 //! # Execution model (§5.10.5)
 //!
 //! One SCHEDULER task per instance root: periodic scan (`scan_interval_secs`,
@@ -103,6 +161,7 @@ use crate::pipeline::extract::{
     pdf_text::{PdfTextConfig, PdfTextTag},
     txt::{TxtConfig, TxtTag},
 };
+use crate::pipeline::normalize::{NormalizeOutcome, normalize};
 use crate::pipeline::{
     Chunk, Chunker, ContentClass, Embedder, Extractor, Fit, Merge, Modality, Part, PipelineError,
 };
@@ -217,12 +276,23 @@ impl BucketPlan {
             .extract
             .get(short)
             .or_else(|| self.extract.get("default"))?;
+        self.resolve_chain(value, short)
+    }
+
+    /// One extract-table VALUE -> its member list (the shared body of the
+    /// object- and child-level chain lookups; `short_key` is the KEY the
+    /// value was found under — the `auto` sentinel resolves against it).
+    fn resolve_chain(
+        &self,
+        value: &ExtractValue,
+        short_key: &str,
+    ) -> Option<Vec<(String, ExtractorKind)>> {
         match value {
             ExtractValue::Single(s) => match s.as_str() {
                 // auto stays the built-in mime->kind single-member chain
                 // (M3 ruling pending: whether auto itself becomes a chain
                 // when pdf-ocr lands — see builtin_extractor).
-                "auto" => builtin_extractor(short).map(|k| vec![(s.clone(), k)]),
+                "auto" => builtin_extractor(short_key).map(|k| vec![(s.clone(), k)]),
                 name => self
                     .extractors
                     .get(name)
@@ -237,18 +307,85 @@ impl BucketPlan {
             ),
         }
     }
+
+    /// The child-routing snapshot for one CPU segment (container unpacking,
+    /// M2.1 step 3): the SAME extract table the document level routes
+    /// through, pre-resolved per mime short key so the `spawn_blocking`
+    /// segment can walk it without borrowing the plan. Children have no
+    /// filename to guess an extension from — the mime IS their identity: a
+    /// table mime routes by its short key, an OFF-table mime falls to the
+    /// `default` route (the user's catch-all, or nothing).
+    fn child_routes(&self) -> ChildRoutes {
+        let mut routes = ChildRoutes::default();
+        for (_, key) in crate::pipeline::extract::MIME_TO_SHORT_KEY {
+            // the same specific-then-default precedence the object level
+            // applies for a known extension
+            let value = self
+                .extract
+                .get(*key)
+                .or_else(|| self.extract.get("default"));
+            if let Some(chain) = value.and_then(|v| self.resolve_chain(v, key)) {
+                routes.per_key.insert(key, chain);
+            }
+        }
+        // off-table mimes (and mimes under a bare `default`): `auto` cannot
+        // serve them — the built-in map is keyed by short key — so a
+        // default of "auto" resolves to nothing here, deliberately.
+        routes.default_chain = self
+            .extract
+            .get("default")
+            .and_then(|v| self.resolve_chain(v, "default"));
+        routes
+    }
+}
+
+/// Pre-resolved child routing (see [`BucketPlan::child_routes`]). Cheap by
+/// construction: a handful of small member lists cloned once per extract
+/// segment (only when the chunk cache is cold).
+#[derive(Default)]
+struct ChildRoutes {
+    /// short key -> chain, for every table key that resolves (specific
+    /// entry, else the default route).
+    per_key: BTreeMap<&'static str, Vec<(String, ExtractorKind)>>,
+    /// the default route's chain, for off-table mimes.
+    default_chain: Option<Vec<(String, ExtractorKind)>>,
+}
+
+impl ChildRoutes {
+    /// The chain one CHILD re-enters, by its mime: table mimes by short key
+    /// (specific entry, else default — the object-level precedence), off-table
+    /// mimes straight to `default`. `None` = no chain carries this child.
+    fn chain_for_mime(&self, mime: &str) -> Option<&[(String, ExtractorKind)]> {
+        match crate::pipeline::extract::short_key_for_mime(mime) {
+            Some(key) => self.per_key.get(key).map(Vec::as_slice),
+            None => self.default_chain.as_deref(),
+        }
+    }
 }
 
 /// Extension -> mime short key (the scan-time mime guess; the canonical mime
 /// then comes from the short key, so extractor mime gates always agree).
 fn short_key_of(object_key: &str) -> Option<&'static str> {
     let file = object_key.rsplit('/').next()?;
+    // A compression wrapper is MECHANISM (the normalize stage), not a
+    // content type: the guess sees through ONE `.gz`/`.gzip` layer, so
+    // `notes.txt.gz` is claimed and routed as the text/plain source it
+    // decompresses into — under the user's EXISTING txt route, zero
+    // configuration. The worker's normalize stage then makes the bytes
+    // match the guess before any extractor runs (a misnamed plain file
+    // under `.gz` degrades gracefully: no magic ⇒ no transform ⇒ the
+    // plain route still reads it).
+    let file = crate::pipeline::normalize::unwrap_compression(file);
     let ext = file.rsplit_once('.')?.1.to_ascii_lowercase();
     match ext.as_str() {
-        "pdf" => Some("pdf"),
-        "txt" | "text" => Some("txt"),
-        "md" | "markdown" => Some("md"),
-        _ => None,
+        // M2.1 step 3 TEST SCAFFOLD: the container mechanism is proven with a
+        // cfg(test) kind, and a container format needs its own short key to
+        // be claimable as a source at all. The production epub/html keys land
+        // with the real M3 kinds + the mime-table rows they bring; this arm
+        // exists only under cfg(test) and ships in no production binary.
+        #[cfg(test)]
+        "ctn" => Some("ctn"),
+        _ => crate::pipeline::extract::short_key_for_extension(&ext),
     }
 }
 
@@ -475,6 +612,235 @@ fn chain_try_order(len: usize, routing: &Routing) -> Vec<usize> {
 struct RouteNote {
     winner: String,
     class: ContentClass,
+}
+
+// ---------------------------------------------------------------------------
+// M2.1 step 3: container unpacking (children re-enter USER routing)
+// ---------------------------------------------------------------------------
+
+/// Bomb guard: how deep CONTAINERS may nest. Depth counts from the document
+/// (a document-level container unpacks at 0, its children walk at 1, a child
+/// container at 1 unpacks grandchildren at 2); a container reached at depth
+/// 2 — the THIRD container layer — Errs outright, before its children are
+/// touched. Two layers cover the real world (an .eml attachment that is
+/// itself an .eml; an epub never nests zip-in-zip legitimately) while making
+/// zip-bomb nesting structurally impossible. A MECHANISM CONSTANT,
+/// deliberately not config: a guardrail is not policy — a knob saying how
+/// much bomb to tolerate would be a policy (§5.10.8's spirit).
+const MAX_CONTAINER_DEPTH: u32 = 2;
+
+/// Bomb guard: one container may unpack at most this many children. Exceeding
+/// it Errs the CONTAINER (naming the entry count) — the member yields like
+/// any Err and the chain may still recover; the file fails loudly if nothing
+/// catches it. 256 sits far above every real-world container at hand (epub
+/// spines, docx parts, eml attachments) while capping the fan-out a hostile
+/// archive can demand from one document. Mechanism constant — same ruling
+/// as [`MAX_CONTAINER_DEPTH`].
+const MAX_CHILDREN: usize = 256;
+
+/// One stderr line per normalize HIT (M2.1 step 3 observability):
+/// `ingest: normalize: docs/a.txt.gz -> gunzip (text/plain)`. Pure
+/// passthrough (nothing applied) logs nothing — the common leaf path stays
+/// silent. `display` is whatever the caller already shows (object key at
+/// document level, `parent!child` below it).
+fn log_normalize(display: &str, outcome: &NormalizeOutcome) {
+    if !outcome.applied.is_empty() {
+        eprintln!(
+            "ingest: normalize: {display} -> {} ({})",
+            outcome.applied.join(" + "),
+            outcome.mime
+        );
+    }
+}
+
+/// Run ONE chain member over ONE document or child (M2.1 step 3): a LEAF
+/// extracts (the pre-container path, byte-for-byte); a CONTAINER unpacks and
+/// re-routes every child through the USER-CONFIGURED chains
+/// ([`ChildRoutes`]), aggregating the winning Parts in child order. Each
+/// child is NORMALIZED first (the same fixed transform table the document
+/// ran through) — its chain resolves by the POST-normalize mime.
+///
+/// The member outcome keeps the chain's uniform yield vocabulary: an unpack
+/// Err (mime gate, bad archive), a guard trip, or "no child produced
+/// content" all arrive as `Err(reason)` — [`pick_from_chain`] records them,
+/// falls to the next member, and the eventual document FAILED carries the
+/// child-level reasons in its aggregate.
+fn run_member(
+    routes: &ChildRoutes,
+    max_child_bytes: u64,
+    display: &str,
+    name: &str,
+    kind: &ExtractorKind,
+    bytes: &[u8],
+    mime: &str,
+    depth: u32,
+) -> Result<Vec<Part>, PipelineError> {
+    let children = match kind.unpack(bytes, mime) {
+        // leaf: plain extract, exactly the pre-container member behavior
+        Ok(None) => return Extractor::extract(kind, bytes, mime),
+        // container: children RE-ENTER the user's routing below
+        Ok(Some(children)) => children,
+        // unpack Err = the member's yield signal (mime gate / bad archive),
+        // the same semantics a leaf's extract Err has
+        Err(e) => return Err(e),
+    };
+    // ---- bomb guards (before any child work) ----
+    if depth >= MAX_CONTAINER_DEPTH {
+        return Err(PipelineError::extract(format!(
+            "container '{name}' sits at nesting depth {} (MAX_CONTAINER_DEPTH = \
+             {MAX_CONTAINER_DEPTH}): the third container layer is refused outright — a bomb \
+             guard, not a policy knob",
+            depth + 1
+        )));
+    }
+    if children.len() > MAX_CHILDREN {
+        return Err(PipelineError::extract(format!(
+            "container '{name}' unpacked {} children (MAX_CHILDREN = {MAX_CHILDREN}) — the \
+             expansion is refused; if the archive is legitimate, split it",
+            children.len()
+        )));
+    }
+    // observability: one line per expansion (stderr is this codebase's
+    // progress channel; `display` is the object key at depth 0 and
+    // `parent!child` below it)
+    eprintln!(
+        "ingest: {display} -> container({name}) x {} children",
+        children.len()
+    );
+    let mut parts: Vec<Part> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for child in &children {
+        let child_display = format!("{display}!{}", child.name);
+        // per-child size cap: the SAME max_file_size_mb the object level
+        // enforces — an archive may not smuggle past the file-size guard
+        // what the scanner would have refused outright
+        if child.bytes.len() as u64 > max_child_bytes {
+            skipped.push(format!(
+                "'{}': {} bytes exceeds max_file_size_mb ({} MiB) — child skipped",
+                child.name,
+                child.bytes.len(),
+                max_child_bytes / 1024 / 1024
+            ));
+            continue;
+        }
+        // ---- child normalize (the SAME mechanism the document got) ----
+        // the child re-enters routing through its POST-normalize state:
+        // its chain is looked up by the derived mime, and the chain's
+        // probe/extract see the transformed bytes. A normalize Err here is
+        // a REASON on the container's aggregate, not a park (only the
+        // document's own normalize parks) — the container keeps walking
+        // its remaining children.
+        let outcome = match normalize(child.bytes.clone(), &child.mime, &child.name) {
+            Ok(o) => o,
+            Err(e) => {
+                skipped.push(format!(
+                    "'{}': normalize: {}",
+                    child.name,
+                    inner_message(&e)
+                ));
+                continue;
+            }
+        };
+        // the same cap again, on the EXPANDED size (decompression
+        // amplification: the document-level rule, applied per child)
+        if outcome.bytes.len() as u64 > max_child_bytes {
+            skipped.push(format!(
+                "'{}': normalize expanded the child to {} bytes, exceeding max_file_size_mb \
+                 ({} MiB) — child skipped",
+                child.name,
+                outcome.bytes.len(),
+                max_child_bytes / 1024 / 1024
+            ));
+            continue;
+        }
+        log_normalize(&child_display, &outcome);
+        match routes.chain_for_mime(&outcome.mime) {
+            None => skipped.push(format!(
+                "'{}': no extractor chain for mime '{}' in this ingest config — child skipped",
+                child.name, outcome.mime
+            )),
+            Some(chain) => match walk_child(
+                routes,
+                max_child_bytes,
+                &child_display,
+                &outcome.bytes,
+                &outcome.mime,
+                chain,
+                depth + 1,
+            ) {
+                Ok(mut child_parts) => parts.append(&mut child_parts),
+                Err(reason) => skipped.push(format!("'{}': {reason}", child.name)),
+            },
+        }
+    }
+    if !has_extracted_content(&parts) {
+        // every child yielded or was skipped: the CONTAINER yields too, with
+        // the child-level reasons on record (a skipped-only container counts
+        // as empty for the same bar every kind's "nothing" refusal uses)
+        return Err(PipelineError::extract(format!(
+            "container '{name}': none of its {} children produced extractable content [{}]",
+            children.len(),
+            skipped.join("; ")
+        )));
+    }
+    Ok(parts)
+}
+
+/// Walk ONE CHILD through its own chain (M2.1 step 3): the FULL routing the
+/// document level gets — probe (multi-member chains), affinity, chain-yield —
+/// recursively, depth-guarded by [`run_member`]. `Err(reason)` is this
+/// child's aggregated yield reason: child-level refusals and exhaustions are
+/// REASONS, not parks (the container keeps going; only the DOCUMENT-level
+/// all-refuse parks, and only the document's own chain can produce it).
+fn walk_child(
+    routes: &ChildRoutes,
+    max_child_bytes: u64,
+    display: &str,
+    bytes: &[u8],
+    mime: &str,
+    chain: &[(String, ExtractorKind)],
+    depth: u32,
+) -> Result<Vec<Part>, String> {
+    // the child's routing short key: its mime's table key, or "default" for
+    // off-table mimes (names the chain in aggregate reasons)
+    let short_key = crate::pipeline::extract::short_key_for_mime(mime).unwrap_or("default");
+    let class = if chain.len() > 1 {
+        crate::pipeline::probe::probe(short_key, bytes)
+    } else {
+        None
+    };
+    let routing = route(short_key, chain, class);
+    if let Routing::Refused(reason) = routing {
+        return Err(reason);
+    }
+    let members = chain_try_order(chain.len(), &routing).into_iter().map(|i| {
+        let (name, kind) = &chain[i];
+        (
+            name.clone(),
+            run_member(
+                routes,
+                max_child_bytes,
+                display,
+                name,
+                kind,
+                bytes,
+                mime,
+                depth,
+            ),
+        )
+    });
+    match pick_from_chain(short_key, members) {
+        Ok((_winner, parts)) => Ok(parts),
+        Err(e) => {
+            // the same class annotation the document level applies: a probe
+            // that engaged names the class in the failure it explains
+            let message = inner_message(&e);
+            Err(match class {
+                Some(c) => format!("{message} (class={c})"),
+                None => message,
+            })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1162,15 +1528,22 @@ impl IngestRuntime {
                          it is not a source of this pipeline"
                     ))
                 })?;
-                // the routing short key names the chain in an aggregated
-                // statusReason (see pick_from_chain); "default" for the
-                // unlikely non-match (a claimed key always has one)
-                let short_key = short_key_of(&job.object_key)
-                    .unwrap_or("default")
-                    .to_string();
                 let chunker = plan.chunker.clone();
+                // the PRE-normalize state: the scan-time mime guess (which
+                // already sees through compression wrappers) and the raw
+                // bytes. The blocking segment normalizes this FIRST and
+                // derives the routing short key from the POST-normalize
+                // mime — the chain itself stays the object-key-resolved one
+                // the scan claimed the source under.
                 let mime = mime_for(&job.object_key).to_string();
                 let bytes = bytes.clone();
+                // container unpacking (M2.1 step 3): the children of any
+                // container member re-enter THIS bucket's extract table —
+                // snapshotted here (plus the per-child size guard) because
+                // the blocking segment cannot borrow the plan
+                let routes = plan.child_routes();
+                let max_child_bytes = plan.max_file_size_bytes;
+                let display = job.object_key.clone();
                 let permit = self
                     .shared
                     .core
@@ -1181,10 +1554,23 @@ impl IngestRuntime {
                     .map_err(|e| AttemptErr::Fail(format!("cpu semaphore closed: {e}")))?;
                 let mut work = tokio::task::spawn_blocking(move || {
                     let _hold = permit;
-                    // M2.1 step 2 (probe → affinity → route) and the chain
-                    // run together inside THIS one CPU segment, no
-                    // concurrency:
+                    // M2.1 step 3 layering, then step 2 — all inside THIS one
+                    // CPU segment, no concurrency:
                     //
+                    // * NORMALIZE first (the generalized preprocessing
+                    //   stage): one fixed ordered table of built-in
+                    //   transforms runs over the raw bytes BEFORE anything
+                    //   else — the probe, the routing short key and every
+                    //   extractor see the POST-normalize state. Err is a
+                    //   deterministic dead end (corrupt input the stage
+                    //   refuses to guess around: retrying cannot uncorrupt
+                    //   a gzip stream), so it parks with the reason instead
+                    //   of burning the retry budget; the amplification gate
+                    //   below applies the SAME max_file_size_mb to the
+                    //   expanded bytes (a decompression bomb may not smuggle
+                    //   past the file-size guard what the scanner would
+                    //   have refused outright — the container-child rule,
+                    //   extended to transforms).
                     // * probe: multi-member chains only (`chain.len() > 1`
                     //   is the zero-cost gate — a single member has nothing
                     //   to route, so the probe never even runs and its
@@ -1199,6 +1585,36 @@ impl IngestRuntime {
                     //   remaining member keeps config order as the
                     //   correctness backstop; the member iterator stays
                     //   lazy — nothing after the winner executes.
+                    // * each member UNPACKS first (M2.1 step 3): a leaf
+                    //   (the default) extracts as before, byte-for-byte; a
+                    //   container's children re-enter the USER-configured
+                    //   chains (`run_member` — each child normalized again
+                    //   inside it), so this map stays the single place a
+                    //   member's outcome is produced — laziness and the
+                    //   yield vocabulary carry over unchanged.
+                    let outcome = normalize(bytes, &mime, &display).map_err(|e| {
+                        AttemptErr::Parked(format!("normalize: {}", inner_message(&e)))
+                    })?;
+                    if outcome.bytes.len() as u64 > max_child_bytes {
+                        return Err(AttemptErr::Parked(format!(
+                            "normalize expanded the content to {} bytes, exceeding the \
+                             configured max_file_size_mb ({} MiB) — the expanded size is what \
+                             the pipeline would have to carry",
+                            outcome.bytes.len(),
+                            max_child_bytes / 1024 / 1024
+                        )));
+                    }
+                    log_normalize(&display, &outcome);
+                    // terminal state: everything downstream — probe, route,
+                    // extract, unpack — sees these, never the raw bytes
+                    let bytes = outcome.bytes;
+                    let mime = outcome.mime;
+                    // routing key from the POST-normalize mime (the scan-time
+                    // guess already sees through compression wrappers the
+                    // same way, so for a claimed key this agrees with it)
+                    let short_key = crate::pipeline::extract::short_key_for_mime(&mime)
+                        .unwrap_or("default")
+                        .to_string();
                     let class = if chain.len() > 1 {
                         crate::pipeline::probe::probe(&short_key, &bytes)
                     } else {
@@ -1210,7 +1626,19 @@ impl IngestRuntime {
                     }
                     let members = chain_try_order(chain.len(), &routing).into_iter().map(|i| {
                         let (name, kind) = &chain[i];
-                        (name.clone(), kind.extract(&bytes, &mime))
+                        (
+                            name.clone(),
+                            run_member(
+                                &routes,
+                                max_child_bytes,
+                                &display,
+                                name,
+                                kind,
+                                &bytes,
+                                &mime,
+                                0,
+                            ),
+                        )
                     });
                     pick_from_chain(&short_key, members)
                         .map_err(|e| {
@@ -3625,5 +4053,673 @@ pub(crate) mod tests {
         // member sequence equals the config order (Run(0) over n members,
         // pinned by chain_try_order(Run(0)) == config order)
         assert_eq!(chain_try_order(2, &Routing::Run(0)), vec![0, 1]);
+    }
+
+    // ---- M2.1 step 3: normalize stage + container unpacking ---------------
+
+    use crate::pipeline::ChildDoc;
+    use crate::pipeline::extract::TestContainerSpec;
+
+    /// Real gzip bytes (the same library the GzNormalizer decodes with).
+    fn gz(payload: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(payload).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Every stored chunk text of one index (the x-vf-chunk-text metadata
+    /// the default config keeps) — the assertion surface for "which KIND
+    /// actually produced this content".
+    async fn chunk_texts(state: &AppState, vb: &str, index: &str) -> Vec<String> {
+        state
+            .storage
+            .scan_vectors(vb, index, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|v| {
+                v.metadata
+                    .as_ref()
+                    .and_then(|m| m.get("x-vf-chunk-text"))
+                    .and_then(|t| t.as_str())
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// runtime_for + a PRE-Arc core patch: the container tests inject the
+    /// cfg(test) TestContainer kind into the loaded plan here (production
+    /// configs can never name it — from_config has no arm; the TOML declares
+    /// placeholder instances so the extract table validates, and the patch
+    /// overwrites their KINDS with scripted containers).
+    async fn runtime_patched(
+        dir: &Path,
+        cfg: &PipelineConfig,
+        patch: impl FnOnce(&mut BucketPlan),
+    ) -> (Arc<IngestRuntime>, Arc<IngestHandle>, Arc<AppState>) {
+        let mut core = IngestCore::load(cfg, Path::new("/nonexistent-models"))
+            .await
+            .expect("fixture embedder loads");
+        patch(core.buckets.get_mut("docs").expect("docs bucket"));
+        let state = test_state(dir);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let handle = Arc::new(IngestHandle::new(IngestShared::new(core)));
+        let rt = IngestRuntime::new(
+            Arc::clone(handle.shared()),
+            state.clone(),
+            Arc::new(Notify::new()),
+            rx,
+        );
+        (rt, handle, state)
+    }
+
+    /// The container e2e fixture: tiny embedder + a parameterized extract
+    /// table (plus any extra ingest keys, e.g. `max_file_size_mb`/`retries`).
+    /// Declares `plain` (txt), `m` (md) and `ctn`/`inner` placeholders so
+    /// routes like `ctn = "ctn"` / `default = "inner"` validate.
+    fn ctn_config(extract_entries: &str, extra: &str) -> PipelineConfig {
+        let text = format!(
+            "[extractor.plain]\nkind = \"txt\"\n\n\
+             [extractor.m]\nkind = \"md\"\n\n\
+             [extractor.ctn]\nkind = \"txt\"\n\n\
+             [extractor.inner]\nkind = \"txt\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = true\n\n\
+             [ingest.docs]\nscope = \"docs/**\"\nextract = {{ {extract_entries} }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"tiny\"]\nscan_interval_secs = 1\n{extra}",
+            fixture_dir().display().to_string(),
+        );
+        crate::pipeline::config::load_pipeline_config(&text).unwrap()
+    }
+
+    /// THE normalize mechanism e2e (M2.1 step 3): a `.txt.gz` document is
+    /// claimed as the text/plain source it decompresses into (the scan-time
+    /// guess sees through the wrapper), the worker's normalize stage gunzips
+    /// it BEFORE routing, the user's plain txt chain extracts the
+    /// DECOMPRESSED text, and the file INDEXES — the real GzNormalizer over
+    /// the real full chain, not a paper mechanism. Run with --nocapture to
+    /// see `normalize: docs/a.txt.gz -> gunzip (text/plain)` and the INDEXED
+    /// line.
+    #[tokio::test]
+    async fn gz_document_full_chain_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _h, state) = runtime_for(dir.path(), &tiny_config("").1).await;
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        let body = "the quick brown fox jumps over the lazy dog again and again";
+        std::fs::write(docs.join("a.txt.gz"), gz(body.as_bytes())).unwrap();
+
+        rt.scan_once().await;
+        rt.drain_queue().await;
+
+        // claimed and indexed as ONE text/plain source
+        let ms = markers(&state, "docs").await;
+        assert_eq!(ms.len(), 1, ".txt.gz is a source: {ms:?}");
+        let m = status_of(&state, "docs", "docs/a.txt.gz").await;
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
+        let chunks = m.chunks.as_ref().unwrap()["text"];
+        assert!(chunks >= 2, "69-char body over a 32 window: {m:?}");
+        // the vectors are the DECOMPRESSED text's (what the txt chain saw),
+        // and the content hash stays the hash of the RAW stored bytes
+        let spec = &rt.shared.core.buckets["docs"].derived["tiny"];
+        let texts = chunk_texts(&state, "docs", &spec.index_name).await;
+        assert_eq!(texts.len() as u32, chunks);
+        assert!(
+            texts.iter().any(|t| t.contains("quick brown fox")),
+            "decompressed content indexed: {texts:?}"
+        );
+        let raw = std::fs::read(docs.join("a.txt.gz")).unwrap();
+        assert_eq!(m.content_hash, marker::content_hash_of(&raw));
+        // a misnamed plain file under .gz degrades gracefully: no magic ⇒ no
+        // transform ⇒ the plain route still reads it
+        std::fs::write(docs.join("b.txt.gz"), b"plain text in a misnamed wrapper").unwrap();
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        assert_eq!(
+            status_of(&state, "docs", "docs/b.txt.gz").await.status,
+            SourceStatus::Indexed
+        );
+    }
+
+    /// A corrupt gzip is a HARD normalize failure (no fallback member exists
+    /// — module docs): the document parks with the reason naming the hint,
+    /// no retry budget is burned, and a later scan leaves it untouched.
+    #[tokio::test]
+    async fn corrupt_gz_document_parks_with_hint_name_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _h, state) = runtime_for(dir.path(), &tiny_config("retries = 3\n").1).await;
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        let mut bad = vec![0x1f, 0x8b, 0x08, 0x00];
+        bad.extend_from_slice(b"definitely not a deflate stream");
+        std::fs::write(docs.join("bad.txt.gz"), &bad).unwrap();
+
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let m = status_of(&state, "docs", "docs/bad.txt.gz").await;
+        assert_eq!(m.status, SourceStatus::Failed);
+        assert!(
+            m.retries_exhausted,
+            "deterministic park, not retry-then-fail"
+        );
+        let reason = m.status_reason.expect("reason");
+        assert!(reason.contains("normalize:"), "{reason}");
+        assert!(reason.contains("gunzip"), "{reason}");
+        assert!(reason.contains("bad.txt.gz"), "the hint name: {reason}");
+        // nothing was indexed
+        let spec = &rt.shared.core.buckets["docs"].derived["tiny"];
+        assert!(
+            state
+                .storage
+                .load_index("docs", &spec.index_name)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // parked: the rescan does not re-enqueue it
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let m2 = status_of(&state, "docs", "docs/bad.txt.gz").await;
+        assert_eq!(m2.updated_at, m.updated_at, "untouched by the rescan");
+    }
+
+    /// The amplification gate: `max_file_size_mb` applies to the
+    /// POST-normalize bytes too — a tiny gz that expands past the cap parks
+    /// (deterministically) instead of handing the pipeline 100x the guard.
+    #[tokio::test]
+    async fn gz_expansion_over_size_cap_parks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _h, state) =
+            runtime_for(dir.path(), &tiny_config("max_file_size_mb = 1\n").1).await;
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        // ~1.5 MiB of highly compressible text: raw gz stays far under the
+        // 1 MiB raw gate, the expansion blows past it
+        let body = "word ".repeat(320 * 1024);
+        std::fs::write(docs.join("bomb.txt.gz"), gz(body.as_bytes())).unwrap();
+        assert!(
+            std::fs::metadata(docs.join("bomb.txt.gz")).unwrap().len() < 1024 * 1024,
+            "the raw file passes the ordinary size gate"
+        );
+
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let m = status_of(&state, "docs", "docs/bomb.txt.gz").await;
+        assert_eq!(m.status, SourceStatus::Failed);
+        let reason = m.status_reason.expect("reason");
+        assert!(
+            reason.contains("normalize expanded the content to"),
+            "{reason}"
+        );
+        assert!(reason.contains("max_file_size_mb"), "{reason}");
+    }
+
+    /// THE configuration-coherence proof (the step's core selling point): a
+    /// container's children re-enter the USER-CONFIGURED routing — the md
+    /// child lands on the configured `m` (md kind) instance, the txt child
+    /// on `plain`, and the aggregated chunks are EXACTLY what those two
+    /// configured instances produce over the children in order. A container
+    /// that digested its own children (the unstructured anti-shape) would
+    /// produce different bytes: the md kind strips the heading marker.
+    #[tokio::test]
+    async fn container_children_reenter_user_configured_chains_e2e() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        let payload = b"CONTAINER-PAYLOAD";
+        std::fs::write(docs.join("book.ctn"), payload).unwrap();
+
+        let cfg = ctn_config("txt = \"plain\", md = \"m\", ctn = \"ctn\"", "");
+        let (rt, _h, state) = runtime_patched(dir.path(), &cfg, |plan| {
+            plan.extractors.insert(
+                "ctn".to_string(),
+                ExtractorKind::TestContainer(TestContainerSpec::one(
+                    "application/octet-stream",
+                    payload,
+                    vec![
+                        ChildDoc::new(
+                            "ch1/chapter.txt",
+                            "text/plain",
+                            "first chapter body, plain words",
+                        ),
+                        ChildDoc::new(
+                            "ch1/chapter.md",
+                            "text/markdown",
+                            "# Heading Two\n\nsecond chapter prose",
+                        ),
+                    ],
+                )),
+            );
+        })
+        .await;
+
+        rt.scan_once().await;
+        rt.drain_queue().await;
+
+        let m = status_of(&state, "docs", "docs/book.ctn").await;
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
+
+        // expected = exactly what the USER'S configured instances produce:
+        // plain(txt) over child 1 ++ m(md) over child 2, in child order,
+        // through the configured chunker
+        let plan = &rt.shared.core.buckets["docs"];
+        let txt = kind_of("t", "kind = \"txt\"");
+        let md = kind_of("t", "kind = \"md\"");
+        let mut expected_parts =
+            Extractor::extract(&txt, b"first chapter body, plain words", "text/plain").unwrap();
+        expected_parts.extend(
+            Extractor::extract(
+                &md,
+                b"# Heading Two\n\nsecond chapter prose",
+                "text/markdown",
+            )
+            .unwrap(),
+        );
+        let expected: Vec<String> = Chunker::chunk(&plan.chunker, &expected_parts)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.text)
+            .collect();
+        let got = chunk_texts(&state, "docs", &plan.derived["tiny"].index_name).await;
+        assert_eq!(
+            got.len() as u32,
+            m.chunks.as_ref().unwrap()["text"],
+            "marker count matches stored vectors"
+        );
+        assert_eq!(
+            got, expected,
+            "children were routed by THEIR mimes through the configured instances"
+        );
+        // the md discrimination made explicit: a self-digesting (txt-only)
+        // container would have kept the heading marker
+        assert!(
+            !got.iter().any(|t| t.contains('#')),
+            "the md kind processed the md child: {got:?}"
+        );
+    }
+
+    /// Child-level normalize: a container child that is ITSELF gzipped
+    /// decompresses BEFORE its chain lookup — the derived text/plain mime
+    /// routes it to the user's txt chain. Without the child normalize this
+    /// child has no chain for `application/gzip` and would be skipped.
+    #[tokio::test]
+    async fn container_child_normalize_runs_before_child_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        let payload = b"GZ-CHILD-CONTAINER";
+        std::fs::write(docs.join("book.ctn"), payload).unwrap();
+
+        let cfg = ctn_config("txt = \"plain\", ctn = \"ctn\"", "");
+        let (rt, _h, state) = runtime_patched(dir.path(), &cfg, |plan| {
+            plan.extractors.insert(
+                "ctn".to_string(),
+                ExtractorKind::TestContainer(TestContainerSpec::one(
+                    "application/octet-stream",
+                    payload,
+                    vec![ChildDoc::new(
+                        "logs/app.txt.gz",
+                        "application/gzip",
+                        gz(
+                            b"gz child body content, decompressed by the child normalize"
+                                .as_slice(),
+                        ),
+                    )],
+                )),
+            );
+        })
+        .await;
+
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        assert_eq!(
+            status_of(&state, "docs", "docs/book.ctn").await.status,
+            SourceStatus::Indexed
+        );
+        let plan = &rt.shared.core.buckets["docs"];
+        let texts = chunk_texts(&state, "docs", &plan.derived["tiny"].index_name).await;
+        assert!(
+            texts.iter().any(|t| t.contains("gz child body content")),
+            "{texts:?}"
+        );
+    }
+
+    /// The child three-state vocabulary on the failure side: a child with NO
+    /// chain for its mime is skipped with a reason; a child whose (single)
+    /// chain exhausts contributes its verbatim reason; when NO child
+    /// produces content the container yields and the document FAILED
+    /// carries both reasons in the aggregate.
+    #[tokio::test]
+    async fn container_children_all_failing_aggregate_reasons() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        let payload = b"EMPTY-CONTAINER";
+        std::fs::write(docs.join("book.ctn"), payload).unwrap();
+
+        let cfg = ctn_config("txt = \"plain\", ctn = \"ctn\"", "retries = 0\n");
+        let (rt, _h, state) = runtime_patched(dir.path(), &cfg, |plan| {
+            plan.extractors.insert(
+                "ctn".to_string(),
+                ExtractorKind::TestContainer(TestContainerSpec::one(
+                    "application/octet-stream",
+                    payload,
+                    vec![
+                        // off-table mime, no default configured: 无承接
+                        ChildDoc::new("pic/logo.png", "image/png", b"\x89PNG-ish".as_slice()),
+                        // invalid UTF-8 under a single-member txt chain: 耗尽
+                        ChildDoc::new(
+                            "bad/note.txt",
+                            "text/plain",
+                            b"\xff\xfe not utf8".as_slice(),
+                        ),
+                    ],
+                )),
+            );
+        })
+        .await;
+
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let m = status_of(&state, "docs", "docs/book.ctn").await;
+        assert_eq!(m.status, SourceStatus::Failed);
+        let reason = m.status_reason.expect("reason");
+        assert!(reason.contains("none of its 2 children"), "{reason}");
+        assert!(
+            reason.contains("no extractor chain for mime 'image/png'"),
+            "{reason}"
+        );
+        assert!(reason.contains("not valid UTF-8"), "{reason}");
+        // nothing was indexed
+        let spec = &rt.shared.core.buckets["docs"].derived["tiny"];
+        assert!(
+            state
+                .storage
+                .load_index("docs", &spec.index_name)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Depth guard, both sides of the line: a container INSIDE a container
+    /// (two layers) walks its grandchildren to leaves and INDEXES; a THIRD
+    /// container layer Errs outright — the depth reason rides the aggregate
+    /// up to the document's FAILED.
+    #[tokio::test]
+    async fn container_nested_two_levels_ok_third_refused() {
+        // ---- two levels: doc.ctn -> ctn -> default(inner) -> leaf.txt ----
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("book.ctn"), b"OUTER".as_slice()).unwrap();
+        let cfg = ctn_config("ctn = \"ctn\", txt = \"plain\", default = \"inner\"", "");
+        let (rt, _h, state) = runtime_patched(dir.path(), &cfg, |plan| {
+            plan.extractors.insert(
+                "ctn".to_string(),
+                ExtractorKind::TestContainer(TestContainerSpec::one(
+                    "application/octet-stream",
+                    b"OUTER",
+                    vec![ChildDoc::new(
+                        "mid",
+                        "application/octet-stream",
+                        b"MID".as_slice(),
+                    )],
+                )),
+            );
+            plan.extractors.insert(
+                "inner".to_string(),
+                ExtractorKind::TestContainer(TestContainerSpec::one(
+                    "application/octet-stream",
+                    b"MID",
+                    vec![ChildDoc::new(
+                        "leaf.txt",
+                        "text/plain",
+                        b"deep leaf text body".as_slice(),
+                    )],
+                )),
+            );
+        })
+        .await;
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let m = status_of(&state, "docs", "docs/book.ctn").await;
+        assert_eq!(m.status, SourceStatus::Indexed, "two layers are allowed");
+        let plan = &rt.shared.core.buckets["docs"];
+        let texts = chunk_texts(&state, "docs", &plan.derived["tiny"].index_name).await;
+        assert!(
+            texts.iter().any(|t| t.contains("deep leaf text body")),
+            "{texts:?}"
+        );
+
+        // ---- three layers: the third container Errs before its children --
+        let dir3 = tempfile::tempdir().unwrap();
+        let docs3 = dir3.path().join("docs");
+        std::fs::create_dir_all(&docs3).unwrap();
+        std::fs::write(docs3.join("book.ctn"), b"OUTER".as_slice()).unwrap();
+        let cfg3 = ctn_config(
+            "ctn = \"ctn\", txt = \"plain\", default = \"inner\"",
+            "retries = 0\n",
+        );
+        let (rt3, _h3, state3) = runtime_patched(dir3.path(), &cfg3, |plan| {
+            plan.extractors.insert(
+                "ctn".to_string(),
+                ExtractorKind::TestContainer(TestContainerSpec::one(
+                    "application/octet-stream",
+                    b"OUTER",
+                    vec![ChildDoc::new(
+                        "mid",
+                        "application/octet-stream",
+                        b"MID".as_slice(),
+                    )],
+                )),
+            );
+            // one instance, two script entries: MID -> [DEEP], DEEP -> [leaf]
+            plan.extractors.insert(
+                "inner".to_string(),
+                ExtractorKind::TestContainer(TestContainerSpec::scripted(
+                    "application/octet-stream",
+                    vec![
+                        (
+                            b"MID".to_vec(),
+                            vec![ChildDoc::new(
+                                "deep",
+                                "application/octet-stream",
+                                b"DEEP".as_slice(),
+                            )],
+                        ),
+                        (
+                            b"DEEP".to_vec(),
+                            vec![ChildDoc::new(
+                                "leaf.txt",
+                                "text/plain",
+                                b"never reached".as_slice(),
+                            )],
+                        ),
+                    ],
+                )),
+            );
+        })
+        .await;
+        rt3.scan_once().await;
+        rt3.drain_queue().await;
+        let m3 = status_of(&state3, "docs", "docs/book.ctn").await;
+        assert_eq!(m3.status, SourceStatus::Failed);
+        let reason = m3.status_reason.expect("reason");
+        assert!(
+            reason.contains("nesting depth 3"),
+            "the third layer refusal names its depth: {reason}"
+        );
+        assert!(reason.contains("MAX_CONTAINER_DEPTH = 2"), "{reason}");
+    }
+
+    /// Child-count guard: 257 children Err the container BEFORE any child
+    /// work — the reason names the entry count and the constant.
+    #[tokio::test]
+    async fn container_children_limit_errs() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("many.ctn"), b"MANY".as_slice()).unwrap();
+        let children: Vec<ChildDoc> = (0..=256)
+            .map(|i| {
+                ChildDoc::new(
+                    format!("e{i:03}.txt"),
+                    "text/plain",
+                    format!("entry number {i}").into_bytes(),
+                )
+            })
+            .collect();
+        let cfg = ctn_config("txt = \"plain\", ctn = \"ctn\"", "retries = 0\n");
+        let (rt, _h, state) = runtime_patched(dir.path(), &cfg, |plan| {
+            plan.extractors.insert(
+                "ctn".to_string(),
+                ExtractorKind::TestContainer(TestContainerSpec::one(
+                    "application/octet-stream",
+                    b"MANY",
+                    children,
+                )),
+            );
+        })
+        .await;
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let m = status_of(&state, "docs", "docs/many.ctn").await;
+        assert_eq!(m.status, SourceStatus::Failed);
+        let reason = m.status_reason.expect("reason");
+        assert!(
+            reason.contains("unpacked 257 children (MAX_CHILDREN = 256)"),
+            "{reason}"
+        );
+        // the guard fires BEFORE any child work: not one vector landed
+        let spec = &rt.shared.core.buckets["docs"].derived["tiny"];
+        assert!(
+            state
+                .storage
+                .load_index("docs", &spec.index_name)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Per-child size guard, raw and expanded: an oversize child (or a gz
+    /// child that EXPANDS past the cap) is skipped with a reason while its
+    /// in-limit sibling still indexes; a container of ONLY oversize
+    /// children yields with the skip reason on record.
+    #[tokio::test]
+    async fn container_oversize_child_skipped_but_sibling_indexes() {
+        let mk = |payload: &[u8], children| {
+            let cfg = ctn_config(
+                "txt = \"plain\", ctn = \"ctn\"",
+                "max_file_size_mb = 1\nretries = 0\n",
+            );
+            (payload.to_vec(), cfg, children)
+        };
+        let big: Vec<u8> = vec![b'x'; 2 * 1024 * 1024];
+        let gz_big = gz(&vec![b'y'; 2 * 1024 * 1024]);
+
+        // (a) raw-oversize + ok sibling -> INDEXED, only the sibling's text
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("book.ctn"), b"PAY-A".as_slice()).unwrap();
+        let (payload, cfg, _) = mk(
+            b"PAY-A",
+            vec![
+                ChildDoc::new("huge.bin", "text/plain", big.clone()),
+                ChildDoc::new("ok.txt", "text/plain", "the in-limit sibling body"),
+            ],
+        );
+        let (rt, _h, state) = runtime_patched(dir.path(), &cfg, |plan| {
+            plan.extractors.insert(
+                "ctn".to_string(),
+                ExtractorKind::TestContainer(TestContainerSpec::one(
+                    "application/octet-stream",
+                    &payload,
+                    vec![
+                        ChildDoc::new("huge.bin", "text/plain", big.clone()),
+                        ChildDoc::new("ok.txt", "text/plain", "the in-limit sibling body"),
+                    ],
+                )),
+            );
+        })
+        .await;
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let m = status_of(&state, "docs", "docs/book.ctn").await;
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
+        let plan = &rt.shared.core.buckets["docs"];
+        let texts = chunk_texts(&state, "docs", &plan.derived["tiny"].index_name).await;
+        assert!(
+            texts.iter().any(|t| t.contains("in-limit sibling")),
+            "{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("xxxx")),
+            "the oversize child contributed nothing: {texts:?}"
+        );
+
+        // (b) a gz child expanding past the cap: skipped at the EXPANDED
+        // size, sibling still indexes (decompression may not smuggle past
+        // the file-size guard)
+        let dir_b = tempfile::tempdir().unwrap();
+        let docs_b = dir_b.path().join("docs");
+        std::fs::create_dir_all(&docs_b).unwrap();
+        std::fs::write(docs_b.join("book.ctn"), b"PAY-B".as_slice()).unwrap();
+        let (payload_b, cfg_b, _) = mk(b"PAY-B", vec![]);
+        let (rt_b, _h_b, state_b) = runtime_patched(dir_b.path(), &cfg_b, |plan| {
+            plan.extractors.insert(
+                "ctn".to_string(),
+                ExtractorKind::TestContainer(TestContainerSpec::one(
+                    "application/octet-stream",
+                    &payload_b,
+                    vec![
+                        ChildDoc::new("bomb.txt.gz", "application/gzip", gz_big.clone()),
+                        ChildDoc::new("ok.txt", "text/plain", "sibling beside the bomb"),
+                    ],
+                )),
+            );
+        })
+        .await;
+        rt_b.scan_once().await;
+        rt_b.drain_queue().await;
+        let m_b = status_of(&state_b, "docs", "docs/book.ctn").await;
+        assert_eq!(m_b.status, SourceStatus::Indexed, "{m_b:?}");
+        let plan_b = &rt_b.shared.core.buckets["docs"];
+        let texts_b = chunk_texts(&state_b, "docs", &plan_b.derived["tiny"].index_name).await;
+        assert!(
+            !texts_b.iter().any(|t| t.contains("yyyy")),
+            "the expanded-past-cap child contributed nothing: {texts_b:?}"
+        );
+
+        // (c) ONLY the oversize child: the container yields, the reason
+        // names the skip
+        let dir_c = tempfile::tempdir().unwrap();
+        let docs_c = dir_c.path().join("docs");
+        std::fs::create_dir_all(&docs_c).unwrap();
+        std::fs::write(docs_c.join("book.ctn"), b"PAY-C".as_slice()).unwrap();
+        let (payload_c, cfg_c, _) = mk(b"PAY-C", vec![]);
+        let (rt_c, _h_c, state_c) = runtime_patched(dir_c.path(), &cfg_c, |plan| {
+            plan.extractors.insert(
+                "ctn".to_string(),
+                ExtractorKind::TestContainer(TestContainerSpec::one(
+                    "application/octet-stream",
+                    &payload_c,
+                    vec![ChildDoc::new("huge.bin", "text/plain", big.clone())],
+                )),
+            );
+        })
+        .await;
+        rt_c.scan_once().await;
+        rt_c.drain_queue().await;
+        let m_c = status_of(&state_c, "docs", "docs/book.ctn").await;
+        assert_eq!(m_c.status, SourceStatus::Failed);
+        let reason = m_c.status_reason.expect("reason");
+        assert!(
+            reason.contains("'huge.bin': 2097152 bytes exceeds max_file_size_mb"),
+            "{reason}"
+        );
     }
 }

@@ -127,6 +127,17 @@ rmcp = { version = "3.8", default-features = false, features = [
   "transport-io",
 ] }
 
+# gzip normalize transform (M2.1 step 3, pipeline/normalize.rs): flate2
+# v1.1.10 is ALREADY compiled into this exact build as a transitive dep of
+# the lance -> reqwest -> tower-http -> async-compression chain, locked
+# there with the default rust_backend (miniz_oxide, pure Rust). Declaring
+# it directly therefore adds ZERO new crates to the graph and ZERO new
+# lockfile versions (same discipline as percent-encoding/sha2/rustix
+# above). default-features = false + rust_backend spells out the exact
+# feature set the tree already unifies on — no zlib C backend can enter
+# through feature drift. MIT OR Apache-2.0.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 # `vf status --endpoint` health probe (M1 T6): hyper's client through
 # hyper-util. hyper-util 0.1 / http-body-util / http 1 are ALREADY transitive
 # deps of axum in this tree — declaring them directly adds ZERO new crates
