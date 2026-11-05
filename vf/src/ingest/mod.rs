@@ -188,7 +188,12 @@ fn short_key_of(object_key: &str) -> Option<&'static str> {
 }
 
 /// The `auto` mapping's default extractor KIND per short key (kept in lock
-/// step with [`MIME_TO_SHORT_KEY`]).
+/// step with [`MIME_TO_SHORT_KEY`]). `pdf` deliberately stays `pdf-text`
+/// even though a second PDF kind (`pdf-inspector`) now exists: pdfium is the
+/// battle-tested rendering path and `auto` is an OPINIONATED default — a new
+/// kind landing must not silently re-route every `extract = { default =
+/// "auto" }` deployment. Deployments that want the classify-first, no-.so
+/// engine opt in explicitly (`extract = { pdf = "inspector-instance" }`).
 fn builtin_extractor(short_key: &str) -> Option<ExtractorKind> {
     match short_key {
         "pdf" => Some(ExtractorKind::PdfText(PdfTextConfig {

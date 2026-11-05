@@ -29,6 +29,7 @@
 | S3 直传裁决（2026-11-04） | 文件上传**复用用户自己的 S3 API**（外部源 `s3-prefix`，M3 提前自 M4+；本地等价 `dir` 监听）——daemon 不在上传路径上，标准工具直达；copy-in（`vf put`）保留为 M2 统一形态与自包含实例根场景；**自建 S3 对象面（PutObject/GetObject 等）明确不做**——第二协议面 + 双份 conformance 负担，负面清单 #1 邻域 | KB DataSource 模型正式采纳（E.5 对照已更新）；外部真源 = 外部列表，补齐对账真源缺口 |
 | **存储布局统一（2026-11-04，v2.2）** | **文件即普通对象**：上传直接落实例根普通键（无包装、无副本、无内容寻址源仓库），vectorfs 自有数据全收进 `.vectorfs/` 单一保留前缀（.git 心智）；copy-in/外部源双形态**取消**，统一为 scope 摄取模型（真源 = 实例根列表，`vf put`/`vf rm` = S3 语义便捷包装）；chunk key 改含**对象键**（防同内容文件互踩），内容哈希仅用于"etag 变但内容未变跳过重嵌" | M2 范围反降（无需建源仓库）；`.vectorfs/` 为保留前缀，一实例根一个 |
 | 默认模型裁决（2026-11-04） | M2 文本默认 = **gte-multilingual-base**（305M、Apache-2.0、中文良好、下载轻——实用性审查 P1-5 采纳）；bge-m3 一行换（更强、1.1GB）。覆盖 multimodal 报告头部所述"bge-m3 已定"的时点快照 | 报告不回改；本行为准 |
+| pdf-inspector kind 增补（2026-11-05，用户裁决） | 新增第四个 M2 extractor kind `pdf-inspector`（firecrawl/pdf-inspector 1.25，MIT，纯 Rust lopdf 系），**双重目的**：PDF 提取的免 .so 替选（扫描件分类 fail-loud + markdown 选项）+ 插件体系"第三方准入"实测。**auto 映射不漂移**（pdf→pdf-text 仍默认——pdfium 是久经考验路径，新增项不改变既有语义）。体积代价 +6.4MiB（159→166MiB，硬顶 175 余 9MiB）——M3 图像模态（image 编解码器）落地前须做**体积专项裁决**（feature 门控 kind / 拆 bin / 接受扩线）。审计结论"体系基本完善"与缺口清单记 §10.8 续 | 零核心改动即接入成功（两段式/枚举/contract/DIP 全复用）；contract 框架据审计补非空文本断言 |
 
 ## 1. 定位
 
@@ -291,7 +292,7 @@ vf CLI ──HTTP/SigV4──►┐    AWS SDK / MCP 客户端
 
 | 轴 | 侧 | 契约（v2.1 修正签名） | 内建 kind（按里程碑标注） |
 |---|---|---|---|
-| Extractor | 摄取 | `{bytes, mime} → Vec<Part(模态)>`；按 mime 配置、可多选 | pdf-text / md / txt（M2）；pdf-pages(dpi) / pdf-ocr(lang) / docx / html / image（M3）；audio(分段/VAD) / video(解复用→帧+音轨+可选 ASR)（M4） |
+| Extractor | 摄取 | `{bytes, mime} → Vec<Part(模态)>`；按 mime 配置、可多选 | pdf-text / md / txt（M2）；pdf-inspector（M2.1 增补 2026-11-05，见 §0：纯 Rust lopdf 系、扫描件分类 fail-loud、markdown 输出选项——插件体系验证试金石，auto 默认不漂移仍 pdf-text）；pdf-pages(dpi) / pdf-ocr(lang) / docx / html / image（M3）；audio(分段/VAD) / video(解复用→帧+音轨+可选 ASR)（M4） |
 | Chunker | 摄取，仅 text 模态（图像类原子入索引） | `&[TextPart] → Vec<Chunk>`；模态分派在机制层 | token-window(size, overlap)（M2）；markdown（M3） |
 | Embedder | 摄取+查询 | `embed_query(Query) → Vec<f32>`（`Query = enum {Text, Image, Audio}`）+ `embed_documents(&[Chunk])`；声明 {dim, doc/query 模态}；ort dim 启动探测、openai dim 配置声明（不出网探测） | ort / openai（M2）；qwen3vl 统一评估（M3）；clap 声学（M4）；远端视频（Nova/TwelveLabs）作 provider 扩展 |
 | Reranker（M3） | 查询 | `query × candidates → scored` | cross-encoder |

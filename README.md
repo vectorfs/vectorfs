@@ -129,10 +129,12 @@ res, err := client.QueryVectors(ctx, &s3vectors.QueryVectorsInput{
   `air-gapped` (local model path, `offline = true`, nothing ever leaves the network).
   `vectorfs init --preset X` materializes `.vectorfs/vectorfs.toml` and prefetches
   models when needed (`HF_ENDPOINT` mirror respected; sha256-verified, atomic).
-- Pipeline = extractor (pdf-text / md / txt) → chunker (token-window, char-counted,
-  CJK-safe) → embedder (local `ort` [onnxruntime, load-dynamic] or any
-  OpenAI-compatible `/embeddings` endpoint). Config in `.vectorfs/vectorfs.toml`;
-  `vectorfs pipelines check` validates it with TOML line numbers.
+- Pipeline = extractor (pdf-text via pdfium / `pdf-inspector` [pure-Rust, scans
+  fail loud with an OCR-needed reason, optional position-aware Markdown] / md /
+  txt) → chunker (token-window, char-counted, CJK-safe) → embedder (local `ort`
+  [onnxruntime, load-dynamic] or any OpenAI-compatible `/embeddings` endpoint).
+  Config in `.vectorfs/vectorfs.toml`; `vectorfs pipelines check` validates it
+  with TOML line numbers.
 - Correctness is fingerprinted, not hoped for: changing extractor/chunker/embedder
   config refuses startup until you re-embed explicitly (`vectorfs serve --reindex`).
 - GC only ever deletes vectors in ingest-managed indexes whose keys match the

@@ -3,8 +3,10 @@
 //!
 //! `dyn`-free by design (§5.10.2 v2.1): the enum below is the registry.
 //! Adding a kind = adding a variant + a `from_config` arm; the compiler then
-//! walks every match site in this tree. Available kinds (M2): `txt`,
-//! `pdf-text`, `md`.
+//! walks every match site in this tree. Available kinds: `txt`,
+//! `pdf-text`, `md`, `pdf-inspector` (the first kind added AFTER the M2
+//! set — the closed-set mechanism's first live exercise; two PDF kinds
+//! coexist behind the one `pdf` short key, selection is explicit).
 //!
 //! # mime <-> short-key table (T4)
 //!
@@ -14,11 +16,13 @@
 //! drift apart (single source of truth, pub for the T3 ingest worker).
 
 pub mod md;
+pub mod pdf_inspector;
 pub mod pdf_text;
 pub mod txt;
 
 use super::{Extractor, Modality, Part, PipelineError};
 use md::{MdConfig, MdExtractor};
+use pdf_inspector::{PdfInspectorConfig, PdfInspectorExtractor};
 use pdf_text::{PdfTextConfig, PdfTextExtractor};
 use txt::{TxtConfig, TxtExtractor};
 
@@ -33,7 +37,7 @@ pub const MIME_TO_SHORT_KEY: &[(&str, &str)] = &[
 
 /// The available-kind list embedded in unknown-kind errors (kept next to the
 /// enum so a new variant and its error line land in the same diff).
-pub const EXTRACTOR_KINDS: &str = "txt, pdf-text, md";
+pub const EXTRACTOR_KINDS: &str = "txt, pdf-text, md, pdf-inspector";
 
 /// mime (parameters like `; charset=utf-8` tolerated) -> short key.
 pub fn short_key_for_mime(mime: &str) -> Option<&'static str> {
@@ -63,6 +67,9 @@ pub enum ExtractorKind {
     PdfText(PdfTextConfig),
     /// CommonMark to plain text (`extract/md.rs`).
     Md(MdConfig),
+    /// lopdf-based classify-then-extract PDF kind, no native library
+    /// (`extract/pdf_inspector.rs`).
+    PdfInspector(PdfInspectorConfig),
 }
 
 impl ExtractorKind {
@@ -96,6 +103,13 @@ impl ExtractorKind {
                 })?;
                 Ok(ExtractorKind::Md(cfg))
             }
+            "pdf-inspector" => {
+                let cfg: PdfInspectorConfig =
+                    raw.clone().try_into().map_err(|e: toml::de::Error| {
+                        super::config::stage2_error(section, Some(&kind), e.message(), line)
+                    })?;
+                Ok(ExtractorKind::PdfInspector(cfg))
+            }
             other => Err(PipelineError::config(
                 format!(
                     "[{section}]: unknown extractor kind '{other}' (available kinds: \
@@ -112,10 +126,11 @@ impl ExtractorKind {
     /// and its modality declaration land in the same diff.
     pub fn output_modalities(&self) -> &'static [Modality] {
         match self {
-            // M2: every built-in kind emits Text only (§5.10.1).
-            ExtractorKind::Txt(_) | ExtractorKind::PdfText(_) | ExtractorKind::Md(_) => {
-                &[Modality::Text]
-            }
+            // Every built-in kind so far emits Text only (§5.10.1).
+            ExtractorKind::Txt(_)
+            | ExtractorKind::PdfText(_)
+            | ExtractorKind::Md(_)
+            | ExtractorKind::PdfInspector(_) => &[Modality::Text],
         }
     }
 
@@ -125,6 +140,15 @@ impl ExtractorKind {
             ExtractorKind::Txt(_) => "txt".to_string(),
             ExtractorKind::PdfText(_) => "pdf-text".to_string(),
             ExtractorKind::Md(_) => "md".to_string(),
+            // the knob shows only when it departs from the pdf-text-aligned
+            // default, keeping summary lines short
+            ExtractorKind::PdfInspector(cfg) => {
+                if cfg.markdown {
+                    "pdf-inspector(markdown=true)".to_string()
+                } else {
+                    "pdf-inspector".to_string()
+                }
+            }
         }
     }
 }
@@ -138,6 +162,14 @@ impl Extractor for ExtractorKind {
             ExtractorKind::Txt(_) => TxtExtractor.extract(bytes, mime),
             ExtractorKind::PdfText(_) => PdfTextExtractor::new().extract(bytes, mime),
             ExtractorKind::Md(_) => MdExtractor.extract(bytes, mime),
+            ExtractorKind::PdfInspector(cfg) => {
+                let x = if cfg.markdown {
+                    PdfInspectorExtractor::markdown()
+                } else {
+                    PdfInspectorExtractor::new()
+                };
+                x.extract(bytes, mime)
+            }
         }
     }
 }
@@ -151,6 +183,7 @@ impl serde::Serialize for ExtractorKind {
             ExtractorKind::Txt(c) => c.serialize(serializer),
             ExtractorKind::PdfText(c) => c.serialize(serializer),
             ExtractorKind::Md(c) => c.serialize(serializer),
+            ExtractorKind::PdfInspector(c) => c.serialize(serializer),
         }
     }
 }
@@ -174,19 +207,30 @@ mod tests {
     }
 
     #[test]
-    fn from_config_accepts_all_three_kinds() {
-        // (kind string, good sample bytes, good sample mime) — pdf runs the
-        // real .so (missing library fails the test honestly, pdf_text.rs)
-        let cases: &[(&str, &[u8], &str)] = &[
-            ("txt", b"hi", "text/plain"),
+    fn from_config_accepts_every_kind() {
+        // (kind string, good sample bytes, good sample mime, expected
+        // canonical TOML of the parsed enum) — pdf-text runs the real .so
+        // (missing library fails the test honestly, pdf_text.rs). The
+        // canonical-form column exists because kinds with knobs
+        // (pdf-inspector) serialize their defaulted fields too — the
+        // fingerprint form is per-kind, not uniformly `kind = "…"`.
+        let cases: &[(&str, &[u8], &str, &str)] = &[
+            ("txt", b"hi", "text/plain", "kind = \"txt\""),
             (
                 "pdf-text",
                 pdf_text::tests::HELLO_PDF_MINIMAL,
                 "application/pdf",
+                "kind = \"pdf-text\"",
             ),
-            ("md", b"# hi", "text/markdown"),
+            ("md", b"# hi", "text/markdown", "kind = \"md\""),
+            (
+                "pdf-inspector",
+                pdf_inspector::tests::HELLO_PDF_MINIMAL,
+                "application/pdf",
+                "kind = \"pdf-inspector\"\nmarkdown = false",
+            ),
         ];
-        for (kind_str, bytes, mime) in cases {
+        for (kind_str, bytes, mime, canonical) in cases {
             let raw: toml::Value = toml::from_str(&format!("kind = \"{kind_str}\"")).unwrap();
             let k = ExtractorKind::from_config("extractor.x", &raw, Some(1)).unwrap();
             assert_eq!(k.describe(), *kind_str);
@@ -198,10 +242,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{kind_str} must dispatch through the enum: {e}"));
             assert_eq!(parts.len(), 1);
             // fingerprints serialize flat: inner config only
-            assert_eq!(
-                toml::to_string(&k).unwrap().trim(),
-                format!("kind = \"{kind_str}\"")
-            );
+            assert_eq!(toml::to_string(&k).unwrap().trim(), *canonical);
         }
     }
 
@@ -215,7 +256,7 @@ mod tests {
         );
         assert!(
             err.to_string()
-                .contains("available kinds: txt, pdf-text, md"),
+                .contains("available kinds: txt, pdf-text, md, pdf-inspector"),
             "{err}"
         );
         assert!(err.to_string().contains("at line 3"), "{err}");
@@ -238,6 +279,7 @@ mod tests {
             ("txt", "dpi = 1"),
             ("pdf-text", "dpi = 300"),
             ("md", "gfm = true"),
+            ("pdf-inspector", "dpi = 300"),
         ] {
             let raw: toml::Value =
                 toml::from_str(&format!("kind = \"{kind_str}\"\n{extra}")).unwrap();

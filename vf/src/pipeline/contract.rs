@@ -4,10 +4,10 @@
 //! These are PUBlic assertion suites, not just our own tests: any future
 //! implementation (community kind, wasm plugin in v2) runs the SAME suite to
 //! be admitted — `#[cfg(test)]` below runs it against the built-ins
-//! (`txt`, `pdf-text`, `md`, `token-window`, the real `ort` kind over the
-//! committed tiny ONNX fixture + the real .so, the real `openai` kind over an
-//! in-process fake provider) and a local mock embedder kept as the LSP canary
-//! for third-party implementations.
+//! (`txt`, `pdf-text`, `md`, `pdf-inspector`, `token-window`, the real `ort`
+//! kind over the committed tiny ONNX fixture + the real .so, the real
+//! `openai` kind over an in-process fake provider) and a local mock embedder
+//! kept as the LSP canary for third-party implementations.
 //!
 //! Assertions panic on violation (assertion-suite convention); callers wrap
 //! them in whatever test harness they use.
@@ -45,6 +45,15 @@ pub fn extractor_contract(x: &dyn Extractor, good: (&[u8], &str)) {
         .extract(bytes, mime)
         .expect("good sample must extract (2nd)");
     assert_eq!(a, b, "extractor is not deterministic on its good sample");
+
+    // non-empty output: a GOOD sample yields extracted content —
+    // `Ok(vec![Part::text("")])` would silently index nothing and still pass
+    // every other assertion (gap found by the 2026-11-05 pdf-inspector
+    // plugin-soundness audit, closed here)
+    assert!(
+        !a.is_empty() && a.iter().any(|p| !p.text.is_empty()),
+        "good sample must produce at least one non-empty text part"
+    );
 
     // modality closed set (executable documentation; Rust enforces it)
     for part in &a {
@@ -382,6 +391,7 @@ mod tests {
     use super::super::embed::openai;
     use super::super::embed::ort;
     use super::super::extract::md::MdExtractor;
+    use super::super::extract::pdf_inspector::PdfInspectorExtractor;
     use super::super::extract::pdf_text;
     use super::super::extract::txt::TxtExtractor;
     use super::super::{Chunk, PipelineError};
@@ -410,6 +420,19 @@ mod tests {
         // char -> non-UTF-8 -> detectable truncation -> must Err
         let good = "# 标题\n\n汉字汉字汉字汉字汉字汉字汉字汉字";
         extractor_contract(&MdExtractor, (good.as_bytes(), "text/markdown"));
+    }
+
+    #[test]
+    fn pdf_inspector_passes_extractor_contract() {
+        // pure-Rust engine: no .so locator, nothing to fetch — the same
+        // suite, zero framework changes (the reuse claim, executed)
+        extractor_contract(
+            &PdfInspectorExtractor::new(),
+            (
+                super::super::extract::pdf_inspector::tests::HELLO_PDF_MINIMAL,
+                "application/pdf",
+            ),
+        );
     }
 
     #[test]

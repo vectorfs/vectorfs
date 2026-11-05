@@ -170,6 +170,19 @@ pdfium-render = { version = "0.9", default-features = false, features = [
   "pdfium_7881",
 ] }
 
+# pdf-inspector extractor: lopdf-based pure-Rust PDF detection/classification
+# + text/markdown extraction (firecrawl). Default feature set is EMPTY (see
+# the crate's [features] table) — the crate is a plain library with zero
+# optional heavy deps in this configuration; the optional features
+# (ocr/render-pdfium/ocr-oar pulling ort + oar-ocr + image, model-download
+# pulling ureq, python pulling pyo3) are all EXPLICITLY NOT enabled: they
+# would violate the §5.7 posture (no second ort copy, no network stack, no
+# python linkage). Runtime deps it does bring (lopdf 0.45 + regex/
+# ttf-parser/unicode-*) are all pure Rust — the kind therefore needs NO .so,
+# unlike pdf-text (pdfium): that zero-native-library property is the ops
+# differentiation of the kind. MIT.
+pdf-inspector = "1.25"
+
 # md extractor: CommonMark pull parser. default-features = false drops the
 # `html` push renderer and `getopts` (binary-only) — we consume the event
 # stream directly, so both are dead weight. MIT.
