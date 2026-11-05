@@ -17,10 +17,10 @@
 
 services:
   vectorfs:
-    # Replace <owner> with the GitHub repository owner (the CI workflow
-    # publishes ghcr.io/${repo}:version + :latest on v* tags). Local images:
-    # comment `image:` out and build with scripts/docker_build.sh.
-    image: ghcr.io/<owner>/vectorfs:latest
+    # Local image from scripts/docker_build.sh (built as vectorfs:local).
+    # CI publishes ghcr.io/vectorfs/vectorfs:version + :latest on v* tags —
+    # once a tag is pushed, switch to the ghcr image.
+    image: vectorfs:local
     ports:
       - "8787:8787"
     volumes:
@@ -55,7 +55,7 @@ services:
   # static credentials). The explicit `serve …` command bypasses first-boot
   # init entirely (entrypoint contract).
   vectorfs-emulator:
-    image: ghcr.io/<owner>/vectorfs:latest
+    image: vectorfs:local
     command: serve --backend memory --no-auth
     ports:
       - "8788:8787"
