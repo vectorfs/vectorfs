@@ -246,7 +246,25 @@ jobs:
             wait $VF_PID
           '
           trap 'docker kill vf-smoke >/dev/null 2>&1 || true' EXIT
-          sleep 2
+          # wait for the creds file, NOT a fixed sleep: the container must
+          # apt-install python3 (~10s+), vectorfs init, serve, and pass its
+          # healthz poll before the cp — the first v0.1.0 rerun lost exactly
+          # this race (sleep 2, then awk: no such file). If the container
+          # dies first, dump its log instead of timing out blind.
+          for i in $(seq 1 120); do
+            [[ -f dist/smoke-creds.toml ]] && break
+            if ! docker inspect -f '{{.State.Running}}' vf-smoke 2>/dev/null | grep -q true; then
+              echo "## vf-smoke container exited before publishing creds:" >&2
+              docker logs vf-smoke 2>&1 | tail -30 >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [[ ! -f dist/smoke-creds.toml ]]; then
+            echo "## creds never appeared after 120s; container log tail:" >&2
+            docker logs vf-smoke 2>&1 | tail -30 >&2 || true
+            exit 1
+          fi
           AK=$(awk -F"\"" "/^access_key_id/{print \$2}" dist/smoke-creds.toml)
           SK=$(awk -F"\"" "/^secret_access_key/{print \$2}" dist/smoke-creds.toml)
           pip install --quiet --user boto3
