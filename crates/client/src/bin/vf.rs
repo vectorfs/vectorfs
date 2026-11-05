@@ -3,10 +3,12 @@
 //! It never touches the engine/server modules (lancedb / the axum router) —
 //! the linker drops them, keeping this binary far smaller than `vectorfs`.
 //!
-//! Connection (附录E.4): `--endpoint` > `VF_ENDPOINT`; `--access-key`/
-//! `--secret-key` > `VF_ACCESS_KEY`/`VF_SECRET_KEY`. The daemon's own
-//! vectorfs.toml credentials are NOT auto-read (the client may be remote);
-//! the failure hints point at `vectorfs init`'s printed env snippet.
+//! Connection (附录E.4 + the 2026-11-05 config ruling): `--endpoint` >
+//! `VF_ENDPOINT` > `~/.config/vectorfs/config.toml` (same chain for the
+//! other knobs; `vf config init` writes that file, seeded from flags/env).
+//! The daemon's own vectorfs.toml credentials are NOT auto-read (the client
+//! may be remote); the failure hints point at `vectorfs init`'s printed env
+//! snippet.
 //! Signing rides the server's own SigV4 stack (sigv4::signer, service
 //! `s3vectors`); HTTP rides the TLS-capable embed leaf, so http and https
 //! endpoints both work.
@@ -79,11 +81,15 @@ enum Command {
     Reindex(ReindexArgs),
     /// /health + ingest status summary of the daemon
     Status(StatusArgs),
+    /// Manage `~/.config/vectorfs/config.toml` — the file layer of the
+    /// connection chain (flag > env > file)
+    Config(ConfigArgs),
 }
 
-/// Connection knobs shared by every verb (flag > env, client.rs). They ride
-/// the VERB (`vf put --endpoint …`, matching the M2-T1 `vf status
-/// --endpoint` convention) — env vars cover the scripting case.
+/// Connection knobs shared by every verb (flag > env > config.toml,
+/// client.rs / client config.rs). They ride the VERB (`vf put --endpoint …`,
+/// matching the M2-T1 `vf status --endpoint` convention) — env vars cover
+/// the scripting case, `vf config init` the interactive one.
 #[derive(Args, Debug)]
 struct CommonArgs {
     /// Daemon endpoint [env: VF_ENDPOINT]
@@ -321,6 +327,35 @@ struct StatusArgs {
     json: bool,
 }
 
+/// `vf config init` — write `~/.config/vectorfs/config.toml` (XDG-aware)
+/// seeded from the CommonArgs flags over the VF_* env (`vf config init` with
+/// VF_ENDPOINT exported bakes that endpoint in). Absent knobs land as
+/// commented placeholders. The file is 0600 (it carries the secret key) and
+/// an existing one is refused without --force.
+#[derive(Args, Debug)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    /// Create the config file from current flags/env (refuses to overwrite;
+    /// --force regenerates)
+    Init(ConfigInitArgs),
+}
+
+#[derive(Args, Debug)]
+struct ConfigInitArgs {
+    /// Seed values — the same knobs every verb takes (flag > env per knob)
+    #[command(flatten)]
+    common: CommonArgs,
+
+    /// Overwrite an existing config file
+    #[arg(long)]
+    force: bool,
+}
+
 #[tokio::main]
 async fn main() {
     match Cli::parse().command {
@@ -336,6 +371,9 @@ async fn main() {
         Command::Ls(args) => ls_cmd(args).await,
         Command::Reindex(args) => reindex_cmd(args).await,
         Command::Status(args) => status_cmd(args).await,
+        Command::Config(args) => match args.command {
+            ConfigCommand::Init(a) => config_init_cmd(a),
+        },
     }
 }
 
@@ -417,6 +455,27 @@ fn resolve_bucket_target(pos: Option<&str>, flag: Option<&str>, verb: &str) -> S
 /// Map a wire/transport failure to the structured triple and exit 1.
 fn die(e: CallError, endpoint: &str) -> ! {
     e.to_failure(endpoint).fail(false, 1)
+}
+
+// ---------------------------------------------------------------------------
+// config init
+// ---------------------------------------------------------------------------
+
+/// Write the config file (stdout = the path — the result; the next-step
+/// hint rides stderr with the other progress lines).
+fn config_init_cmd(args: ConfigInitArgs) {
+    let seeds = client::config::seed(
+        args.common.endpoint.clone(),
+        args.common.access_key.clone(),
+        args.common.secret_key.clone(),
+        args.common.region.clone(),
+    );
+    let path = client::config::init(&seeds, args.force).unwrap_or_else(|f| f.fail(false, 2));
+    println!("{}", path.display());
+    match seeds.endpoint {
+        Some(_) => eprintln!("connection knobs now resolve from the file; next: vf status"),
+        None => eprintln!("set `endpoint` in the file, then: vf status"),
+    }
 }
 
 // ---------------------------------------------------------------------------

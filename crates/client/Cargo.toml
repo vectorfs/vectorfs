@@ -26,6 +26,14 @@ vectorfs-common = { path = "../common", version = "0.1" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
+
+# config.toml (2026-11-05 用户裁决: ~/.config/vectorfs/config.toml + `vf
+# config init`): the third precedence layer under flag > env. Parser-only
+# additions (no engine/protocol deps — the small-client guarantee holds; vf
+# measured ~6 MiB against the 15 MiB size_guard line at the split, these add
+# well under 1 MiB release-prod).
+serde = { version = "1", features = ["derive"] }
+toml = "1"
 # the transport builds plain http::Request values around the shared leaf's
 # client (types only — the TLS/proxy machinery stays inside common).
 http = "1"
@@ -55,3 +63,5 @@ axum = { version = "0.8", default-features = false, features = [
 ] }
 # the decode half of the header-value round-trip test.
 percent-encoding = "2"
+# config.toml tests write throwaway files (dev-only — never in the binary).
+tempfile = "3"

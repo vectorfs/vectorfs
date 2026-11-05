@@ -226,6 +226,23 @@ fn vf(port: u16, args: &[&str], strip_creds: bool) -> Output {
     cmd.output().expect("run vf")
 }
 
+/// The config.toml layer's shape: vf with an ISOLATED HOME (so the config
+/// file lives under the test's tmp, and a developer's real one cannot leak
+/// in) and every VF_* var scrubbed — only flags and the file may carry
+/// connection state.
+fn vf_env_home(home: &Path, args: &[&str]) -> Output {
+    Command::new(vf_bin())
+        .args(args)
+        .env("HOME", home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("VF_ENDPOINT")
+        .env_remove("VF_ACCESS_KEY")
+        .env_remove("VF_SECRET_KEY")
+        .env_remove("VF_REGION")
+        .output()
+        .expect("run vf")
+}
+
 fn out(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
@@ -518,6 +535,56 @@ fn cli_full_command_smoke() {
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert!(out(&o).contains("health-only probe"), "{}", out(&o));
     assert!(out(&o).contains("health"), "{}", out(&o));
+
+    // ---- config.toml layer (2026-11-05 ruling): `vf config init` writes
+    // the file seeded from flags, a signed verb then resolves with NO
+    // flags and NO VF_* env (isolated HOME — the file is the ONLY
+    // connection state), and re-init without --force refuses ----
+    let cfg_home = work.join("cfg-home");
+    std::fs::create_dir_all(&cfg_home).unwrap();
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let o = vf_env_home(
+        &cfg_home,
+        &[
+            "config",
+            "init",
+            "--endpoint",
+            &endpoint,
+            "--access-key",
+            AK,
+            "--secret-key",
+            SK,
+        ],
+    );
+    assert!(
+        o.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        out(&o),
+        err(&o)
+    );
+    let cfg_path = cfg_home.join(".config/vectorfs/config.toml");
+    let cfg_text = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(
+        cfg_text.contains(&format!("endpoint = \"{endpoint}\"")),
+        "{cfg_text}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = cfg_path.metadata().unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "secret-bearing config must be 0600");
+    }
+    let o = vf_env_home(&cfg_home, &["sources", "list", "--bucket", "docs"]);
+    assert!(
+        o.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        out(&o),
+        err(&o)
+    );
+    assert!(out(&o).contains("fox.txt"), "{}", out(&o));
+    let o = vf_env_home(&cfg_home, &["config", "init"]);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(err(&o).contains("CONFIG_EXISTS"), "{}", err(&o));
 
     daemon.dump_log_tail("end of smoke (informational)");
 }

@@ -6603,8 +6603,11 @@ dependencies = [
  "http",
  "http-body-util",
  "percent-encoding",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "toml",
  "vectorfs-common",
 ]
 

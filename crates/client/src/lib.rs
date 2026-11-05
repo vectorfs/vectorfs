@@ -12,11 +12,12 @@
 //! ([`vectorfs_common::http`], aws-lc-rs rustls — local `http://` and remote
 //! `https://` endpoints both work).
 //!
-//! Connection resolution (appendix E.4): `--endpoint` > `VF_ENDPOINT`;
-//! `--access-key`/`--secret-key` > `VF_ACCESS_KEY`/`VF_SECRET_KEY`. The
-//! SERVER's vectorfs.toml credentials are deliberately NOT auto-read — the
-//! client may run on a different machine; the hint points at
-//! `vectorfs init`'s printed env snippet instead.
+//! Connection resolution (appendix E.4 + the 2026-11-05 config ruling):
+//! `--endpoint` > `VF_ENDPOINT` > `~/.config/vectorfs/config.toml`
+//! (same chain for the other knobs; [`config`] module, seeded by
+//! `vf config init`). The SERVER's vectorfs.toml credentials are
+//! deliberately NOT auto-read — the client may run on a different machine;
+//! the hint points at `vectorfs init`'s printed env snippet instead.
 //!
 //! Error contract (§5.8): every failure surfaces as a report::Failure
 //! `{code, message, hint}` — transport trouble as `ENDPOINT_UNREACHABLE`,
@@ -25,6 +26,8 @@
 use bytes::Bytes;
 use http_body_util::BodyExt as _;
 use http_body_util::Full;
+
+pub mod config;
 
 use vectorfs_common::http;
 use vectorfs_common::report::Failure;
@@ -108,47 +111,69 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// flag > env resolution for the four client knobs; every miss is a
-    /// structured usage failure (exit 2 at the call site).
+    /// flag > env > config.toml resolution for the four client knobs; every
+    /// miss is a structured usage failure (exit 2 at the call site). The
+    /// config layer is loaded ONCE here (a missing file or undeterminable
+    /// config dir is simply no layer; a PRESENT-but-broken file is a
+    /// usage failure — a typo must fail loudly, never silently never apply).
     pub fn resolve(
         endpoint: Option<String>,
         access_key: Option<String>,
         secret_key: Option<String>,
         region: Option<String>,
     ) -> Result<Connection, Failure> {
-        let endpoint = endpoint
-            .or_else(|| env_nonempty("VF_ENDPOINT"))
-            .ok_or_else(|| {
-                Failure::new(
-                    "NO_ENDPOINT",
-                    "no endpoint given and VF_ENDPOINT is unset",
-                    "pass --endpoint http://127.0.0.1:8787 (or export VF_ENDPOINT; the daemon \
-                     prints its endpoint at startup)",
-                )
-            })?;
-        let access_key = access_key
-            .or_else(|| env_nonempty("VF_ACCESS_KEY"))
-            .ok_or_else(|| {
-                Failure::new(
-                    "NO_CREDENTIALS",
-                    "no access key given and VF_ACCESS_KEY is unset",
-                    "pass --access-key (or export VF_ACCESS_KEY/VF_SECRET_KEY — the values are \
-                     printed by `vectorfs init` / stored in the daemon's vectorfs.toml)",
-                )
-            })?;
-        let secret_key = secret_key
-            .or_else(|| env_nonempty("VF_SECRET_KEY"))
-            .ok_or_else(|| {
-                Failure::new(
-                    "NO_CREDENTIALS",
-                    "no secret key given and VF_SECRET_KEY is unset",
-                    "pass --secret-key (or export VF_ACCESS_KEY/VF_SECRET_KEY — the values are \
-                     printed by `vectorfs init` / stored in the daemon's vectorfs.toml)",
-                )
-            })?;
-        let region = region
-            .or_else(|| env_nonempty("VF_REGION"))
-            .unwrap_or_else(|| "us-east-1".to_string());
+        let file = config::load()?;
+        // Option<&FileConfig> -> per-knob Option<String> (None file = no layer)
+        let from_file = |get: fn(&config::FileConfig) -> Option<&String>| {
+            file.as_ref().and_then(|f| get(f).cloned())
+        };
+        let endpoint = config::chain(
+            endpoint,
+            env_nonempty("VF_ENDPOINT"),
+            from_file(|f| f.endpoint.as_ref()),
+        )
+        .ok_or_else(|| {
+            Failure::new(
+                "NO_ENDPOINT",
+                "no endpoint given, VF_ENDPOINT is unset, and no config.toml carries one",
+                "pass --endpoint http://127.0.0.1:8787, export VF_ENDPOINT, or run \
+                 `vf config init` (the daemon prints its endpoint at startup)",
+            )
+        })?;
+        let access_key = config::chain(
+            access_key,
+            env_nonempty("VF_ACCESS_KEY"),
+            from_file(|f| f.access_key.as_ref()),
+        )
+        .ok_or_else(|| {
+            Failure::new(
+                "NO_CREDENTIALS",
+                "no access key given, VF_ACCESS_KEY is unset, and no config.toml carries one",
+                "pass --access-key (or export VF_ACCESS_KEY/VF_SECRET_KEY, or `vf config init`) \
+                 — the values are printed by `vectorfs init` / stored in the daemon's \
+                 vectorfs.toml",
+            )
+        })?;
+        let secret_key = config::chain(
+            secret_key,
+            env_nonempty("VF_SECRET_KEY"),
+            from_file(|f| f.secret_key.as_ref()),
+        )
+        .ok_or_else(|| {
+            Failure::new(
+                "NO_CREDENTIALS",
+                "no secret key given, VF_SECRET_KEY is unset, and no config.toml carries one",
+                "pass --secret-key (or export VF_ACCESS_KEY/VF_SECRET_KEY, or `vf config init`) \
+                 — the values are printed by `vectorfs init` / stored in the daemon's \
+                 vectorfs.toml",
+            )
+        })?;
+        let region = config::chain(
+            region,
+            env_nonempty("VF_REGION"),
+            from_file(|f| f.region.as_ref()),
+        )
+        .unwrap_or_else(|| "us-east-1".to_string());
 
         let (endpoint, authority) = parse_endpoint(endpoint)?;
         Ok(Connection {
@@ -171,15 +196,20 @@ impl Connection {
     /// present (the daemon's credentials live in the data volume's
     /// vectorfs.toml, not the probe's environment; §5.10.7).
     pub fn resolve_probe(endpoint: Option<String>) -> Result<Connection, Failure> {
-        let endpoint = endpoint
-            .or_else(|| env_nonempty("VF_ENDPOINT"))
-            .ok_or_else(|| {
-                Failure::new(
-                    "NO_ENDPOINT",
-                    "no endpoint given and VF_ENDPOINT is unset",
-                    "pass --endpoint http://127.0.0.1:8787 (or export VF_ENDPOINT)",
-                )
-            })?;
+        let file = config::load()?;
+        let endpoint = config::chain(
+            endpoint,
+            env_nonempty("VF_ENDPOINT"),
+            file.as_ref().and_then(|f| f.endpoint.clone()),
+        )
+        .ok_or_else(|| {
+            Failure::new(
+                "NO_ENDPOINT",
+                "no endpoint given, VF_ENDPOINT is unset, and no config.toml carries one",
+                "pass --endpoint http://127.0.0.1:8787 (or export VF_ENDPOINT, or `vf config \
+                 init`)",
+            )
+        })?;
         let (endpoint, authority) = parse_endpoint(endpoint)?;
         Ok(Connection {
             endpoint,
