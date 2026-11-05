@@ -25,7 +25,23 @@
 
 ## Five-minute quickstart
 
-Download a release tarball for Linux x86_64/aarch64 from
+Install the `vf` CLI (default `~/.local/bin`; checksum-verified against the
+release's `sha256sums.txt`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vectorfs/vectorfs/main/scripts/install-cli.sh | bash
+# or: install-cli.sh --with-server   (also installs the `vectorfs` daemon binary)
+# or: install-cli.sh --version v0.1.0 --to /usr/local/bin
+```
+
+Then configure once — `vf config init` writes `~/.config/vectorfs/config.toml`
+(connection knobs resolve `--flag` > `VF_*` env > that file):
+
+```bash
+vf config init --endpoint http://127.0.0.1:8787 --access-key <AK> --secret-key <SK>
+```
+
+Manually: download a release tarball for Linux x86_64/aarch64 from
 [Releases](https://github.com/vectorfs/vectorfs/releases) (published on `v*` tags with
 `sha256sums.txt`; contains `vectorfs` + `vf`), or build from source (Rust 1.94+,
 C toolchain, cmake, protoc):
