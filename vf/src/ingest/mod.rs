@@ -25,6 +25,34 @@
 //! list, not a conditional/DAG (§5.10.8 stands); the decision core is the
 //! pure [`pick_from_chain`].
 //!
+//! ## Smart routing (M2.1 step 2: probe → affinity → route)
+//!
+//! Pure order has two blind spots: a MIS-ORDERED chain is a quality
+//! accident waiting to happen (an OCR-first chain would OCR native text —
+//! strictly worse output the chain then accepts), and members discover
+//! their suitability only by burning an attempt. Step 2 adds three
+//! MECHANISM stages, zero config surface (§5.10.8 still stands — no
+//! routing table, no conditionals in config; the config-ordered chain
+//! itself remains the correctness backstop):
+//!
+//! 1. **probe** — [`pipeline::probe::probe`] classifies the bytes into a
+//!    [`ContentClass`] before any extractor runs (pdf family only; probe
+//!    errors read as Unknown so cross-parser recovery survives).
+//! 2. **affinity** — each kind DECLARES its fit per class
+//!    ([`Extractor::affinity`](crate::pipeline::Extractor::affinity));
+//!    class-level and static, never a knob.
+//! 3. **route** — the pure [`route`] below: first Preferred in config
+//!    order, else first Capable, else all-refuse ⇒ the file FAILED with an
+//!    aggregate reason (more informative than running everyone and
+//!    failing). Routing only decides WHO RUNS FIRST — a routed member that
+//!    still yields falls back to the remaining members in config order, so
+//!    the chain remains the correctness兜底 and every M2.1 chain semantic
+//!    (yield-on-Err/empty, first-win, single-member passthrough) is
+//!    preserved. Routing is mechanism, not configuration: it does NOT
+//!    enter the pipeline fingerprint (code-version drift semantics are
+//!    §5.10.5's existing stance), and single-member chains skip the probe
+//!    entirely (`members.len() > 1` is the zero-cost gate).
+//!
 //! # Execution model (§5.10.5)
 //!
 //! One SCHEDULER task per instance root: periodic scan (`scan_interval_secs`,
@@ -75,7 +103,9 @@ use crate::pipeline::extract::{
     pdf_text::{PdfTextConfig, PdfTextTag},
     txt::{TxtConfig, TxtTag},
 };
-use crate::pipeline::{Chunk, Chunker, Embedder, Extractor, Merge, Modality, Part, PipelineError};
+use crate::pipeline::{
+    Chunk, Chunker, ContentClass, Embedder, Extractor, Fit, Merge, Modality, Part, PipelineError,
+};
 use crate::store::{SourceMarker, SourceStatus, Storage};
 
 use domain::DerivedSpec;
@@ -294,7 +324,8 @@ fn inner_message(e: &PipelineError) -> String {
 ///   to the next member".
 /// * the FIRST win ends the chain and its Parts are THE result (no
 ///   cross-member merging — a merged Frankenstein document is worse than
-///   either engine's honest output).
+///   either engine's honest output); the winner's NAME rides along for the
+///   progress line (`INDEXED via {name}`).
 /// * full exhaustion fails the chain: the message aggregates every
 ///   member's yield reason as `{mime短键} chain [{a→b}]: {a}: {ra}; {b}: {rb}`
 ///   so the fail-loud contract survives (a blank/scanned PDF with no OCR
@@ -303,16 +334,18 @@ fn inner_message(e: &PipelineError) -> String {
 ///   member's own message through verbatim — the wrapper describes a
 ///   chain, and there is nothing to describe with one member; this also
 ///   keeps every existing failure message byte-stable.
-fn pick_from_chain<I>(short_key: &str, members: I) -> Result<Vec<Part>, PipelineError>
+fn pick_from_chain<I>(short_key: &str, members: I) -> Result<(String, Vec<Part>), PipelineError>
 where
     I: IntoIterator<Item = (String, Result<Vec<Part>, PipelineError>)>,
 {
     let mut names: Vec<String> = Vec::new();
     let mut reasons: Vec<String> = Vec::new();
     for (name, outcome) in members {
-        names.push(name);
+        names.push(name.clone());
         match outcome {
-            Ok(parts) if has_extracted_content(&parts) => return Ok(parts),
+            Ok(parts) if has_extracted_content(&parts) => {
+                return Ok((name, parts));
+            }
             Ok(_) => reasons.push(
                 "produced no extractable content (empty output — refusing to index \
                      nothing)"
@@ -338,6 +371,110 @@ where
         names.join("→"),
         aggregate.join("; ")
     )))
+}
+
+// ---------------------------------------------------------------------------
+// M2.1 step 2: probe → affinity → route (pure decision core)
+// ---------------------------------------------------------------------------
+
+/// What the router decided for one chain against one (possibly unknown)
+/// content class. `Run`/`Order` carry the MEMBER INDICES to try, in try
+/// order; `Refused` carries the aggregate refusal message (the file FAILED
+/// without anyone executing — more informative than running the whole chain
+/// into guaranteed failures).
+#[derive(Debug, PartialEq)]
+enum Routing {
+    /// A member was selected by affinity (Preferred, else first Capable):
+    /// run it FIRST, then the remaining members in CONFIG order as the
+    /// correctness backstop (a routed member that still yields falls back
+    /// exactly like the linear chain).
+    Run(usize),
+    /// Unknown class (no probe for the family, or the probe itself could
+    /// not parse the bytes): the full chain in config order — the pure
+    /// M2.1 semantics, cross-parser recovery intact.
+    Order(Vec<usize>),
+    /// Every member declares [`Fit::Refuses`] for the probed class: nobody
+    /// runs; the message names the class and every member's refusal reason.
+    Refused(String),
+}
+
+/// The routing decision core (M2.1 step 2). Pure, deterministic, and
+/// unit-tested below; the worker supplies the chain (config order) and the
+/// probe's class verdict.
+///
+/// Deterministic pass structure over the CONFIG order (a list scan, not an
+/// engine — §5.10.8's ban stands):
+///
+/// * `class = None` ⇒ [`Routing::Order`] with every member, config order —
+///   bit-for-bit the pre-routing chain semantics.
+/// * `class = Some(c)` ⇒ pass 1 takes the FIRST member whose affinity is
+///   [`Fit::Preferred`] (config order is the tie-break: two equally-right
+///   tools resolve to the one the operator listed first); pass 2 (no
+///   Preferred anywhere) takes the FIRST [`Fit::Capable`]; all-Refuses ⇒
+///   [`Routing::Refused`] with the aggregate reason.
+///
+/// NOTE: routing accelerates and protects quality; it does not REPLACE the
+/// chain. [`Routing::Run`] only reorders who is tried first — see
+/// [`chain_try_order`].
+fn route(
+    short_key: &str,
+    members: &[(String, ExtractorKind)],
+    class: Option<ContentClass>,
+) -> Routing {
+    let Some(class) = class else {
+        return Routing::Order((0..members.len()).collect());
+    };
+    if let Some(i) = members
+        .iter()
+        .position(|(_, kind)| kind.affinity(class) == Fit::Preferred)
+    {
+        return Routing::Run(i);
+    }
+    if let Some(i) = members
+        .iter()
+        .position(|(_, kind)| kind.affinity(class) == Fit::Capable)
+    {
+        return Routing::Run(i);
+    }
+    // everyone refuses: say so WITHOUT executing anyone — the class names
+    // the content, each member's declaration says why it will not serve it,
+    // and the remedy names the missing capability (the M3 OCR kind).
+    let refusals: Vec<String> = members
+        .iter()
+        .map(|(name, kind)| format!("{name} refuses ({})", kind.refusal_note(class)))
+        .collect();
+    Routing::Refused(format!(
+        "{short_key} class={class}: {} — add an OCR-capable extractor to this chain \
+         (the planned pdf-ocr kind, M3)",
+        refusals.join("; ")
+    ))
+}
+
+/// The EXECUTION order a routing verdict implies: the routed member first,
+/// then every remaining member in config order (they are the correctness
+/// backstop — a Refuses-class member still runs there if the routed member
+/// yields, because its extract-time behavior, not its class declaration,
+/// is the last word on cross-parser recovery).
+fn chain_try_order(len: usize, routing: &Routing) -> Vec<usize> {
+    match routing {
+        Routing::Run(i) => {
+            let mut order = vec![*i];
+            order.extend((0..len).filter(|j| j != i));
+            order
+        }
+        Routing::Order(order) => order.clone(),
+        // Refused never executes anyone; an empty order makes the (unused)
+        // chain walk a trivial exhaustion instead of a panic.
+        Routing::Refused(_) => Vec::new(),
+    }
+}
+
+/// What the extract segment reports upward for the progress line: the
+/// member that actually WON and the probe class, present only when routing
+/// engaged (multi-member chain + a class verdict).
+struct RouteNote {
+    winner: String,
+    class: ContentClass,
 }
 
 // ---------------------------------------------------------------------------
@@ -923,6 +1060,9 @@ impl IngestRuntime {
 
         // ---- attempts ----
         let mut cached_chunks: Option<Vec<Chunk>> = None;
+        // routing trace of the (first) successful extract segment — rides
+        // the same lifecycle as cached_chunks: set once, read at completion
+        let mut route_note: Option<RouteNote> = None;
         let mut succeeded: BTreeSet<String> = BTreeSet::new();
         let mut last_err = String::new();
         let mut parked: Option<String> = None;
@@ -930,7 +1070,14 @@ impl IngestRuntime {
         loop {
             attempts += 1;
             match self
-                .try_attempt(job, plan, &bytes, &mut cached_chunks, &mut succeeded)
+                .try_attempt(
+                    job,
+                    plan,
+                    &bytes,
+                    &mut cached_chunks,
+                    &mut route_note,
+                    &mut succeeded,
+                )
                 .await
             {
                 Ok(()) => {
@@ -963,6 +1110,12 @@ impl IngestRuntime {
                 hash,
                 chunks: chunks_map,
                 retries: attempts - 1,
+                // progress-line routing note, present only when the probe
+                // actually engaged (multi-member chain + class verdict):
+                // "plain (class=mixed-text-scan)"
+                via: route_note
+                    .take()
+                    .map(|n| format!("{} (class={})", n.winner, n.class)),
             }
         } else if !succeeded.is_empty() {
             let failed: Vec<&str> = plan
@@ -996,6 +1149,7 @@ impl IngestRuntime {
         plan: &BucketPlan,
         bytes: &Bytes,
         cached: &mut Option<Vec<Chunk>>,
+        note: &mut Option<RouteNote>,
         succeeded: &mut BTreeSet<String>,
     ) -> Result<(), AttemptErr> {
         // ---- extract + chunk (CPU segment) ----
@@ -1027,15 +1181,64 @@ impl IngestRuntime {
                     .map_err(|e| AttemptErr::Fail(format!("cpu semaphore closed: {e}")))?;
                 let mut work = tokio::task::spawn_blocking(move || {
                     let _hold = permit;
-                    // M2.1: the whole chain runs inside THIS one CPU
-                    // segment, members strictly in order, no concurrency.
-                    // The member iterator is lazy — pick_from_chain stops
-                    // pulling at the first winner, so members after it
-                    // never execute.
-                    let members = chain
-                        .iter()
-                        .map(|(name, kind)| (name.clone(), kind.extract(&bytes, &mime)));
-                    pick_from_chain(&short_key, members).and_then(|parts| chunker.chunk(&parts))
+                    // M2.1 step 2 (probe → affinity → route) and the chain
+                    // run together inside THIS one CPU segment, no
+                    // concurrency:
+                    //
+                    // * probe: multi-member chains only (`chain.len() > 1`
+                    //   is the zero-cost gate — a single member has nothing
+                    //   to route, so the probe never even runs and its
+                    //   byte-stable messages stay untouched); a probe that
+                    //   cannot parse the bytes yields Unknown.
+                    // * route: the pure affinity scan; all-Refuses parks the
+                    //   file WITHOUT executing any extractor (a
+                    //   deterministic dead end — retrying cannot change a
+                    //   class verdict, and the aggregate reason is more
+                    //   informative than a chain of guaranteed failures).
+                    // * Run/Order: the routed member runs FIRST, every
+                    //   remaining member keeps config order as the
+                    //   correctness backstop; the member iterator stays
+                    //   lazy — nothing after the winner executes.
+                    let class = if chain.len() > 1 {
+                        crate::pipeline::probe::probe(&short_key, &bytes)
+                    } else {
+                        None
+                    };
+                    let routing = route(&short_key, &chain, class);
+                    if let Routing::Refused(reason) = routing {
+                        return Err(AttemptErr::Parked(reason));
+                    }
+                    let members = chain_try_order(chain.len(), &routing).into_iter().map(|i| {
+                        let (name, kind) = &chain[i];
+                        (name.clone(), kind.extract(&bytes, &mime))
+                    });
+                    pick_from_chain(&short_key, members)
+                        .map_err(|e| {
+                            // observability: the exhaustion aggregate names
+                            // the class when the probe engaged (Unknown-class
+                            // and single-member messages stay byte-stable —
+                            // no verdict, no annotation)
+                            match (class, e) {
+                                (Some(c), PipelineError::Extract(m)) => {
+                                    AttemptErr::Fail(format!("{m} (class={c})"))
+                                }
+                                (_, e) => AttemptErr::Fail(e.to_string()),
+                            }
+                        })
+                        .and_then(|(winner, parts)| {
+                            chunker
+                                .chunk(&parts)
+                                .map(|chunks| (winner, chunks))
+                                .map_err(|e| AttemptErr::Fail(e.to_string()))
+                        })
+                        .map(|(winner, chunks)| {
+                            // the note exists only when routing engaged
+                            let traced = class.map(|c| RouteNote { winner, class: c });
+                            match traced {
+                                Some(t) => (Some(t), chunks),
+                                None => (None, chunks),
+                            }
+                        })
                 });
                 // wall-clock cap around the extract call (§5.10.5 poison
                 // guard). On timeout the handle is ABORTED (not dropped:
@@ -1052,13 +1255,14 @@ impl IngestRuntime {
                         )));
                     }
                 };
-                // joined: Result<Result<Vec<Chunk>, PipelineError>, JoinError>
-                // (timeout layer already unwrapped by the match above)
-                let chunks: Vec<Chunk> = match joined {
-                    Ok(Ok(c)) => c,
-                    Ok(Err(e)) => return Err(AttemptErr::Fail(e.to_string())),
+                // joined: Result<Result<(Option<RouteNote>, Vec<Chunk>),
+                // AttemptErr>, JoinError> (timeout layer already unwrapped)
+                let (traced, chunks): (Option<RouteNote>, Vec<Chunk>) = match joined {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => return Err(e),
                     Err(e) => return Err(AttemptErr::Fail(format!("extract task panicked: {e}"))),
                 };
+                *note = traced;
                 *cached = Some(chunks);
                 cached.as_deref().expect("just stored")
             }
@@ -1187,6 +1391,7 @@ impl IngestRuntime {
                 hash,
                 chunks,
                 retries,
+                via,
             } => {
                 m.status = SourceStatus::Indexed;
                 m.etag_sig = sig;
@@ -1196,14 +1401,24 @@ impl IngestRuntime {
                 m.retries_exhausted = false;
                 m.status_reason = None;
                 m.pipeline_fingerprint = self.shared.core.buckets[&job.vb].fingerprint.clone();
-                eprintln!(
-                    "ingest: {} -> INDEXED (chunks={})",
-                    job.object_key,
-                    m.chunks
-                        .as_ref()
-                        .and_then(|c| c.get("text").copied())
-                        .unwrap_or(0)
-                );
+                let count = m
+                    .chunks
+                    .as_ref()
+                    .and_then(|c| c.get("text").copied())
+                    .unwrap_or(0);
+                match via {
+                    // routing engaged: name the member that won and the
+                    // probed class it won under (M2.1 step 2 observability)
+                    Some(v) => {
+                        eprintln!(
+                            "ingest: {} -> INDEXED via {v} (chunks={count})",
+                            job.object_key
+                        )
+                    }
+                    // no probe verdict (single-member chain / Unknown):
+                    // the pre-routing line, byte-stable
+                    None => eprintln!("ingest: {} -> INDEXED (chunks={count})", job.object_key),
+                }
             }
             Outcome::Partial {
                 sig,
@@ -1276,6 +1491,11 @@ enum Outcome {
         hash: String,
         chunks: Option<BTreeMap<String, u32>>,
         retries: u32,
+        /// Routing trace for the progress line — `"{winner} (class={c})"`,
+        /// present only when the probe engaged (M2.1 step 2). NOT marker
+        /// state: statusReason stays None on success; this is stderr-only
+        /// observability.
+        via: Option<String>,
     },
     Partial {
         sig: String,
@@ -2996,8 +3216,12 @@ pub(crate) mod tests {
         ]
         .into_iter()
         .inspect(|_| pulled += 1);
-        let parts = pick_from_chain("txt", members).expect("first member wins");
+        let (winner, parts) = pick_from_chain("txt", members).expect("first member wins");
         assert_eq!(parts, vec![Part::text("winner content")]);
+        assert_eq!(
+            winner, "first",
+            "the winner's name rides along (progress line)"
+        );
         assert_eq!(pulled, 1, "the chain advanced past the winner");
     }
 
@@ -3011,10 +3235,9 @@ pub(crate) mod tests {
             ),
             ("b".to_string(), Ok(vec![Part::text("b wins")])),
         ];
-        assert_eq!(
-            pick_from_chain("txt", members).expect("b wins"),
-            vec![Part::text("b wins")]
-        );
+        let (winner, parts) = pick_from_chain("txt", members).expect("b wins");
+        assert_eq!(parts, vec![Part::text("b wins")]);
+        assert_eq!(winner, "b");
         // ...and so does every empty shape of Ok (no Parts, empty text,
         // whitespace-only text — the same "nothing" bar the kinds' own
         // refusals use)
@@ -3027,11 +3250,10 @@ pub(crate) mod tests {
                 ("a".to_string(), Ok(empty.clone())),
                 ("b".to_string(), Ok(vec![Part::text("b wins")])),
             ];
-            assert_eq!(
-                pick_from_chain("txt", members)
-                    .unwrap_or_else(|e| panic!("empty shape {empty:?} must yield: {e}")),
-                vec![Part::text("b wins")]
-            );
+            let (winner, parts) = pick_from_chain("txt", members)
+                .unwrap_or_else(|e| panic!("empty shape {empty:?} must yield: {e}"));
+            assert_eq!(parts, vec![Part::text("b wins")]);
+            assert_eq!(winner, "b");
         }
     }
 
@@ -3089,7 +3311,9 @@ pub(crate) mod tests {
                 Extractor::extract(&insp, HELLO_PDF, "application/pdf"),
             ),
         ];
-        assert_eq!(pick_from_chain("pdf", members).unwrap(), direct);
+        let (winner, parts) = pick_from_chain("pdf", members).unwrap();
+        assert_eq!(parts, direct);
+        assert_eq!(winner, "plain");
     }
 
     /// tiny-embedder pipeline with a parameterized `pdf` extract route over
@@ -3108,17 +3332,22 @@ pub(crate) mod tests {
         crate::pipeline::config::load_pipeline_config(&text).unwrap()
     }
 
-    /// THE cross-parser recovery run (golden-corpus-adjacent, real engines):
-    /// the mixed text+image PDF is content pdf-inspector cannot honestly
-    /// serve (one page needs OCR — its classification Err is the yield
-    /// signal) while pdfium still extracts the text page. The chain hands
-    /// it over: [insp, plain] INDEXED where the single-member insp route
-    /// stays FAILED. "Cannot handle it" goes to the member that can.
+    /// THE cross-parser recovery run (golden-corpus-adjacent, real engines),
+    /// now under M2.1 step 2 routing: the mixed text+image PDF probes
+    /// mixed-text-scan, pdf-inspector REFUSES that class (its classification
+    /// gate) while pdf-text is Capable — the router selects plain directly,
+    /// the inspector never executes, and the file INDEXES where the
+    /// single-member insp route stays FAILED. Pre-routing this same file
+    /// recovered by the inspector's Err yielding (same winner, one wasted
+    /// extraction); routing reaches it without the wasted attempt — and the
+    /// stderr line names the routing ("INDEXED via plain (class=...)"; run
+    /// with --nocapture to see it).
     #[tokio::test]
     async fn chain_recovers_across_parsers_where_the_first_member_yields() {
         let bytes = crate::pipeline::extract::pdf_inspector::tests::mixed_text_image_pdf();
 
-        // (1) chain ["insp", "plain"]: inspector yields, pdf-text wins
+        // (1) chain ["insp", "plain"]: mixed class routes to plain (Capable;
+        // insp refuses) — INDEXED via the pdfium half of the divergence
         let dir = tempfile::tempdir().unwrap();
         let docs = dir.path().join("docs");
         std::fs::create_dir_all(&docs).unwrap();
@@ -3142,8 +3371,28 @@ pub(crate) mod tests {
             chunks
         );
 
-        // (2) the SAME bytes under the single-member "insp" route: FAILED,
-        // fail-loud intact (no relay configured), reason verbatim
+        // (1b) the REVERSED chain over a TEXT-NATIVE PDF: both members are
+        // Preferred for text-native, the tie resolves to CONFIG ORDER —
+        // [plain, insp] runs plain first, [insp, plain] runs insp first
+        // (pinned precisely at the router in the route unit tests); the
+        // file indexes either way.
+        let dir_tb = tempfile::tempdir().unwrap();
+        let docs_tb = dir_tb.path().join("docs");
+        std::fs::create_dir_all(&docs_tb).unwrap();
+        std::fs::write(docs_tb.join("hello.pdf"), HELLO_PDF).unwrap();
+        let (rt_tb, _h_tb, state_tb) =
+            runtime_for(dir_tb.path(), &pdf_route_config("[\"plain\", \"insp\"]")).await;
+        rt_tb.scan_once().await;
+        rt_tb.drain_queue().await;
+        assert_eq!(
+            status_of(&state_tb, "docs", "docs/hello.pdf").await.status,
+            SourceStatus::Indexed
+        );
+
+        // (2) the SAME mixed bytes under the single-member "insp" route:
+        // FAILED, fail-loud intact (no relay configured), reason verbatim —
+        // and NO routing vocabulary: a single member never probes
+        // (members.len() > 1 gate), so no class annotation, no wrapper
         let dir2 = tempfile::tempdir().unwrap();
         let docs2 = dir2.path().join("docs");
         std::fs::create_dir_all(&docs2).unwrap();
@@ -3160,14 +3409,61 @@ pub(crate) mod tests {
             !reason.contains("chain"),
             "one member, no wrapper: {reason}"
         );
+        assert!(
+            !reason.contains("class=") && !reason.contains("refuses ("),
+            "single-member chains never probe/route: {reason}"
+        );
     }
 
-    /// Full exhaustion (image-only PDF: BOTH members yield — inspector
-    /// classifies it scanned, pdfium finds no text either): the file is
-    /// FAILED with every member's reason on record. A blank/scanned PDF
-    /// with no OCR relay stays a visible failure, not a silent nothing.
+    /// Full exhaustion on the UNKNOWN-class path (M2.1 chain semantics,
+    /// byte-stable): corrupt bytes defeat the probe itself (detect errs ⇒
+    /// Unknown ⇒ full config order), then BOTH members genuinely run and
+    /// yield — the file FAILED with every member's reason on record and no
+    /// routing vocabulary anywhere in the message.
     #[tokio::test]
     async fn chain_exhausted_failed_lists_every_member_reason() {
+        let mut corrupt = b"%PDF-1.7\n".to_vec();
+        corrupt.extend_from_slice(&[0x00, 0xff, 0x13, 0x37, 0xde, 0xad, 0xbe, 0xef]);
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("corrupt.pdf"), &corrupt).unwrap();
+        let (rt, _h, state) =
+            runtime_for(dir.path(), &pdf_route_config("[\"insp\", \"plain\"]")).await;
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let m = status_of(&state, "docs", "docs/corrupt.pdf").await;
+        assert_eq!(m.status, SourceStatus::Failed);
+        assert!(m.retries_exhausted);
+        let reason = m.status_reason.expect("reason");
+        assert!(reason.contains("pdf chain [insp→plain]"), "{reason}");
+        assert!(reason.contains("insp: "), "{reason}");
+        assert!(reason.contains("plain: "), "{reason}");
+        // Unknown class: no annotation — the pre-routing aggregate verbatim
+        assert!(!reason.contains("class="), "{reason}");
+        // nothing was indexed — the derived index was never even created
+        let spec = &rt.shared.core.buckets["docs"].derived["tiny"];
+        assert!(
+            state
+                .storage
+                .load_index("docs", &spec.index_name)
+                .await
+                .unwrap()
+                .is_none(),
+            "a fully-exhausted chain must not create or write any index"
+        );
+    }
+
+    /// The all-Refuses terminal (M2.1 step 2): an image-only PDF probes
+    /// scan-dominant and NO member of ["insp", "plain"] will serve it (the
+    /// inspector's classification gate; pdf-text has no text layer to
+    /// read). Nobody executes — the file parks immediately with the
+    /// aggregate routing reason naming the class, every member's refusal,
+    /// and the missing capability. More informative than running the chain
+    /// into two guaranteed failures (the pre-routing behavior for the same
+    /// file was the chain-exhaustion aggregate above's shape).
+    #[tokio::test]
+    async fn routing_all_refuse_parks_without_executing_any_member() {
         let dir = tempfile::tempdir().unwrap();
         let docs = dir.path().join("docs");
         std::fs::create_dir_all(&docs).unwrap();
@@ -3182,14 +3478,17 @@ pub(crate) mod tests {
         rt.drain_queue().await;
         let m = status_of(&state, "docs", "docs/scan.pdf").await;
         assert_eq!(m.status, SourceStatus::Failed);
-        assert!(m.retries_exhausted);
+        assert!(m.retries_exhausted, "all-refuse is a deterministic park");
         let reason = m.status_reason.expect("reason");
-        assert!(reason.contains("pdf chain [insp→plain]"), "{reason}");
-        assert!(reason.contains("insp: "), "{reason}");
-        assert!(reason.contains("scanned"), "{reason}");
-        assert!(reason.contains("plain: "), "{reason}");
-        assert!(reason.contains("no extractable text"), "{reason}");
-        // nothing was indexed — the derived index was never even created
+        assert!(reason.contains("pdf class=scan-dominant"), "{reason}");
+        assert!(reason.contains("insp refuses ("), "{reason}");
+        assert!(reason.contains("plain refuses ("), "{reason}");
+        assert!(reason.contains("OCR"), "{reason}");
+        assert!(
+            reason.contains("add an OCR-capable extractor"),
+            "the remedy must name the missing capability: {reason}"
+        );
+        // nothing was indexed — no member ever ran, no index was touched
         let spec = &rt.shared.core.buckets["docs"].derived["tiny"];
         assert!(
             state
@@ -3198,7 +3497,133 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
                 .is_none(),
-            "a fully-exhausted chain must not create or write any index"
+            "an all-refusing chain must not create or write any index"
         );
+    }
+
+    // ---- M2.1 step 2: the pure router (probe → affinity → route) ----------
+
+    /// A two-PDF-kind chain, config order parameterized (inspector first,
+    /// pdf-text second).
+    fn pdf_members(first: &str, second: &str) -> Vec<(String, ExtractorKind)> {
+        vec![
+            (first.to_string(), kind_of("t", "kind = \"pdf-inspector\"")),
+            (second.to_string(), kind_of("t", "kind = \"pdf-text\"")),
+        ]
+    }
+
+    #[test]
+    fn route_takes_first_preferred_with_config_order_tie_break() {
+        // text-native: BOTH pdf kinds are Preferred — whichever sits FIRST
+        // in config order wins the tie (the operator's order is the
+        // tie-break, exactly like the linear chain it degenerates to)
+        let insp_first = pdf_members("insp", "plain");
+        assert_eq!(
+            route("pdf", &insp_first, Some(ContentClass::TextNative)),
+            Routing::Run(0)
+        );
+        // the REVERSED config (plain first) also routes to ITS first
+        // member — the choice follows config order, not kind identity
+        // (this is what proves the tie rule, not a lucky fixed order)
+        let plain_first = vec![
+            ("plain".to_string(), kind_of("t", "kind = \"pdf-text\"")),
+            ("insp".to_string(), kind_of("t", "kind = \"pdf-inspector\"")),
+        ];
+        assert_eq!(
+            route("pdf", &plain_first, Some(ContentClass::TextNative)),
+            Routing::Run(0)
+        );
+    }
+
+    #[test]
+    fn route_falls_back_to_first_capable_when_no_preferred() {
+        // mixed-text-scan: insp refuses, plain is Capable ⇒ plain is
+        // selected even though it sits SECOND in config order — the
+        // mis-order quality protection this step exists for
+        let members = pdf_members("insp", "plain");
+        assert_eq!(
+            route("pdf", &members, Some(ContentClass::MixedTextScan)),
+            Routing::Run(1)
+        );
+        // scan-dominant: everyone refuses
+        assert!(matches!(
+            route("pdf", &members, Some(ContentClass::ScanDominant)),
+            Routing::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn route_unknown_class_is_the_full_config_order() {
+        // Unknown (no probe verdict): pure M2.1 semantics, every member in
+        // config order
+        let members = pdf_members("insp", "plain");
+        assert_eq!(route("pdf", &members, None), Routing::Order(vec![0, 1]));
+    }
+
+    #[test]
+    fn route_all_refuse_message_names_class_members_and_remedy() {
+        let members = pdf_members("insp", "plain");
+        let Routing::Refused(reason) = route("pdf", &members, Some(ContentClass::ScanDominant))
+        else {
+            panic!("scan-dominant must be refused by both members");
+        };
+        assert!(reason.starts_with("pdf class=scan-dominant:"), "{reason}");
+        assert!(
+            reason.contains("insp refuses (its whole-document"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("plain refuses (a scan has no text layer"),
+            "{reason}"
+        );
+        assert!(reason.contains("add an OCR-capable extractor"), "{reason}");
+    }
+
+    #[test]
+    fn chain_try_order_routes_first_then_config_order_tail() {
+        // Run(i): the routed member first, everyone else in CONFIG order —
+        // the tail IS the linear chain (cross-parser backstop: a member
+        // that refuses the class still runs there if the routed member
+        // yields, because its extract-time behavior is the last word)
+        assert_eq!(chain_try_order(3, &Routing::Run(1)), vec![1, 0, 2]);
+        assert_eq!(chain_try_order(2, &Routing::Run(0)), vec![0, 1]);
+        // Order: verbatim
+        assert_eq!(chain_try_order(2, &Routing::Order(vec![0, 1])), vec![0, 1]);
+        // Refused: nobody executes
+        assert_eq!(
+            chain_try_order(2, &Routing::Refused("x".into())),
+            Vec::<usize>::new()
+        );
+    }
+
+    /// Backward compatibility of the affinity DEFAULT (the mechanism that
+    /// keeps every pre-declaration implementation — contract kinds, future
+    /// third-party kinds — chain-compatible): an implementation that does
+    /// not override [`Extractor::affinity`] is Capable for every class, so
+    /// routing degenerates to pure config order: no Preferred exists (pass
+    /// 1 finds nothing), the first Capable is member 0, and Run(0)'s try
+    /// order IS the config order (pinned in chain_try_order above). The
+    /// default itself is pinned in pipeline::tests.
+    #[test]
+    fn undeclared_affinity_degenerates_routing_to_pure_config_order() {
+        struct Undeclared;
+        impl Extractor for Undeclared {
+            fn extract(&self, _: &[u8], _: &str) -> Result<Vec<Part>, PipelineError> {
+                unreachable!("affinity-only test double")
+            }
+            // NO affinity override: the trait default is the test subject
+        }
+        for class in [
+            ContentClass::TextNative,
+            ContentClass::ScanDominant,
+            ContentClass::MixedTextScan,
+            ContentClass::NoText,
+        ] {
+            assert_eq!(Undeclared.affinity(class), Fit::Capable, "{class}");
+        }
+        // ...and all-Capable ⇒ first-Capable = index 0 ⇒ [0, 1, …]: the
+        // member sequence equals the config order (Run(0) over n members,
+        // pinned by chain_try_order(Run(0)) == config order)
+        assert_eq!(chain_try_order(2, &Routing::Run(0)), vec![0, 1]);
     }
 }

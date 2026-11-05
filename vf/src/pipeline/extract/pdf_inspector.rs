@@ -67,7 +67,7 @@
 
 use pdf_inspector::{PdfType, detect_pdf_mem, process_pdf_mem};
 
-use super::{Extractor, Modality, Part, PipelineError};
+use super::{ContentClass, Extractor, Fit, Modality, Part, PipelineError};
 
 /// Guidance line every OCR-gate error carries: the reason is a
 /// pdf-inspector OCR-reason constant VALUE (`scanned`,
@@ -197,6 +197,36 @@ impl Extractor for PdfInspectorExtractor {
 }
 
 // ---------------------------------------------------------------------------
+// affinity (M2.1 step 2): the kind's class-level routing declaration
+// ---------------------------------------------------------------------------
+
+/// Class-level affinity (see [`super::super::Extractor::affinity`]): this
+/// kind's whole-document classification gate accepts exactly text-native
+/// documents — any page needing OCR refuses the DOCUMENT (the gate's existing
+/// stance since it landed, now machine-readable for the router). Static and
+/// knob-independent: `markdown = true` changes output flavor, never routing.
+pub fn affinity(class: super::ContentClass) -> super::Fit {
+    match class {
+        ContentClass::TextNative => Fit::Preferred,
+        _ => Fit::Refuses,
+    }
+}
+
+/// One-line reason the router quotes when this kind Refuses a class (the
+/// all-refuse aggregate message; only called on the Refuses arm of
+/// [`affinity`]).
+pub fn refusal_note(class: super::ContentClass) -> String {
+    match class {
+        ContentClass::TextNative => {
+            unreachable!("TextNative is Preferred, never refused: {class}")
+        }
+        _ => "its whole-document classification gate refuses any PDF with a \
+              page needing OCR"
+            .to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // tests — pure Rust engine, no .so locator needed (the operational contrast
 // with pdf_text.rs's extractor_or_panic is the point).
 // ---------------------------------------------------------------------------
@@ -212,7 +242,8 @@ pub(crate) mod tests {
     /// Minimal single-page PDF whose page carries NO text and NO image (an
     /// empty content stream): the detector classifies it Scanned with the
     /// `no_text` OCR reason (probed) — the in-test stand-in for a scan.
-    fn no_text_page_pdf() -> Vec<u8> {
+    /// `pub(crate)`: the M2.1 probe tests reuse it as the NoText specimen.
+    pub(crate) fn no_text_page_pdf() -> Vec<u8> {
         build_pdf(&[b"<< /Length 0 >>\nstream\n\nendstream".to_vec()])
     }
 
@@ -311,6 +342,55 @@ pub(crate) mod tests {
         let c2 = b"q 612 0 0 792 0 0 cm /Im0 Do Q\n";
         // objects: 1 catalog, 2 pages, 3 font, 4 image, then (page,
         // contents) pairs 5..8
+        let bodies: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [5 0 R 7 0 R] /Count 2 >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            {
+                let mut v = format!(
+                    "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace \
+                     /DeviceRGB /BitsPerComponent 8 /Length {} >>\nstream\n",
+                    img.len()
+                )
+                .into_bytes();
+                v.extend_from_slice(img);
+                v.extend_from_slice(b"\nendstream");
+                v
+            },
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << \
+              /F1 3 0 R >> >> /Contents 6 0 R >>"
+                .to_vec(),
+            format!(
+                "<< /Length {} >>\nstream\n{}endstream",
+                c1.len(),
+                String::from_utf8_lossy(c1)
+            )
+            .into_bytes(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << \
+              /Im0 4 0 R >> >> /Contents 8 0 R >>"
+                .to_vec(),
+            format!(
+                "<< /Length {} >>\nstream\n{}endstream",
+                c2.len(),
+                String::from_utf8_lossy(c2)
+            )
+            .into_bytes(),
+        ];
+        assemble(&bodies)
+    }
+
+    /// Text-HEAVY page 1 (five Tj ops — above the classifier's per-page
+    /// text-op threshold) + image-only page 2: the detector names this shape
+    /// `Mixed` with only page 2 flagged (probed 2026-11-05), where the
+    /// single-op [`mixed_text_image_pdf`] lands `ImageBased` with both pages
+    /// flagged. `pub(crate)`: the M2.1 probe tests assert both shapes map to
+    /// the same MixedTextScan class.
+    pub(crate) fn text_heavy_mixed_pdf() -> Vec<u8> {
+        let img: &[u8] = &[0x80, 0x80, 0x80];
+        let c1 = b"BT /F1 12 Tf 72 720 Td (line one of real text) Tj 0 -16 Td (line two of \
+              real text) Tj 0 -16 Td (line three of real text) Tj 0 -16 Td (line four of real \
+              text) Tj 0 -16 Td (line five of real text) Tj ET\n";
+        let c2 = b"q 612 0 0 792 0 0 cm /Im0 Do Q\n";
         let bodies: Vec<Vec<u8>> = vec![
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [5 0 R 7 0 R] /Count 2 >>".to_vec(),
@@ -484,6 +564,19 @@ pub(crate) mod tests {
             .extract(b"plain text, no magic", "application/pdf")
             .unwrap_err();
         assert!(err.to_string().contains("cannot classify"), "{err}");
+    }
+
+    #[test]
+    fn affinity_declares_the_classification_gate() {
+        assert_eq!(affinity(ContentClass::TextNative), Fit::Preferred);
+        for class in [
+            ContentClass::ScanDominant,
+            ContentClass::MixedTextScan,
+            ContentClass::NoText,
+        ] {
+            assert_eq!(affinity(class), Fit::Refuses, "{class}");
+            assert!(!refusal_note(class).is_empty(), "{class}");
+        }
     }
 
     #[test]

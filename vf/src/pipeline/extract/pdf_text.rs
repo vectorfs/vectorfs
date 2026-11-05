@@ -61,7 +61,7 @@ use std::sync::OnceLock;
 
 use pdfium_render::prelude::*;
 
-use super::{Extractor, Modality, Part, PipelineError};
+use super::{ContentClass, Extractor, Fit, Modality, Part, PipelineError};
 
 /// Guidance line shared by the runtime bind error and the test locator so
 /// both point at the same fix (library file name is platform-dependent:
@@ -218,6 +218,42 @@ impl Extractor for PdfTextExtractor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// affinity (M2.1 step 2): the kind's class-level routing declaration
+// ---------------------------------------------------------------------------
+
+/// Class-level affinity (see [`super::super::Extractor::affinity`]):
+/// * text-native documents are this kind's exact use case — `Preferred`;
+/// * mixed text+scan documents stay `Capable` — pdfium extracts the text
+///   pages (partial output), which IS this kind's M2.1 chain behavior; an
+///   OCR member routed first would still beat it via Preferred, an
+///   inspector member refuses the class outright;
+/// * scans and no-text documents are `Refuses`: pdfium would find nothing
+///   (its own "no extractable text" refusal), so declaring it spares the
+///   attempt and lets the router fail the file with a class-accurate reason.
+///
+/// Static and knob-independent (this kind has no knobs; the library source
+/// is deployment state, never routing).
+pub fn affinity(class: super::ContentClass) -> super::Fit {
+    match class {
+        ContentClass::TextNative => Fit::Preferred,
+        ContentClass::MixedTextScan => Fit::Capable,
+        ContentClass::ScanDominant | ContentClass::NoText => Fit::Refuses,
+    }
+}
+
+/// One-line reason the router quotes when this kind Refuses a class (only
+/// called on the Refuses arm of [`affinity`]).
+pub fn refusal_note(class: super::ContentClass) -> String {
+    match class {
+        ContentClass::ScanDominant => {
+            "a scan has no text layer to extract — OCR territory".to_string()
+        }
+        ContentClass::NoText => "the document has no text layer at all".to_string(),
+        other => unreachable!("pdf-text is {other:?}, never refuses it"),
+    }
+}
+
 /// Per-kind config struct: `pdf-text` has no knobs in M2 (the .so location
 /// is environment/deployment state, §5.10.7, not pipeline policy — it must
 /// not change chunk identity, so it does not belong in the fingerprint).
@@ -302,6 +338,16 @@ pub(crate) mod tests {
         };
         let err = x.extract(&corrupt, "application/pdf").unwrap_err();
         assert!(matches!(err, PipelineError::Extract(_)), "{err}");
+    }
+
+    #[test]
+    fn affinity_declares_text_extraction_territory() {
+        assert_eq!(affinity(ContentClass::TextNative), Fit::Preferred);
+        assert_eq!(affinity(ContentClass::MixedTextScan), Fit::Capable);
+        for class in [ContentClass::ScanDominant, ContentClass::NoText] {
+            assert_eq!(affinity(class), Fit::Refuses, "{class}");
+            assert!(!refusal_note(class).is_empty(), "{class}");
+        }
     }
 
     #[test]

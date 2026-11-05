@@ -18,7 +18,7 @@
 
 use pulldown_cmark::{Event, Parser, TagEnd};
 
-use super::{Extractor, Modality, Part, PipelineError};
+use super::{ContentClass, Extractor, Fit, Modality, Part, PipelineError};
 
 /// Runtime instance (configless — the kind has no knobs).
 #[derive(Debug, Clone, Copy, Default)]
@@ -37,6 +37,29 @@ pub struct MdConfig {
 pub enum MdTag {
     #[serde(rename = "md")]
     Md,
+}
+
+// ---------------------------------------------------------------------------
+// affinity (M2.1 step 2): the kind's class-level routing declaration
+// ---------------------------------------------------------------------------
+
+/// Class-level affinity (see [`super::super::Extractor::affinity`]): a
+/// markdown SOURCE is text-native by construction — decoding IS the
+/// classification, no probe exists for the md family, so no other class can
+/// ever reach it. The Refuses arms exist for completeness of the closed
+/// vocabulary (a hypothetical cross-family chain route): the router would
+/// skip this member rather than feed it bytes it cannot honestly serve.
+pub fn affinity(class: super::ContentClass) -> super::Fit {
+    match class {
+        ContentClass::TextNative => Fit::Preferred,
+        _ => Fit::Refuses,
+    }
+}
+
+/// One-line reason the router quotes when this kind Refuses a class (only
+/// called on the Refuses arm of [`affinity`]).
+pub fn refusal_note(_class: super::ContentClass) -> String {
+    "a text-family kind: only text-native content is its input".to_string()
 }
 
 /// Block-level closers that terminate the current output LINE. Everything
@@ -192,6 +215,19 @@ mod tests {
             .extract(&[0xff, 0xfe], "text/markdown")
             .unwrap_err();
         assert!(err.to_string().contains("UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn affinity_is_text_native_only() {
+        assert_eq!(affinity(ContentClass::TextNative), Fit::Preferred);
+        for class in [
+            ContentClass::ScanDominant,
+            ContentClass::MixedTextScan,
+            ContentClass::NoText,
+        ] {
+            assert_eq!(affinity(class), Fit::Refuses, "{class}");
+        }
+        assert!(!refusal_note(ContentClass::ScanDominant).is_empty());
     }
 
     #[test]

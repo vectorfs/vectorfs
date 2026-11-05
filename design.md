@@ -31,6 +31,7 @@
 | 默认模型裁决（2026-11-04） | M2 文本默认 = **gte-multilingual-base**（305M、Apache-2.0、中文良好、下载轻——实用性审查 P1-5 采纳）；bge-m3 一行换（更强、1.1GB）。覆盖 multimodal 报告头部所述"bge-m3 已定"的时点快照 | 报告不回改；本行为准 |
 | pdf-inspector kind 增补（2026-11-05，用户裁决） | 新增第四个 M2 extractor kind `pdf-inspector`（firecrawl/pdf-inspector 1.25，MIT，纯 Rust lopdf 系），**双重目的**：PDF 提取的免 .so 替选（扫描件分类 fail-loud + markdown 选项）+ 插件体系"第三方准入"实测。**auto 映射不漂移**（pdf→pdf-text 仍默认——pdfium 是久经考验路径，新增项不改变既有语义）。体积代价 +6.4MiB（159→166MiB，硬顶 175 余 9MiB）——M3 图像模态（image 编解码器）落地前须做**体积专项裁决**（feature 门控 kind / 拆 bin / 接受扩线）。审计结论"体系基本完善"与缺口清单记 §10.8 续 | 零核心改动即接入成功（两段式/枚举/contract/DIP 全复用）；contract 框架据审计补非空文本断言 |
 | **Extractor 回退链（2026-11-05，用户裁决）** | `extract` 的每 mime 短键值从单实例名扩为**有序线性链**（字符串或数组形）：按序尝试，Err 或空产出 ⇒ 退让到下一成员，首个非空 Ok 胜出（不跨成员合并），全链耗尽 ⇒ FAILED 聚合各成员原因。**§5.10.8 禁令继续有效**——线性列表不是分支/条件/DAG（与 embedders 列表即 fan-out 同构）；内容路由智能住在 kind 内部（pdf-inspector 的分类 Err 即退让信号），机制层零路由引擎。**trait/contract 零改动**（链是 ingest 编排层机制）。指纹含链组成与序（`"x" ≡ ["x"]` 等价、序变即变）。`auto` 不动（M3 pdf-ocr 落地时再裁决是否升为内建链）。多值语义按产物性质分：extractor 多值 = 回退链（首个胜），embedder 多值 = fan-out（全写） | 实证：混合文字+图片页 PDF，链 `[pdf-inspector, pdf-text]` INDEXED、单 pdf-inspector FAILED——"不能处理交给能处理的"成立；任务书原设想的截断恢复差异样本经实测不存在（两引擎截断行为一致），已换真实差异样本 |
+| **Extractor 智能路由（2026-11-05，用户裁决「再好好设计」）** | M2.1 第二步：链前加**三段机制**（probe → affinity → route），全部进代码，**零配置面增长**（§5.10.8 红线不越——无条件表达式/DAG/配置路由表；配置路由表方案已否决）。(1) **ContentClass** 封闭枚举（text-native/scan-dominant/mixed-text-scan/no-text，pipeline/mod.rs，与 Modality 同居，可跨族加值）；(2) **Fit 三级封闭词汇** + `Extractor::affinity(class)` **带默认 Capable**（未声明 kind 永不 Refuse ⇒ 路由退化为纯链序，向后兼容，trait/contract 套件不破）；kind 各自模块声明类级 fit（配置旋钮不改变路由）；(3) **probe**（`pipeline/probe.rs`，pdf 族调 pdf-inspector detect，probe Err ⇒ None=Unknown——保住跨解析器恢复；其他族 None）；(4) **route** 纯函数：配置序首个 Preferred（tie 按配置序）⇒ 否则首个 Capable ⇒ 全 Refuse ⇒ FAILED 聚合拒绝原因（不执行任何成员）。**路由只决定先跑谁**：选定成员 Err/空产出仍按链退让到剩余成员（配置序）——路由是加速与质量防护，链是正确性兜底；单成员链不跑 probe（`members.len() > 1` 零开销门）；路由不进指纹（机制非配置，§5.10.5 漂移语义覆盖）；成功 stderr 行 `INDEXED via {成员} (class=…)`，失败聚合含 class | 实测映射（pdf-inspector 1.25.2）：TextBased→text-native；Scanned→scan-dominant；**ImageBased→mixed-text-scan**（提交的混合样本单 Tj 页实测落 ImageBased 且 pdfium 可提其文字页——设计稿的 Scanned/ImageBased→scan-dominant 若照抄会退化为全拒，已按实测修正）；Mixed→mixed-text-scan；全页 `no_text` ⇒ no-text；损坏 ⇒ Unknown。实证：混合样本 + 链 `[insp, plain]` ⇒ `INDEXED via plain (class=mixed-text-scan)`（inspector 不执行）；image-only + 同链 ⇒ `pdf class=scan-dominant: insp refuses (…); plain refuses (…) — add an OCR-capable extractor`；两 Preferred 并存（text-native 的两 PDF kind）⇒ 配置序首个胜 |
 
 ## 1. 定位
 
@@ -293,7 +294,7 @@ vf CLI ──HTTP/SigV4──►┐    AWS SDK / MCP 客户端
 
 | 轴 | 侧 | 契约（v2.1 修正签名） | 内建 kind（按里程碑标注） |
 |---|---|---|---|
-| Extractor | 摄取 | `{bytes, mime} → Vec<Part(模态)>`；按 mime 配置、可多选 | pdf-text / md / txt（M2）；pdf-inspector（M2.1 增补 2026-11-05，见 §0：纯 Rust lopdf 系、扫描件分类 fail-loud、markdown 输出选项——插件体系验证试金石，auto 默认不漂移仍 pdf-text）；pdf-pages(dpi) / pdf-ocr(lang) / docx / html / image（M3）；audio(分段/VAD) / video(解复用→帧+音轨+可选 ASR)（M4） |
+| Extractor | 摄取 | `{bytes, mime} → Vec<Part(模态)>` + `affinity(ContentClass) → Fit{Preferred,Capable,Refuses}`（默认 Capable，未声明即纯链序）；按 mime 配置有序链（多成员先 probe→route，§5.10.3/§0 智能路由裁决） | pdf-text / md / txt（M2）；pdf-inspector（M2.1 增补 2026-11-05，见 §0：纯 Rust lopdf 系、扫描件分类 fail-loud、markdown 输出选项——插件体系验证试金石，auto 默认不漂移仍 pdf-text）；pdf-pages(dpi) / pdf-ocr(lang) / docx / html / image（M3）；audio(分段/VAD) / video(解复用→帧+音轨+可选 ASR)（M4） |
 | Chunker | 摄取，仅 text 模态（图像类原子入索引） | `&[TextPart] → Vec<Chunk>`；模态分派在机制层 | token-window(size, overlap)（M2）；markdown（M3） |
 | Embedder | 摄取+查询 | `embed_query(Query) → Vec<f32>`（`Query = enum {Text, Image, Audio}`）+ `embed_documents(&[Chunk])`；声明 {dim, doc/query 模态}；ort dim 启动探测、openai dim 配置声明（不出网探测） | ort / openai（M2）；qwen3vl 统一评估（M3）；clap 声学（M4）；远端视频（Nova/TwelveLabs）作 provider 扩展 |
 | Reranker（M3） | 查询 | `query × candidates → scored` | cross-encoder |
@@ -310,8 +311,11 @@ contract test 最低断言（四轴各一份 + 查询选项；LSP 防线 + 未�
 #### 5.10.3 数据流（固定机制）
 
 ```
-ingest: Source → extractor 链（按 mime 短键取有序链：按序尝试，Err/空产出 ⇒
-        退让下一成员，首个非空 Ok 胜出；auto = 内置 mime→kind 单射）
+ingest: Source → extractor 链（按 mime 短键取有序链；多成员时先 probe 内容分类
+        → 按各 kind 的 affinity 声明路由：配置序首个 Preferred ⇒ 首个 Capable
+        ⇒ 全拒即 FAILED 聚合原因；选定成员 Err/空产出仍按链退让——
+        路由是加速与质量防护，链是正确性兜底；分类未知/单成员 = 纯链序；
+        auto = 内置 mime→kind 单射）
         → Parts → 每模态路由到全部 doc-模态匹配的 embedder
         → chunker（仅 text 模态）→ embed → 分批 put_vectors(x-vf-src-*)
 query: 输入 → query 模态匹配的各 embedder → embed_query → 各查各 index（filter 可带）

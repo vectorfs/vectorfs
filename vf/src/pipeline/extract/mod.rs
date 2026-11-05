@@ -7,6 +7,10 @@
 //! `pdf-text`, `md`, `pdf-inspector` (the first kind added AFTER the M2
 //! set — the closed-set mechanism's first live exercise; two PDF kinds
 //! coexist behind the one `pdf` short key, selection is explicit).
+//! Since M2.1 step 2 every kind also declares its per-[`ContentClass`]
+//! affinity (kind module `affinity`/`refusal_note` free functions, dispatched
+//! exhaustively below) — the ingest router consumes those declarations to
+//! order extract chains by content class.
 //!
 //! # mime <-> short-key table (T4)
 //!
@@ -20,7 +24,7 @@ pub mod pdf_inspector;
 pub mod pdf_text;
 pub mod txt;
 
-use super::{Extractor, Modality, Part, PipelineError};
+use super::{ContentClass, Extractor, Fit, Modality, Part, PipelineError};
 use md::{MdConfig, MdExtractor};
 use pdf_inspector::{PdfInspectorConfig, PdfInspectorExtractor};
 use pdf_text::{PdfTextConfig, PdfTextExtractor};
@@ -172,6 +176,38 @@ impl Extractor for ExtractorKind {
             }
         }
     }
+
+    /// Affinity dispatch (M2.1 step 2): each arm delegates to its kind
+    /// module's class-level declaration — a NEW variant lands here with the
+    /// compiler walking it (same discipline as `output_modalities`), so a
+    /// kind cannot be routed without declaring its fit. The declarations are
+    /// free functions in the kind modules because affinity is CLASS-level:
+    /// no instance state participates (the pdf-text arm deliberately does
+    /// NOT construct an extractor — library resolution is deployment state,
+    /// routing must not touch it).
+    fn affinity(&self, class: ContentClass) -> Fit {
+        match self {
+            ExtractorKind::Txt(_) => txt::affinity(class),
+            ExtractorKind::PdfText(_) => pdf_text::affinity(class),
+            ExtractorKind::Md(_) => md::affinity(class),
+            ExtractorKind::PdfInspector(_) => pdf_inspector::affinity(class),
+        }
+    }
+}
+
+impl ExtractorKind {
+    /// One-line reason the ingest router quotes when this kind Refuses a
+    /// probed class (the all-refuse aggregate message). Dispatches to the
+    /// kind modules' declarations next to [`affinity`](Extractor::affinity);
+    /// callers only invoke it on Refuses verdicts.
+    pub fn refusal_note(&self, class: ContentClass) -> String {
+        match self {
+            ExtractorKind::Txt(_) => txt::refusal_note(class),
+            ExtractorKind::PdfText(_) => pdf_text::refusal_note(class),
+            ExtractorKind::Md(_) => md::refusal_note(class),
+            ExtractorKind::PdfInspector(_) => pdf_inspector::refusal_note(class),
+        }
+    }
 }
 
 /// Fingerprint-facing serialization: the INNER config only — the kind tag is
@@ -244,6 +280,59 @@ mod tests {
             // fingerprints serialize flat: inner config only
             assert_eq!(toml::to_string(&k).unwrap().trim(), *canonical);
         }
+    }
+
+    #[test]
+    fn affinity_dispatch_reaches_every_kind_declaration() {
+        // the enum delegates to the kind modules' class-level declarations —
+        // spot-check one discriminating cell per kind (the full matrices are
+        // pinned in each kind module's own tests)
+        let kind = |s: &str| {
+            let raw: toml::Value = toml::from_str(&format!("kind = \"{s}\"")).unwrap();
+            ExtractorKind::from_config("extractor.x", &raw, None).unwrap()
+        };
+        let pdf_text = kind("pdf-text");
+        assert_eq!(
+            Extractor::affinity(&pdf_text, ContentClass::TextNative),
+            Fit::Preferred
+        );
+        assert_eq!(
+            Extractor::affinity(&pdf_text, ContentClass::MixedTextScan),
+            Fit::Capable
+        );
+        assert_eq!(
+            Extractor::affinity(&pdf_text, ContentClass::ScanDominant),
+            Fit::Refuses
+        );
+        // inspector: text-native preferred, everything else refused
+        let insp = kind("pdf-inspector");
+        assert_eq!(
+            Extractor::affinity(&insp, ContentClass::TextNative),
+            Fit::Preferred
+        );
+        assert_eq!(
+            Extractor::affinity(&insp, ContentClass::MixedTextScan),
+            Fit::Refuses
+        );
+        // text family: text-native preferred only
+        for s in ["txt", "md"] {
+            let k = kind(s);
+            assert_eq!(
+                Extractor::affinity(&k, ContentClass::TextNative),
+                Fit::Preferred
+            );
+            assert_eq!(Extractor::affinity(&k, ContentClass::NoText), Fit::Refuses);
+        }
+        // refusal notes exist for every refusing cell (the router quotes them)
+        assert!(
+            pdf_text
+                .refusal_note(ContentClass::ScanDominant)
+                .contains("OCR")
+        );
+        assert!(
+            insp.refusal_note(ContentClass::ScanDominant)
+                .contains("classification gate")
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@
 //!   mime↔short-key mapping that ingest's `auto` resolves through lives in
 //!   that one table.
 
-use super::{Extractor, Modality, Part, PipelineError};
+use super::{ContentClass, Extractor, Fit, Modality, Part, PipelineError};
 
 /// Runtime instance (configless — the kind has no knobs).
 #[derive(Debug, Clone, Copy, Default)]
@@ -36,6 +36,27 @@ pub struct TxtConfig {
 pub enum TxtTag {
     #[serde(rename = "txt")]
     Txt,
+}
+
+// ---------------------------------------------------------------------------
+// affinity (M2.1 step 2): the kind's class-level routing declaration
+// ---------------------------------------------------------------------------
+
+/// Class-level affinity (see [`super::super::Extractor::affinity`]): a txt
+/// SOURCE is text-native by construction — decoding IS the classification,
+/// no probe exists for the txt family, so no other class can ever reach it.
+/// The Refuses arms exist for completeness of the closed vocabulary.
+pub fn affinity(class: super::ContentClass) -> super::Fit {
+    match class {
+        ContentClass::TextNative => Fit::Preferred,
+        _ => Fit::Refuses,
+    }
+}
+
+/// One-line reason the router quotes when this kind Refuses a class (only
+/// called on the Refuses arm of [`affinity`]).
+pub fn refusal_note(_class: super::ContentClass) -> String {
+    "a text-family kind: only text-native content is its input".to_string()
 }
 
 impl Extractor for TxtExtractor {
@@ -112,6 +133,19 @@ mod tests {
                 .contains("cannot handle mime 'application/pdf'"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn affinity_is_text_native_only() {
+        assert_eq!(affinity(ContentClass::TextNative), Fit::Preferred);
+        for class in [
+            ContentClass::ScanDominant,
+            ContentClass::MixedTextScan,
+            ContentClass::NoText,
+        ] {
+            assert_eq!(affinity(class), Fit::Refuses, "{class}");
+        }
+        assert!(!refusal_note(ContentClass::ScanDominant).is_empty());
     }
 
     #[test]

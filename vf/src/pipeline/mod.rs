@@ -6,6 +6,17 @@
 //! the ORCHESTRATION is fixed mechanism in code, the POLICY (which kinds,
 //! which parameters) is TOML (§5.10.0 axiom 1).
 //!
+//! # Content routing (M2.1 step 2: probe → affinity → route)
+//!
+//! Extract chains run in three MECHANISM stages, zero config surface:
+//! [`probe::probe`] classifies the bytes into a [`ContentClass`] (pdf family
+//! only today; other families read as Unknown), kinds declare their [`Fit`]
+//! per class ([`Extractor::affinity`]), and the ingest worker's pure router
+//! turns member affinities into a try order — the config-ordered chain stays
+//! the correctness backstop (a routed member that still yields falls back to
+//! the remaining members), while mis-ORDERED chains can no longer put a
+//! quality-inferior member first for content a later member serves exactly.
+//!
 //! # Registration model (§5.10.2, Rust form, v2.1)
 //!
 //! * **Config layer, two-stage**: first read the `kind` STRING from an
@@ -45,6 +56,7 @@ pub mod contract;
 pub mod embed;
 pub mod extract;
 pub mod models;
+pub mod probe;
 
 use std::collections::BTreeMap;
 
@@ -67,6 +79,60 @@ impl std::fmt::Display for Modality {
             Modality::Text => f.write_str("text"),
         }
     }
+}
+
+/// Content CLASS of one source's bytes (M2.1 step 2: probe → affinity →
+/// route): what the bytes ARE, family-agnostic — the same vocabulary serves
+/// the pdf family today and the image family in M3.
+///
+/// Lives beside [`Modality`] with the same "increment adds values"哲学:
+/// modality says what a Part CARRIES, class says what the SOURCE bytes
+/// contain. The ingest worker's classification PROBE ([`probe::probe`])
+/// derives it; extractor kinds declare their [`Fit`] for it via
+/// [`Extractor::affinity`]; the router ([`crate::ingest`]'s `route`) turns
+/// the two into a try order. Closed enum, kebab-case Display, zero config
+/// surface (§5.10.8 stands: this is mechanism, not a routing table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ContentClass {
+    /// A real text layer: extraction is a decode, quality is exact.
+    TextNative,
+    /// Raster scans dominate; a text extractor has nothing honest to read —
+    /// OCR territory.
+    ScanDominant,
+    /// Text pages and scan/image pages coexist: a text extractor is CAPABLE
+    /// (partial output — today's pdfium behavior on such documents) but not
+    /// the best possible answer (OCR on the scan pages would add more).
+    MixedTextScan,
+    /// No text and no scan payload at all (blank pages): nothing to extract
+    /// and nothing to OCR.
+    NoText,
+}
+
+impl std::fmt::Display for ContentClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            ContentClass::TextNative => f.write_str("text-native"),
+            ContentClass::ScanDominant => f.write_str("scan-dominant"),
+            ContentClass::MixedTextScan => f.write_str("mixed-text-scan"),
+            ContentClass::NoText => f.write_str("no-text"),
+        }
+    }
+}
+
+/// How well an extractor kind serves a [`ContentClass`] — the three-level
+/// closed vocabulary kinds declare (see [`Extractor::affinity`]) and the
+/// ingest router consumes: first `Preferred` wins, else first `Capable`,
+/// else the chain is `Refused` outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// The right tool: exact, preferred output for this class.
+    Preferred,
+    /// Can serve it honestly (partial/degraded-but-real output); chosen only
+    /// when no member is `Preferred`.
+    Capable,
+    /// Will not serve this class at all — running it would Err or, worse,
+    /// produce quality-inferior output the chain would then ACCEPT.
+    Refuses,
 }
 
 /// One extracted payload. M2 carries text only; the struct grows image/audio
@@ -195,6 +261,30 @@ impl From<std::io::Error> for PipelineError {
 /// ceremony every kind would immediately wrap away.
 pub trait Extractor: Send + Sync {
     fn extract(&self, bytes: &[u8], mime: &str) -> Result<Vec<Part>, PipelineError>;
+
+    /// Class-level AFFINITY declaration (M2.1 step 2): how well this kind
+    /// serves a probed [`ContentClass`]. The ingest router consumes it to
+    /// order an extract chain (first `Preferred`, else first `Capable`;
+    /// all-`Refuses` fails the file with an aggregate reason instead of
+    /// running anyone).
+    ///
+    /// * **Class-level, not instance-level**: the declaration is a property
+    ///   of the KIND's core semantics — config knobs (e.g. pdf-inspector's
+    ///   `markdown`) never change routing, which is why the signature takes
+    ///   no `&self` state beyond the kind itself and returns a static,
+    ///   stateless verdict.
+    /// * **Default `Capable`** for every class: an implementation that does
+    ///   not declare affinity can never `Refuse`, so under a known class the
+    ///   router picks it exactly where config order would have — routing
+    ///   degenerates to the pure M2.1 linear chain (backward compatible by
+    ///   construction; contract suites and future kinds need no change).
+    fn affinity(&self, class: ContentClass) -> Fit {
+        // deliberately silence the unused-parameter lint IN the default (an
+        // undeclared kind is Capable for every class); overriding kinds match
+        // on the class.
+        let _ = class;
+        Fit::Capable
+    }
 }
 
 /// `&[Part] -> Vec<Chunk>`: split extracted payloads into embeddable chunks.
@@ -396,6 +486,38 @@ mod tests {
         let err = Merge::parse("weighted").unwrap_err();
         assert!(err.contains("unknown merge strategy 'weighted'"), "{err}");
         assert!(err.contains("M3"), "{err}");
+    }
+
+    #[test]
+    fn content_class_and_fit_vocabulary() {
+        // kebab-case Display (progress lines + statusReason quote these)
+        let all = [
+            (ContentClass::TextNative, "text-native"),
+            (ContentClass::ScanDominant, "scan-dominant"),
+            (ContentClass::MixedTextScan, "mixed-text-scan"),
+            (ContentClass::NoText, "no-text"),
+        ];
+        for (c, s) in all {
+            assert_eq!(c.to_string(), s);
+        }
+        // the fit vocabulary is three-level and closed (router relies on
+        // exactly these three verdicts)
+        assert_ne!(Fit::Preferred, Fit::Capable);
+        assert_ne!(Fit::Capable, Fit::Refuses);
+        assert_ne!(Fit::Preferred, Fit::Refuses);
+        // the trait DEFAULT is Capable for every class — the backward-compat
+        // degeneration (an undeclared kind never refuses, routing collapses
+        // to config order); pinned again with a local implementation in the
+        // ingest router tests.
+        struct Undeclared;
+        impl Extractor for Undeclared {
+            fn extract(&self, _: &[u8], _: &str) -> Result<Vec<Part>, PipelineError> {
+                unreachable!("affinity-only test double")
+            }
+        }
+        for (c, _) in all {
+            assert_eq!(Undeclared.affinity(c), Fit::Capable, "{c}");
+        }
     }
 
     #[test]
