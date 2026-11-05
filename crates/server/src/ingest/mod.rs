@@ -1299,6 +1299,15 @@ impl IngestRuntime {
     }
 
     async fn enqueue(&self, job: Job) {
+        // reindex quiesce barrier: a reindex pass is draining this bucket's
+        // jobs before its clear+flip section — taking NEW work now would
+        // both extend its wait and race its flip. Refuse: the flip turns
+        // everything PENDING anyway, and the reindex's trailing wake
+        // re-covers every refused source on the very next scan (unchanged
+        // signature + PENDING is the scanner's own Enqueue case).
+        if self.shared.reindex_barrier_held(&job.vb) {
+            return;
+        }
         let k = job.dedup_key();
         if !self.shared.inflight().lock().unwrap().insert(k.clone()) {
             return; // already queued or in flight
@@ -2173,6 +2182,14 @@ pub struct IngestShared {
     /// Shared with the reindex path: a source a worker owns right now is
     /// skipped by the flip (its current-config result is already valid).
     inflight: std::sync::Mutex<HashSet<String>>,
+    /// The reindex QUIESCE BARRIER (job-level serialization, 2026-11-05 —
+    /// closes the §10.8 "reindex vs in-flight worker" debt): while a bucket
+    /// is held here, `enqueue` refuses its new jobs and a running
+    /// [`reindex_bucket`] waits for its in-flight jobs to drain before the
+    /// clear+flip section. This is what moves reindex from "skip whatever
+    /// is in flight RIGHT NOW" (the old narrow-race semantics) to "run
+    /// strictly BETWEEN jobs" — no worker can commit around the flip.
+    reindex_barrier: std::sync::Mutex<BTreeSet<String>>,
     /// Serializes put/delete commits across workers AND the reindex
     /// clear+flip section: lance commits are optimistic
     /// (read-modify-write), so concurrent merge_inserts into ONE derived
@@ -2195,6 +2212,7 @@ impl IngestShared {
             jobs: std::sync::Mutex::new(BTreeMap::new()),
             stats,
             inflight: std::sync::Mutex::new(HashSet::new()),
+            reindex_barrier: std::sync::Mutex::new(BTreeSet::new()),
             write_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -2216,6 +2234,33 @@ impl IngestShared {
             .lock()
             .unwrap()
             .contains(&format!("{}\u{1}{}", bucket, object_key))
+    }
+
+    /// Hold/release/read the reindex quiesce barrier for one bucket (see
+    /// the field doc). Private to this module: `reindex_bucket` is the only
+    /// holder; the tests reach in to pin the enqueue-refusal rule.
+    fn hold_reindex_barrier(&self, bucket: &str) {
+        self.reindex_barrier.lock().unwrap().insert(bucket.into());
+    }
+
+    fn release_reindex_barrier(&self, bucket: &str) {
+        self.reindex_barrier.lock().unwrap().remove(bucket);
+    }
+
+    fn reindex_barrier_held(&self, bucket: &str) -> bool {
+        self.reindex_barrier.lock().unwrap().contains(bucket)
+    }
+
+    /// How many queued + in-flight jobs belong to `bucket` (the drain-wait
+    /// condition of the barrier).
+    fn bucket_inflight_count(&self, bucket: &str) -> usize {
+        let prefix = format!("{bucket}\u{1}");
+        self.inflight
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|k| k.starts_with(&prefix))
+            .count()
     }
 
     /// The configured ingest buckets, name-sorted (BTreeMap order).
@@ -2409,6 +2454,18 @@ pub struct ReindexOutcome {
 /// running daemon) and `vectorfs serve --reindex` (the startup-flag path
 /// that resolves the fingerprint-gate deadlock): for one bucket —
 ///
+/// 0. **静默屏障** (job-level serialization, 2026-11-05 — closes the §10.8
+///    "reindex vs in-flight worker" debt) — hold the per-bucket quiesce
+///    barrier (new enqueues for the bucket are refused while held) and wait
+///    for the bucket's queued + in-flight jobs to DRAIN before enumerating.
+///    The wait does NOT hold the write lock (workers need that lock to
+///    commit their batches — a barrier holding it would deadlock them);
+///    waiting on the in-flight set alone is sufficient because `enqueue`
+///    cannot add to it while the barrier stands. Bounded at 90s: on timeout
+///    the pass degrades to the pre-barrier semantics (skip whatever is
+///    still in flight) — strictly no worse than the old behavior, and
+///    loudly logged. `serve --reindex` runs before workers spawn, so its
+///    barrier passes trivially.
 /// 1. **清旧块** — delete every derived chunk of the target sources across ALL
 ///    of the bucket's MANAGED indexes, old-derived ones included (an embedder
 ///    config change derives a new index NAME; the previous index keeps its
@@ -2424,11 +2481,9 @@ pub struct ReindexOutcome {
 /// 3. **job registry** — T6's entry (total = flipped sources; workers bump
 ///    `done` per completion).
 ///
-/// Sources a worker currently owns are skipped (their result under the
-/// RUNNING config is already valid); the residual race — a worker committing
-/// a batch between this pass's enumeration and its DELETE — only delays
-/// that source's clear to the next reindex and is documented as an M2
-/// limitation.
+/// With the barrier drained, the target enumeration sees a QUIESCENT bucket:
+/// nothing is in flight, so the old skip-in-flight filter is a no-op on the
+/// happy path (it remains for the timeout degradation).
 pub async fn reindex_bucket(
     state: &AppState,
     shared: &Arc<IngestShared>,
@@ -2437,6 +2492,44 @@ pub async fn reindex_bucket(
     let fingerprint = shared
         .fingerprint_of(bucket)
         .ok_or_else(|| format!("bucket {bucket:?} is not ingest-configured"))?;
+    // ---- 0. quiesce barrier: run strictly BETWEEN this bucket's jobs ----
+    shared.hold_reindex_barrier(bucket);
+    let drain = drain_bucket_inflight(shared, bucket).await;
+    let result = reindex_bucket_quiesced(state, shared, bucket, &fingerprint).await;
+    shared.release_reindex_barrier(bucket);
+    if !drain {
+        eprintln!(
+            "ingest: reindex {bucket}: quiesce barrier timed out with jobs still in flight — \
+             proceeding with the legacy skip-in-flight semantics (their clear lands on the next \
+             reindex; the §10.8 debt's OLD shape, degraded loudly)"
+        );
+    }
+    result
+}
+
+/// The barrier's bounded drain wait. `false` = timed out (caller degrades
+/// to the legacy semantics and says so on stderr).
+async fn drain_bucket_inflight(shared: &Arc<IngestShared>, bucket: &str) -> bool {
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while shared.bucket_inflight_count(bucket) > 0 {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    true
+}
+
+/// The clear+flip section proper (steps 1–3 above), run with the bucket
+/// quiesced (or degraded after a timeout).
+async fn reindex_bucket_quiesced(
+    state: &AppState,
+    shared: &Arc<IngestShared>,
+    bucket: &str,
+    fingerprint: &str,
+) -> Result<ReindexOutcome, String> {
     let markers = state
         .storage
         .list_sources(bucket)
@@ -2475,7 +2568,7 @@ pub async fn reindex_bucket(
             object_key: m.object_key.clone(),
             etag_sig: m.etag_sig.clone(),
             content_hash: String::new(),
-            pipeline_fingerprint: fingerprint.clone(),
+            pipeline_fingerprint: fingerprint.to_string(),
             status: SourceStatus::Pending,
             status_reason: None,
             retries: 0,
@@ -3468,6 +3561,99 @@ pub(crate) mod tests {
         );
         assert_eq!(stats.modified_indexed, 1, "{stats:?}");
         assert_eq!(stats.failed, 0, "{stats:?}");
+    }
+
+    /// The quiesce barrier's enqueue rule (job-level serialization, 2026-11-05):
+    /// while a bucket's barrier is held, `enqueue` refuses its NEW jobs — no
+    /// dedup entry, no channel send. A refused source needs no repair: the
+    /// reindex flip turns it PENDING and the trailing wake re-covers it.
+    #[tokio::test]
+    async fn reindex_barrier_refuses_new_enqueues() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("a.txt"), LONG_BODY).unwrap();
+
+        let cfg = sized_config(32, "tiny-fixture");
+        let (rt, handle, _state) = runtime_for(dir.path(), &cfg).await;
+        handle.shared().hold_reindex_barrier("docs");
+        let job = Job {
+            vb: "docs".into(),
+            object_key: "docs/a.txt".into(),
+            key_hash: marker::object_key_hash("docs/a.txt"),
+        };
+        rt.enqueue(job).await;
+        assert!(
+            !handle.shared().is_inflight("docs", "docs/a.txt"),
+            "a barrier-held bucket must not accept new jobs"
+        );
+        assert_eq!(
+            handle.shared().bucket_inflight_count("docs"),
+            0,
+            "and nothing of it may linger queued"
+        );
+        // release, and the same enqueue goes through (the refusal is the
+        // barrier's, not a broken queue)
+        handle.shared().release_reindex_barrier("docs");
+        let job = Job {
+            vb: "docs".into(),
+            object_key: "docs/a.txt".into(),
+            key_hash: marker::object_key_hash("docs/a.txt"),
+        };
+        rt.enqueue(job).await;
+        assert!(handle.shared().is_inflight("docs", "docs/a.txt"));
+        rt.drain_queue().await;
+    }
+
+    /// The barrier's DRAIN rule — the race the §10.8 debt described, made
+    /// deterministic with the drain_queue harness: a job enqueued BEFORE the
+    /// reindex pass must BLOCK the pass (pre-barrier, the enumeration would
+    /// have skipped it as in-flight); once the job drains, the pass proceeds
+    /// and flips that SAME source — proof the clear+flip section runs
+    /// strictly between jobs, never around one.
+    #[tokio::test]
+    async fn reindex_barrier_waits_for_inflight_then_flips_it_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("a.txt"), LONG_BODY).unwrap();
+
+        let cfg = sized_config(32, "tiny-fixture");
+        let (rt, handle, state) = runtime_for(dir.path(), &cfg).await;
+        // one job sits QUEUED (= in the in-flight set; no worker spawned —
+        // the marker stays PENDING until process_job flips IN_PROGRESS)
+        rt.scan_once().await;
+        assert!(handle.shared().is_inflight("docs", "docs/a.txt"));
+
+        // the reindex pass starts and must STALL on the barrier's drain wait
+        // (spawned over cloned Arcs — the harness keeps its own for asserts)
+        let state_c = state.clone();
+        let shared_c = handle.shared().clone();
+        let mut pass =
+            tokio::spawn(async move { reindex_bucket(&state_c, &shared_c, "docs").await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut pass)
+                .await
+                .is_err(),
+            "reindex must not complete while a job of this bucket is in flight"
+        );
+        // the barrier is held for the duration (new work refused)
+        assert!(handle.shared().reindex_barrier_held("docs"));
+
+        // the job drains: the barrier releases, the pass completes, and the
+        // SAME source is flipped (the pre-barrier pass would have SKIPPED it
+        // as in-flight and reported flipped == 0)
+        rt.drain_queue().await;
+        let outcome = pass.await.unwrap().expect("reindex completes after drain");
+        assert_eq!(outcome.flipped, 1, "the drained source is a flip target");
+        let flipped = status_of(&state, "docs", "docs/a.txt").await;
+        assert_eq!(flipped.status, SourceStatus::Pending);
+        assert_eq!(
+            flipped.pipeline_fingerprint,
+            cfg.fingerprint("docs").unwrap()
+        );
+        // barrier released afterwards (the bucket accepts work again)
+        assert!(!handle.shared().reindex_barrier_held("docs"));
     }
 
     /// Orphan sweep: chunks whose marker is GONE (not merely DELETING) are
