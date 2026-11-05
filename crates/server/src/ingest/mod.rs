@@ -522,10 +522,10 @@ where
 #[derive(Debug, PartialEq)]
 enum Routing {
     /// A member was selected by affinity (Preferred, else first Capable):
-    /// run it FIRST, then the remaining members in CONFIG order as the
-    /// correctness backstop (a routed member that still yields falls back
-    /// exactly like the linear chain).
-    Run(usize),
+    /// run it FIRST; the remaining members follow by AFFINITY TIER (see
+    /// [`chain_try_order`]). Carries the class — the tail tiering needs it,
+    /// and `first` + `class` is exactly what the progress line reports.
+    Run { first: usize, class: ContentClass },
     /// Unknown class (no probe for the family, or the probe itself could
     /// not parse the bytes): the full chain in config order — the pure
     /// M2.1 semantics, cross-parser recovery intact.
@@ -548,7 +548,8 @@ enum Routing {
 ///   [`Fit::Preferred`] (config order is the tie-break: two equally-right
 ///   tools resolve to the one the operator listed first); pass 2 (no
 ///   Preferred anywhere) takes the FIRST [`Fit::Capable`]; all-Refuses ⇒
-///   [`Routing::Refused`] with the aggregate reason.
+///   [`Routing::Refused`] with the aggregate reason (remedy phrased by the
+///   class — [`ContentClass::remedy`]).
 ///
 /// NOTE: routing accelerates and protects quality; it does not REPLACE the
 /// chain. [`Routing::Run`] only reorders who is tried first — see
@@ -565,43 +566,70 @@ fn route(
         .iter()
         .position(|(_, kind)| kind.affinity(class) == Fit::Preferred)
     {
-        return Routing::Run(i);
+        return Routing::Run { first: i, class };
     }
     if let Some(i) = members
         .iter()
         .position(|(_, kind)| kind.affinity(class) == Fit::Capable)
     {
-        return Routing::Run(i);
+        return Routing::Run { first: i, class };
     }
     // everyone refuses: say so WITHOUT executing anyone — the class names
     // the content, each member's declaration says why it will not serve it,
-    // and the remedy names the missing capability (the M3 OCR kind).
+    // and the remedy names the missing capability, phrased by the CLASS
+    // (a scan needs OCR; a blank document needs nothing any extractor has).
     let refusals: Vec<String> = members
         .iter()
         .map(|(name, kind)| format!("{name} refuses ({})", kind.refusal_note(class)))
         .collect();
     Routing::Refused(format!(
-        "{short_key} class={class}: {} — add an OCR-capable extractor to this chain \
-         (the planned pdf-ocr kind, M3)",
-        refusals.join("; ")
+        "{short_key} class={class}: {} — {}",
+        refusals.join("; "),
+        class.remedy()
     ))
 }
 
-/// The EXECUTION order a routing verdict implies: the routed member first,
-/// then every remaining member in config order (they are the correctness
-/// backstop — a Refuses-class member still runs there if the routed member
-/// yields, because its extract-time behavior, not its class declaration,
-/// is the last word on cross-parser recovery).
-fn chain_try_order(len: usize, routing: &Routing) -> Vec<usize> {
+/// Affinity rank for tail tiering (lower = tried earlier).
+fn fit_rank(fit: Fit) -> u8 {
+    match fit {
+        Fit::Preferred => 0,
+        Fit::Capable => 1,
+        Fit::Refuses => 2,
+    }
+}
+
+/// The EXECUTION order a routing verdict implies (hardening revision,
+/// 2026-11-05: the tail is now AFFINITY-TIERED, superseding the original
+/// "remaining members in config order" ruling — recorded in design.md §0):
+///
+/// * `Run { first, class }` ⇒ `first` first (the routed member), then the
+///   remaining members sorted by their declared affinity for `class`
+///   (Preferred, then Capable, then Refuses), CONFIG ORDER STABLE WITHIN a
+///   tier. Rationale: the tail is the correctness backstop that runs only
+///   if the routed member yields — a member DECLARING Refuses for this
+///   class running before a Capable one burns an attempt on the most
+///   likely-to-fail member and, worse, risks its degraded output WINNING
+///   ("first non-empty Ok wins") over the Capable member's better one.
+///   Tiering the tail extends "mis-order is a quality accident" (the
+///   probe→affinity→route motivation) from who runs FIRST to the whole
+///   try order. Refuses members still RUN (extract-time behavior, not the
+///   class declaration, remains the last word on cross-parser recovery) —
+///   just last.
+/// * `Order` ⇒ verbatim (Unknown class ⇒ pure config order, byte-stable
+///   pre-routing semantics).
+/// * `Refused` ⇒ nobody executes; an empty order makes the (unused) chain
+///   walk a trivial exhaustion instead of a panic.
+fn chain_try_order(members: &[(String, ExtractorKind)], routing: &Routing) -> Vec<usize> {
     match routing {
-        Routing::Run(i) => {
-            let mut order = vec![*i];
-            order.extend((0..len).filter(|j| j != i));
+        Routing::Run { first, class } => {
+            let mut order = vec![*first];
+            let mut tail: Vec<usize> = (0..members.len()).filter(|j| j != first).collect();
+            // sort_by_key is stable: config order survives within a tier
+            tail.sort_by_key(|j| fit_rank(members[*j].1.affinity(*class)));
+            order.extend(tail);
             order
         }
         Routing::Order(order) => order.clone(),
-        // Refused never executes anyone; an empty order makes the (unused)
-        // chain walk a trivial exhaustion instead of a panic.
         Routing::Refused(_) => Vec::new(),
     }
 }
@@ -813,7 +841,7 @@ fn walk_child(
     if let Routing::Refused(reason) = routing {
         return Err(reason);
     }
-    let members = chain_try_order(chain.len(), &routing).into_iter().map(|i| {
+    let members = chain_try_order(chain, &routing).into_iter().map(|i| {
         let (name, kind) = &chain[i];
         (
             name.clone(),
@@ -1624,7 +1652,7 @@ impl IngestRuntime {
                     if let Routing::Refused(reason) = routing {
                         return Err(AttemptErr::Parked(reason));
                     }
-                    let members = chain_try_order(chain.len(), &routing).into_iter().map(|i| {
+                    let members = chain_try_order(&chain, &routing).into_iter().map(|i| {
                         let (name, kind) = &chain[i];
                         (
                             name.clone(),
@@ -3948,7 +3976,10 @@ pub(crate) mod tests {
         let insp_first = pdf_members("insp", "plain");
         assert_eq!(
             route("pdf", &insp_first, Some(ContentClass::TextNative)),
-            Routing::Run(0)
+            Routing::Run {
+                first: 0,
+                class: ContentClass::TextNative
+            }
         );
         // the REVERSED config (plain first) also routes to ITS first
         // member — the choice follows config order, not kind identity
@@ -3959,7 +3990,10 @@ pub(crate) mod tests {
         ];
         assert_eq!(
             route("pdf", &plain_first, Some(ContentClass::TextNative)),
-            Routing::Run(0)
+            Routing::Run {
+                first: 0,
+                class: ContentClass::TextNative
+            }
         );
     }
 
@@ -3971,7 +4005,10 @@ pub(crate) mod tests {
         let members = pdf_members("insp", "plain");
         assert_eq!(
             route("pdf", &members, Some(ContentClass::MixedTextScan)),
-            Routing::Run(1)
+            Routing::Run {
+                first: 1,
+                class: ContentClass::MixedTextScan
+            }
         );
         // scan-dominant: everyone refuses
         assert!(matches!(
@@ -4004,22 +4041,119 @@ pub(crate) mod tests {
             reason.contains("plain refuses (a scan has no text layer"),
             "{reason}"
         );
+        // the remedy is phrased by the CLASS: scan classes name the missing
+        // OCR capability
         assert!(reason.contains("add an OCR-capable extractor"), "{reason}");
     }
 
     #[test]
-    fn chain_try_order_routes_first_then_config_order_tail() {
-        // Run(i): the routed member first, everyone else in CONFIG order —
-        // the tail IS the linear chain (cross-parser backstop: a member
-        // that refuses the class still runs there if the routed member
-        // yields, because its extract-time behavior is the last word)
-        assert_eq!(chain_try_order(3, &Routing::Run(1)), vec![1, 0, 2]);
-        assert_eq!(chain_try_order(2, &Routing::Run(0)), vec![0, 1]);
-        // Order: verbatim
-        assert_eq!(chain_try_order(2, &Routing::Order(vec![0, 1])), vec![0, 1]);
+    fn route_all_refuse_on_no_text_names_the_blank_document_remedy() {
+        // no-text is a DIFFERENT dead end than a scan: blank pages have
+        // nothing to extract AND nothing to OCR — pointing the operator at
+        // OCR (the pre-hardening hardwired remedy) would be wrong advice
+        let members = pdf_members("insp", "plain");
+        let Routing::Refused(reason) = route("pdf", &members, Some(ContentClass::NoText)) else {
+            panic!("no-text must be refused by both members");
+        };
+        assert!(reason.starts_with("pdf class=no-text:"), "{reason}");
+        assert!(
+            reason.contains("no text layer and no raster content"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("OCR-capable"),
+            "the blank-document remedy must not pitch OCR: {reason}"
+        );
+    }
+
+    #[test]
+    fn chain_try_order_routes_first_then_affinity_tiers_the_tail() {
+        // Run{first, class}: the routed member first, the REST by affinity
+        // tier (Preferred > Capable > Refuses), config order STABLE within
+        // a tier — the tail is still the cross-parser backstop (a
+        // Refuses-class member still runs, just last: extract-time behavior
+        // remains the last word)
+        //
+        // [insp, plain] under mixed-text-scan: plain (Capable) is routed;
+        // insp (Refuses) is the tiered tail
+        let members = pdf_members("insp", "plain");
+        assert_eq!(
+            chain_try_order(
+                &members,
+                &Routing::Run {
+                    first: 1,
+                    class: ContentClass::MixedTextScan
+                }
+            ),
+            vec![1, 0]
+        );
+        // under text-native (plain routed at 1, insp ALSO Preferred): both
+        // tail-less tier-0s keep config order — [0] stays after [1] only by
+        // config position, which is the stable-sort guarantee
+        assert_eq!(
+            chain_try_order(
+                &members,
+                &Routing::Run {
+                    first: 1,
+                    class: ContentClass::TextNative
+                }
+            ),
+            vec![1, 0]
+        );
+        // a THREE-member chain shows the tiering: [insp, md, plain] under
+        // mixed-text-scan routes plain (the only Capable); insp and md both
+        // Refuse — the tail keeps config order WITHIN the single tier
+        let mixed = vec![
+            ("insp".to_string(), kind_of("t", "kind = \"pdf-inspector\"")),
+            ("md".to_string(), kind_of("t", "kind = \"md\"")),
+            ("plain".to_string(), kind_of("t", "kind = \"pdf-text\"")),
+        ];
+        assert_eq!(
+            chain_try_order(
+                &mixed,
+                &Routing::Run {
+                    first: 2,
+                    class: ContentClass::MixedTextScan
+                }
+            ),
+            vec![2, 0, 1]
+        );
+        // CROSS-tier tail: [ctn (Capable — the cfg(test) container declares
+        // no affinity, so the default is Capable everywhere), md (Refuses),
+        // plain (Capable)] routes ctn (first Capable); the tail's plain
+        // (Capable, tier 1) outranks md (Refuses, tier 2) DESPITE md's
+        // earlier config position — the burn-a-guaranteed-failure-later
+        // rule this revision exists for
+        let ctn = crate::pipeline::extract::ExtractorKind::TestContainer(
+            crate::pipeline::extract::TestContainerSpec::one(
+                "application/x-test",
+                b"payload",
+                vec![],
+            ),
+        );
+        let cross_tier = vec![
+            ("ctn".to_string(), ctn),
+            ("md".to_string(), kind_of("t", "kind = \"md\"")),
+            ("plain".to_string(), kind_of("t", "kind = \"pdf-text\"")),
+        ];
+        assert_eq!(
+            chain_try_order(
+                &cross_tier,
+                &Routing::Run {
+                    first: 0,
+                    class: ContentClass::MixedTextScan
+                }
+            ),
+            vec![0, 2, 1]
+        );
+        // Order: verbatim (Unknown class = pure config order, byte-stable)
+        assert_eq!(
+            chain_try_order(&members, &Routing::Order(vec![0, 1])),
+            vec![0, 1]
+        );
         // Refused: nobody executes
         assert_eq!(
-            chain_try_order(2, &Routing::Refused("x".into())),
+            chain_try_order(&members, &Routing::Refused("x".into())),
             Vec::<usize>::new()
         );
     }
@@ -4067,9 +4201,37 @@ pub(crate) mod tests {
             assert_eq!(Undeclared.affinity(class), Fit::Capable, "{class}");
         }
         // ...and all-Capable ⇒ first-Capable = index 0 ⇒ [0, 1, …]: the
-        // member sequence equals the config order (Run(0) over n members,
-        // pinned by chain_try_order(Run(0)) == config order)
-        assert_eq!(chain_try_order(2, &Routing::Run(0)), vec![0, 1]);
+        // member sequence equals the config order (Run{first: 0} over
+        // all-Capable members: a single-tier tail keeps config order, so
+        // tiering never perturbs the degenerate case)
+        let all_capable = vec![
+            (
+                "a".to_string(),
+                crate::pipeline::extract::ExtractorKind::TestContainer(TestContainerSpec::one(
+                    "application/x-test",
+                    b"p",
+                    vec![],
+                )),
+            ),
+            (
+                "b".to_string(),
+                crate::pipeline::extract::ExtractorKind::TestContainer(TestContainerSpec::one(
+                    "application/x-test",
+                    b"q",
+                    vec![],
+                )),
+            ),
+        ];
+        assert_eq!(
+            chain_try_order(
+                &all_capable,
+                &Routing::Run {
+                    first: 0,
+                    class: ContentClass::ScanDominant
+                }
+            ),
+            vec![0, 1]
+        );
     }
 
     // ---- M2.1 step 3: normalize stage + container unpacking ---------------

@@ -142,6 +142,36 @@ impl std::fmt::Display for ContentClass {
     }
 }
 
+impl ContentClass {
+    /// The remedy line the router quotes when EVERY member of a chain
+    /// refuses this class — what capability is missing, phrased by the
+    /// CLASS (the class knows what it lacks; a PDF-specific hint here would
+    /// misdirect every future non-PDF family). This is why the all-refuse
+    /// remedy is a method and not a route()-local string: scan classes
+    /// genuinely need an OCR member, but `no-text` needs nothing any
+    /// extractor can provide — pointing its operator at OCR would be wrong
+    /// advice, and was (hardening, 2026-11-05: the pre-method message
+    /// hardcoded the OCR hint for every class).
+    pub fn remedy(self) -> &'static str {
+        match self {
+            ContentClass::ScanDominant | ContentClass::MixedTextScan => {
+                "add an OCR-capable extractor to this chain (the planned pdf-ocr kind, M3)"
+            }
+            ContentClass::NoText => {
+                "no text layer and no raster content — no extractor, OCR included, can index \
+                 this document; verify the file is the one you meant to ingest"
+            }
+            // a text-native refusing member is possible (a text-family kind
+            // under a mis-probed class), but an ALL-refuse text-native chain
+            // cannot: every text extractor declares text-native Preferred
+            ContentClass::TextNative => {
+                "no member of this chain extracts native text — every built-in text kind does; \
+                 this aggregate is reachable only through custom undeclared kinds"
+            }
+        }
+    }
+}
+
 /// How well an extractor kind serves a [`ContentClass`] — the three-level
 /// closed vocabulary kinds declare (see [`Extractor::affinity`]) and the
 /// ingest router consumes: first `Preferred` wins, else first `Capable`,
