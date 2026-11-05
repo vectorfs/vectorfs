@@ -298,6 +298,7 @@ fn pending_marker(key: &str, sig: &str, fingerprint: &str) -> SourceMarker {
         retries_exhausted: false,
         updated_at: crate::ingest::marker::now_rfc3339(),
         chunks: None,
+        engines: None,
     }
 }
 

@@ -31,9 +31,19 @@ bytes = "1"
 http = "1"
 http-body-util = "0.1"
 
-# #[tokio::main] + the shared HTTP leaf's connector (tokio/net arrives via
-# vectorfs-common; rt-multi-thread matches the server bin's runtime shape).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+# #[tokio::main] + the shared HTTP leaf's connector + the client verbs' own
+# needs: fs (put/get read/write files), time (poll timeouts/backoff).
+# Declared EXPLICITLY for this package — a workspace-wide build would
+# unify server's feature set in and hide an omission (the dependency list
+# is the small-client guarantee; `cargo build -p vectorfs-client` must
+# stand alone, which is exactly how the omission was caught).
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "fs",
+  "time",
+] }
 
 [dev-dependencies]
 # in-process fake daemon for the signature round-trip test (same feature

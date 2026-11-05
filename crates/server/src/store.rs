@@ -237,6 +237,15 @@ pub struct SourceMarker {
     /// E.2; the wire adapter lands with T6). Absent until something lands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunks: Option<BTreeMap<String, u32>>,
+    /// Engine versions of the stack that produced this completion (engine
+    /// observability, 2026-11-05): engine upgrades change extraction output
+    /// WITHOUT changing the pipeline fingerprint, and the re-embed ruling
+    /// keeps that the operator's explicit call — this field is what makes
+    /// the drift visible (doctor compares it against the running
+    /// [`crate::pipeline::engines`] table). `None` = pre-observability
+    /// markers (never warned on) or a non-completing outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engines: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug)]
@@ -2013,7 +2022,50 @@ mod tests {
             retries_exhausted: false,
             updated_at: "2026-11-05T00:00:00.000Z".into(),
             chunks: Some(BTreeMap::from([("text".to_string(), 3)])),
+            engines: None,
         }
+    }
+
+    /// Engine-observability schema interop (2026-11-05): a marker JSON from
+    /// BEFORE the `engines` field deserializes with `engines == None`
+    /// (pre-observability markers never warn in doctor), and a marker WITH
+    /// the field round-trips it byte-equal.
+    #[test]
+    fn source_marker_engines_schema_interop() {
+        let pre = serde_json::json!({
+            "object_key": "docs/a.txt",
+            "etag_sig": "size=1;mtime_ns=2",
+            "pipeline_fingerprint": "fp",
+            "status": "INDEXED",
+            "updated_at": "2026-11-01T00:00:00.000Z",
+        });
+        let m: SourceMarker = serde_json::from_value(pre).expect("pre-observability marker");
+        assert_eq!(m.status, SourceStatus::Indexed);
+        assert!(m.engines.is_none(), "old markers read as None, never warn");
+
+        let mut with = serde_json::json!({
+            "object_key": "docs/b.txt",
+            "etag_sig": "size=1;mtime_ns=3",
+            "pipeline_fingerprint": "fp",
+            "status": "INDEXED",
+            "updated_at": "2026-11-05T00:00:00.000Z",
+            "engines": { "pdfium": "chromium/8066", "pdf-inspector": "1.25.2" },
+        });
+        let m: SourceMarker = serde_json::from_value(with.clone()).unwrap();
+        assert_eq!(m.engines.as_ref().unwrap()["pdfium"], "chromium/8066");
+        // and serializes the field back (skip_serializing_if only omits None)
+        let out = serde_json::to_value(&m).unwrap();
+        assert_eq!(out["engines"], with["engines"]);
+        // a None engine set is OMITTED from the JSON (byte-stable for
+        // old readers)
+        let mut none_marker = m.clone();
+        none_marker.engines = None;
+        assert!(
+            serde_json::to_value(&none_marker)
+                .unwrap()
+                .get("engines")
+                .is_none()
+        );
     }
 
     #[tokio::test]

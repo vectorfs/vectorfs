@@ -629,6 +629,20 @@ pub fn render_endpoint_human(r: &EndpointReport) -> String {
             let _ = writeln!(out, "  {key:<9}: {v}");
         }
     }
+    // engine observability (2026-11-05): the extraction/embedding engine
+    // versions the daemon runs — one line each, sorted (the JSON object is
+    // a BTreeMap, so health.get preserves that order)
+    if let Some(engines) = r.health.get("engines").and_then(|e| e.as_object()) {
+        let _ = writeln!(out, "  engines  :");
+        for (name, version) in engines {
+            // bare string rendering (a Value's Display keeps JSON quotes)
+            let v = version
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| version.to_string());
+            let _ = writeln!(out, "    {name:<9} {v}");
+        }
+    }
     out
 }
 
@@ -884,6 +898,7 @@ mod tests {
                     retries_exhausted: false,
                     updated_at: "t".into(),
                     chunks: None,
+                    engines: None,
                 },
             )
             .await

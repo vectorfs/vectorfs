@@ -688,6 +688,24 @@ async fn reindex_cmd(args: ReindexArgs) {
     println!("{job}");
 }
 
+/// Engine versions under the daemon (engine observability, 2026-11-05): one
+/// line per engine from the health body's `engines` object, absent silently
+/// on older daemons that do not report it (the client never assumes the
+/// server's vintage).
+fn print_engines(health: &Value) {
+    if let Some(engines) = health.get("engines").and_then(|e| e.as_object()) {
+        println!("  engines  :");
+        for (name, version) in engines {
+            // bare string rendering (a Value's Display keeps JSON quotes)
+            let v = version
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| version.to_string());
+            println!("    {name:<9} {v}");
+        }
+    }
+}
+
 async fn status_cmd(args: StatusArgs) {
     // Health-only degradation (container HEALTHCHECK shape, §5.10.7): with
     // no credentials resolvable the full GetIngestStatus depth is
@@ -724,6 +742,7 @@ async fn status_cmd(args: StatusArgs) {
                     health["ok"],
                     health["version"].as_str().unwrap_or("?")
                 );
+                print_engines(&health);
                 println!("  ingest   : (no credentials — health-only probe)");
             }
             return;
@@ -758,6 +777,7 @@ async fn status_cmd(args: StatusArgs) {
         health["ok"],
         health["version"].as_str().unwrap_or("?")
     );
+    print_engines(&health);
     let buckets = ingest["buckets"].as_array().cloned().unwrap_or_default();
     if buckets.is_empty() {
         println!("  ingest   : none configured (pure protocol face)");

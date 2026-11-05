@@ -154,8 +154,10 @@ pub fn build_router(state: ops::AppState) -> Router {
 }
 
 /// /healthz (M1 T6 upgrade): `{"ok": true}` is kept verbatim — liveness
-/// probes keyed on it stay compatible — with `version` and `uptimeSeconds`
-/// added for `vf status --endpoint` (client probe; see STARTED_AT above).
+/// probes keyed on it stay compatible — with `version`, `uptimeSeconds`
+/// (added for `vf status --endpoint`, see STARTED_AT above) and `engines`
+/// (engine observability, 2026-11-05: the extraction/embedding engine
+/// versions this binary runs — additive members only, same rule as before).
 async fn healthz() -> Json<serde_json::Value> {
     let uptime = STARTED_AT
         .get()
@@ -165,18 +167,22 @@ async fn healthz() -> Json<serde_json::Value> {
         "ok": true,
         "version": report::version_string(),
         "uptimeSeconds": uptime,
+        "engines": pipeline::engines::engine_versions(),
     }))
 }
 
 /// GET /health (M2 T6, appendix E): the CONTAINER healthcheck probe —
 /// no-auth (see `gate_middleware`), unauthenticated readers must never need
-/// credentials to tell "up" from "down". `{"ok":true}` plus the version; the
-/// richer uptime member stays on /healthz (kept byte-stable above), and
-/// `vf status` reads BOTH (health for up/down, GetIngestStatus for depth).
+/// credentials to tell "up" from "down". `{"ok":true}` plus the version and
+/// the engine table (identity members — same additive rule as /healthz's;
+/// `vf status`'s single unsigned probe carries them). The uptime member
+/// stays on /healthz only (telemetry, not identity), and `vf status` reads
+/// BOTH (health for up/down + engines, GetIngestStatus for depth).
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "ok": true,
         "version": report::version_string(),
+        "engines": pipeline::engines::engine_versions(),
     }))
 }
 
@@ -422,7 +428,8 @@ mod tests {
     }
 
     /// /healthz (M1 T6): `ok:true` stays byte-stable (liveness probes keyed
-    /// on it keep working); version + uptimeSeconds are ADDITIVE members.
+    /// on it keep working); version + uptimeSeconds are ADDITIVE members, and
+    /// so is the engine table (engine observability, 2026-11-05).
     #[tokio::test]
     async fn healthz_keeps_ok_and_adds_version_uptime() {
         let dir = tempfile::tempdir().unwrap();
@@ -437,6 +444,12 @@ mod tests {
         );
         assert!(
             body["uptimeSeconds"].as_f64().is_some_and(|u| u >= 0.0),
+            "{body}"
+        );
+        // the engine table rides along (the SAME map the marker persists)
+        assert_eq!(
+            body["engines"]["pdfium"],
+            serde_json::json!(pipeline::engines::PDFIUM_PIN),
             "{body}"
         );
     }
@@ -454,6 +467,15 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ok"], serde_json::json!(true));
         assert!(body["version"].is_string(), "{body}");
+        // /health carries the engine table too (vf status's single unsigned
+        // probe reports it; the container HEALTHCHECK only reads the exit
+        // code, so the additive member costs nothing)
+        assert!(
+            body["engines"]
+                .as_object()
+                .is_some_and(|e| e.contains_key("pdfium")),
+            "{body}"
+        );
         // and the control: an unsigned AWS-face call still 403s
         let req = post_json("/PutVectors", r#"{"vectors":[]}"#, &[]);
         let (status, _, _) = send(&router, req).await;

@@ -673,6 +673,8 @@ async fn check_ingest(cfg: &StorageConfig, storage: &Storage) -> Check {
     }
     let mut lines = Vec::new();
     let mut any_stale = false;
+    let mut any_engine_drift = false;
+    let engines_now = crate::pipeline::engines::engine_versions_owned();
     for vb in pcfg.ingest.keys() {
         let fp = pcfg.fingerprint(vb).expect("bucket in config");
         let markers = match storage.list_sources(vb).await {
@@ -693,6 +695,21 @@ async fn check_ingest(cfg: &StorageConfig, storage: &Storage) -> Check {
             })
             .count();
         any_stale |= stale > 0;
+        // engine drift: completing markers record the engine table that
+        // produced them; a marker recorded under a DIFFERENT engine stack
+        // (and None = pre-observability, never warned on) means this root
+        // would mix outputs from different engine generations after the
+        // next ingest. The re-embed stays the operator's call — the
+        // fingerprint deliberately ignores engine versions — this count is
+        // what makes the mixing visible instead of silent.
+        let engine_drift = markers
+            .iter()
+            .filter(|m| {
+                m.status != crate::store::SourceStatus::Deleting
+                    && m.engines.as_ref().is_some_and(|e| *e != engines_now)
+            })
+            .count();
+        any_engine_drift |= engine_drift > 0;
         let derived = match storage.list_indexes(vb).await {
             Ok(ix) => ix
                 .into_iter()
@@ -722,8 +739,8 @@ async fn check_ingest(cfg: &StorageConfig, storage: &Storage) -> Check {
             }
         }
         lines.push(format!(
-            "{vb}: {} source(s), {stale} stale fingerprint(s), {} derived index(es), {vectors} \
-             vectors, fingerprint {}",
+            "{vb}: {} source(s), {stale} stale fingerprint(s), {engine_drift} engine-drifted, {} \
+             derived index(es), {vectors} vectors, fingerprint {}",
             markers.len(),
             derived.len(),
             &fp[..8]
@@ -731,18 +748,28 @@ async fn check_ingest(cfg: &StorageConfig, storage: &Storage) -> Check {
     }
     let mut detail = lines.join("; ");
     detail.push_str("; gc orphan window = one scan period (scan_interval_secs, default 30s)");
-    if any_stale {
-        Check::not_pass(
-            "ingest",
-            CheckStatus::Warn,
-            detail,
-            format!(
+    if any_stale || any_engine_drift {
+        let mut remedy = String::new();
+        if any_stale {
+            remedy.push_str(&format!(
                 "restart with: vectorfs serve --reindex --data-dir {} (clears old chunks and \
                  re-embeds drifted sources at startup); a RUNNING daemon with an UNCHANGED config \
                  can be forced with: vf reindex --bucket <b>",
                 cfg.data_dir.display()
-            ),
-        )
+            ));
+        }
+        if any_engine_drift {
+            if !remedy.is_empty() {
+                remedy.push_str("; ");
+            }
+            remedy.push_str(
+                "engine-drifted sources were indexed by an OLDER engine stack (pdfium / \
+                 pdf-inspector / onnxruntime) — an engine upgrade does not change the \
+                 fingerprint, so re-embedding after one is the operator's explicit call \
+                 (same --reindex); do nothing if mixing generations is acceptable",
+            );
+        }
+        Check::not_pass("ingest", CheckStatus::Warn, detail, remedy)
     } else {
         Check::pass("ingest", detail)
     }
@@ -964,6 +991,7 @@ mod tests {
                     retries_exhausted: false,
                     updated_at: "t".into(),
                     chunks: None,
+                    engines: None,
                 },
             )
             .await

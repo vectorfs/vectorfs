@@ -1850,6 +1850,10 @@ impl IngestRuntime {
     async fn finish_marker(&self, job: &Job, prev: &SourceMarker, outcome: Outcome) {
         let mut m = prev.clone();
         m.updated_at = marker::now_rfc3339();
+        // engine observability: completing outcomes record WHAT PRODUCED
+        // them (doctor compares against the running table); failures carry
+        // no evidence and no engines either
+        let engines_now = Some(crate::pipeline::engines::engine_versions_owned());
         match outcome {
             Outcome::Indexed {
                 sig,
@@ -1865,6 +1869,7 @@ impl IngestRuntime {
                 m.retries = retries;
                 m.retries_exhausted = false;
                 m.status_reason = None;
+                m.engines = engines_now;
                 m.pipeline_fingerprint = self.shared.core.buckets[&job.vb].fingerprint.clone();
                 let count = m
                     .chunks
@@ -1897,6 +1902,7 @@ impl IngestRuntime {
                 m.chunks = chunks;
                 m.retries_exhausted = true; // the retry budget IS spent
                 m.status_reason = Some(reason.clone());
+                m.engines = engines_now;
                 m.pipeline_fingerprint = self.shared.core.buckets[&job.vb].fingerprint.clone();
                 eprintln!("ingest: {} -> PARTIALLY_INDEXED ({reason})", job.object_key);
             }
@@ -1905,6 +1911,7 @@ impl IngestRuntime {
                 m.retries_exhausted = true;
                 m.status_reason = Some(reason.clone());
                 m.chunks = None;
+                m.engines = None;
                 eprintln!("ingest: {} -> FAILED ({reason})", job.object_key);
             }
             Outcome::Parked(reason) => {
@@ -1912,6 +1919,7 @@ impl IngestRuntime {
                 m.retries_exhausted = true;
                 m.status_reason = Some(reason.clone());
                 m.chunks = None;
+                m.engines = None;
                 eprintln!("ingest: {} -> FAILED/parked ({reason})", job.object_key);
             }
         }
@@ -2575,6 +2583,7 @@ async fn reindex_bucket_quiesced(
             retries_exhausted: false,
             updated_at: now.clone(),
             chunks: None,
+            engines: None,
         };
         state
             .storage
@@ -2793,7 +2802,7 @@ pub(crate) mod tests {
             .load_source(vb, &marker::object_key_hash(key))
             .await
             .unwrap()
-            .unwrap_or_else(|| panic!("marker for {key}"))
+            .unwrap_or_else(|| panic!("marker for {key} not found"))
     }
 
     #[tokio::test]
@@ -3236,6 +3245,7 @@ pub(crate) mod tests {
             retries_exhausted: false,
             updated_at: "t".into(),
             chunks: Some(BTreeMap::from([("text".to_string(), 1)])),
+            engines: None,
         };
         state
             .storage
@@ -3445,6 +3455,12 @@ pub(crate) mod tests {
         rt1.drain_queue().await;
         let m1 = status_of(&state, "docs", "docs/a.txt").await;
         assert_eq!(m1.status, SourceStatus::Indexed);
+        // engine observability: a completing marker records the engine table
+        // that produced it (doctor compares against the running one)
+        assert_eq!(
+            m1.engines.as_ref().unwrap(),
+            &crate::pipeline::engines::engine_versions_owned()
+        );
         let old_chunks = m1.chunks.as_ref().unwrap()["text"];
         assert!(old_chunks >= 8, "32-window over a long body: {old_chunks}");
         let old_spec = rt1.shared.core.buckets["docs"].derived["tiny"].clone();
@@ -3488,6 +3504,10 @@ pub(crate) mod tests {
             new_cfg.fingerprint("docs").unwrap()
         );
         assert!(flipped.chunks.is_none(), "completion evidence cleared");
+        assert!(
+            flipped.engines.is_none(),
+            "engine evidence cleared with the rest"
+        );
 
         // (4) rewrite: scan-and-diff re-embeds under the new pipeline
         rt2.scan_once().await;

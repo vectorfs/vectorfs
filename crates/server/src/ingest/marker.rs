@@ -259,6 +259,7 @@ pub fn plan_present(
             retries_exhausted: false,
             updated_at: now.to_string(),
             chunks: None,
+            engines: None,
         });
     };
     if m.status == SourceStatus::Failed && m.retries_exhausted {
@@ -352,6 +353,7 @@ mod tests {
             retries_exhausted: false,
             updated_at: "t0".into(),
             chunks: None,
+            engines: None,
         }
     }
 

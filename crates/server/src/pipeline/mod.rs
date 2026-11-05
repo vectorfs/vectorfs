@@ -75,6 +75,7 @@ pub mod chunk;
 pub mod config;
 pub mod contract;
 pub mod embed;
+pub mod engines;
 pub mod extract;
 pub mod gate;
 pub mod models;
