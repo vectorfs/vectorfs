@@ -50,10 +50,22 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Host-side protoc for the native build; the cross build gets it from
-      # Cross.toml's pre-build hook (inside the container).
-      - name: install protoc (lance-encoding build dep)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+      # Pinned protoc staged into the WORKSPACE (.tools/protoc), reached
+      # through the PROTOC env var in BOTH build environments (bookworm
+      # container mounts /work; cross mounts /project and gets it via
+      # Cross.toml passthrough). Replaces the old apt installs: cross's
+      # ubuntu-20.04 apt only carries protoc 3.6 — too old for
+      # --experimental_allow_proto3_optional (lance-encoding passes it;
+      # supported 3.12..3.21; v21.12 is what this bookworm path compiled
+      # green with on the first v0.1.0 run).
+      - name: stage pinned protoc (21.12)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/protoc.zip \
+            https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-x86_64.zip
+          mkdir -p .tools/protoc
+          unzip -qo /tmp/protoc.zip -d .tools/protoc
+          .tools/protoc/bin/protoc --version
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -83,22 +95,31 @@ jobs:
           mkdir -p "stage/${{ matrix.docker-arch }}"
           if [[ "${{ matrix.use-cross }}" == "true" ]]; then
             cargo install cross --locked
-            cross build --profile release-prod --workspace --target "${{ matrix.target }}"
+            # PROTOC at cross's own /project mount of the workspace; the
+            # Cross.toml passthrough carries it into the container.
+            PROTOC=/project/.tools/protoc/bin/protoc \
+              cross build --profile release-prod --workspace --target "${{ matrix.target }}"
             cp "target/${{ matrix.target }}/release-prod/vectorfs" "stage/${{ matrix.docker-arch }}/"
             cp "target/${{ matrix.target }}/release-prod/vf" "stage/${{ matrix.docker-arch }}/"
           else
+            # protoc rides the workspace mount (PROTOC=/work/…); the 2026-
+            # 11-05 v0.1.0 first-tag run ALSO caught the staging cp: it
+            # spliced the HOST $PWD into the container, where the workspace
+            # is mounted at /work — binaries cp to RELATIVE stage/ paths now
+            # (-w /work makes them land in the host's stage/ via the mount).
             docker run --rm -v "$PWD:/work" -w /work \
               -e CARGO_TARGET_DIR=/tmp/cargo-target \
               -e VF_GIT_HASH \
+              -e PROTOC=/work/.tools/protoc/bin/protoc \
               -v /tmp/.cargo-registry:/usr/local/cargo/registry \
               -v /tmp/cargo-target:/tmp/cargo-target \
               rust:1-bookworm bash -c '
                 set -euo pipefail
                 apt-get update -qq
-                apt-get install -y -qq --no-install-recommends cmake protobuf-compiler libprotobuf-dev
+                apt-get install -y -qq --no-install-recommends cmake
                 cargo build --profile release-prod --workspace --target '"${{ matrix.target }}"'
-                cp "/tmp/cargo-target/${{ matrix.target }}/release-prod/vectorfs" "'"$PWD"'/stage/${{ matrix.docker-arch }}/"
-                cp "/tmp/cargo-target/${{ matrix.target }}/release-prod/vf" "'"$PWD"'/stage/${{ matrix.docker-arch }}/"
+                cp "/tmp/cargo-target/${{ matrix.target }}/release-prod/vectorfs" "stage/${{ matrix.docker-arch }}/"
+                cp "/tmp/cargo-target/${{ matrix.target }}/release-prod/vf" "stage/${{ matrix.docker-arch }}/"
               '
           fi
           ls -la "stage/${{ matrix.docker-arch }}"

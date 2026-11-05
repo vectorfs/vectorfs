@@ -36,6 +36,10 @@ conformance/go/*.out
 # pinned .so/.dylib downloads (pdfium now, onnxruntime in T5) never enter the
 # tree; the fetch script + CI cache restore them deterministically.
 runtime-libs/
+# pinned protoc staged by the release/docker workflows (PROTOC env var
+# points the build containers at it; apt inside cross's 20.04 image is too
+# old and the bullseye run is unprivileged)
+.tools/
 target-docker/
 target-bullseye/
 .zcode/

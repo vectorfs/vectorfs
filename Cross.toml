@@ -1,17 +1,21 @@
 # cross-rs configuration for the aarch64-unknown-linux-gnu release build
-# (.github/workflows/release.yml; cross runs inside Docker on the x86_64
-# runner — the runner ships docker, nothing is needed locally).
+# (.github/workflows/release.yml + docker.yml; cross runs inside Docker on
+# the x86_64 runner — the runner ships docker, nothing is needed locally).
 #
-# NOT yet exercised on a real tag (first-verification list in release.yml):
+# First real-tag verification (v0.1.0, 2026-11-05) repaid the debt list:
 #   - `passthrough` carries VF_GIT_HASH into the build container so
 #     option_env!("VF_GIT_HASH") in vf/src/report.rs bakes the commit;
-#   - `pre-build` apt-installs cmake (aws-lc-sys C build dep) and protoc
-#     (lance-encoding/prost build dep) INSIDE the container — the host-side
-#     apt install does not reach cross's build environment.
+#   - PROTOC now rides the passthrough TOO, pointing at the workspace-staged
+#     pinned binary (.tools/protoc, mounted at /project) — the container's
+#     ubuntu-20.04 apt only has protoc 3.6, which rejects the
+#     --experimental_allow_proto3_optional flag lance-encoding passes
+#     (supported 3.12..3.21);
+#   - `pre-build` keeps apt-installing cmake (aws-lc-sys C build dep) — as
+#     root it works fine; only the protoc part moved to the staged binary.
 [build.env]
-passthrough = ["VF_GIT_HASH"]
+passthrough = ["VF_GIT_HASH", "PROTOC"]
 
 [target.aarch64-unknown-linux-gnu]
 pre-build = [
-    "apt-get update && apt-get install -y --no-install-recommends cmake protobuf-compiler",
+    "apt-get update && apt-get install -y --no-install-recommends cmake",
 ]

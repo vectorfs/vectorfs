@@ -80,10 +80,23 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Host-side protoc (the cross build gets it from Cross.toml's pre-build
-      # hook, inside the container).
-      - name: install protoc (lance-encoding build dep)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+      # Pinned protoc staged into the WORKSPACE (.tools/protoc) so every
+      # build container sees it at a known mount-relative path via the
+      # PROTOC env var (prost-build's documented sourcing knob): the
+      # bullseye container mounts /ws, cross mounts /project — apt inside
+      # those is NOT an option (the bullseye run is unprivileged; cross's
+      # ubuntu-20.04 apt only has protoc 3.6, which rejects
+      # --experimental_allow_proto3_optional that lance-encoding passes —
+      # flag support is 3.12..3.21; v21.12 is the bookworm version the
+      # Docker workflow's amd64 build already compiled green with).
+      - name: stage pinned protoc (21.12)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/protoc.zip \
+            https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-x86_64.zip
+          mkdir -p .tools/protoc
+          unzip -qo /tmp/protoc.zip -d .tools/protoc
+          .tools/protoc/bin/protoc --version
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -107,13 +120,27 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -n "${{ matrix.build-in-container }}" ]]; then
-            # rust:1-bullseye ships no protoc — install it inside the same run
-            docker run --rm --user "$(id -u):$(id -g)"               -e VF_GIT_HASH -e CARGO_NET_GIT_FETCH_WITH_CLI=true               -v "$PWD:/ws" -w /ws               "${{ matrix.build-in-container }}"               bash -c 'set -euo pipefail;
-                       apt-get update -qq && apt-get install -y -qq --no-install-recommends protobuf-compiler libprotobuf-dev >/dev/null;
+            # unprivileged (--user): the workspace's target/ stays runner-
+            # owned, so rust-cache and the package step below keep working.
+            # protoc rides the workspace mount — no apt, no root (the
+            # 2026-11-05 v0.1.0 first-tag run proved apt is impossible here:
+            # unprivileged apt-get dies on /var/lib/apt/lists, and its
+            # failure was swallowed by an `a && b;` list's set -e
+            # exemption, surfacing only later as prost's "Could not find
+            # protoc").
+            docker run --rm --user "$(id -u):$(id -g)" \
+              -e VF_GIT_HASH -e CARGO_NET_GIT_FETCH_WITH_CLI=true \
+              -e PROTOC=/ws/.tools/protoc/bin/protoc \
+              -v "$PWD:/ws" -w /ws \
+              "${{ matrix.build-in-container }}" \
+              bash -c 'set -euo pipefail;
                        cargo build --profile release-prod --workspace --target ${{ matrix.target }}'
           else
             cargo install cross --locked
-            cross build --profile release-prod --workspace --target "${{ matrix.target }}"
+            # PROTOC points at cross's own mount of the workspace (/project);
+            # Cross.toml's passthrough carries it into the container.
+            PROTOC=/project/.tools/protoc/bin/protoc \
+              cross build --profile release-prod --workspace --target "${{ matrix.target }}"
           fi
 
       # size_guard.sh takes the binary path as $1 (default
