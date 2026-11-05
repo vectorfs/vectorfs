@@ -131,7 +131,9 @@ res, err := client.QueryVectors(ctx, &s3vectors.QueryVectorsInput{
   models when needed (`HF_ENDPOINT` mirror respected; sha256-verified, atomic).
 - Pipeline = extractor (pdf-text via pdfium / `pdf-inspector` [pure-Rust, scans
   fail loud with an OCR-needed reason, optional position-aware Markdown] / md /
-  txt) → chunker (token-window, char-counted, CJK-safe) → embedder (local `ort`
+  txt; per-mime values may be an **ordered fallback chain** — a member that
+  declines, e.g. pdf-inspector on a scanned PDF, yields to the next) → chunker
+  (token-window, char-counted, CJK-safe) → embedder (local `ort`
   [onnxruntime, load-dynamic] or any OpenAI-compatible `/embeddings` endpoint).
   Config in `.vectorfs/vectorfs.toml`; `vectorfs pipelines check` validates it
   with TOML line numbers.

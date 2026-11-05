@@ -46,6 +46,15 @@
 //! * page texts are joined `"\n\n"` into ONE Text Part (§5.10.2: one
 //!   logical document, one extraction product; page-level chunking is the
 //!   chunker's job).
+//!
+//! # Chain semantics (M2.1)
+//!
+//! Under an `extract` fallback chain this kind's Err or empty output IS
+//! its yield signal: the ingest worker hands the bytes to the next chain
+//! member instead of failing the file (and this kind is itself a common
+//! LAST member — the pdfium recovery path after a stricter first member
+//! yields). Standalone (single-member route) the same Err stays a plain,
+//! visible FAILED.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

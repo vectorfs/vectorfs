@@ -57,6 +57,13 @@
 //!   observed).
 //! * encrypted PDFs err (`Encrypted`); empty/non-PDF bytes err (`Not a
 //!   PDF: …`).
+//!
+//! # Chain semantics (M2.1)
+//!
+//! Under an `extract` fallback chain this kind's Err IS its yield signal:
+//! the ingest worker hands the bytes to the next chain member (a future
+//! `pdf-ocr`) instead of failing the file. Standalone (single-member
+//! route) the same Err stays a plain, visible FAILED.
 
 use pdf_inspector::{PdfType, detect_pdf_mem, process_pdf_mem};
 
@@ -212,8 +219,9 @@ pub(crate) mod tests {
     /// Minimal single-page PDF whose page draws ONLY a full-page image
     /// XObject (uncompressed 1x1 RGB): the detector classifies it Scanned
     /// with the `scanned` OCR reason (probed) — a genuine raster-scan shape,
-    /// built in-test, nothing committed.
-    fn image_only_pdf() -> Vec<u8> {
+    /// built in-test, nothing committed. `pub(crate)`: the M2.1 ingest
+    /// chain tests reuse it as the ALL-members-yield specimen.
+    pub(crate) fn image_only_pdf() -> Vec<u8> {
         let img: &[u8] = &[0x80, 0x80, 0x80];
         let image_obj = format!(
             "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB \
@@ -287,6 +295,86 @@ pub(crate) mod tests {
         out
     }
 
+    /// Two-page PDF: page 1 draws text, page 2 draws ONLY a full-page image
+    /// XObject — the RECORDED cross-engine divergence specimen (probed
+    /// 2026-11-05): this kind classifies the document as needing OCR and
+    /// refuses, while pdfium (`pdf-text`) still extracts page 1's text.
+    /// That asymmetry is exactly what the M2.1 fallback chain recovers
+    /// (`extract = { pdf = ["inspector", "pdf-text"] }`); the ingest chain
+    /// tests consume this builder. (Tail-truncation shapes do NOT diverge
+    /// on the pinned engines — both tolerate ~21 bytes of tail loss, both
+    /// refuse deeper cuts — which is why the divergence fixture is the
+    /// mixed text+image page, not a truncation.)
+    pub(crate) fn mixed_text_image_pdf() -> Vec<u8> {
+        let img: &[u8] = &[0x80, 0x80, 0x80];
+        let c1 = b"BT /F1 12 Tf 72 720 Td (Hello from the text page) Tj ET\n";
+        let c2 = b"q 612 0 0 792 0 0 cm /Im0 Do Q\n";
+        // objects: 1 catalog, 2 pages, 3 font, 4 image, then (page,
+        // contents) pairs 5..8
+        let bodies: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [5 0 R 7 0 R] /Count 2 >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            {
+                let mut v = format!(
+                    "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace \
+                     /DeviceRGB /BitsPerComponent 8 /Length {} >>\nstream\n",
+                    img.len()
+                )
+                .into_bytes();
+                v.extend_from_slice(img);
+                v.extend_from_slice(b"\nendstream");
+                v
+            },
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << \
+              /F1 3 0 R >> >> /Contents 6 0 R >>"
+                .to_vec(),
+            format!(
+                "<< /Length {} >>\nstream\n{}endstream",
+                c1.len(),
+                String::from_utf8_lossy(c1)
+            )
+            .into_bytes(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << \
+              /Im0 4 0 R >> >> /Contents 8 0 R >>"
+                .to_vec(),
+            format!(
+                "<< /Length {} >>\nstream\n{}endstream",
+                c2.len(),
+                String::from_utf8_lossy(c2)
+            )
+            .into_bytes(),
+        ];
+        assemble(&bodies)
+    }
+
+    /// xref-exact assembly for fully-formed object bodies the single-page
+    /// [`build_pdf`] helper cannot express (same hand-assembly discipline).
+    fn assemble(bodies: &[Vec<u8>]) -> Vec<u8> {
+        let mut out: Vec<u8> = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let mut offsets = Vec::with_capacity(bodies.len());
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_pos = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", bodies.len() + 1).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            &format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n",
+                bodies.len() + 1
+            )
+            .into_bytes(),
+        );
+        out
+    }
+
     #[test]
     fn extracts_text_from_real_pdf() {
         let parts = PdfInspectorExtractor::new()
@@ -355,6 +443,19 @@ pub(crate) mod tests {
             .extract(&no_text_page_pdf(), "application/pdf")
             .unwrap_err();
         assert!(err.to_string().contains("no_text"), "{err}");
+    }
+
+    #[test]
+    fn mixed_text_image_divergence_specimen_refuses_here() {
+        // the inspector half of the recorded cross-engine divergence (the
+        // pdfium half — page 1's text extracted — is asserted in the M2.1
+        // ingest chain e2e, where the real .so is honest-failed): this kind
+        // refuses the whole document because ONE page needs OCR
+        let err = PdfInspectorExtractor::new()
+            .extract(&mixed_text_image_pdf(), "application/pdf")
+            .unwrap_err();
+        assert!(matches!(err, PipelineError::Extract(_)), "{err}");
+        assert!(err.to_string().contains("scanned"), "{err}");
     }
 
     #[test]

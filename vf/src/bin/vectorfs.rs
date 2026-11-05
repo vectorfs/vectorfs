@@ -510,14 +510,26 @@ fn print_pipeline_summary(cfg: &vectorfs::pipeline::config::PipelineConfig) {
     }
     for (bucket, ingest) in &cfg.ingest {
         let scope = ingest.scope.as_deref().unwrap_or("<whole root>");
+        // extract routes, BTreeMap order; the array form shows the chain
+        // (order = try order), the string form shows verbatim
+        let routes = if ingest.extract.is_empty() {
+            "(none)".to_string()
+        } else {
+            ingest
+                .extract
+                .iter()
+                .map(|(key, value)| format!("{key} -> {}", value.describe()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let embedders = if ingest.embedders.is_empty() {
             "[]".to_string()
         } else {
             format!("[{}]", ingest.embedders.join(", "))
         };
         println!(
-            "ingest {bucket}: chunker={} scope={scope} embedders={embedders} merge={} \
-             fingerprint={}",
+            "ingest {bucket}: chunker={} scope={scope} extract: {routes} \
+             embedders={embedders} merge={} fingerprint={}",
             ingest.chunk.describe(),
             ingest.merge,
             cfg.fingerprint(bucket).expect("bucket present"),

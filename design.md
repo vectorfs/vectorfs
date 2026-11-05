@@ -30,6 +30,7 @@
 | **存储布局统一（2026-11-04，v2.2）** | **文件即普通对象**：上传直接落实例根普通键（无包装、无副本、无内容寻址源仓库），vectorfs 自有数据全收进 `.vectorfs/` 单一保留前缀（.git 心智）；copy-in/外部源双形态**取消**，统一为 scope 摄取模型（真源 = 实例根列表，`vf put`/`vf rm` = S3 语义便捷包装）；chunk key 改含**对象键**（防同内容文件互踩），内容哈希仅用于"etag 变但内容未变跳过重嵌" | M2 范围反降（无需建源仓库）；`.vectorfs/` 为保留前缀，一实例根一个 |
 | 默认模型裁决（2026-11-04） | M2 文本默认 = **gte-multilingual-base**（305M、Apache-2.0、中文良好、下载轻——实用性审查 P1-5 采纳）；bge-m3 一行换（更强、1.1GB）。覆盖 multimodal 报告头部所述"bge-m3 已定"的时点快照 | 报告不回改；本行为准 |
 | pdf-inspector kind 增补（2026-11-05，用户裁决） | 新增第四个 M2 extractor kind `pdf-inspector`（firecrawl/pdf-inspector 1.25，MIT，纯 Rust lopdf 系），**双重目的**：PDF 提取的免 .so 替选（扫描件分类 fail-loud + markdown 选项）+ 插件体系"第三方准入"实测。**auto 映射不漂移**（pdf→pdf-text 仍默认——pdfium 是久经考验路径，新增项不改变既有语义）。体积代价 +6.4MiB（159→166MiB，硬顶 175 余 9MiB）——M3 图像模态（image 编解码器）落地前须做**体积专项裁决**（feature 门控 kind / 拆 bin / 接受扩线）。审计结论"体系基本完善"与缺口清单记 §10.8 续 | 零核心改动即接入成功（两段式/枚举/contract/DIP 全复用）；contract 框架据审计补非空文本断言 |
+| **Extractor 回退链（2026-11-05，用户裁决）** | `extract` 的每 mime 短键值从单实例名扩为**有序线性链**（字符串或数组形）：按序尝试，Err 或空产出 ⇒ 退让到下一成员，首个非空 Ok 胜出（不跨成员合并），全链耗尽 ⇒ FAILED 聚合各成员原因。**§5.10.8 禁令继续有效**——线性列表不是分支/条件/DAG（与 embedders 列表即 fan-out 同构）；内容路由智能住在 kind 内部（pdf-inspector 的分类 Err 即退让信号），机制层零路由引擎。**trait/contract 零改动**（链是 ingest 编排层机制）。指纹含链组成与序（`"x" ≡ ["x"]` 等价、序变即变）。`auto` 不动（M3 pdf-ocr 落地时再裁决是否升为内建链）。多值语义按产物性质分：extractor 多值 = 回退链（首个胜），embedder 多值 = fan-out（全写） | 实证：混合文字+图片页 PDF，链 `[pdf-inspector, pdf-text]` INDEXED、单 pdf-inspector FAILED——"不能处理交给能处理的"成立；任务书原设想的截断恢复差异样本经实测不存在（两引擎截断行为一致），已换真实差异样本 |
 
 ## 1. 定位
 
@@ -309,7 +310,8 @@ contract test 最低断言（四轴各一份 + 查询选项；LSP 防线 + 未�
 #### 5.10.3 数据流（固定机制）
 
 ```
-ingest: Source → extractor(s)（按 mime 短键如 "pdf"，可多选；auto = 内置 mime→kind 映射）
+ingest: Source → extractor 链（按 mime 短键取有序链：按序尝试，Err/空产出 ⇒
+        退让下一成员，首个非空 Ok 胜出；auto = 内置 mime→kind 单射）
         → Parts → 每模态路由到全部 doc-模态匹配的 embedder
         → chunker（仅 text 模态）→ embed → 分批 put_vectors(x-vf-src-*)
 query: 输入 → query 模态匹配的各 embedder → embed_query → 各查各 index（filter 可带）
@@ -342,7 +344,10 @@ kind = "pdf-text"
 
 [ingest.docs]                         # 绑定 vector bucket "docs"
 scope = "docs/**"                     # 摄取范围（实例根内前缀/glob）；省略 = 整根（.vectorfs/ 恒排除）
-extract = { pdf = "pdf", default = "auto" }   # mime 短键 → extractor 实例名
+extract = { pdf = ["insp", "pdf"], default = "auto" }
+                                     # mime 短键 → extractor 实例名或有序回退链
+                                     # （数组：Err/空产出 ⇒ 退让下一成员，首个非空 Ok 胜；
+                                     # "auto" 只可独占整值；多值语义详见 §5.10.3/§0 回退链裁决）
 chunk = { kind = "token-window", size = 512, overlap = 64 }
 embedders = ["text"]                  # 实例集合；同模态多实例 = fan-out
 merge = "rrf"
@@ -374,7 +379,7 @@ ghcr multi-arch（amd64/arm64 对齐发布矩阵）debian-slim non-root，内含
 
 #### 5.10.8 明确不做
 
-分支声明 / 条件表达式 / 拓扑引擎（多路 fan-out 只是 embedders 列表里多一个名字）；任意 DAG；独立任务队列；后台隐式重嵌引擎（重嵌 = 显式 `vf reindex`）；模态槽位配置（路由由 embedder 模态声明推导）；**自建 S3 对象面**（PutObject/GetObject 等对象 API 不实现——标准工具直接操作实例根，vectorfs 只读扫描）；**内容寻址源仓库/文件副本**（v2.2：文件即普通对象，不做第二份存储）；插件商店；v1 不做 wasm runtime 与进程外插件。
+分支声明 / 条件表达式 / 拓扑引擎（多路 fan-out 只是 embedders 列表里多一个名字；**extractor 有序回退链同理**——2026-11-05 裁决：线性列表非 DAG，内容路由智能住在 kind 内部，机制层零路由引擎）；任意 DAG；独立任务队列；后台隐式重嵌引擎（重嵌 = 显式 `vf reindex`）；模态槽位配置（路由由 embedder 模态声明推导）；**自建 S3 对象面**（PutObject/GetObject 等对象 API 不实现——标准工具直接操作实例根，vectorfs 只读扫描）；**内容寻址源仓库/文件副本**（v2.2：文件即普通对象，不做第二份存储）；插件商店；v1 不做 wasm runtime 与进程外插件。
 
 ## 6. 一致性模型（卖点之一）
 

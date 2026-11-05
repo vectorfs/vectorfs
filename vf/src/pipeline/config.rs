@@ -74,7 +74,7 @@ struct RawFile {
 struct IngestRaw {
     scope: Option<String>,
     #[serde(default)]
-    extract: BTreeMap<String, String>,
+    extract: BTreeMap<String, ExtractValue>,
     chunk: Option<toml::Value>,
     #[serde(default)]
     embedders: Vec<String>,
@@ -115,6 +115,96 @@ fn default_extract_timeout_secs() -> u64 {
 }
 fn default_store_chunk_text() -> bool {
     true
+}
+
+// ---------------------------------------------------------------------------
+// extract routing values (M2.1 fallback chains)
+// ---------------------------------------------------------------------------
+
+/// One `extract` map value: the STRING form — a declared extractor instance
+/// name, or the reserved sentinel `"auto"` (the built-in mime→kind map) —
+/// or the ARRAY form, an ORDERED linear fallback chain of declared instance
+/// names (`extract = { pdf = ["pdf-inspector", "pdf-ocr-未来"] }`).
+///
+/// # Design rulings baked into this shape (main-session 2026-11-05)
+///
+/// * A chain is a LIST, not a conditional/DAG (§5.10.8's ban stands): a list
+///   of names is the same shape `embedders` already uses for fan-out — "one
+///   more name in the list" is not an engine. The routing INTELLIGENCE stays
+///   inside the kinds themselves (a member's Err/empty output IS its yield
+///   signal); the mechanism layer only tries in order.
+/// * `"auto"` is legal ONLY as the whole string value. Mixed into an array
+///   it is semantically ambiguous ("auto resolves to one kind — then fall
+///   back to what?") and is refused at parse time with the section line
+///   rather than guessed.
+/// * Duplicate members in an array are ALLOWED (deterministic — a repeated
+///   attempt yields the same verdict; no rule without grounds).
+/// * A string value and its one-element array are the SAME chain; the
+///   fingerprint serializes both as the array form (see
+///   [`pipeline_fingerprint`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExtractValue {
+    /// String form: an instance name, or `"auto"` (built-in mapping).
+    Single(String),
+    /// Array form: ordered fallback chain of declared instance names.
+    /// Parse-time validation guarantees non-empty and `"auto"`-free.
+    Chain(Vec<String>),
+}
+
+impl ExtractValue {
+    /// Normalized chain view (fingerprint + routing): the string form IS a
+    /// one-element chain — `"x" ≡ ["x"]` — so every consumer sees one shape.
+    pub fn chain(&self) -> Vec<&str> {
+        match self {
+            ExtractValue::Single(s) => vec![s.as_str()],
+            ExtractValue::Chain(names) => names.iter().map(String::as_str).collect(),
+        }
+    }
+
+    /// Human form for the `pipelines check` summary: verbatim for the
+    /// string shape (`auto`, `insp`), bracketed for the array shape
+    /// (`[insp, plain]`) so the two remain distinguishable on one line.
+    pub fn describe(&self) -> String {
+        match self {
+            ExtractValue::Single(s) => s.clone(),
+            ExtractValue::Chain(names) => {
+                format!("[{}]", names.join(", "))
+            }
+        }
+    }
+}
+
+/// Typed parse for [`ExtractValue`]: a plain string or an array of strings,
+/// with serde's native type error for anything else (line attribution then
+/// flows through the shared stage-2 section-line path like every other
+/// ingest field error).
+impl<'de> serde::Deserialize<'de> for ExtractValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = ExtractValue;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "an extractor instance name, \"auto\", or an ordered array of instance \
+                     names",
+                )
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<ExtractValue, E> {
+                Ok(ExtractValue::Single(s.to_string()))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<ExtractValue, A::Error> {
+                let mut out = Vec::new();
+                while let Some(name) = seq.next_element::<String>()? {
+                    out.push(name);
+                }
+                Ok(ExtractValue::Chain(out))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
 }
 
 /// Validated pipeline configuration (the parse product consumed by T3's
@@ -239,8 +329,10 @@ pub struct IngestConfig {
     /// root (`.vectorfs/` is always excluded — mechanism, not config).
     pub scope: Option<String>,
     /// mime short key (plus the reserved `default` key) -> extractor
-    /// instance name, or the sentinel `"auto"` (built-in mime->kind map).
-    pub extract: BTreeMap<String, String>,
+    /// instance name, the sentinel `"auto"` (built-in mime->kind map), or an
+    /// ORDERED array of instance names (M2.1 fallback chain; see
+    /// [`ExtractValue`]).
+    pub extract: BTreeMap<String, ExtractValue>,
     /// Inline chunker (two-stage kind parse).
     pub chunk: ChunkerKind,
     /// Embedder instance names (fan-out per §5.10.1 routing rules).
@@ -441,14 +533,44 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
         let merge = Merge::parse(rawi.merge.as_deref().unwrap_or("rrf"))
             .map_err(|m| PipelineError::config(format!("[{section}]: {m}"), line))?;
 
-        // extract references must resolve ("auto" = built-in mapping, T3).
-        for (mime_key, instance) in &rawi.extract {
-            if instance != "auto" && !extractors.contains_key(instance) {
+        // extract references must resolve ("auto" = built-in mapping, T3;
+        // array form = M2.1 fallback chain, see ExtractValue).
+        for (mime_key, value) in &rawi.extract {
+            for instance in value.chain() {
+                if instance == "auto" {
+                    // legal as the WHOLE string value only: inside a chain
+                    // it is semantically ambiguous and refused (see
+                    // ExtractValue docs), so this arm fires iff the value is
+                    // the array form with "auto" among its members.
+                    if matches!(value, ExtractValue::Chain(_)) {
+                        return Err(PipelineError::config(
+                            format!(
+                                "[{section}]: extract['{mime_key}'] mixes 'auto' into a chain \
+                                 — 'auto' is only legal as the whole value (extract = {{ \
+                                 {mime_key} = \"auto\" }}); a chain lists declared extractor \
+                                 instance names in order",
+                            ),
+                            line,
+                        ));
+                    }
+                    continue; // the whole-value sentinel: nothing to resolve
+                }
+                if !extractors.contains_key(instance) {
+                    return Err(PipelineError::config(
+                        format!(
+                            "[{section}]: extract['{mime_key}'] references unknown extractor \
+                             instance '{instance}' (declared extractor instances: {})",
+                            names_or_none(&declared_extractors)
+                        ),
+                        line,
+                    ));
+                }
+            }
+            if matches!(value, ExtractValue::Chain(names) if names.is_empty()) {
                 return Err(PipelineError::config(
                     format!(
-                        "[{section}]: extract['{mime_key}'] references unknown extractor \
-                         instance '{instance}' (declared extractor instances: {})",
-                        names_or_none(&declared_extractors)
+                        "[{section}]: extract['{mime_key}'] is an empty chain — declare at \
+                         least one extractor instance name, or route the key with \"auto\"",
                     ),
                     line,
                 ));
@@ -598,12 +720,15 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
 }
 
 /// Extractor instance names an ingest section actually uses (deduped,
-/// sorted; `"auto"` resolves at scan time in T3, not to an instance).
-fn used_extractor_instances(extract: &BTreeMap<String, String>) -> Vec<&str> {
+/// sorted; `"auto"` resolves at scan time in T3, not to an instance — every
+/// chain member counts, chains and string values are the same shape here).
+fn used_extractor_instances(extract: &BTreeMap<String, ExtractValue>) -> Vec<&str> {
     let mut used: BTreeSet<&str> = BTreeSet::new();
-    for instance in extract.values() {
-        if instance != "auto" {
-            used.insert(instance.as_str());
+    for value in extract.values() {
+        for instance in value.chain() {
+            if instance != "auto" {
+                used.insert(instance);
+            }
         }
     }
     used.into_iter().collect()
@@ -678,7 +803,8 @@ fn toml_line(text: &str, err: &toml::de::Error) -> Option<usize> {
 /// Pipeline fingerprint of one ingest section: first
 /// [`FINGERPRINT_HEX_LEN`] hex chars of `sha256(canonical TOML)` over the
 /// RELEVANT instance configuration — the referenced extractor instances,
-/// the chunker, and the listed embedder instances, all name-keyed and
+/// the extract ROUTING (M2.1: chain composition AND order; see below), the
+/// chunker, and the listed embedder instances, all name-keyed and
 /// BTreeMap-normalized so key order and formatting in the source file do
 /// not matter. Query-side (`merge`) and routing-only fields (`scope`,
 /// `index-prefix`) are deliberately EXCLUDED: they never change chunk
@@ -691,6 +817,13 @@ pub fn pipeline_fingerprint(
     #[derive(serde::Serialize)]
     struct Fp<'a> {
         extractors: BTreeMap<&'a str, &'a ExtractorKind>,
+        /// mime short key -> ordered chain, in the NORMALIZED ARRAY form:
+        /// the string value `"x"` and the array value `["x"]` are the same
+        /// chain and must derive the same fingerprint (pinned by test),
+        /// while the Vec keeps the serialization order-SENSITIVE —
+        /// `["a","b"]` and `["b","a"]` are different pipelines (a file the
+        /// first member yields on ends up extracted by a different engine).
+        extract_routes: BTreeMap<&'a str, Vec<&'a str>>,
         chunk: &'a ChunkerKind,
         embedders: BTreeMap<&'a str, &'a EmbedderKind>,
     }
@@ -701,6 +834,11 @@ pub fn pipeline_fingerprint(
             fp_extractors.insert(instance, kind);
         }
     }
+    let fp_routes: BTreeMap<&str, Vec<&str>> = ingest
+        .extract
+        .iter()
+        .map(|(mime_key, value)| (mime_key.as_str(), value.chain()))
+        .collect();
     let mut fp_embedders: BTreeMap<&str, &EmbedderKind> = BTreeMap::new();
     for instance in &ingest.embedders {
         if let Some(kind) = embedders.get(instance) {
@@ -712,6 +850,7 @@ pub fn pipeline_fingerprint(
     // could go NaN, no non-string map keys): toml serialization cannot fail.
     let canonical = toml::to_string(&Fp {
         extractors: fp_extractors,
+        extract_routes: fp_routes,
         chunk: &ingest.chunk,
         embedders: fp_embedders,
     })
@@ -766,8 +905,8 @@ index-prefix = "docs"
         assert_eq!(cfg.ingest.len(), 1);
         let d = &cfg.ingest["docs"];
         assert_eq!(d.scope.as_deref(), Some("docs/**"));
-        assert_eq!(d.extract["txt"], "plain");
-        assert_eq!(d.extract["default"], "auto");
+        assert_eq!(d.extract["txt"], ExtractValue::Single("plain".into()));
+        assert_eq!(d.extract["default"], ExtractValue::Single("auto".into()));
         assert_eq!(d.merge, Merge::Rrf);
         assert_eq!(d.index_prefix.as_deref(), Some("docs"));
         assert_eq!(d.embedders, Vec::<String>::new());
@@ -974,6 +1113,119 @@ index-prefix = "docs"
         let ok = "[ingest.ddd]\nextract = { default = \"auto\" }\nchunk = { kind = \"token-window\", \
                   size = 8, overlap = 2 }\n";
         assert!(parse(ok).is_ok());
+    }
+
+    // ---- M2.1: extract fallback chains ----
+
+    /// Two extractor instances + a parameterized pdf route over lines 1-6
+    /// so every error below attributes to a known section line.
+    fn chain_config(route: &str) -> String {
+        format!(
+            "[extractor.insp]\nkind = \"pdf-inspector\"\n\n[extractor.plain]\nkind = \
+             \"pdf-text\"\n\n[ingest.ddd]\nextract = {{ pdf = {route} }}\nchunk = {{ kind = \
+             \"token-window\", size = 8, overlap = 2 }}\n"
+        )
+    }
+
+    #[test]
+    fn extract_chain_forms_parse_and_describe() {
+        // both forms of the SAME route parse; describe() keeps the shapes
+        // distinguishable (verbatim string vs bracketed array)
+        let cfg = parse(&chain_config("\"insp\"")).unwrap();
+        assert_eq!(
+            cfg.ingest["ddd"].extract["pdf"],
+            ExtractValue::Single("insp".into())
+        );
+        assert_eq!(cfg.ingest["ddd"].extract["pdf"].describe(), "insp");
+        let cfg = parse(&chain_config("[\"insp\", \"plain\"]")).unwrap();
+        assert_eq!(
+            cfg.ingest["ddd"].extract["pdf"],
+            ExtractValue::Chain(vec!["insp".into(), "plain".into()])
+        );
+        assert_eq!(cfg.ingest["ddd"].extract["pdf"].describe(), "[insp, plain]");
+        // normalized chain view: string form IS a one-element chain
+        assert_eq!(
+            parse(&chain_config("\"insp\"")).unwrap().ingest["ddd"].extract["pdf"].chain(),
+            vec!["insp"]
+        );
+        // duplicate members are the user's call: deterministic, allowed
+        assert!(parse(&chain_config("[\"insp\", \"insp\"]")).is_ok());
+    }
+
+    #[test]
+    fn extract_chain_unknown_instance_fails_with_line() {
+        let text = chain_config("[\"insp\", \"nope\"]");
+        let err = parse(&text).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "[ingest.ddd]: extract['pdf'] references unknown extractor instance \
+                 'nope' (declared extractor instances: insp, plain)"
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains("at line 7"), "{msg}");
+    }
+
+    #[test]
+    fn extract_chain_auto_mixed_in_fails_with_line() {
+        let err = parse(&chain_config("[\"insp\", \"auto\"]")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[ingest.ddd]: extract['pdf'] mixes 'auto' into a chain"),
+            "{msg}"
+        );
+        assert!(msg.contains("only legal as the whole value"), "{msg}");
+        assert!(msg.contains("at line 7"), "{msg}");
+    }
+
+    #[test]
+    fn extract_chain_empty_array_fails() {
+        let err = parse(&chain_config("[]")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[ingest.ddd]: extract['pdf'] is an empty chain"),
+            "{msg}"
+        );
+        assert!(msg.contains("at line 7"), "{msg}");
+    }
+
+    #[test]
+    fn extract_chain_non_string_member_fails() {
+        // typed visitor: an int member is a serde type error attributed to
+        // the section line (same path every other ingest field error takes)
+        let err = parse(&chain_config("[\"insp\", 7]")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[ingest.ddd]:") && msg.contains("invalid type: integer"),
+            "{msg}"
+        );
+        // a non-string non-array value is equally refused
+        let err = parse(&chain_config("7")).unwrap_err();
+        assert!(err.to_string().contains("invalid type"), "{}", err);
+    }
+
+    #[test]
+    fn fingerprint_string_equals_single_element_array() {
+        // "x" ≡ ["x"]: the fingerprint normalizes to the array form, so the
+        // two config spellings of the same route derive the SAME digest
+        // (pinned; see pipeline_fingerprint).
+        let single = fp_of(&chain_config("\"insp\""));
+        let array = fp_of(&chain_config("[\"insp\"]"));
+        assert_eq!(single, array);
+    }
+
+    #[test]
+    fn fingerprint_chain_order_matters() {
+        // ["a","b"] != ["b","a"]: chain order changes which engine extracts
+        // a yielded file, so it MUST move the fingerprint (canonical TOML
+        // serializes Vecs in order — this test is the pin).
+        let ab = fp_of(&chain_config("[\"insp\", \"plain\"]"));
+        let ba = fp_of(&chain_config("[\"plain\", \"insp\"]"));
+        assert_ne!(ab, ba);
+        // and adding a member changes it too
+        let single = fp_of(&chain_config("\"insp\""));
+        assert_ne!(single, ab);
     }
 
     #[test]

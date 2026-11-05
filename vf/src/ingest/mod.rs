@@ -14,6 +14,17 @@
 //!   [`IngestRuntime`] (scheduler + workers + queue), [`IngestHandle`]
 //!   (wake/drain handle the protocol face and `vectorfs serve` hold).
 //!
+//! # Extractor fallback chains (M2.1)
+//!
+//! An `extract` route may name an ORDERED chain of extractor instances
+//! (`extract = { pdf = ["pdf-inspector", "pdf-text"] }`): content one
+//! member cannot handle (its Err or empty output — e.g. pdf-inspector
+//! meeting a scan) falls to the next member better suited to it, instead
+//! of failing or being勉强处理. The chain is INGEST ORCHESTRATION on top
+//! of the unchanged [`Extractor`](crate::pipeline::Extractor) trait — a
+//! list, not a conditional/DAG (§5.10.8 stands); the decision core is the
+//! pure [`pick_from_chain`].
+//!
 //! # Execution model (§5.10.5)
 //!
 //! One SCHEDULER task per instance root: periodic scan (`scan_interval_secs`,
@@ -56,7 +67,7 @@ use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 
 use crate::ops::{self, AppState};
 use crate::pipeline::chunk::ChunkerKind;
-use crate::pipeline::config::PipelineConfig;
+use crate::pipeline::config::{ExtractValue, PipelineConfig};
 use crate::pipeline::embed::LoadedEmbedder;
 use crate::pipeline::extract::{
     ExtractorKind,
@@ -64,7 +75,7 @@ use crate::pipeline::extract::{
     pdf_text::{PdfTextConfig, PdfTextTag},
     txt::{TxtConfig, TxtTag},
 };
-use crate::pipeline::{Chunk, Chunker, Embedder, Extractor, Merge, Modality, PipelineError};
+use crate::pipeline::{Chunk, Chunker, Embedder, Extractor, Merge, Modality, Part, PipelineError};
 use crate::store::{SourceMarker, SourceStatus, Storage};
 
 use domain::DerivedSpec;
@@ -135,9 +146,10 @@ pub async fn fingerprint_gate(
 pub(crate) struct BucketPlan {
     pub fingerprint: String,
     pub scope: Scope,
-    /// raw extract routing: mime short key (or `default`) -> instance name
-    /// or the `auto` sentinel.
-    extract: BTreeMap<String, String>,
+    /// raw extract routing: mime short key (or `default`) -> instance name,
+    /// the `auto` sentinel, or an ordered chain of instance names (M2.1;
+    /// see [`crate::pipeline::config::ExtractValue`]).
+    extract: BTreeMap<String, ExtractValue>,
     /// declared extractor instances (name -> kind).
     extractors: BTreeMap<String, ExtractorKind>,
     chunker: ChunkerKind,
@@ -157,19 +169,42 @@ pub(crate) struct BucketPlan {
 }
 
 impl BucketPlan {
-    /// The extractor this bucket routes `object_key` to, or None — None
-    /// means the object is NOT a source of this pipeline (unknown/absent
-    /// extension with no matching extract entry): no marker, no ingest
-    /// (§5.10.1: sources are the objects this pipeline claims).
-    fn extractor_for(&self, object_key: &str) -> Option<ExtractorKind> {
+    /// The ordered extractor CHAIN this bucket routes `object_key` through
+    /// (M2.1 linear fallback), as (member name, kind) pairs — the name is
+    /// what the aggregated statusReason quotes ("auto" names the sentinel's
+    /// one-member chain, instance names name themselves). `None` means the
+    /// object is NOT a source of this pipeline (unknown/absent extension
+    /// with no matching extract entry): no marker, no ingest (§5.10.1:
+    /// sources are the objects this pipeline claims).
+    ///
+    /// Every configured member resolved at PARSE time (config validation
+    /// guarantees chain members are declared instances), so a missing entry
+    /// here can only mean "routing changed under a running process" — the
+    /// safe answer is None (not a source), same as pre-M2.1.
+    fn extractor_chain_for(&self, object_key: &str) -> Option<Vec<(String, ExtractorKind)>> {
         let short = short_key_of(object_key)?;
-        let instance = self
+        let value = self
             .extract
             .get(short)
             .or_else(|| self.extract.get("default"))?;
-        match instance.as_str() {
-            "auto" => builtin_extractor(short),
-            name => self.extractors.get(name).cloned(),
+        match value {
+            ExtractValue::Single(s) => match s.as_str() {
+                // auto stays the built-in mime->kind single-member chain
+                // (M3 ruling pending: whether auto itself becomes a chain
+                // when pdf-ocr lands — see builtin_extractor).
+                "auto" => builtin_extractor(short).map(|k| vec![(s.clone(), k)]),
+                name => self
+                    .extractors
+                    .get(name)
+                    .map(|k| vec![(name.to_string(), k.clone())]),
+            },
+            // array form: the declared order IS the try order
+            ExtractValue::Chain(names) => Some(
+                names
+                    .iter()
+                    .map(|n| self.extractors.get(n).map(|k| (n.clone(), k.clone())))
+                    .collect::<Option<Vec<_>>>()?,
+            ),
         }
     }
 }
@@ -194,6 +229,9 @@ fn short_key_of(object_key: &str) -> Option<&'static str> {
 /// kind landing must not silently re-route every `extract = { default =
 /// "auto" }` deployment. Deployments that want the classify-first, no-.so
 /// engine opt in explicitly (`extract = { pdf = "inspector-instance" }`).
+/// M2.1 keeps `auto` a single-member chain: whether it should become a
+/// built-in chain (pdf → pdf-inspector → pdf-text, say) is an M3 ruling,
+/// taken when `pdf-ocr` actually exists to chain onto.
 fn builtin_extractor(short_key: &str) -> Option<ExtractorKind> {
     match short_key {
         "pdf" => Some(ExtractorKind::PdfText(PdfTextConfig {
@@ -212,6 +250,94 @@ pub(crate) fn mime_for(object_key: &str) -> &'static str {
     short_key_of(object_key)
         .and_then(crate::pipeline::extract::mime_for_short_key)
         .unwrap_or("application/octet-stream")
+}
+
+// ---------------------------------------------------------------------------
+// M2.1: the linear extractor fallback chain (pure decision core)
+// ---------------------------------------------------------------------------
+
+/// Does an `Ok` extraction carry content? "Non-empty" means at least one
+/// Part whose text is not blank (whitespace-only counts as nothing — the
+/// same bar every built-in kind's own "no extractable text" refusal uses).
+fn has_extracted_content(parts: &[Part]) -> bool {
+    !parts.is_empty() && parts.iter().any(|p| !p.text.trim().is_empty())
+}
+
+/// The inner message of an extractor error, without the `PipelineError`
+/// Display prefix (the chain aggregate adds ONE prefix of its own; member
+/// reasons must not arrive pre-prefixed or the aggregate would say "extract
+/// failed" once per member).
+fn inner_message(e: &PipelineError) -> String {
+    match e {
+        PipelineError::Extract(m) => m.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Pick the winning extraction off an ORDERED fallback chain (M2.1). The
+/// pure decision core of the chain mechanism — unit-tested below; the
+/// worker only supplies the members and executes.
+///
+/// `members` yields `(name, outcome)` pairs LAZILY: the iterator is only
+/// advanced past a member when that member YIELDED, which is what makes
+/// "first non-empty Ok wins — later members never run" true in production
+/// (the worker maps `extract` over the kinds; a member after the winner is
+/// never pulled, never executed).
+///
+/// Chain semantics (uniform rules, no new error type — an extractor's Err
+/// or empty output IS its yield signal, so the [`Extractor`] trait stays
+/// untouched and routing intelligence keeps living inside the kinds):
+///
+/// * `Ok(parts)` WINS iff [`has_extracted_content`]; an `Ok` of nothing
+///   (no Parts, all-blank text) YIELDS, exactly like an Err — "cannot
+///   handle this content" and "handled it into nothing" both mean "give it
+///   to the next member".
+/// * the FIRST win ends the chain and its Parts are THE result (no
+///   cross-member merging — a merged Frankenstein document is worse than
+///   either engine's honest output).
+/// * full exhaustion fails the chain: the message aggregates every
+///   member's yield reason as `{mime短键} chain [{a→b}]: {a}: {ra}; {b}: {rb}`
+///   so the fail-loud contract survives (a blank/scanned PDF with no OCR
+///   relay is still a visible FAILED with every reason on record).
+///   A ONE-member chain (every pre-M2.1 config, and `auto`) passes the
+///   member's own message through verbatim — the wrapper describes a
+///   chain, and there is nothing to describe with one member; this also
+///   keeps every existing failure message byte-stable.
+fn pick_from_chain<I>(short_key: &str, members: I) -> Result<Vec<Part>, PipelineError>
+where
+    I: IntoIterator<Item = (String, Result<Vec<Part>, PipelineError>)>,
+{
+    let mut names: Vec<String> = Vec::new();
+    let mut reasons: Vec<String> = Vec::new();
+    for (name, outcome) in members {
+        names.push(name);
+        match outcome {
+            Ok(parts) if has_extracted_content(&parts) => return Ok(parts),
+            Ok(_) => reasons.push(
+                "produced no extractable content (empty output — refusing to index \
+                     nothing)"
+                    .to_string(),
+            ),
+            Err(e) => reasons.push(inner_message(&e)),
+        }
+    }
+    // exhaustion (a validated chain is never empty, so names is never empty
+    // here in production; the pure function still handles it as a trivial
+    // exhaustion)
+    if names.len() <= 1 {
+        let reason = reasons.into_iter().next().unwrap_or_default();
+        return Err(PipelineError::extract(reason));
+    }
+    let aggregate: Vec<String> = names
+        .iter()
+        .zip(reasons)
+        .map(|(n, r)| format!("{n}: {r}"))
+        .collect();
+    Err(PipelineError::extract(format!(
+        "{short_key} chain [{}]: {}",
+        names.join("→"),
+        aggregate.join("; ")
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -563,7 +689,7 @@ impl IngestRuntime {
         let mut present = HashSet::new();
         let (mut n_new, mut n_changed, mut n_requeue) = (0u32, 0u32, 0u32);
         for (key, meta) in listing {
-            if !plan.scope.matches(key) || plan.extractor_for(key).is_none() {
+            if !plan.scope.matches(key) || plan.extractor_chain_for(key).is_none() {
                 continue;
             }
             present.insert(key.clone());
@@ -876,12 +1002,18 @@ impl IngestRuntime {
         let chunks: &[Chunk] = match cached {
             Some(c) => c,
             None => {
-                let extractor = plan.extractor_for(&job.object_key).ok_or_else(|| {
+                let chain = plan.extractor_chain_for(&job.object_key).ok_or_else(|| {
                     AttemptErr::Parked(format!(
                         "no extractor handles this object (routing changed after the scan) — \
                          it is not a source of this pipeline"
                     ))
                 })?;
+                // the routing short key names the chain in an aggregated
+                // statusReason (see pick_from_chain); "default" for the
+                // unlikely non-match (a claimed key always has one)
+                let short_key = short_key_of(&job.object_key)
+                    .unwrap_or("default")
+                    .to_string();
                 let chunker = plan.chunker.clone();
                 let mime = mime_for(&job.object_key).to_string();
                 let bytes = bytes.clone();
@@ -895,9 +1027,15 @@ impl IngestRuntime {
                     .map_err(|e| AttemptErr::Fail(format!("cpu semaphore closed: {e}")))?;
                 let mut work = tokio::task::spawn_blocking(move || {
                     let _hold = permit;
-                    extractor
-                        .extract(&bytes, &mime)
-                        .and_then(|parts| chunker.chunk(&parts))
+                    // M2.1: the whole chain runs inside THIS one CPU
+                    // segment, members strictly in order, no concurrency.
+                    // The member iterator is lazy — pick_from_chain stops
+                    // pulling at the first winner, so members after it
+                    // never execute.
+                    let members = chain
+                        .iter()
+                        .map(|(name, kind)| (name.clone(), kind.extract(&bytes, &mime)));
+                    pick_from_chain(&short_key, members).and_then(|parts| chunker.chunk(&parts))
                 });
                 // wall-clock cap around the extract call (§5.10.5 poison
                 // guard). On timeout the handle is ABORTED (not dropped:
@@ -1445,13 +1583,12 @@ impl IngestShared {
     }
 
     /// Is `object_key` a SOURCE of this bucket's pipeline (scope match AND a
-    /// routed extractor)? PutSource refuses keys outside it — a marker for an
-    /// unscoped key would never be touched by the scanner again.
+    /// routed extractor chain)? PutSource refuses keys outside it — a marker
+    /// for an unscoped key would never be touched by the scanner again.
     pub fn claims_key(&self, bucket: &str, object_key: &str) -> bool {
-        self.core
-            .buckets
-            .get(bucket)
-            .is_some_and(|p| p.scope.matches(object_key) && p.extractor_for(object_key).is_some())
+        self.core.buckets.get(bucket).is_some_and(|p| {
+            p.scope.matches(object_key) && p.extractor_chain_for(object_key).is_some()
+        })
     }
 
     /// Stamp a completed scan (scheduler -> GetIngestStatus).
@@ -2826,5 +2963,242 @@ pub(crate) mod tests {
         // the DELETING reap advanced the KB deleted counter
         let stats = rt.shared.stats_of("docs");
         assert_eq!(stats.deleted, 1, "{stats:?}");
+    }
+
+    // ---- M2.1: extractor fallback chains -----------------------------------
+
+    /// The committed hello fixture (same bytes the extract/golden suites
+    /// use; chain tests exercise the runner, not engine behavior).
+    const HELLO_PDF: &[u8] = include_bytes!("../../tests/golden/hello.pdf");
+
+    /// Construct a registered ExtractorKind the way the worker does.
+    fn kind_of(section: &str, body: &str) -> ExtractorKind {
+        ExtractorKind::from_config(
+            section,
+            &toml::from_str::<toml::Value>(body).expect("test kind body"),
+            None,
+        )
+        .expect("test kind parses")
+    }
+
+    #[test]
+    fn chain_first_winner_never_pulls_the_second_member() {
+        // laziness IS "the second member never runs": the counter only
+        // moves when pick_from_chain PULLS an item, and pulling is what
+        // executes a member in the worker (extract runs inside the map)
+        let mut pulled = 0usize;
+        let members = [
+            ("first".to_string(), Ok(vec![Part::text("winner content")])),
+            (
+                "second".to_string(),
+                Err(PipelineError::extract("must never be computed")),
+            ),
+        ]
+        .into_iter()
+        .inspect(|_| pulled += 1);
+        let parts = pick_from_chain("txt", members).expect("first member wins");
+        assert_eq!(parts, vec![Part::text("winner content")]);
+        assert_eq!(pulled, 1, "the chain advanced past the winner");
+    }
+
+    #[test]
+    fn chain_err_and_every_empty_ok_shape_yield_to_the_next_member() {
+        // Err yields
+        let members = vec![
+            (
+                "a".to_string(),
+                Err(PipelineError::extract("cannot handle this content")),
+            ),
+            ("b".to_string(), Ok(vec![Part::text("b wins")])),
+        ];
+        assert_eq!(
+            pick_from_chain("txt", members).expect("b wins"),
+            vec![Part::text("b wins")]
+        );
+        // ...and so does every empty shape of Ok (no Parts, empty text,
+        // whitespace-only text — the same "nothing" bar the kinds' own
+        // refusals use)
+        for empty in [
+            Vec::<Part>::new(),
+            vec![Part::text("")],
+            vec![Part::text(" \n\t ")],
+        ] {
+            let members = vec![
+                ("a".to_string(), Ok(empty.clone())),
+                ("b".to_string(), Ok(vec![Part::text("b wins")])),
+            ];
+            assert_eq!(
+                pick_from_chain("txt", members)
+                    .unwrap_or_else(|e| panic!("empty shape {empty:?} must yield: {e}")),
+                vec![Part::text("b wins")]
+            );
+        }
+    }
+
+    #[test]
+    fn chain_exhausted_aggregates_every_member_reason() {
+        let members = vec![
+            (
+                "insp".to_string(),
+                Err(PipelineError::extract(
+                    "pdf-inspector classification: page 1: scanned",
+                )),
+            ),
+            (
+                "plain".to_string(),
+                Err(PipelineError::extract("no extractable text")),
+            ),
+        ];
+        let err = pick_from_chain("pdf", members).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "extract failed: pdf chain [insp→plain]: insp: pdf-inspector classification: \
+             page 1: scanned; plain: no extractable text"
+        );
+    }
+
+    #[test]
+    fn chain_single_member_passes_the_message_through_verbatim() {
+        // a one-member chain (every pre-M2.1 route, and `auto`) keeps the
+        // member's own message byte-stable — no wrapper to describe
+        let members = vec![("only".to_string(), Err(PipelineError::extract("boom")))];
+        assert_eq!(
+            pick_from_chain("txt", members).unwrap_err().to_string(),
+            "extract failed: boom"
+        );
+        let members = vec![("only".to_string(), Ok(Vec::<Part>::new()))];
+        let msg = pick_from_chain("txt", members).unwrap_err().to_string();
+        assert!(msg.contains("produced no extractable content"), "{msg}");
+        assert!(!msg.contains("chain"), "no wrapper on one member: {msg}");
+    }
+
+    #[test]
+    fn chain_over_real_kinds_winner_parts_equal_direct_extraction() {
+        // in-process over registered kinds: the chain winner's Parts are
+        // EXACTLY the direct extraction's (no cross-member merging)
+        let pdf_text = kind_of("t", "kind = \"pdf-text\"");
+        let insp = kind_of("t", "kind = \"pdf-inspector\"");
+        let direct = Extractor::extract(&pdf_text, HELLO_PDF, "application/pdf").unwrap();
+        let members = vec![
+            (
+                "plain".to_string(),
+                Extractor::extract(&pdf_text, HELLO_PDF, "application/pdf"),
+            ),
+            (
+                "insp".to_string(),
+                Extractor::extract(&insp, HELLO_PDF, "application/pdf"),
+            ),
+        ];
+        assert_eq!(pick_from_chain("pdf", members).unwrap(), direct);
+    }
+
+    /// tiny-embedder pipeline with a parameterized `pdf` extract route over
+    /// two declared PDF instances (the chain e2e fixture).
+    fn pdf_route_config(route: &str) -> PipelineConfig {
+        let text = format!(
+            "[extractor.insp]\nkind = \"pdf-inspector\"\n\n\
+             [extractor.plain]\nkind = \"pdf-text\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = \
+             true\n\n\
+             [ingest.docs]\nscope = \"docs/**\"\nextract = {{ pdf = {route} }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"tiny\"]\nscan_interval_secs = 1\nretries = 0\n",
+            fixture_dir().display().to_string(),
+        );
+        crate::pipeline::config::load_pipeline_config(&text).unwrap()
+    }
+
+    /// THE cross-parser recovery run (golden-corpus-adjacent, real engines):
+    /// the mixed text+image PDF is content pdf-inspector cannot honestly
+    /// serve (one page needs OCR — its classification Err is the yield
+    /// signal) while pdfium still extracts the text page. The chain hands
+    /// it over: [insp, plain] INDEXED where the single-member insp route
+    /// stays FAILED. "Cannot handle it" goes to the member that can.
+    #[tokio::test]
+    async fn chain_recovers_across_parsers_where_the_first_member_yields() {
+        let bytes = crate::pipeline::extract::pdf_inspector::tests::mixed_text_image_pdf();
+
+        // (1) chain ["insp", "plain"]: inspector yields, pdf-text wins
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("mixed.pdf"), &bytes).unwrap();
+        let (rt, _h, state) =
+            runtime_for(dir.path(), &pdf_route_config("[\"insp\", \"plain\"]")).await;
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let m = status_of(&state, "docs", "docs/mixed.pdf").await;
+        assert_eq!(m.status, SourceStatus::Indexed);
+        let chunks = m.chunks.as_ref().unwrap()["text"];
+        assert!(chunks >= 1, "the pdfium half of the divergence: {m:?}");
+        // the winner's Parts walked the ordinary path: vectors landed
+        let spec = &rt.shared.core.buckets["docs"].derived["tiny"];
+        assert_eq!(
+            state
+                .storage
+                .count_vectors("docs", &spec.index_name)
+                .await
+                .unwrap() as u32,
+            chunks
+        );
+
+        // (2) the SAME bytes under the single-member "insp" route: FAILED,
+        // fail-loud intact (no relay configured), reason verbatim
+        let dir2 = tempfile::tempdir().unwrap();
+        let docs2 = dir2.path().join("docs");
+        std::fs::create_dir_all(&docs2).unwrap();
+        std::fs::write(docs2.join("mixed.pdf"), &bytes).unwrap();
+        let (rt2, _h2, state2) = runtime_for(dir2.path(), &pdf_route_config("\"insp\"")).await;
+        rt2.scan_once().await;
+        rt2.drain_queue().await;
+        let m2 = status_of(&state2, "docs", "docs/mixed.pdf").await;
+        assert_eq!(m2.status, SourceStatus::Failed);
+        assert!(m2.retries_exhausted);
+        let reason = m2.status_reason.expect("reason");
+        assert!(reason.contains("scanned"), "{reason}");
+        assert!(
+            !reason.contains("chain"),
+            "one member, no wrapper: {reason}"
+        );
+    }
+
+    /// Full exhaustion (image-only PDF: BOTH members yield — inspector
+    /// classifies it scanned, pdfium finds no text either): the file is
+    /// FAILED with every member's reason on record. A blank/scanned PDF
+    /// with no OCR relay stays a visible failure, not a silent nothing.
+    #[tokio::test]
+    async fn chain_exhausted_failed_lists_every_member_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            docs.join("scan.pdf"),
+            crate::pipeline::extract::pdf_inspector::tests::image_only_pdf(),
+        )
+        .unwrap();
+        let (rt, _h, state) =
+            runtime_for(dir.path(), &pdf_route_config("[\"insp\", \"plain\"]")).await;
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let m = status_of(&state, "docs", "docs/scan.pdf").await;
+        assert_eq!(m.status, SourceStatus::Failed);
+        assert!(m.retries_exhausted);
+        let reason = m.status_reason.expect("reason");
+        assert!(reason.contains("pdf chain [insp→plain]"), "{reason}");
+        assert!(reason.contains("insp: "), "{reason}");
+        assert!(reason.contains("scanned"), "{reason}");
+        assert!(reason.contains("plain: "), "{reason}");
+        assert!(reason.contains("no extractable text"), "{reason}");
+        // nothing was indexed — the derived index was never even created
+        let spec = &rt.shared.core.buckets["docs"].derived["tiny"];
+        assert!(
+            state
+                .storage
+                .load_index("docs", &spec.index_name)
+                .await
+                .unwrap()
+                .is_none(),
+            "a fully-exhausted chain must not create or write any index"
+        );
     }
 }

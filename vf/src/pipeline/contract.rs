@@ -11,6 +11,12 @@
 //!
 //! Assertions panic on violation (assertion-suite convention); callers wrap
 //! them in whatever test harness they use.
+//!
+//! Note on M2.1 fallback chains: an ordered `extract` chain is INGEST
+//! ORCHESTRATION layered on top of these contracts (the worker tries
+//! members in order; see `ingest::pick_from_chain`) — the trait and this
+//! suite are untouched by it, which is the point: a kind admitted here
+//! composes into any chain with zero framework changes.
 
 use super::{Chunker, Embedder, Extractor, Hit, HitList, Merge, Modality, Part, Query};
 
