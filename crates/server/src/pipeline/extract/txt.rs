@@ -17,6 +17,7 @@
 //!   mime↔short-key mapping that ingest's `auto` resolves through lives in
 //!   that one table.
 
+use super::super::gate;
 use super::{ContentClass, Extractor, Fit, Modality, Part, PipelineError};
 
 /// Runtime instance (configless — the kind has no knobs).
@@ -61,18 +62,10 @@ pub fn refusal_note(_class: super::ContentClass) -> String {
 
 impl Extractor for TxtExtractor {
     fn extract(&self, bytes: &[u8], mime: &str) -> Result<Vec<Part>, PipelineError> {
-        if bytes.is_empty() {
-            return Err(PipelineError::extract(
-                "empty input (0 bytes): the txt kind refuses empty files — the ingest \
-                 worker marks the source FAILED instead of silently indexing nothing",
-            ));
-        }
-        if !mime.is_empty() && !mime.starts_with("text/") {
-            return Err(PipelineError::extract(format!(
-                "txt kind cannot handle mime '{mime}' (accepts text/* or empty/unknown); \
-                 this is an extract-routing bug, not a bad file"
-            )));
-        }
+        // the shared input gates (messages byte-identical to the hand-rolled
+        // copies this replaced — see pipeline/gate.rs)
+        gate::refuse_empty_input("txt", bytes)?;
+        gate::refuse_foreign_mime("txt", mime, gate::Accept::Family("text/"))?;
         let text = std::str::from_utf8(bytes).map_err(|e| {
             PipelineError::extract(format!(
                 "input is not valid UTF-8 (txt kind is strict, no lossy decode): {e}"

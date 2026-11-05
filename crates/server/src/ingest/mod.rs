@@ -4024,6 +4024,23 @@ pub(crate) mod tests {
         );
     }
 
+    /// The `auto` mapping's view of the registry (plugin-axis hardening):
+    /// every family the mime table declares must resolve under `auto` — a
+    /// table row without a [`builtin_extractor`] arm would silently strand
+    /// every `extract = { default = "auto" }` deployment for that family.
+    /// (The cfg(test) `ctn` scaffold key is deliberately exempt: it is
+    /// scanner-side claiming only, never an `auto` family.)
+    #[test]
+    fn auto_mapping_serves_every_mime_family() {
+        for (_mime, key) in crate::pipeline::extract::MIME_TO_SHORT_KEY {
+            assert!(
+                builtin_extractor(key).is_some(),
+                "auto has no built-in extractor for family {key} — every MIME_TO_SHORT_KEY \
+                 row needs a builtin_extractor arm"
+            );
+        }
+    }
+
     /// Backward compatibility of the affinity DEFAULT (the mechanism that
     /// keeps every pre-declaration implementation — contract kinds, future
     /// third-party kinds — chain-compatible): an implementation that does

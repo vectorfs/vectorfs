@@ -18,6 +18,7 @@
 
 use pulldown_cmark::{Event, Parser, TagEnd};
 
+use super::super::gate;
 use super::{ContentClass, Extractor, Fit, Modality, Part, PipelineError};
 
 /// Runtime instance (configless — the kind has no knobs).
@@ -117,18 +118,10 @@ pub fn markdown_to_text(md: &str) -> String {
 
 impl Extractor for MdExtractor {
     fn extract(&self, bytes: &[u8], mime: &str) -> Result<Vec<Part>, PipelineError> {
-        if bytes.is_empty() {
-            return Err(PipelineError::extract(
-                "empty input (0 bytes): the md kind refuses empty files — the ingest worker \
-                 marks the source FAILED instead of silently indexing nothing",
-            ));
-        }
-        if !mime.is_empty() && mime != "text/markdown" {
-            return Err(PipelineError::extract(format!(
-                "md kind cannot handle mime '{mime}' (accepts text/markdown or empty/unknown); \
-                 this is an extract-routing bug, not a bad file"
-            )));
-        }
+        // the shared input gates (messages byte-identical to the hand-rolled
+        // copies this replaced — see pipeline/gate.rs)
+        gate::refuse_empty_input("md", bytes)?;
+        gate::refuse_foreign_mime("md", mime, gate::Accept::Exact("text/markdown"))?;
         let md = std::str::from_utf8(bytes).map_err(|e| {
             PipelineError::extract(format!(
                 "input is not valid UTF-8 (md kind is strict, no lossy decode): {e}"

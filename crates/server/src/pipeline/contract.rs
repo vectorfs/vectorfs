@@ -30,6 +30,9 @@ use super::{Chunker, Embedder, Extractor, Hit, HitList, Merge, Modality, Part, Q
 /// * **Determinism**: two calls with the same input produce identical
 ///   output.
 /// * **Wrong mime** (`application/octet-stream`): Err, never a guess.
+/// * **Empty mime** (`""`): TOLERATED without panic — "unspecified" means
+///   the bytes are the truth (the uniform gate every built-in kind opens
+///   with, `pipeline::gate`); the kind may still Err on the bytes.
 /// * **Empty file**: Err (uniform empty-source handling — see txt.rs for
 ///   the rationale; every registered kind must match it).
 /// * **Truncated bytes** (first half of `good`): must not panic, and must
@@ -71,6 +74,12 @@ pub fn extractor_contract(x: &dyn Extractor, good: (&[u8], &str)) {
         x.extract(bytes, "application/octet-stream").is_err(),
         "wrong mime must Err, not guess"
     );
+
+    // empty mime ("unspecified") -> tolerated, never a panic: the shared
+    // gate's uniform rule (pipeline::gate) — the kind proceeds on the bytes;
+    // Err on the bytes themselves is fine, a surprise rejection of the
+    // UNSPECIFIED mime is not
+    let _ = x.extract(bytes, "");
 
     // empty file -> Err (uniform contract; see txt.rs rationale)
     assert!(

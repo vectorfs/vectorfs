@@ -61,6 +61,7 @@ use std::sync::OnceLock;
 
 use pdfium_render::prelude::*;
 
+use super::super::gate;
 use super::{ContentClass, Extractor, Fit, Modality, Part, PipelineError};
 
 /// Guidance line shared by the runtime bind error and the test locator so
@@ -168,18 +169,10 @@ impl PdfTextExtractor {
 
 impl Extractor for PdfTextExtractor {
     fn extract(&self, bytes: &[u8], mime: &str) -> Result<Vec<Part>, PipelineError> {
-        if bytes.is_empty() {
-            return Err(PipelineError::extract(
-                "empty input (0 bytes): the pdf-text kind refuses empty files — the ingest \
-                 worker marks the source FAILED instead of silently indexing nothing",
-            ));
-        }
-        if !mime.is_empty() && mime != "application/pdf" {
-            return Err(PipelineError::extract(format!(
-                "pdf-text kind cannot handle mime '{mime}' (accepts application/pdf or \
-                 empty/unknown); this is an extract-routing bug, not a bad file"
-            )));
-        }
+        // the shared input gates (messages byte-identical to the hand-rolled
+        // copies this replaced — see pipeline/gate.rs)
+        gate::refuse_empty_input("pdf-text", bytes)?;
+        gate::refuse_foreign_mime("pdf-text", mime, gate::Accept::Exact("application/pdf"))?;
         let pdfium = self.pdfium()?;
         // load_pdf_from_byte_vec takes ownership (pdfium keeps a handle to the
         // buffer), so one copy is inherent to the API.

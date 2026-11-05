@@ -67,6 +67,7 @@
 
 use pdf_inspector::{PdfType, detect_pdf_mem, process_pdf_mem};
 
+use super::super::gate;
 use super::{ContentClass, Extractor, Fit, Modality, Part, PipelineError};
 
 /// Guidance line every OCR-gate error carries: the reason is a
@@ -156,18 +157,14 @@ fn classify_or_refuse(bytes: &[u8]) -> Result<(), PipelineError> {
 
 impl Extractor for PdfInspectorExtractor {
     fn extract(&self, bytes: &[u8], mime: &str) -> Result<Vec<Part>, PipelineError> {
-        if bytes.is_empty() {
-            return Err(PipelineError::extract(
-                "empty input (0 bytes): the pdf-inspector kind refuses empty files — the \
-                 ingest worker marks the source FAILED instead of silently indexing nothing",
-            ));
-        }
-        if !mime.is_empty() && mime != "application/pdf" {
-            return Err(PipelineError::extract(format!(
-                "pdf-inspector kind cannot handle mime '{mime}' (accepts application/pdf or \
-                 empty/unknown); this is an extract-routing bug, not a bad file"
-            )));
-        }
+        // the shared input gates (messages byte-identical to the hand-rolled
+        // copies this replaced — see pipeline/gate.rs)
+        gate::refuse_empty_input("pdf-inspector", bytes)?;
+        gate::refuse_foreign_mime(
+            "pdf-inspector",
+            mime,
+            gate::Accept::Exact("application/pdf"),
+        )?;
         classify_or_refuse(bytes)?;
         let text = if self.markdown {
             // Full pipeline: detect (again, cheap) + extract + Markdown. The

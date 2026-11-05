@@ -76,6 +76,7 @@ pub mod config;
 pub mod contract;
 pub mod embed;
 pub mod extract;
+pub mod gate;
 pub mod models;
 pub mod normalize;
 pub mod probe;

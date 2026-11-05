@@ -39,9 +39,19 @@ pub const MIME_TO_SHORT_KEY: &[(&str, &str)] = &[
     ("text/plain", "txt"),
 ];
 
-/// The available-kind list embedded in unknown-kind errors (kept next to the
-/// enum so a new variant and its error line land in the same diff).
+/// The available-kind list embedded in unknown-kind errors. Derived view of
+/// [`KIND_LABELS`] (the parity test pins the two together — a new kind that
+/// updates the enum but forgets the string fails there, not in a user's
+/// error message).
 pub const EXTRACTOR_KINDS: &str = "txt, pdf-text, md, pdf-inspector";
+
+/// Every production kind's config label, IN AVAILABILITY-LIST ORDER. This is
+/// the registry's identity anchor: `kind_label` (the exhaustive match the
+/// compiler walks on a new variant) must agree with this table row for row
+/// (the `kind_registry_views_agree` test walks it). A new kind lands here,
+/// in `kind_label`, and in `from_config` in one diff — everything else in
+/// this module is exhaustive dispatch the compiler already checks.
+pub const KIND_LABELS: &[&str] = &["txt", "pdf-text", "md", "pdf-inspector"];
 
 /// mime (parameters like `; charset=utf-8` tolerated) -> short key.
 pub fn short_key_for_mime(mime: &str) -> Option<&'static str> {
@@ -71,14 +81,27 @@ pub fn mime_for_short_key(key: &str) -> Option<&'static str> {
 /// `x.txt.gz` must claim and route as the same text/plain source it
 /// decompresses into. Extension ALIASES live beside their canonical key
 /// (`markdown`/`text`); test scaffolding keys (the cfg(test) `ctn`) stay
-/// in the scanner, which owns claiming.
+/// in the scanner, which owns claiming. Since the plugin-axis hardening
+/// the lookup is TABLE-driven (like the normalizer TABLE) instead of a
+/// hand-written match: one const table, and the
+/// `mime_table_extension_and_auto_views_agree` test pins every family row
+/// of [`MIME_TO_SHORT_KEY`] to an alias row here AND to a
+/// [`builtin_extractor`] arm — three views, one anchor, zero drift.
+pub const EXTENSION_ALIASES: &[(&str, &str)] = &[
+    ("pdf", "pdf"),
+    ("md", "md"),
+    ("markdown", "md"),
+    ("txt", "txt"),
+    ("text", "txt"),
+];
+
+/// Extension lookup over [`EXTENSION_ALIASES`] (exact, case-normalized by
+/// the caller).
 pub fn short_key_for_extension(ext: &str) -> Option<&'static str> {
-    match ext {
-        "pdf" => Some("pdf"),
-        "md" | "markdown" => Some("md"),
-        "txt" | "text" => Some("txt"),
-        _ => None,
-    }
+    EXTENSION_ALIASES
+        .iter()
+        .find(|(e, _)| *e == ext)
+        .map(|(_, key)| *key)
 }
 
 /// Registered extractor kinds. Exhaustive match everywhere = zero vtable;
@@ -225,6 +248,22 @@ impl ExtractorKind {
             // text (txt/md chains)
             #[cfg(test)]
             ExtractorKind::TestContainer(_) => &[Modality::Text],
+        }
+    }
+
+    /// The kind's REGISTRY label — the `kind = "…"` config string, one per
+    /// variant, exhaustively matched so a new kind MUST land here (the
+    /// compiler walks it; [`KIND_LABELS`] and the parity test then force the
+    /// table views to agree). Unlike [`Self::describe`] this is knob-free:
+    /// it names the KIND, not the configuration.
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            ExtractorKind::Txt(_) => "txt",
+            ExtractorKind::PdfText(_) => "pdf-text",
+            ExtractorKind::Md(_) => "md",
+            ExtractorKind::PdfInspector(_) => "pdf-inspector",
+            #[cfg(test)]
+            ExtractorKind::TestContainer(_) => "test-container",
         }
     }
 
@@ -375,6 +414,54 @@ mod tests {
         assert_eq!(short_key_for_mime("application/octet-stream"), None);
         assert_eq!(mime_for_short_key("default"), None);
         assert_eq!(mime_for_short_key("auto"), None);
+    }
+
+    #[test]
+    fn extension_alias_view_covers_every_family() {
+        // every family row of the mime table has at least one alias mapping
+        // to it, and every alias routes back to its family's canonical mime:
+        // x.txt.gz / x.text.gz / x.md.gz all claim as the source they
+        // decompress into (the scanner + normalizer contract)
+        for (mime, key) in MIME_TO_SHORT_KEY {
+            let aliases = EXTENSION_ALIASES
+                .iter()
+                .filter(|(_, k)| *k == *key)
+                .collect::<Vec<_>>();
+            assert!(!aliases.is_empty(), "family {key} has no extension alias");
+            for (ext, _) in aliases {
+                assert_eq!(short_key_for_extension(ext), Some(*key), "{ext}");
+                assert_eq!(
+                    mime_for_short_key(short_key_for_extension(ext).unwrap()),
+                    Some(*mime)
+                );
+            }
+        }
+        // unknown extensions claim nothing
+        assert_eq!(short_key_for_extension("docx"), None);
+        assert_eq!(short_key_for_extension(""), None);
+    }
+
+    #[test]
+    fn kind_registry_views_agree() {
+        // THE parity test (plugin-axis hardening): the availability string,
+        // the label table, the exhaustive kind_label match and from_config
+        // are four views of one registry — a new kind that updates some but
+        // not all of them fails HERE instead of drifting in production
+        // error messages.
+        assert_eq!(EXTRACTOR_KINDS, KIND_LABELS.join(", "));
+        for label in KIND_LABELS {
+            // config round trip: label parses, names its variant, and the
+            // variant names the label back (no .so touched — parsing and
+            // labeling are library-free)
+            let raw: toml::Value = toml::from_str(&format!("kind = \"{label}\"")).unwrap();
+            let k = ExtractorKind::from_config("x", &raw, None).unwrap_or_else(|e| {
+                panic!("KIND_LABELS entry {label} must parse: {e}");
+            });
+            assert_eq!(k.kind_label(), *label);
+            // the DEFAULT config's describe is the bare label too (knob
+            // suffixes appear only when knobs depart from defaults)
+            assert_eq!(k.describe(), *label);
+        }
     }
 
     #[test]
