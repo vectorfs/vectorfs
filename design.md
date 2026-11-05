@@ -38,6 +38,7 @@
 | **路由尾序 affinity 分层 + 补救语按类解耦（2026-11-05，用户裁决）** | **修订** M2.1 智能路由裁决的「选定成员退让后剩余成员按配置序」条款为「剩余成员按 affinity 分层（Preferred>Capable>Refuses，同层内配置序稳定）」——`Routing::Run` 增携 class，`chain_try_order` 尾部分层。动机与三段机制同源：Refuses 成员先于 Capable 执行 = 烧一次必败尝试，更有「低质输出先胜」（首个非空 Ok 胜）的质量风险；「错序是质量事故」的立论从「谁先跑」延伸到整个尝试序。Unknown（无 probe 判定）路径逐字节不变。全拒补救语从 route() 硬编码 PDF OCR 指引改为 **`ContentClass::remedy()` 按类表述**：scan 类指 OCR、**no-text 明确「无文字层亦无栅格，OCR 也救不了」**（原硬编码文案对空白文档是错误指引）；补救语随类走意味着未来非 PDF 族不再继承 PDF 专属提示 | 实证：`chain_try_order_routes_first_then_affinity_tiers_the_tail`（同层稳定 + 跨层重排，cfg(test) 容器充当第二个 Capable）；`route_all_refuse_on_no_text_names_the_blank_document_remedy`（断言 no-text 不再提 OCR）；混合样本 e2e 回归不破（INDEXED via plain 不变）；280 单测全绿 |
 | **/x-vf/Reindex 作业级串行——静默屏障（2026-11-05，用户裁决；清偿 §10.8 留账）** | reindex_bucket 增第 0 步**静默屏障**（per-bucket quiesce barrier）：置屏障 → `enqueue` 对该桶拒收新作业（被拒源由 flip 转 PENDING + reindex 尾随 wake 自动收敛，零遗漏）→ **不持 write_lock** 有界等待（90s/100ms 轮询）该桶 in-flight 清空 → 枚举+锁内 clear+flip（原机制不动）。屏障等待不持锁（worker 提交需 write_lock，持锁等待成死锁环）；超时**响亮降级**为旧「跳过在飞」语义（严格不劣于 §10.8 原状并记 stderr）；`serve --reindex` 在 workers 孵化前运行天然无争用。语义从「跳过当下在飞的源」升级为「严格在作业之间运行」——清旧块不再可能围绕一个迟到的 worker 提交进行 | 实证（drain_queue 确定性复现竞态形状）：`reindex_barrier_waits_for_inflight_then_flips_it_too`（在飞 job 阻塞 reindex、drain 后**同一源也被翻转**——旧行为会跳过它 flipped=0）；`reindex_barrier_refuses_new_enqueues`（屏障期拒收、撤屏障后同 enqueue 通过）；既有 reindex 全链/gate 恢复/ops_xvf 集成测试不回退 |
 | **引擎版本可观测（2026-11-05，用户裁决；接受新增持久字段）** | 「引擎升级=操作员显式重嵌」既定立场补上**可见的一半**：`pipeline::engines` 表（pdfium=runtime_lib_pins 的 PDFIUM_RELEASE、onnxruntime=ORT_RELEASE+ort crate 版本+API 版本、pdf-inspector=Cargo.lock 版本；**parity 测试**对脚本与 lockfile 锁死，改版本不更新表=CI 红）暴露于 /healthz 与 /health（additive 成员，与 version 同属身份信息；uptime 仍限 healthz）与 `vf status`/`vectorfs status --endpoint`；`SourceMarker` 增 `engines` 字段（serde default，旧 marker=None=前观测时代**永不告警**），INDEXED/PARTIAL 完成时写入、flip/失败时清空；`doctor` 的 ingest 检查按桶计数引擎漂移源并给「引擎升级不改指纹，重嵌是操作员显式决定」的补救语（Warn 级，混合代次可接受则不动作）。**不进指纹**（指纹漂移拒启动，引擎漂移只警告——两级严重度刻意分离）。PR 三问记录：新增持久字段有用户裁决 | 实证：schema 互读测试（旧 JSON→None、新字段往返、None 不序列化）；healthz/health additive 断言；reindex 全链断言 INDEXED 载表/flip 清空；真 daemon 冒烟（healthz+health+vf status 三面输出）；单包构建暴露并修复 client tokio feature 缺声明（fs/time——整仓特征合曾掩蔽，恰证「依赖清单即客户端保证」） |
+| **vf 命令面借鉴 S3 CLI 惯用形态（2026-11-05，用户裁决「轻量包 A+B+C」）** | 对照 aws s3 / mc / s5cmd / rclone 后采纳三条，**明确不采纳** cp/mv 统一（稀释 put 的摄取等待独有语义）与 sync/rm 递归/alias set（M3+ 出需求再裁，sync 与 scope 扫摄取语义重叠）：(A) **`bucket/key` 路径位置参数**贯穿 get/cat/rm（put 用尾随 `/` 的目标位，aws-cp 式 `docs/pre/`⇒key `pre/<文件名>`；search/reindex 用裸桶名位参）——**flag 优先的向后兼容**：`--bucket` 在场时位置参数一律是完整 key（含 `/` 的 key 以 flag 形态寻址，首个 `/` 前为桶的歧义由显式 flag 消解；开发期实测互斥方案会破坏既有 `get docs/fox.txt --bucket docs` 合法形态而否决）；put 的目标位与 --bucket 互斥为 USAGE 错误；(B) **`vf ls`**：无参=列摄取桶（`aws s3 ls` 形，复用 GetIngestStatus）、带桶=列已摄取文件（与 sources list 同渲染，`--status` 过滤，prefix 客户端过滤——wire 无 prefix 参数）；(C) **`vf cat`**=get 的 stdout 直出（无 --out，能写文件的 cat 只是可发现性更差的 get）。差异动词保持一等公民不动：put 等待 INDEXED、search 回源、reindex | 实证：`cli_s3_style_forms_smoke` 真 daemon 全形态（ls 三形/put 目标位/cat/get 路径/search/reindex 位参/USAGE 错误形状/flag 形态含 `/` key 向后兼容）；既有 `cli_full_command_smoke` 全形态不回退；docker 实机走查（无 scope 配置）路径形态全通；附录E.4 表已按新形态改写 |
 
 ## 1. 定位
 
@@ -626,17 +627,19 @@ AWS 面 21 op 不受影响——文件层经它们写入（公理 2 §5.10.0）�
 | `pipelines list` | 已物化 pipeline、派生 index 与指纹 |
 | `mcp [--tools ro\|rw]` | stdio MCP server（单写者模式，同锁） |
 
-**客户端 `vf`**（HTTP 远程；端点/凭证：`--endpoint` 或 `VF_ENDPOINT` + `VF_*` env）：
+**客户端 `vf`**（HTTP 远程；端点/凭证：`--endpoint` 或 `VF_ENDPOINT` + `VF_*` env）。**S3-CLI 形态（2026-11-05 裁决）**：`bucket/key` 路径位置参数与 `--bucket` flag 并行——flag 在场时位置参数一律是完整 key（含 `/` 的 key 以 flag 形态寻址，向后兼容优先）；路径形态在无 flag 时生效，首个 `/` 前为桶：
 
 | 命令 | 作用 |
 |---|---|
-| `put <file…> --bucket <b> [--key <k>] [--async]` | 落实例根普通对象 + 即时触发摄取；默认前台 + stderr 进度 |
-| `search "<text>" --bucket <b> [--top-k N] [--filter JSON] [--json]`（M3+ 增 `--image <f>`，M4 增 `--audio <f>`） | 唯一检索动词：fan-out + merge + 回源 |
-| `sources list --bucket <b> [--status S]` | 列已摄取文件（标记 × 列表 join，分页） |
+| `put <file…> <bucket>/[<prefix>/]` 或 `--bucket <b> [--key <k>]` `[--async]` | 落实例根普通对象 + 即时触发摄取；默认前台 + stderr 进度；尾随 `/` 的末位参数是 aws-cp 式目标位（`docs/pre/` ⇒ key `pre/<文件名>`） |
+| `search "<text>" [<b>] 或 --bucket <b> [--top-k N] [--filter JSON] [--json]`（M3+ 增 `--image <f>`，M4 增 `--audio <f>`） | 唯一检索动词：fan-out + merge + 回源 |
+| `ls [<bucket>[/prefix>]] [--status S]` | S3-CLI 列表形态：无参=列摄取桶（`aws s3 ls` 形）、带桶=列已摄取文件（prefix 客户端过滤）；与 `sources list` 同渲染 |
+| `sources list --bucket <b> [--status S]` | 列已摄取文件（标记 × 列表 join，分页）——动词形态，`ls` 为其简写 |
 | `sources status <key> --bucket <b>` | 单文件状态（statusReason / 失败详情可见） |
-| `get <key> --bucket <b> [--out <f>]` | 下载原文件（回源；等价于直接 GetObject） |
-| `rm <key> --bucket <b>` | 删对象 + GC（与 S3 直接删除等价的便捷包装） |
-| `reindex --bucket <b>` | 触发显式重嵌（daemon 内执行） |
+| `get <bucket>/<key>` 或 `<key> --bucket <b>` `[--out <f>]` | 下载原文件（回源；等价于直接 GetObject） |
+| `cat <bucket>/<key>` | get 的 stdout 直出形态（S3-CLI 惯用） |
+| `rm <bucket>/<key>` 或 `<key> --bucket <b>` | 删对象 + GC（与 S3 直接删除等价的便捷包装） |
+| `reindex [<b>] 或 --bucket <b>` | 触发显式重嵌（daemon 内执行） |
 | `status` | `/health` + GetIngestStatus 汇总 |
 
 通用契约（§5.8 agent 一等契约）：`--json` 带 schema_version、结构化错误 `{code, exit, message, hint}`、stdout=结果 / stderr=进度、零交互、幂等、确定性输出。

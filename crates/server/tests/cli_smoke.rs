@@ -70,6 +70,18 @@ fn fixture_dir() -> PathBuf {
 }
 
 fn config_toml(data_dir: &Path) -> String {
+    config_toml_scoped(data_dir, true)
+}
+
+/// The S3-forms smoke's variant: NO `scope` (the whole instance root, the
+/// preset/docker shape) — so `bucket/key` paths land wherever the operator
+/// puts them, which is what the destination-form semantics assert.
+fn config_toml_unscoped(data_dir: &Path) -> String {
+    config_toml_scoped(data_dir, false)
+}
+
+fn config_toml_scoped(data_dir: &Path, scoped: bool) -> String {
+    let scope = if scoped { "scope = \"docs/**\"\n" } else { "" };
     format!(
         r#"version = 1
 region = "us-east-1"
@@ -88,8 +100,7 @@ path = "{fixture}"
 offline = true
 
 [ingest.docs]
-scope = "docs/**"
-extract = {{ txt = "plain" }}
+{scope}extract = {{ txt = "plain" }}
 chunk = {{ kind = "token-window", size = 32, overlap = 8 }}
 embedders = ["tiny"]
 scan_interval_secs = 1
@@ -509,6 +520,160 @@ fn cli_full_command_smoke() {
     assert!(out(&o).contains("health"), "{}", out(&o));
 
     daemon.dump_log_tail("end of smoke (informational)");
+}
+
+/// The S3-CLI-style argument forms (2026-11-05 adjudication: bucket/key
+/// PATHS alongside the --bucket flags, `ls`/`cat` shorthands — the aws s3 /
+/// mc / s5cmd shapes): every form is exercised against a REAL daemon, plus
+/// the USAGE error shapes for mixing the two spellings.
+#[test]
+fn cli_s3_style_forms_smoke() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let work = tmp.path().join("work");
+    let data_dir = work.join("data");
+    std::fs::create_dir_all(data_dir.join(".vectorfs")).unwrap();
+    std::fs::write(
+        data_dir.join(".vectorfs/vectorfs.toml"),
+        config_toml_unscoped(&data_dir),
+    )
+    .unwrap();
+
+    let fox = work.join("fox.txt");
+    std::fs::write(&fox, "the quick brown fox jumps over the lazy dog").unwrap();
+
+    let port = free_port();
+    let daemon = Daemon::spawn(&data_dir, port, "serve.log");
+    wait_healthy(port, Instant::now() + Duration::from_secs(60));
+
+    // ---- ls with no argument: the bucket inventory (aws `s3 ls` shape) ----
+    let o = vf(port, &["ls"], false);
+    assert!(o.status.success(), "stderr:\n{}", err(&o));
+    assert!(out(&o).contains("docs"), "{}", out(&o));
+    assert!(out(&o).contains("INDEXED=0"), "{}", out(&o));
+    let o = vf(port, &["ls", "--json"], false);
+    assert!(o.status.success(), "{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(v["buckets"][0]["bucket"], "docs", "{}", out(&o));
+
+    // ---- put with a `bucket[/prefix]/` destination: key = pre/<name> ----
+    let o = vf(
+        port,
+        &[
+            "put",
+            fox.to_str().unwrap(),
+            "docs/stories/",
+            "--timeout",
+            "120",
+        ],
+        false,
+    );
+    assert!(
+        o.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        out(&o),
+        err(&o)
+    );
+    assert!(
+        out(&o).starts_with("INDEXED\tstories/fox.txt"),
+        "destination prefix becomes the key: {}",
+        out(&o)
+    );
+
+    // ---- ls <bucket>: the sources table (shares sources list rendering) ----
+    let o = vf(port, &["ls", "docs"], false);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).contains("stories/fox.txt"), "{}", out(&o));
+    assert!(out(&o).contains("KEY"), "{}", out(&o));
+    // ---- ls <bucket/prefix>: client-side key filter ----
+    let o = vf(port, &["ls", "docs/stories"], false);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).contains("stories/fox.txt"), "{}", out(&o));
+    let o = vf(port, &["ls", "docs/nowhere"], false);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!out(&o).contains("fox.txt"), "prefix filters: {}", out(&o));
+
+    // ---- get/cat path form + cat's stdout bytes ----
+    let roundtrip = work.join("rt.txt");
+    let o = vf(
+        port,
+        &[
+            "get",
+            "docs/stories/fox.txt",
+            "--out",
+            roundtrip.to_str().unwrap(),
+        ],
+        false,
+    );
+    assert!(o.status.success(), "stderr:\n{}", err(&o));
+    assert!(err(&o).contains("vf: got stories/fox.txt"), "{}", err(&o));
+    assert_eq!(
+        std::fs::read(&roundtrip).unwrap(),
+        std::fs::read(&fox).unwrap(),
+        "path-form get round trip"
+    );
+    let o = vf(port, &["cat", "docs/stories/fox.txt"], false);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o), "the quick brown fox jumps over the lazy dog");
+
+    // ---- the PRE-S3-forms contract survives: with --bucket present the
+    // positional is the full key VERBATIM, even when it contains '/' (a
+    // `bucket/key`-shaped key stays addressable through the flag form) ----
+    let back = work.join("back.txt");
+    let o = vf(
+        port,
+        &[
+            "get",
+            "stories/fox.txt",
+            "--bucket",
+            "docs",
+            "--out",
+            back.to_str().unwrap(),
+        ],
+        false,
+    );
+    assert!(o.status.success(), "stderr:\n{}", err(&o));
+    assert!(err(&o).contains("vf: got stories/fox.txt"), "{}", err(&o));
+
+    // ---- search / reindex positional bucket ----
+    let o = vf(
+        port,
+        &["search", "quick brown fox", "docs", "--top-k", "1"],
+        false,
+    );
+    assert!(o.status.success(), "stdout:\n{}", out(&o));
+    assert!(out(&o).contains("stories/fox.txt"), "{}", out(&o));
+    let o = vf(port, &["reindex", "docs"], false);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o).trim().len(), 32, "jobId hex: {}", out(&o));
+    wait_vf_indexed(
+        port,
+        "stories/fox.txt",
+        Instant::now() + Duration::from_secs(120),
+    );
+
+    // ---- rm path form ----
+    let o = vf(port, &["rm", "docs/stories/fox.txt"], false);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).starts_with("DELETING\tstories/fox.txt"),
+        "{}",
+        out(&o)
+    );
+
+    // ---- USAGE error shapes (the put destination never mixes with
+    // --bucket; a keyless bare positional is refused with a repair hint) ----
+    let o = vf(port, &["get", "fox.txt"], false);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(err(&o).contains("no '/' to split"), "{}", err(&o));
+    let o = vf(
+        port,
+        &["put", fox.to_str().unwrap(), "docs/", "--bucket", "docs"],
+        false,
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(err(&o).contains("second one"), "{}", err(&o));
+
+    daemon.dump_log_tail("end of s3-forms smoke (informational)");
 }
 
 /// SIGKILL leaves the LOCK object behind (a killed process cannot release

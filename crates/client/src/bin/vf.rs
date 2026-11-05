@@ -47,18 +47,35 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Upload files into the instance root and (by default) wait for the
-    /// file layer to index them (poll GetSource to a terminal state)
+    /// file layer to index them (poll GetSource to a terminal state).
+    /// S3-CLI-style destination: the LAST positional ending in `/` names the
+    /// bucket[/prefix] (`vf put a.txt docs/`, `vf put a.txt docs/pre/` ->
+    /// key `pre/a.txt`); `--bucket`/`--key` remain the explicit form
     Put(PutArgs),
     /// The one retrieval verb: fan-out + merge + 回源 over the bucket's
-    /// embedders
+    /// embedders. Bucket as a bare second positional (`vf search "q" docs`)
+    /// or via `--bucket`
     Search(SearchArgs),
-    /// List ingested files / inspect one file's status
+    /// List ingested files / inspect one file's status (the verb forms; the
+    /// `vf ls` shorthand covers listing)
     Sources(SourcesArgs),
-    /// Download a source file's original bytes
+    /// Download a source file's original bytes. S3-CLI-style path:
+    /// `vf get docs/hello.pdf` (first `/` splits bucket from key);
+    /// `--bucket` + bare key remains the explicit form
     Get(GetArgs),
-    /// Delete a source file (object + async chunk GC)
+    /// Print a source file's bytes to stdout (the `get` stdout form, S3-CLI
+    /// convention): `vf cat docs/hello.pdf`
+    Cat(CatArgs),
+    /// Delete a source file (object + async chunk GC). S3-CLI-style path:
+    /// `vf rm docs/sample.md`; `--bucket` + bare key remains the explicit
+    /// form
     Rm(RmArgs),
-    /// Trigger an explicit re-embed of a bucket (after pipeline changes)
+    /// List ingested buckets / a bucket's sources, S3-CLI style: no argument
+    /// = the ingest buckets (`aws s3 ls` shape); `vf ls docs` / `vf ls
+    /// docs/pre` = sources (prefix filtered client-side); `--status` filters
+    Ls(LsArgs),
+    /// Trigger an explicit re-embed of a bucket (after pipeline changes).
+    /// Bucket as a bare positional (`vf reindex docs`) or via `--bucket`
     Reindex(ReindexArgs),
     /// /health + ingest status summary of the daemon
     Status(StatusArgs),
@@ -102,14 +119,18 @@ struct PutArgs {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Files to upload (looped; --key only valid with exactly one)
+    /// Files to upload — a LAST positional ending in `/` is the DESTINATION
+    /// bucket[/prefix], not a file (`vf put a.txt docs/`, `vf put a.txt
+    /// docs/pre/`); looped; --key only valid with exactly one
     files: Vec<std::path::PathBuf>,
 
-    /// Vector bucket (its [ingest.<bucket>] section owns the file)
+    /// Vector bucket (its [ingest.<bucket>] section owns the file); omit
+    /// when a `bucket[/prefix]/` destination positional is given
     #[arg(long)]
-    bucket: String,
+    bucket: Option<String>,
 
-    /// Object key (default: the file's name)
+    /// Object key (default: the file's name, prefixed by a destination
+    /// prefix if one was given)
     #[arg(long)]
     key: Option<String>,
 
@@ -131,9 +152,13 @@ struct SearchArgs {
     /// Query text
     text: String,
 
-    /// Vector bucket to search
+    /// Vector bucket to search (bare name positional, S3-CLI style)
+    bucket_pos: Option<String>,
+
+    /// Vector bucket to search (explicit form; mutually exclusive with the
+    /// positional)
     #[arg(long)]
-    bucket: String,
+    bucket: Option<String>,
 
     /// Results to request, 1..=1000 [default: 10]
     #[arg(long, default_value_t = 10)]
@@ -207,16 +232,34 @@ struct GetArgs {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Object key
-    key: String,
+    /// Source as `bucket/key` (S3-CLI style path) or a bare key alongside
+    /// `--bucket`
+    key: Option<String>,
 
-    /// Vector bucket
+    /// Vector bucket (explicit form; mutually exclusive with the path
+    /// positional)
     #[arg(long)]
-    bucket: String,
+    bucket: Option<String>,
 
     /// Write to this file instead of stdout
     #[arg(long)]
     out: Option<std::path::PathBuf>,
+}
+
+/// `vf cat <bucket/key>` — the get stdout form, spelled like every S3 CLI.
+#[derive(Args, Debug)]
+struct CatArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
+    /// Source as `bucket/key` (S3-CLI style path) or a bare key alongside
+    /// `--bucket`
+    key: Option<String>,
+
+    /// Vector bucket (explicit form; mutually exclusive with the path
+    /// positional)
+    #[arg(long)]
+    bucket: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -224,12 +267,35 @@ struct RmArgs {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Object key
-    key: String,
+    /// Source as `bucket/key` (S3-CLI style path) or a bare key alongside
+    /// `--bucket`
+    key: Option<String>,
 
-    /// Vector bucket
+    /// Vector bucket (explicit form; mutually exclusive with the path
+    /// positional)
     #[arg(long)]
-    bucket: String,
+    bucket: Option<String>,
+}
+
+/// `vf ls [bucket[/prefix]]` — the S3-CLI listing shape over the ingest
+/// face: no argument lists the daemon's ingest buckets; `docs` / `docs/`
+/// lists its sources; `docs/pre` filters by key prefix (client-side).
+#[derive(Args, Debug)]
+struct LsArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
+    /// bucket[/prefix] — omit to list the ingest buckets themselves
+    path: Option<String>,
+
+    /// Only this status (PENDING / IN_PROGRESS / PARTIALLY_INDEXED / INDEXED
+    /// / FAILED / DELETING)
+    #[arg(long)]
+    status: Option<String>,
+
+    /// Structured output (schema_version'd JSON)
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -237,9 +303,12 @@ struct ReindexArgs {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Vector bucket
+    /// Vector bucket (bare name positional, S3-CLI style)
+    bucket_pos: Option<String>,
+
+    /// Vector bucket (explicit form; mutually exclusive with the positional)
     #[arg(long)]
-    bucket: String,
+    bucket: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -262,9 +331,86 @@ async fn main() {
             SourcesCommand::Status(a) => sources_status_cmd(a).await,
         },
         Command::Get(args) => get_cmd(args).await,
+        Command::Cat(args) => cat_cmd(args).await,
         Command::Rm(args) => rm_cmd(args).await,
+        Command::Ls(args) => ls_cmd(args).await,
         Command::Reindex(args) => reindex_cmd(args).await,
         Command::Status(args) => status_cmd(args).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S3-CLI-style argument resolution (2026-11-05 adjudication: bucket/key
+// PATHS alongside the --bucket flag forms — the borrowed conventions are
+// `aws s3`/`mc`/`s5cmd` shapes; the flags stay for scripts and muscle
+// memory, and mixing the two forms for the same target is a USAGE error,
+// never a silent precedence)
+// ---------------------------------------------------------------------------
+
+/// Split a `bucket/key…` path at the FIRST `/` (S3 semantics: the bucket
+/// name never contains one). `None` = not a path (no `/`, or an empty side).
+fn split_bucket_path(path: &str) -> Option<(&str, &str)> {
+    let (bucket, key) = path.split_once('/')?;
+    (!bucket.is_empty() && !key.is_empty()).then(|| (bucket, key))
+}
+
+/// Resolve a key-carrying verb's target from its positional (+ optional
+/// `--bucket` flag). Precedence, chosen for BACKWARD COMPATIBILITY with the
+/// documented flag form (keys may legally contain `/` — e.g. `get
+/// docs/fox.txt --bucket docs` addresses the KEY `docs/fox.txt`):
+///
+/// * `--bucket` present ⇒ the positional is the FULL KEY, verbatim, whatever
+///   it contains (the explicit flag wins; this is the pre-S3-forms contract).
+/// * `--bucket` absent ⇒ the positional must be a `bucket/key` PATH, split
+///   at the FIRST `/` — keys that THEMSELVES look like `bucket/key` are
+///   addressable through the flag form, by this same precedence.
+fn resolve_key_target(path: Option<&str>, flag: Option<&str>, verb: &str) -> (String, String) {
+    let Some(p) = path else {
+        Failure::new(
+            "USAGE",
+            format!("no target given for {verb}"),
+            format!("use '{verb} <bucket>/<key>' or a bare key with --bucket"),
+        )
+        .fail(false, 2)
+    };
+    match flag {
+        // explicit form (pre-S3-forms contract, unchanged): the positional
+        // is the key verbatim — `vf get docs/fox.txt --bucket docs`
+        Some(b) => (b.to_string(), p.to_string()),
+        // path form: `vf get docs/hello.pdf`
+        None => match split_bucket_path(p) {
+            Some((b, k)) => (b.to_string(), k.to_string()),
+            None => Failure::new(
+                "USAGE",
+                format!("'{p}' is not a bucket/key path (no '/' to split at)"),
+                format!(
+                    "use '{verb} <bucket>/<key>', or pass the key with --bucket (the flag form \
+                     also addresses keys that themselves contain '/')"
+                ),
+            )
+            .fail(false, 2),
+        },
+    }
+}
+
+/// Resolve a bucket-only target (search/reindex): a bare-name positional
+/// (trailing `/` tolerated) or `--bucket`; exactly one form.
+fn resolve_bucket_target(pos: Option<&str>, flag: Option<&str>, verb: &str) -> String {
+    match (pos, flag) {
+        (Some(p), None) => p.trim_end_matches('/').to_string(),
+        (None, Some(b)) => b.to_string(),
+        (Some(_), Some(_)) => Failure::new(
+            "USAGE",
+            "positional bucket and --bucket are mutually exclusive",
+            format!("pass the bucket once: '{verb} <bucket>' or --bucket <bucket>"),
+        )
+        .fail(false, 2),
+        (None, None) => Failure::new(
+            "USAGE",
+            format!("no bucket given for {verb}"),
+            format!("use '{verb} <bucket>' or --bucket <bucket>"),
+        )
+        .fail(false, 2),
     }
 }
 
@@ -279,7 +425,65 @@ fn die(e: CallError, endpoint: &str) -> ! {
 
 async fn put_cmd(args: PutArgs) {
     let conn = args.common.connect().unwrap_or_else(|f| f.fail(false, 2));
-    if args.key.is_some() && args.files.len() != 1 {
+    // S3-CLI-style destination (2026-11-05): a LAST positional ending in `/`
+    // is `bucket[/prefix]/`, not a file — `vf put a.txt docs/` (key a.txt),
+    // `vf put a.txt docs/pre/` (key pre/a.txt); `aws s3 cp`'s trailing-slash
+    // convention, adapted to vf's single implicit instance root (no s3://).
+    let mut files = args.files.clone();
+    let dest = files
+        .last()
+        .and_then(|p| p.to_str())
+        .filter(|p| p.ends_with('/'))
+        .map(str::to_string);
+    if dest.is_some() {
+        files.pop(); // the destination is not a file to read
+    }
+    let (dest_bucket, dest_prefix) = match &dest {
+        None => (None, None),
+        // strip the trailing '/', then the first `/` splits bucket/prefix
+        Some(d) => {
+            let bare = d.trim_end_matches('/');
+            match bare.split_once('/') {
+                Some((b, prefix)) => (Some(b.to_string()), Some(prefix.to_string())),
+                None => (Some(bare.to_string()), None),
+            }
+        }
+    };
+    // the two bucket spellings are mutually exclusive (a second opinion on
+    // the same fact is a bug, not a precedence question)
+    if args.bucket.is_some() && dest_bucket.is_some() {
+        Failure::new(
+            "USAGE",
+            "a bucket[/prefix]/ destination already names its bucket — --bucket would be a \
+             second one",
+            "pick one form: 'vf put <files…> <bucket>/[<prefix>/]' or --bucket <bucket>",
+        )
+        .fail(false, 2);
+    }
+    // --key names THE key; a destination PREFIX would rename it under itself
+    // (pre/ + --key k = k or pre/k? both defensible = ambiguous = refused)
+    if args.key.is_some() && dest_prefix.is_some() {
+        Failure::new(
+            "USAGE",
+            "--key cannot be combined with a destination prefix",
+            "drop --key (keys default to <prefix>/<file name>) or drop the prefix from the \
+             destination",
+        )
+        .fail(false, 2);
+    }
+    let bucket = args
+        .bucket
+        .clone()
+        .or_else(|| dest_bucket.clone())
+        .unwrap_or_else(|| {
+            Failure::new(
+                "USAGE",
+                "no bucket given",
+                "use 'vf put <files…> <bucket>/[<prefix>/]' or --bucket <bucket>",
+            )
+            .fail(false, 2)
+        });
+    if args.key.is_some() && files.len() != 1 {
         Failure::new(
             "USAGE",
             "--key cannot be combined with multiple files",
@@ -287,12 +491,17 @@ async fn put_cmd(args: PutArgs) {
         )
         .fail(false, 2);
     }
-    if args.files.is_empty() {
-        Failure::new("USAGE", "no files given", "pass at least one file path").fail(false, 2);
+    if files.is_empty() {
+        Failure::new(
+            "USAGE",
+            "no files given",
+            "pass at least one file path before the <bucket>/[<prefix>/] destination",
+        )
+        .fail(false, 2);
     }
 
     let mut any_failed = false;
-    for file in &args.files {
+    for file in &files {
         let bytes = match tokio::fs::read(file).await {
             Ok(b) => b,
             Err(e) => {
@@ -301,16 +510,22 @@ async fn put_cmd(args: PutArgs) {
                 continue;
             }
         };
-        // default key = the file's NAME (aws s3 cp single-file convention);
-        // directory structure is the caller's choice via --key
+        // default key = the file's NAME (aws s3 cp single-file convention),
+        // under the destination prefix when one was given; --key overrides
+        // the name entirely (prefix + --key was refused above)
         let key = args.key.clone().unwrap_or_else(|| {
-            file.file_name()
+            let name = file
+                .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| file.display().to_string())
+                .unwrap_or_else(|| file.display().to_string());
+            match &dest_prefix {
+                Some(prefix) => format!("{prefix}/{name}"),
+                None => name,
+            }
         });
 
         let headers = vec![
-            ("x-vf-bucket".to_string(), args.bucket.clone()),
+            ("x-vf-bucket".to_string(), bucket.clone()),
             (
                 "x-vf-file-name".to_string(),
                 client::encode_header_value(&key),
@@ -342,7 +557,7 @@ async fn put_cmd(args: PutArgs) {
         let mut terminal: Option<(String, Value)> = None;
         loop {
             let s = match conn
-                .call_json("GetSource", &json!({"bucket": args.bucket, "key": key}))
+                .call_json("GetSource", &json!({"bucket": bucket, "key": key}))
                 .await
             {
                 Ok(v) => v,
@@ -404,6 +619,8 @@ async fn put_cmd(args: PutArgs) {
 
 async fn search_cmd(args: SearchArgs) {
     let conn = args.common.connect().unwrap_or_else(|f| f.fail(false, 2));
+    let bucket =
+        resolve_bucket_target(args.bucket_pos.as_deref(), args.bucket.as_deref(), "search");
     let filter: Option<Value> = match &args.filter {
         None => None,
         Some(f) => match serde_json::from_str(f) {
@@ -417,7 +634,7 @@ async fn search_cmd(args: SearchArgs) {
         },
     };
     let mut body = json!({
-        "bucket": args.bucket,
+        "bucket": bucket,
         "query": { "text": args.text },
         "topK": args.top_k,
         "returnText": !args.no_text,
@@ -435,7 +652,7 @@ async fn search_cmd(args: SearchArgs) {
             "{}",
             serde_json::to_string_pretty(&json!({
                 "schema_version": SCHEMA_VERSION,
-                "bucket": args.bucket,
+                "bucket": bucket,
                 "query": { "text": args.text },
                 "topK": args.top_k,
                 "hits": hits,
@@ -487,11 +704,24 @@ async fn sources_list_cmd(args: SourcesListArgs) {
         .common
         .connect()
         .unwrap_or_else(|f| f.fail(args.json, 2));
+    list_sources(&conn, &args.bucket, args.status.as_deref(), None, args.json).await;
+}
+
+/// The sources-listing core shared by `sources list` and the `ls` shorthand:
+/// paginate ListSources (status filter server-side, key prefix CLIENT-side —
+/// the wire has no prefix parameter in M2), then the table or JSON view.
+async fn list_sources(
+    conn: &Connection,
+    bucket: &str,
+    status: Option<&str>,
+    prefix: Option<&str>,
+    json_out: bool,
+) {
     let mut rows: Vec<Value> = Vec::new();
     let mut token: Option<String> = None;
     loop {
-        let mut body = json!({"bucket": args.bucket, "maxResults": 1000});
-        if let Some(s) = &args.status {
+        let mut body = json!({"bucket": bucket, "maxResults": 1000});
+        if let Some(s) = status {
             body["status"] = json!(s);
         }
         if let Some(t) = &token {
@@ -507,12 +737,15 @@ async fn sources_list_cmd(args: SourcesListArgs) {
             break;
         }
     }
-    if args.json {
+    if let Some(prefix) = prefix {
+        rows.retain(|s| s["key"].as_str().is_some_and(|k| k.starts_with(prefix)));
+    }
+    if json_out {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "schema_version": SCHEMA_VERSION,
-                "bucket": args.bucket,
+                "bucket": bucket,
                 "count": rows.len(),
                 "sources": rows,
             }))
@@ -539,6 +772,65 @@ async fn sources_list_cmd(args: SourcesListArgs) {
             s["updatedAt"].as_str().unwrap_or(""),
         );
     }
+}
+
+/// `vf ls [bucket[/prefix]]` — the S3-CLI listing shape: no argument lists
+/// the daemon's ingest buckets (`aws s3 ls` analog over GetIngestStatus);
+/// with a bucket (optional `/`-terminated) it lists that bucket's sources
+/// (`ls` shares `sources list`'s rendering and --status filter); a prefix
+/// past the bucket filters keys client-side.
+async fn ls_cmd(args: LsArgs) {
+    let conn = args
+        .common
+        .connect()
+        .unwrap_or_else(|f| f.fail(args.json, 2));
+    let Some(path) = args.path else {
+        // bucket inventory: same GetIngestStatus call `vf status` uses
+        let v = match conn.call_json("GetIngestStatus", &json!({})).await {
+            Ok(v) => v,
+            Err(e) => die(e, conn.endpoint()),
+        };
+        let buckets = v["buckets"].as_array().cloned().unwrap_or_default();
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "count": buckets.len(),
+                    "buckets": buckets,
+                }))
+                .expect("serializes")
+            );
+            return;
+        }
+        for b in &buckets {
+            let c = &b["counts"];
+            println!(
+                "{:<24} INDEXED={} PARTIAL={} PENDING={} FAILED={}",
+                b["bucket"].as_str().unwrap_or("?"),
+                c["INDEXED"],
+                c["PARTIALLY_INDEXED"],
+                c["PENDING"],
+                c["FAILED"],
+            );
+        }
+        return;
+    };
+    // bucket[/prefix]: the first `/` splits bucket from key prefix
+    let bare = path.trim_end_matches('/');
+    let (bucket, prefix) = match bare.split_once('/') {
+        Some((b, p)) => (b, Some(p)),
+        None => (bare, None),
+    };
+    if bucket.is_empty() {
+        Failure::new(
+            "USAGE",
+            "empty bucket name",
+            "use 'vf ls <bucket>[/<prefix>]'",
+        )
+        .fail(args.json, 2);
+    }
+    list_sources(&conn, bucket, args.status.as_deref(), prefix, args.json).await;
 }
 
 async fn sources_status_cmd(args: SourcesStatusArgs) {
@@ -602,13 +894,13 @@ async fn sources_status_cmd(args: SourcesStatusArgs) {
 }
 
 // ---------------------------------------------------------------------------
-// get / rm / reindex / status
+// get / cat / rm / reindex / status
 // ---------------------------------------------------------------------------
 
 async fn get_cmd(args: GetArgs) {
+    let (bucket, key) = resolve_key_target(args.key.as_deref(), args.bucket.as_deref(), "get");
     let conn = args.common.connect().unwrap_or_else(|f| f.fail(false, 2));
-    let body =
-        serde_json::to_vec(&json!({"bucket": args.bucket, "key": args.key})).expect("serializes");
+    let body = serde_json::to_vec(&json!({"bucket": bucket, "key": key})).expect("serializes");
     let (_, content_type, bytes) = match conn
         .call("/x-vf/GetSourceData", body, &[], "application/json")
         .await
@@ -643,18 +935,42 @@ async fn get_cmd(args: GetArgs) {
     }
     eprintln!(
         "vf: got {} ({}, {content_type})",
-        args.key,
+        key,
         human_bytes(bytes.len() as u64)
     );
 }
 
+/// `vf cat <bucket/key>` — the get stdout form (no --out knob by design: a
+/// cat that can also write files is just get with worse discoverability).
+async fn cat_cmd(args: CatArgs) {
+    let (bucket, key) = resolve_key_target(args.key.as_deref(), args.bucket.as_deref(), "cat");
+    let conn = args.common.connect().unwrap_or_else(|f| f.fail(false, 2));
+    let body = serde_json::to_vec(&json!({"bucket": bucket, "key": key})).expect("serializes");
+    let (_, _content_type, bytes) = match conn
+        .call("/x-vf/GetSourceData", body, &[], "application/json")
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => die(e, conn.endpoint()),
+    };
+    use std::io::Write as _;
+    let mut out = std::io::stdout();
+    if let Err(e) = out.write_all(&bytes) {
+        Failure::new(
+            "WRITE_FAILED",
+            format!("cannot write to stdout: {e}"),
+            "is stdout redirected to a full disk or a closed pipe?",
+        )
+        .fail(false, 1);
+    }
+    out.flush().ok();
+}
+
 async fn rm_cmd(args: RmArgs) {
+    let (bucket, key) = resolve_key_target(args.key.as_deref(), args.bucket.as_deref(), "rm");
     let conn = args.common.connect().unwrap_or_else(|f| f.fail(false, 2));
     let v = match conn
-        .call_json(
-            "DeleteSource",
-            &json!({"bucket": args.bucket, "key": args.key}),
-        )
+        .call_json("DeleteSource", &json!({"bucket": bucket, "key": key}))
         .await
     {
         Ok(v) => v,
@@ -662,29 +978,24 @@ async fn rm_cmd(args: RmArgs) {
     };
     eprintln!(
         "vf: rm {} -> {} (chunk GC is asynchronous)",
-        args.key, v["status"]
+        key, v["status"]
     );
-    println!(
-        "{}\t{}",
-        v["status"].as_str().unwrap_or("DELETING"),
-        args.key
-    );
+    println!("{}\t{}", v["status"].as_str().unwrap_or("DELETING"), key);
 }
 
 async fn reindex_cmd(args: ReindexArgs) {
+    let bucket = resolve_bucket_target(
+        args.bucket_pos.as_deref(),
+        args.bucket.as_deref(),
+        "reindex",
+    );
     let conn = args.common.connect().unwrap_or_else(|f| f.fail(false, 2));
-    let v = match conn
-        .call_json("Reindex", &json!({"bucket": args.bucket}))
-        .await
-    {
+    let v = match conn.call_json("Reindex", &json!({"bucket": bucket})).await {
         Ok(v) => v,
         Err(e) => die(e, conn.endpoint()),
     };
     let job = v["jobId"].as_str().unwrap_or_default();
-    eprintln!(
-        "vf: reindex of {} queued ({job}) — poll with: vf status",
-        args.bucket
-    );
+    eprintln!("vf: reindex of {bucket} queued ({job}) — poll with: vf status");
     println!("{job}");
 }
 
