@@ -327,6 +327,8 @@ ingest: Source → normalize（固定有序内建变换表：Same/Transformed/Ex
         auto = 内置 mime→kind 单射）
         → Parts → 每模态路由到全部 doc-模态匹配的 embedder
         → chunker（仅 text 模态）→ embed → 分批 put_vectors(x-vf-src-*)
+**顺序裁决（normalize 为什么在 route 前，2026-11-05 复核）**：不变式 = **normalize 是每级第一个触碰字节的东西，路由三段（短键/probe/affinity）永远只见 normalize 后状态**；normalize 之前只有扫描层按文件名的廉价认领（提示而非变换，magic 校验兜住谎报文件名）。五条强制理由：①**短键身份依赖 normalize**——`.txt.gz` 的可路由身份是 text/plain，route 先行则按 application/gzip 查链无承接即被跳过，gz 透明性的全部价值依赖路由看穿包装；②**probe 只对真实内容有意义**——`scan.pdf.gz` 先解压才能分类 text-native/scan-dominant 选对提取器，route 先行则 probe 吃压缩字节得 Unknown，智能路由对一切包装文件静默退化纯顺序；③**放大门必须在扩张点**——解压炸弹守卫贴着变换出口（normalize 后、任何下游之前）；④**确定性死端先泊车**——损坏 gz 后置会被翻译成"成员退让"，链逐个白跑同错且语义错（损坏不是退让）；⑤**成员/子文档同一性**——每成员惰性变换重复解压且引入成员间字节不一致裂缝；一处变换一处门一行日志，全员见同一终态。被否决的替代位：route 原始 mime（丢①②）、每成员惰性变换（破⑤）、route→normalize→再 route 的双相循环（为省一次**有界**解压引入再路由循环=迷你拓扑引擎，§5.10.8 恰禁；且未认领包装已由扫描层文件名剥包在源头过滤，唯一残余浪费是谎报文件名——有界且响亮失败）。"某些变换只对某些提取器有意义"的忧虑由判据本身隔离：那是格式智力，归 kind 内部，不是 normalizer。
+
 query: 输入 → query 模态匹配的各 embedder → embed_query → 各查各 index（filter 可带）
        → merge → (rerank, M3) → 回源（x-vf-src-*）
 ```
