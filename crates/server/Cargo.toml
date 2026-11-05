@@ -1,26 +1,20 @@
 [package]
-name = "vectorfs"
+name = "vectorfs-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Single-binary, self-hosted AWS S3 Vectors compatible gateway"
-publish = false
+repository.workspace = true
+description = "Single-binary, self-hosted AWS S3 Vectors compatible gateway + file-to-vector ingestion server"
 
-# Dual thin bins (design.md §0 command ruling + 附录E.4):
-# - `vectorfs`: the SERVER (init/serve/status/doctor/mcp) — links the engine
-#   (lancedb) and the axum router; this is the binary size_guard.sh gates on.
-# - `vf`: the CLIENT skeleton over HTTP (status --endpoint; T6 grows the
-#   put/search/get/... verbs). References only the probe/render slice of the
-#   lib, so the linker drops the engine/server code — it stays a small
-#   binary, not a second copy of the daemon.
+# Three-crate split (design.md §0 2026-11-05 ruling): the SERVER keeps the
+# engine (lancedb), the protocol face, and every plugin kind — this binary
+# may be large (size_guard.sh gates it on the 155/175 MiB lines). The `vf`
+# CLIENT is its own small crate now (`vectorfs-client`), sharing only
+# `vectorfs-common` with this one.
 [[bin]]
 name = "vectorfs"
 path = "src/bin/vectorfs.rs"
-
-[[bin]]
-name = "vf"
-path = "src/bin/vf.rs"
 
 # Dependencies carried over from the verified M0 spike (spike/Cargo.toml,
 # spike/REPORT.md 2026-11-03): same versions, same feature convergence.
@@ -31,6 +25,12 @@ path = "src/bin/vf.rs"
 # (design.md §5.7, machine-enforced by scripts/deps_guard.sh). The S3 backend
 # route is unchanged: object_store's own client (aws-lc-rs crypto only).
 [dependencies]
+# The shared wire core (three-crate split): SigV4 sign/verify, the TLS HTTP
+# leaf, the report vocabulary. Re-exported at the crate root so the
+# historical `crate::sigv4` / `crate::report` / `crate::pipeline::embed::http`
+# paths keep working inside this crate.
+vectorfs-common = { path = "../common", version = "0.1" }
+
 # HTTP: converged features (no default catch-all). http1 + json + tokio runtime glue only.
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 
@@ -64,13 +64,11 @@ toml = "1"
 percent-encoding = "2"
 base64 = "0.22"
 
-# SigV4 (hand-rolled verify, design.md §5.7: no aws-* SDK crates).
+# SigV4 itself lives in vectorfs-common since the split (signer + verifier,
+# one canonicalization). sha2 stays a DIRECT dep here: ingest's content-hash
+# skip (ingest/marker.rs content_hash_of) hashes object bytes with it.
 # Versions chosen to match already-locked transitive copies (zero new subgraph).
-# NOTE: the spike also declared `hex` here, but nothing ever imported it
-# (sigv4.rs hand-rolls its own hex encoder — the zero-dep point). Dropped in
-# the product crate; caught by cargo-machete in CI.
 sha2 = "0.10"
-hmac = "0.12"
 futures-util = { version = "0.3", default-features = false }
 
 # CLI args. Env precedence (flag > env > vf.json > default) is resolved
@@ -138,29 +136,20 @@ rmcp = { version = "3.8", default-features = false, features = [
 # through feature drift. MIT OR Apache-2.0.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
-# `vf status --endpoint` health probe (M1 T6): hyper's client through
-# hyper-util. hyper-util 0.1 / http-body-util / http 1 are ALREADY transitive
+# `vectorfs status` health probe (M1 T6): hyper's client through hyper-util
+# (status.rs). hyper-util 0.1 / http-body-util / http 1 are ALREADY transitive
 # deps of axum in this tree — declaring them directly adds ZERO new crates
 # (recorded for the deps_guard/deny review). http only, no TLS provider is
-# linked: matches the no-outbound-network posture (§5.7 "出网: 无") — the
-# probe is a user-initiated liveness check of a local daemon.
+# linked here: the probe is a user-initiated liveness check of a local daemon
+# (the TLS/proxy leaf for real egress lives in vectorfs-common).
 hyper-util = { version = "0.1", default-features = false, features = [
   "client",
   "client-legacy",
-  # client-proxy: the CONNECT `Tunnel` connector (model prefetch / openai
-  # egress through corporate proxies — standard *_PROXY env semantics, see
-  # pipeline/embed/http.rs). A feature of an existing dep: zero new crates.
-  "client-proxy",
   "http1",
   "tokio",
 ] }
 http-body-util = "0.1"
 http = "1"
-# tower-service trait ONLY (implementing the proxy-aware transport connector
-# in pipeline/embed/http.rs — hyper-util's legacy client takes any
-# tower Service<Uri> as its connector). Same version already locked via
-# hyper-util: declaring it directly adds zero new crates.
-tower-service = "0.3"
 
 # ---- M2 T4 pipeline kinds (design.md §5.7 "文件层" row, §5.10.2 kind table) ----
 
@@ -239,39 +228,13 @@ tokenizers = { version = "0.23", default-features = false, features = [
   "fancy-regex",
 ] }
 
-# openai embedder TLS: rustls 0.23 + hyper-rustls are ALREADY transitive
-# deps in this tree (object_store/reqwest/lance chain, unified version
-# 0.23.x) — declaring them directly adds ZERO new crates beyond
-# webpki-roots. Provider = aws-lc-rs (the crypto object_store already
-# binds, design.md §8 #11; NOT ring). The openai kind is hand-rolled HTTP
-# over hyper-util (§5.7 "自研 HTTP 复用 hyper 树 ~150 行, 零 reqwest") — these
-# are its TLS plumbing only. Features are the minimum: http1, tls12, the
-# aws-lc-rs provider, and webpki-roots for the root store.
-#   - hyper-rustls / rustls: MIT OR Apache-2.0; aws-lc-rs: ISC + OpenSSL
-#     (already accepted in deny.toml).
-#   - webpki-roots: MPL-2.0 — accepted per the M1 ruling recorded in
-#     deny.toml (consumed as a data library; file-level weak copyleft, not
-#     viral). It bundles the Mozilla root set so the binary works on
-#     slim containers without /etc/ssl/certs; the alternative
-#     (rustls-native-certs) depends on the host cert store, which is
-#     exactly the failure mode a self-contained binary must avoid.
-#   - rustls is declared DIRECTLY (same 0.23.x the tree already locks, zero
-#     new crates) because the tree's rustls has BOTH provider features
-#     enabled (hyper-rustls/aws-lc-rs via object_store AND ring via
-#     reqwest's feature unification) — rustls's default provider selection
-#     PANICS on that ambiguity, so embed/http.rs must name the provider
-#     explicitly (aws-lc-rs, the object_store-blessed crypto).
-hyper-rustls = { version = "0.27", default-features = false, features = [
-  "http1",
-  "tls12",
-  "aws-lc-rs",
-  "webpki-tokio",
-] }
-rustls = { version = "0.23", default-features = false, features = [
-  "std",
-  "tls12",
-  "aws-lc-rs",
-] }
+# openai embedder TLS: since the three-crate split the rustls/hyper-rustls
+# declarations live in vectorfs-common (the shared TLS leaf the openai kind
+# and the vf client both ride). The full feature/licensing rationale
+# (aws-lc-rs provider choice, webpki-roots MPL-2.0 ruling, the dual-provider
+# PANIC pitfall that forces naming the provider explicitly) moved with it —
+# see crates/common/Cargo.toml. Still transitive here via object_store/lance,
+# never declared directly: this crate's own HTTP egress goes through the leaf.
 
 [dev-dependencies]
 # tower::oneshot for in-process integration tests (no network port).

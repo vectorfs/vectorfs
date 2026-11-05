@@ -33,7 +33,8 @@ use std::time::{Duration, Instant};
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("vf/../ is the repo root")
+        .and_then(|p| p.parent())
+        .expect("crates/server/../../ is the repo root")
         .to_path_buf()
 }
 
@@ -389,7 +390,7 @@ fn kill9_mid_ingest_restart_converges_exactly_once() {
         .build()
         .unwrap();
     rt.block_on(async move {
-        let storage = vectorfs::store::Storage::file(&data_dir);
+        let storage = vectorfs_server::store::Storage::file(&data_dir);
         // find the derived index (the one stamped x_vf_derived)
         let indexes = storage.list_indexes("docs").await.unwrap();
         assert!(!indexes.is_empty(), "derived index exists: {indexes:?}");

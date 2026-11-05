@@ -6594,7 +6594,42 @@ dependencies = [
 ]
 
 [[package]]
-name = "vectorfs"
+name = "vectorfs-client"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "clap",
+ "http",
+ "http-body-util",
+ "percent-encoding",
+ "serde_json",
+ "tokio",
+ "vectorfs-common",
+]
+
+[[package]]
+name = "vectorfs-common"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hmac",
+ "http",
+ "http-body-util",
+ "hyper-rustls",
+ "hyper-util",
+ "percent-encoding",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tower-service",
+ "url",
+]
+
+[[package]]
+name = "vectorfs-server"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -6605,10 +6640,8 @@ dependencies = [
  "flate2",
  "futures-util",
  "getrandom 0.3.4",
- "hmac",
  "http",
  "http-body-util",
- "hyper-rustls",
  "hyper-util",
  "lance",
  "lance-io",
@@ -6621,7 +6654,6 @@ dependencies = [
  "pulldown-cmark",
  "rmcp",
  "rustix",
- "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -6631,8 +6663,8 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
- "tower-service",
  "url",
+ "vectorfs-common",
 ]
 
 [[package]]

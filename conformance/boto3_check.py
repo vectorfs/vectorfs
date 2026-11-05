@@ -270,7 +270,7 @@ def main() -> int:
     # Note: invalid-enum / maxResults-range ValidationException paths cannot
     # be driven through boto3 (botocore validates enums & ranges client-side
     # and raises ParamValidationError before sending) — those live in the
-    # tower oneshot unit tests (vf/src/ops.rs).
+    # tower oneshot unit tests (crates/server/src/ops.rs).
     # ------------------------------------------------------------------
 
     def m10():
@@ -449,7 +449,7 @@ def main() -> int:
     # Range violations that botocore itself validates client-side (keys>100
     # / >500, maxResults range, segment pairing is NOT client-checked) cannot
     # be driven through boto3 — those live in the tower oneshot unit tests
-    # (vf/src/ops.rs). Document-typed metadata limits (2 KB filterable,
+    # (crates/server/src/ops.rs). Document-typed metadata limits (2 KB filterable,
     # nested-object types) ARE drivable and checked server-side here.
     # ------------------------------------------------------------------
 
@@ -627,7 +627,7 @@ def main() -> int:
     # index — eq / and / range / in / startsWith / exists, each asserting the
     # exact key set (plus any-element list semantics where they land).
     # Operator/validation negatives live in the tower oneshot unit tests
-    # (vf/src/ops.rs + vf/src/filter.rs); these steps pin the WIRE path.
+    # (crates/server/src/ops.rs + crates/server/src/filter.rs); these steps pin the WIRE path.
     # ------------------------------------------------------------------
 
     def f_seed():

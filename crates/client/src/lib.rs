@@ -1,12 +1,16 @@
 //! `vf` CLIENT transport (M2 T6, appendix E.1/E.4): the signed-HTTP slice
-//! the `vf` binary talks to a running `vectorfs serve` daemon with.
+//! the `vf` binary talks to a running `vectorfs serve` daemon with. Since the
+//! three-crate split this is the `vectorfs-client` CRATE (lib + `vf` bin) —
+//! it depends on `vectorfs-common` and NOTHING server-side, so the client
+//! binary structurally cannot link lancedb/axum/ort/pdfium (the small-client
+//! guarantee is the dependency list, not linker luck).
 //!
-//! Deliberately reuses the SERVER's own primitives — the SigV4 signer
-//! ([`crate::sigv4::signer`], the same canonicalization the gate verifies
-//! against, so the pair stays byte-exact by construction) and the TLS-capable
-//! HTTP leaf ([`crate::pipeline::embed::http`], aws-lc-rs rustls — local
-//! `http://` and remote `https://` endpoints both work). No engine/server
-//! module is referenced, so the `vf` binary still links none of lancedb/axum.
+//! Deliberately reuses the SHARED wire primitives from `vectorfs-common` —
+//! the SigV4 signer ([`vectorfs_common::sigv4::signer`], the same
+//! canonicalization the server's gate verifies against, so the pair stays
+//! byte-exact by construction) and the TLS-capable HTTP leaf
+//! ([`vectorfs_common::http`], aws-lc-rs rustls — local `http://` and remote
+//! `https://` endpoints both work).
 //!
 //! Connection resolution (appendix E.4): `--endpoint` > `VF_ENDPOINT`;
 //! `--access-key`/`--secret-key` > `VF_ACCESS_KEY`/`VF_SECRET_KEY`. The
@@ -22,19 +26,14 @@ use bytes::Bytes;
 use http_body_util::BodyExt as _;
 use http_body_util::Full;
 
-use crate::pipeline::embed::http;
-use crate::report::Failure;
-use crate::sigv4::{Credentials, signer};
+use vectorfs_common::http;
+use vectorfs_common::report::Failure;
+use vectorfs_common::sigv4::{Credentials, signer};
 
-/// Percent-encode a `x-vf-*` header VALUE: HTTP header values are ASCII-only,
-/// so controls, space, `%` (round-trip safety) and every non-ASCII byte are
-/// escaped; the server percent-decodes with the exact inverse
-/// (ops_xvf::put_source). Always-encode/always-decode on both ends keeps the
-/// mapping bijective for any key.
-pub fn encode_header_value(v: &str) -> String {
-    const SET: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS.add(b' ').add(b'%');
-    percent_encoding::utf8_percent_encode(v, SET).to_string()
-}
+// The wire-pair encoder lives in common (the server's MCP tool encodes with
+// the same function); re-exported so the bin's `client::encode_header_value`
+// call sites keep working.
+pub use vectorfs_common::http::encode_header_value;
 
 /// What a signed call came back with when it did not succeed.
 #[derive(Debug)]

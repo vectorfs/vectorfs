@@ -38,3 +38,4 @@ conformance/go/*.out
 runtime-libs/
 target-docker/
 target-bullseye/
+.zcode/

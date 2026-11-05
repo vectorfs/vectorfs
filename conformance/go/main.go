@@ -12,7 +12,7 @@
 // Talks to an already-running server; owns no server lifecycle. Any FAIL ->
 // exit 1. Like boto3, enum / maxResults-range negatives that the Go SDK would
 // happily put on the wire are NOT driven here (parity with the boto3 scope —
-// they live in the tower oneshot unit tests, vf/src/ops.rs).
+// they live in the tower oneshot unit tests, crates/server/src/ops.rs).
 //
 // Assertion-scope adjustments forced by the Go SDK (vs the boto3 text):
 //   - parsed members are TYPED, not dict keys: "member absent" checks become

@@ -23,12 +23,12 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
-use vectorfs::client::{self, CallError, Connection};
-use vectorfs::report::{Failure, SCHEMA_VERSION, human_bytes};
+use vectorfs_client::{self as client, CallError, Connection};
+use vectorfs_common::report::{Failure, SCHEMA_VERSION, human_bytes};
 
 fn version_str() -> &'static str {
     static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    V.get_or_init(vectorfs::report::version_string)
+    V.get_or_init(vectorfs_common::report::version_string)
 }
 
 #[derive(Parser, Debug)]

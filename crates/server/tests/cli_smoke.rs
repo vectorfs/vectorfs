@@ -1,6 +1,7 @@
 //! M2 T6 CLI integration smoke: a REAL `vectorfs serve` daemon (SigV4 auth
 //! ON, tiny-embedder fixture pipeline) exercised end to end through the REAL
-//! `vf` client binary (`CARGO_BIN_EXE_vf`) — every 附录E.4 verb:
+//! `vf` client binary (from the sibling vectorfs-client crate — see
+//! [`vf_bin`]) — every 附录E.4 verb:
 //!
 //!   put (foreground wait to INDEXED, and --async), get (byte round-trip),
 //!   sources list / sources status, search (hit + location 回源), rm (202
@@ -22,8 +23,27 @@ const SK: &str = "vf-test-secret";
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("vf/../ is the repo root")
+        .and_then(|p| p.parent())
+        .expect("crates/server/../../ is the repo root")
         .to_path_buf()
+}
+
+/// The `vf` client binary lives in the vectorfs-CLIENT crate since the
+/// three-crate split, so this test crate has no `CARGO_BIN_EXE_vf`. Both
+/// bins land in the SAME target/<profile>/ directory when the workspace
+/// builds, so derive the client's path from this crate's own `vectorfs`
+/// binary — and fail loud (not skip) if a package-scoped run left it unbuilt.
+fn vf_bin() -> PathBuf {
+    let vf = PathBuf::from(env!("CARGO_BIN_EXE_vectorfs"))
+        .parent()
+        .expect("bin dir")
+        .join("vf");
+    assert!(
+        vf.is_file(),
+        "vf client binary missing at {} — build the workspace: cargo test --workspace",
+        vf.display()
+    );
+    vf
 }
 
 fn ort_lib() -> PathBuf {
@@ -184,7 +204,7 @@ fn wait_healthy(port: u16, deadline: Instant) {
 
 /// One `vf` invocation with the endpoint/credentials environment set.
 fn vf(port: u16, args: &[&str], strip_creds: bool) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_vf"));
+    let mut cmd = Command::new(vf_bin());
     cmd.args(args)
         .env("VF_ENDPOINT", format!("http://127.0.0.1:{port}"))
         .env("VF_ACCESS_KEY", AK)

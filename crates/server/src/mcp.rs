@@ -678,8 +678,12 @@ impl VfMcp {
         for (name, value) in [
             ("x-vf-bucket", p.bucket.clone()),
             // ASCII-safe transport: non-ASCII keys ride percent-encoding
-            // (client.rs owns the matching encoder; same wire as `vf put`)
-            ("x-vf-file-name", crate::client::encode_header_value(&key)),
+            // (the encoder lives in vectorfs-common with its exact decoder
+            // counterpart here in ops_xvf::put_source; same wire as `vf put`)
+            (
+                "x-vf-file-name",
+                vectorfs_common::http::encode_header_value(&key),
+            ),
         ] {
             headers.insert(
                 axum::http::HeaderName::from_static(name),

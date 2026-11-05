@@ -95,12 +95,14 @@ pub fn locate_library() -> Result<LibrarySource, String> {
         ));
     }
     // Repo-local fetch-script output. cargo runs test binaries from the
-    // workspace root AND from the member dir depending on invocation, so both
-    // are candidates; the file name follows the platform (libpdfium.so on
-    // Linux, libpdfium.dylib on macOS — pdfium-render's own
+    // workspace root AND from the member dir depending on invocation; since
+    // the three-crate split the member dir sits TWO levels below the root
+    // (crates/server), so all three relative prefixes are candidates. The
+    // file name follows the platform (libpdfium.so on Linux,
+    // libpdfium.dylib on macOS — pdfium-render's own
     // `pdfium_platform_library_name`).
     let lib_name = Pdfium::pdfium_platform_library_name();
-    for prefix in [".", ".."] {
+    for prefix in [".", "..", "../.."] {
         let p = PathBuf::from(prefix).join("runtime-libs").join(&lib_name);
         if p.is_file() {
             return Ok(LibrarySource::File(p));

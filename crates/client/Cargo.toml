@@ -1,0 +1,47 @@
+[package]
+name = "vectorfs-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "vf — the vectorfs client CLI: talks to a running vectorfs daemon over signed HTTP"
+
+# The three-crate split (design.md §0 2026-11-05 ruling): the client binary
+# must stay SMALL — "服务端大一些问题不大，客户端可以小一些" (user). This
+# package's whole dependency list is the guarantee: vectorfs-common (the
+# shared wire core: SigV4 signer + TLS HTTP leaf + report vocabulary) plus CLI
+# essentials. No engine, no protocol face, no plugin kinds. size_guard.sh
+# gates this binary on its own (much lower) line.
+
+[[bin]]
+name = "vf"
+path = "src/bin/vf.rs"
+
+[dependencies]
+vectorfs-common = { path = "../common", version = "0.1" }
+
+# CLI: same derivation style as the server bin; env precedence (flag >
+# VF_ENDPOINT etc.) is resolved manually in the client lib, so no clap "env".
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+# the transport builds plain http::Request values around the shared leaf's
+# client (types only — the TLS/proxy machinery stays inside common).
+http = "1"
+http-body-util = "0.1"
+
+# #[tokio::main] + the shared HTTP leaf's connector (tokio/net arrives via
+# vectorfs-common; rt-multi-thread matches the server bin's runtime shape).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+
+[dev-dependencies]
+# in-process fake daemon for the signature round-trip test (same feature
+# convergence as the server's axum).
+axum = { version = "0.8", default-features = false, features = [
+  "http1",
+  "json",
+  "tokio",
+] }
+# the decode half of the header-value round-trip test.
+percent-encoding = "2"

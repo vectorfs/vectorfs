@@ -5,7 +5,7 @@
 #      EXCEPT `aws-lc-rs` / `aws-lc-sys` (the crypto provider hard-bound to
 #      object_store's "aws" feature — a C library, NOT part of the SDK chain;
 #      accepted in design.md §8 risk #11). The SigV4 verify is hand-rolled
-#      (vf/src/sigv4.rs) and the S3 client is object_store's own — the SDK
+#      (crates/common/src/sigv4.rs) and the S3 client is object_store's own — the SDK
 #      chain (aws-config -> aws-sdk-sso/sts/ssooidc, aws-smithy-*, opendal)
 #      must never re-enter, e.g. via `lance`/`lance-io` default features.
 #

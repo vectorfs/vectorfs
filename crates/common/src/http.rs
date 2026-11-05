@@ -1,13 +1,17 @@
-//! Shared HTTP leaf for the two networked M2-T5 components: the `openai`
-//! embedder kind and `pipeline::models` prefetch (§5.7: "openai provider 走
-//! 自研 HTTP（复用 hyper 树 ~150 行，零 reqwest）").
+//! Shared HTTP leaf for the three networked consumers of the three-crate
+//! split: the `openai` embedder kind, `pipeline::models` prefetch (§5.7:
+//! "openai provider 走自研 HTTP（复用 hyper 树 ~150 行，零 reqwest）"), and —
+//! since the split — the `vf` CLIENT's transport to a running daemon (the
+//! client talks to the same wire the server serves, so it shares the leaf
+//! instead of growing a second one).
 //!
 //! DIP note: this module exists so the HTTP/TLS TYPES stay confined to one
-//! leaf — `openai.rs` and `pipeline::models` see only [`HttpClient`] and plain
-//! `http`/`bytes` types, never hyper-rustls/rustls internals. reqwest (already
-//! in the tree via lance-namespace) is deliberately NOT used: it would tie the
-//! provider's client policy to the engine's dependency, exactly what §5.7's
-//! "自研" ruling forbids.
+//! leaf — `openai.rs`, `pipeline::models` and the client see only
+//! [`HttpClient`] and plain `http`/`bytes` types, never hyper-rustls/rustls
+//! internals. reqwest (already in the SERVER's tree via lance-namespace) is
+//! deliberately NOT used: it would tie the provider's client policy to the
+//! engine's dependency, exactly what §5.7's "自研" ruling forbids — and it
+//! would drag the engine's closure into the client crate.
 //!
 //! TLS: rustls 0.23 with the **aws-lc-rs** provider — the same crypto
 //! object_store already binds (§8 #11; `rustls/aws_lc_rs` is enabled tree-wide
@@ -25,6 +29,18 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::connect::proxy::Tunnel;
 use hyper_util::rt::TokioExecutor;
+
+/// Percent-encode a `x-vf-*` header VALUE: HTTP header values are ASCII-only,
+/// so controls, space, `%` (round-trip safety) and every non-ASCII byte are
+/// escaped; the server percent-decodes with the exact inverse
+/// (ops_xvf::put_source). Always-encode/always-decode on both ends keeps the
+/// mapping bijective for any key. Lives in common because BOTH sides of the
+/// wire pair use it — the `vf` client (PutSource file names) and the server's
+/// MCP tool (x-vf-file-name) encode; one function, one inverse, no drift.
+pub fn encode_header_value(v: &str) -> String {
+    const SET: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS.add(b' ').add(b'%');
+    percent_encoding::utf8_percent_encode(v, SET).to_string()
+}
 
 /// The shared client shape: https-or-http, http1, no pooling knobs (process
 /// default pool; embedding traffic is low-volume and keep-alive reuse comes

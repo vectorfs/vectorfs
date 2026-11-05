@@ -1,0 +1,73 @@
+[package]
+name = "vectorfs-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared wire core for vectorfs: SigV4 sign/verify, the TLS HTTP leaf, and the CLI report vocabulary"
+
+# The three-crate split (design.md §0 2026-11-05 ruling): the SERVER binary
+# may be large (engine + protocol face + plugin kinds — size_guard.sh gates it
+# at its own lines), but the `vf` CLIENT binary must stay small — it links
+# ONLY this crate plus its CLI deps, never lance/ort/pdfium. This crate is
+# therefore the exact shared surface: the SigV4 signer+verifier pair (one
+# canonicalization, byte-exact by construction — the property that bans
+# copying it into either side), the proxy-aware TLS HTTP leaf (server
+# embedder egress + client transport), and the report vocabulary (Failure /
+# SCHEMA_VERSION / version_string). Nothing engine-shaped is allowed in.
+#
+# Every dependency here is one the CLIENT would carry anyway (transport +
+# signing); nothing pulls lance/arrow/ort into the client closure.
+
+[dependencies]
+# report.rs: the Failure vocabulary is serialized on both sides of the wire
+# (vf's --json output, the MCP/server error face).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# SigV4 (hand-rolled sign + verify, design.md §5.7: no aws-* SDK crates).
+# Versions chosen to match already-locked transitive copies (zero new subgraph).
+sha2 = "0.10"
+hmac = "0.12"
+
+# The TLS HTTP leaf (src/http.rs): hyper-util legacy client + aws-lc-rs
+# rustls (the crypto object_store binds — §8 #11; NOT ring) + standard
+# *_PROXY env semantics. Feature sets mirror the pre-split declarations.
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper-util = { version = "0.1", default-features = false, features = [
+  "client",
+  "client-legacy",
+  # client-proxy: the CONNECT `Tunnel` connector (model prefetch / openai /
+  # client egress through corporate proxies — see src/http.rs).
+  "client-proxy",
+  "http1",
+  "tokio",
+] }
+tower-service = "0.3"
+hyper-rustls = { version = "0.27", default-features = false, features = [
+  "http1",
+  "tls12",
+  "aws-lc-rs",
+  "webpki-tokio",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+  "std",
+  "tls12",
+  "aws-lc-rs",
+] }
+tokio = { version = "1", features = ["net"] }
+
+# Redirect-Location algebra in the HTTP leaf (HF resolve/ -> CDN 302s).
+url = "2"
+
+# x-vf-* header VALUE percent-encoding (the wire pair: vf client + MCP server
+# encode, ops_xvf::put_source decodes with the exact inverse).
+percent-encoding = "2"
+
+[dev-dependencies]
+# the http leaf's proxy test drives a real TCP listener; the round-trip tests
+# need a tokio runtime.
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util"] }

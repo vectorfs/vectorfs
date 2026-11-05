@@ -10,7 +10,6 @@
 //! `POST /<OperationName>`, JSON bodies; PutVectors success = 200 empty body.
 
 pub mod backends;
-pub mod client;
 pub mod config;
 pub mod doctor;
 pub mod filter;
@@ -21,10 +20,16 @@ pub mod ops;
 pub mod ops_xvf;
 pub mod pipeline;
 pub mod preset;
-pub mod report;
-pub mod sigv4;
 pub mod status;
 pub mod store;
+
+// Shared wire core (three-crate split, design.md §0 2026-11-05): the SigV4
+// signer+verifier pair, the TLS HTTP leaf, and the report vocabulary live in
+// `vectorfs-common` so the `vf` client links them WITHOUT this crate. They
+// are re-exported at their historical crate-root paths so every internal
+// `crate::sigv4` / `crate::report` reference keeps compiling unchanged —
+// the split moves code between crates, not names within this one.
+pub use vectorfs_common::{report, sigv4};
 
 /// Engine-level experiments carried over from the spike as regression tests
 /// (conditional writes, merge_insert x schema evolution — design.md §5.2/§5.3).

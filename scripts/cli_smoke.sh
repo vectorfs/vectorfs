@@ -17,7 +17,7 @@ BIN_DIR="${VF_BIN_DIR:-$REPO_ROOT/target/debug}"
 VECTORFS="$BIN_DIR/vectorfs"
 VF="$BIN_DIR/vf"
 PORT="${VF_PORT:-8791}"
-FIXTURE="$REPO_ROOT/vf/tests/fixtures/tiny-embedder"
+FIXTURE="$REPO_ROOT/crates/server/tests/fixtures/tiny-embedder"
 ORT_LIB="${VF_ORT_PATH:-$REPO_ROOT/runtime-libs/libonnxruntime.so}"
 
 fail() { echo "cli_smoke: FAIL: $*" >&2; exit 1; }

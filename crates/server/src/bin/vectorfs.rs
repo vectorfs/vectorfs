@@ -18,16 +18,16 @@
 use std::sync::Arc;
 
 use clap::{CommandFactory, Parser, Subcommand};
-use vectorfs::config::{self, ServeFlags};
-use vectorfs::ops::AppState;
-use vectorfs::report::Failure;
-use vectorfs::{backends, lock, mcp, status, store};
+use vectorfs_server::config::{self, ServeFlags};
+use vectorfs_server::ops::AppState;
+use vectorfs_server::report::Failure;
+use vectorfs_server::{backends, lock, mcp, status, store};
 
 /// `--version` needs a `&'static str` for clap; compute once (report.rs
 /// explains the VF_GIT_HASH compile-time option).
 fn version_str() -> &'static str {
     static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    V.get_or_init(vectorfs::report::version_string)
+    V.get_or_init(vectorfs_server::report::version_string)
 }
 
 #[derive(Parser, Debug)]
@@ -108,7 +108,7 @@ struct InitArgs {
     /// progress, HF_ENDPOINT mirror honored); air-gapped = offline ort
     /// embedder, no download — supply the model directory yourself
     #[arg(long)]
-    preset: Option<vectorfs::preset::Preset>,
+    preset: Option<vectorfs_server::preset::Preset>,
 
     /// Report-only hint: the endpoint the daemon will serve on (host or
     /// host:port). Shapes the printed serve command + client env snippet;
@@ -374,7 +374,7 @@ async fn doctor_cmd(args: DoctorArgs) {
         "vectorfs: probing data root at {} …",
         cfg.data_dir.display()
     );
-    match vectorfs::doctor::run(&cfg).await {
+    match vectorfs_server::doctor::run(&cfg).await {
         Ok(report) => {
             if args.json {
                 println!(
@@ -382,7 +382,7 @@ async fn doctor_cmd(args: DoctorArgs) {
                     serde_json::to_string_pretty(&report).expect("report serializes")
                 );
             } else {
-                print!("{}", vectorfs::doctor::render_human(&report));
+                print!("{}", vectorfs_server::doctor::render_human(&report));
             }
             if report.any_fail() {
                 std::process::exit(1);
@@ -465,7 +465,7 @@ fn pipelines_cmd(args: PipelinesArgs) {
                 .map(std::path::PathBuf::from)
         })
         .unwrap_or_else(|| std::path::PathBuf::from(config::DEFAULT_DATA_DIR));
-    match vectorfs::pipeline::config::load_pipeline_config(&text) {
+    match vectorfs_server::pipeline::config::load_pipeline_config(&text) {
         Ok(cfg) => {
             // availability gate (fs pass over the models cache): an offline
             // ort config whose model is missing must fail the check, not the
@@ -491,7 +491,7 @@ fn pipelines_cmd(args: PipelinesArgs) {
 
 /// Deterministic (BTreeMap-ordered) stdout summary of a parsed pipeline
 /// config. stdout = results, stderr = progress/errors (report.rs contract).
-fn print_pipeline_summary(cfg: &vectorfs::pipeline::config::PipelineConfig) {
+fn print_pipeline_summary(cfg: &vectorfs_server::pipeline::config::PipelineConfig) {
     if cfg.extractors.is_empty() && cfg.embedders.is_empty() && cfg.ingest.is_empty() {
         println!("no pipeline sections (pure protocol face; nothing to do)");
         return;
@@ -575,14 +575,14 @@ async fn init(args: InitArgs) {
     // BEFORE printing the report (the §3 "model ready" five-minute promise
     // happens here, at init, not at first serve). air-gapped deliberately
     // downloads nothing (offline semantics); dev has no models at all.
-    if outcome.preset == vectorfs::preset::Preset::TextRag {
+    if outcome.preset == vectorfs_server::preset::Preset::TextRag {
         eprintln!(
             "vectorfs init: preset text-rag: prefetching '{}' (3 files, ~1.17 GiB) into {} …",
-            vectorfs::preset::Preset::DEFAULT_MODEL,
+            vectorfs_server::preset::Preset::DEFAULT_MODEL,
             outcome.models_dir.display()
         );
-        match vectorfs::pipeline::models::prefetch(
-            vectorfs::preset::Preset::DEFAULT_MODEL,
+        match vectorfs_server::pipeline::models::prefetch(
+            vectorfs_server::preset::Preset::DEFAULT_MODEL,
             &outcome.models_dir,
         )
         .await
@@ -643,7 +643,7 @@ async fn serve(args: ServeArgs) {
     // ingest sections (if any) drive the file-layer runtime below.
     let mut pipeline_cfg = None;
     match std::fs::read_to_string(config::config_path(&cfg.data_dir)) {
-        Ok(text) => match vectorfs::pipeline::config::load_pipeline_config(&text) {
+        Ok(text) => match vectorfs_server::pipeline::config::load_pipeline_config(&text) {
             Err(e) => {
                 eprintln!("vectorfs: pipeline config invalid: {e}");
                 eprintln!(
@@ -716,16 +716,15 @@ async fn serve(args: ServeArgs) {
                  at startup"
             );
         } else if let Err(e) =
-            vectorfs::ingest::fingerprint_gate(&storage, pcfg, &cfg.data_dir).await
+            vectorfs_server::ingest::fingerprint_gate(&storage, pcfg, &cfg.data_dir).await
         {
             eprintln!("vectorfs: refusing to start: {e}");
             std::process::exit(2);
         }
-        let models_dir = pcfg
-            .models_dir
-            .clone()
-            .unwrap_or_else(|| vectorfs::pipeline::models::default_models_dir(&cfg.data_dir));
-        match vectorfs::ingest::IngestCore::load(pcfg, &models_dir).await {
+        let models_dir = pcfg.models_dir.clone().unwrap_or_else(|| {
+            vectorfs_server::pipeline::models::default_models_dir(&cfg.data_dir)
+        });
+        match vectorfs_server::ingest::IngestCore::load(pcfg, &models_dir).await {
             Ok(core) => {
                 for (vb, embedders, scan) in core.describe_buckets() {
                     eprintln!(
@@ -786,8 +785,8 @@ async fn serve(args: ServeArgs) {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let storage = Arc::new(storage);
     let handle = ingest_core.map(|core| {
-        Arc::new(vectorfs::ingest::IngestHandle::new(
-            vectorfs::ingest::IngestShared::new(core),
+        Arc::new(vectorfs_server::ingest::IngestHandle::new(
+            vectorfs_server::ingest::IngestShared::new(core),
         ))
     });
     let state = AppState {
@@ -810,7 +809,9 @@ async fn serve(args: ServeArgs) {
         && let Some(handle) = handle.as_ref()
     {
         for vb in handle.shared().bucket_names() {
-            match vectorfs::ingest::reindex_bucket_if_stale(&state, handle.shared(), &vb).await {
+            match vectorfs_server::ingest::reindex_bucket_if_stale(&state, handle.shared(), &vb)
+                .await
+            {
                 Ok(Some(outcome)) => {
                     reindexed_buckets += 1;
                     eprintln!(
@@ -829,7 +830,7 @@ async fn serve(args: ServeArgs) {
         }
     }
     if let Some(handle) = handle {
-        let runtime = vectorfs::ingest::IngestRuntime::new(
+        let runtime = vectorfs_server::ingest::IngestRuntime::new(
             Arc::clone(handle.shared()),
             Arc::new(state.clone()),
             handle.notify(),
@@ -854,7 +855,7 @@ async fn serve(args: ServeArgs) {
         cfg.trace
     );
 
-    let app = vectorfs::build_router(state);
+    let app = vectorfs_server::build_router(state);
     let listener = match tokio::net::TcpListener::bind((cfg.bind_host.as_str(), cfg.port)).await {
         Ok(l) => l,
         Err(e) => {
@@ -908,7 +909,9 @@ async fn serve(args: ServeArgs) {
     eprintln!("vectorfs: shutting down, releasing lock…");
     let _ = shutdown_tx.send(true);
     if let Some(ingest) = ingest_drain.as_ref() {
-        ingest.shutdown(vectorfs::ingest::SHUTDOWN_BUDGET).await;
+        ingest
+            .shutdown(vectorfs_server::ingest::SHUTDOWN_BUDGET)
+            .await;
     }
     heartbeat_lock.lock().await.release().await;
 }

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["vf"]
+# Three-crate split (design.md §0 2026-11-05 ruling): the SERVER may be large
+# (engine + protocol face + plugin kinds), the CLIENT must stay small, and
+# COMMON is the exact shared wire surface between them (SigV4 sign/verify,
+# TLS HTTP leaf, report vocabulary). Crate names are crates.io-ready;
+# `cargo publish` itself is a separate, explicitly adjudicated step.
+members = ["crates/common", "crates/server", "crates/client"]
 # spike/ = M0 throwaway crate (design.md §7 M0): kept verbatim for
 # REPORT/NOTES provenance, never part of the product build.
 exclude = ["spike"]
@@ -10,6 +15,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
+repository = "https://github.com/vectorfs/vectorfs"
 
 # Product profile (design.md §5.7): lto=thin + codegen-units=1 + strip.
 # 2026-11-04 ruling: fat LTO's cold link (~25-35 min) was killed 4/4 by the

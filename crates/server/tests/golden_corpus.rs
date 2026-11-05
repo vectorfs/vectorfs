@@ -18,14 +18,14 @@
 //! `vf/tests/golden/` (integration-test side, keeps binary fixtures out of
 //! `src/`; also proves the pub pipeline API suffices without crate internals).
 
-use vectorfs::pipeline::chunk::ChunkerKind;
-use vectorfs::pipeline::chunk::token_window::TokenWindowChunker;
-use vectorfs::pipeline::contract::chunker_contract;
-use vectorfs::pipeline::extract::md::MdExtractor;
-use vectorfs::pipeline::extract::pdf_inspector::PdfInspectorExtractor;
-use vectorfs::pipeline::extract::pdf_text::{PdfTextExtractor, locate_library};
-use vectorfs::pipeline::extract::txt::TxtExtractor;
-use vectorfs::pipeline::{Chunk, Chunker, Extractor, Modality, Part};
+use vectorfs_server::pipeline::chunk::ChunkerKind;
+use vectorfs_server::pipeline::chunk::token_window::TokenWindowChunker;
+use vectorfs_server::pipeline::contract::chunker_contract;
+use vectorfs_server::pipeline::extract::md::MdExtractor;
+use vectorfs_server::pipeline::extract::pdf_inspector::PdfInspectorExtractor;
+use vectorfs_server::pipeline::extract::pdf_text::{PdfTextExtractor, locate_library};
+use vectorfs_server::pipeline::extract::txt::TxtExtractor;
+use vectorfs_server::pipeline::{Chunk, Chunker, Extractor, Modality, Part};
 
 // ---------------------------------------------------------------------------
 // harness
@@ -192,7 +192,7 @@ fn golden_extract_then_chunk_round_trips() {
         (SAMPLE_MD, "text/markdown"),
         (SAMPLE_TXT, "text/plain"),
     ] {
-        let kind = vectorfs::pipeline::extract::ExtractorKind::from_config(
+        let kind = vectorfs_server::pipeline::extract::ExtractorKind::from_config(
             "golden",
             &toml::from_str::<toml::Value>(&format!(
                 "kind = \"{}\"",
@@ -534,15 +534,16 @@ fn golden_pdf_inspector_multipage_and_config_path() {
     // and through the REGISTERED config route (the ingest worker's
     // construction path), both flavors:
     let raw = toml::from_str::<toml::Value>("kind = \"pdf-inspector\"").unwrap();
-    let kind =
-        vectorfs::pipeline::extract::ExtractorKind::from_config("golden", &raw, None).unwrap();
+    let kind = vectorfs_server::pipeline::extract::ExtractorKind::from_config("golden", &raw, None)
+        .unwrap();
     let via_enum = kind.extract(&pdf_bytes, "application/pdf").unwrap();
     assert_eq!(via_enum.len(), 1);
     assert!(via_enum[0].text.contains("page 0001 of 0300"));
     let raw_md =
         toml::from_str::<toml::Value>("kind = \"pdf-inspector\"\nmarkdown = true").unwrap();
     let kind_md =
-        vectorfs::pipeline::extract::ExtractorKind::from_config("golden", &raw_md, None).unwrap();
+        vectorfs_server::pipeline::extract::ExtractorKind::from_config("golden", &raw_md, None)
+            .unwrap();
     let via_enum_md = kind_md.extract(&pdf_bytes, "application/pdf").unwrap();
     // RECORDED quirk of pdf-inspector 1.25.2's markdown pipeline on these
     // minimal synthetic pages: only the page-marker headings survive (the
