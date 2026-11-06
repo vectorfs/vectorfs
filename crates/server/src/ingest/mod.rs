@@ -1052,6 +1052,19 @@ impl IngestCore {
             embedders.insert(name.clone(), loaded);
         }
 
+        // M3-T10: pdf-ocr extractor instances resolve their model directory
+        // HERE (the embedder-load discipline, sync-trait-compatible): a
+        // builtin name prefetches into the models cache when not ready, a
+        // `path` must already be complete. The resolved directory rides the
+        // worker's CLONE — the fingerprint keeps serializing the config as
+        // written, and the hydrate field is serde-skipped.
+        let mut extractors = cfg.extractors.clone();
+        for kind in extractors.values_mut() {
+            if let ExtractorKind::PdfOcr(ocfg) = kind {
+                crate::pipeline::extract::pdf_ocr::hydrate(ocfg, models_dir).await?;
+            }
+        }
+
         let mut buckets = BTreeMap::new();
         for (vb, icfg) in &cfg.ingest {
             let mut derived = BTreeMap::new();
@@ -1069,7 +1082,7 @@ impl IngestCore {
                     fingerprint: cfg.fingerprint(vb).expect("bucket in config"),
                     claim: ClaimFilter::new(&icfg.include, &icfg.exclude),
                     extract: icfg.extract.clone(),
-                    extractors: cfg.extractors.clone(),
+                    extractors: extractors.clone(),
                     chunker: icfg.chunk.clone(),
                     embedders: icfg.embedders.clone(),
                     derived,
@@ -4663,6 +4676,105 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_none(),
             "an all-refusing chain must not create or write any index"
+        );
+    }
+
+    // ---- M3-T10: the OCR route (scanned-docs preset shape, hermetic) ----
+
+    /// The tiny-embedder pipeline with a [pdf-text, pdf-ocr] pdf route —
+    /// the scanned-docs preset's chain — over an OCR instance pointing at
+    /// the tiny-ppocr fixture (constant det map / constant rec winner: every
+    /// page reads "B"; real engines pdfium + ort, hermetic models).
+    async fn ocr_route_config() -> PipelineConfig {
+        let fixture = crate::pipeline::extract::pdf_ocr::tests::fixture_dir();
+        let text = format!(
+            "[extractor.plain]\nkind = \"pdf-text\"\n\n\
+             [extractor.ocr]\nkind = \"pdf-ocr\"\ndpi = 96\npath = {:?}\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = \
+             true\n\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ pdf = [\"plain\", \"ocr\"] }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"tiny\"]\nscan_interval_secs = 1\nretries = 0\n",
+            fixture.display().to_string(),
+            fixture_dir().display().to_string(),
+        );
+        crate::pipeline::config::load_pipeline_config(&text).unwrap()
+    }
+
+    /// THE M3-T10 acceptance run: a scan-dominant PDF (image-only specimen)
+    /// probes scan-dominant, pdf-text REFUSES it, pdf-ocr is Preferred —
+    /// the router hands the bytes to OCR, the fixture models read it, and
+    /// the file INDEXES where the pre-T10 world parked it as all-refuse.
+    /// The reverse also holds: a text-native PDF on the same chain routes
+    /// to pdf-text (Preferred beats Capable — OCR never runs on it), and a
+    /// no-text (blank) PDF refuses BOTH members with the honest "nothing to
+    /// OCR" vocabulary (ContentClass::remedy's no-text semantics).
+    #[tokio::test]
+    async fn scan_dominant_routes_to_ocr_and_indexes_through_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        // (1) scan-dominant: the all-refuse specimen from the M2.1 era,
+        // now SERVED by the OCR member
+        std::fs::write(
+            docs.join("scan.pdf"),
+            crate::pipeline::extract::pdf_inspector::tests::image_only_pdf(),
+        )
+        .unwrap();
+        // (2) text-native: the committed hello.pdf (has a real text layer)
+        std::fs::write(
+            docs.join("text.pdf"),
+            include_bytes!("../../tests/golden/hello.pdf") as &[u8],
+        )
+        .unwrap();
+        // (3) blank (no text, no raster): both members refuse the class
+        std::fs::write(
+            docs.join("blank.pdf"),
+            crate::pipeline::extract::pdf_inspector::tests::no_text_page_pdf(),
+        )
+        .unwrap();
+        let (rt, _h, state) = runtime_for(dir.path(), &ocr_route_config().await).await;
+        rt.scan_once().await;
+        rt.drain_queue().await;
+
+        // (1) INDEXED via ocr — the routing fact is structural: plain
+        // REFUSES scan-dominant, so only ocr can have produced the parts
+        let m = status_of(&state, "docs", "docs/scan.pdf").await;
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
+        let scan_chunks = m.chunks.as_ref().unwrap()["text"];
+        assert!(scan_chunks >= 1, "the fixture OCR read the page: {m:?}");
+
+        // (2) text-native: INDEXED (by plain — Preferred beats ocr's
+        // Capable; the winner's identity is structural again: whichever
+        // member ran, the chain indexes the file)
+        let m = status_of(&state, "docs", "docs/text.pdf").await;
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
+        let text_chunks = m.chunks.as_ref().unwrap()["text"];
+        assert!(text_chunks >= 1);
+
+        // both files' OCR/text vectors landed in the one derived index
+        // (the count is cumulative across the bucket's indexed sources)
+        let spec = &rt.shared.core.buckets["docs"].derived["tiny"];
+        assert_eq!(
+            state
+                .storage
+                .count_vectors("docs", &spec.index_name)
+                .await
+                .unwrap() as u32,
+            scan_chunks + text_chunks
+        );
+
+        // (3) no-text: BOTH members refuse the class — nobody runs, the
+        // aggregate names the class and the OCR refusal honestly
+        let m = status_of(&state, "docs", "docs/blank.pdf").await;
+        assert_eq!(m.status, SourceStatus::Failed, "{m:?}");
+        let reason = m.status_reason.expect("reason");
+        assert!(reason.contains("pdf class=no-text"), "{reason}");
+        assert!(reason.contains("plain refuses ("), "{reason}");
+        assert!(reason.contains("ocr refuses ("), "{reason}");
+        assert!(
+            reason.contains("no extractor, OCR included, can index this"),
+            "the no-text remedy must NOT point at OCR: {reason}"
         );
     }
 

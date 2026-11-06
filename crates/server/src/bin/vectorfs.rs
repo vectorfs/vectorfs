@@ -124,7 +124,9 @@ struct InitArgs {
     /// embedder, no download — supply the model directory yourself;
     /// multimodal = gte + siglip2 dual embedders (text AND image queries,
     /// prefetches both models, ~2.7 GiB); image-search = siglip2 only
-    /// (以图搜图, prefetches ~1.5 GiB)
+    /// (以图搜图, prefetches ~1.5 GiB); scanned-docs = gte text pipeline +
+    /// OCR for scanned PDFs (chain pdf-text -> pdf-ocr, prefetches gte +
+    /// the ~20 MiB PaddleOCR PP-OCRv5 mobile pair)
     #[arg(long)]
     preset: Option<vectorfs_server::preset::Preset>,
 
@@ -724,7 +726,8 @@ fn print_pipeline_summary(cfg: &vectorfs_server::pipeline::config::PipelineConfi
 
 /// `vectorfs init`: materialize credentials (+ preset pipeline sections,
 /// §5.10.4) and — for the model-carrying presets (text-rag, multimodal,
-/// image-search) — PREFETCH every model the preset names (progress/sha256/
+/// image-search, scanned-docs) — PREFETCH every model the preset names
+/// (progress/sha256/
 /// tmp+rename/HF_ENDPOINT mirror: pipeline::models). Async solely for those
 /// downloads; everything else is local file IO.
 async fn init(args: InitArgs) {

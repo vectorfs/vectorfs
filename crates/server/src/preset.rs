@@ -3,15 +3,17 @@
 //!
 //! A preset is a static TOML template APPENDED to the generated server
 //! fields (config.rs keeps owning credential generation + file writing).
-//! Five tiers ship (§5.10.4): `dev` (pure protocol face, no pipeline
+//! Six tiers ship (§5.10.4): `dev` (pure protocol face, no pipeline
 //! sections — byte-identical to the pre-preset init), `text-rag` (the gte
 //! text pipeline; init PREFETCHES the model, ~1.17 GiB, stderr progress —
 //! see pipeline::models), `air-gapped` (offline `path` embedder, NO
-//! download by construction), and the two M3-T4 image tiers:
-//! `multimodal` (gte text + siglip2 image DUAL embedders — one bucket,
-//! text and image queries both served) and `image-search` (siglip2 only,
-//! 以图搜图 over the images you put). `scanned-docs` (OCR) is T8+ and
-//! deliberately absent.
+//! download by construction), the two M3-T4 image tiers: `multimodal`
+//! (gte text + siglip2 image DUAL embedders — one bucket, text and image
+//! queries both served) and `image-search` (siglip2 only, 以图搜图 over
+//! the images you put), and `scanned-docs` (M3-T10: gte + the pdf chain
+//! `[pdf-text, pdf-ocr]` — the probe→affinity router sends text-native
+//! PDFs to the text layer and scan-dominant ones through OCR, mixed
+//! documents fall to the text member; one text index either way).
 //!
 //! # Why text templates instead of typed structs
 //!
@@ -63,6 +65,13 @@ pub enum Preset {
     /// siglip2 image pipeline only (M3-T4, 以图搜图): image files in,
     /// image (and text) queries out; init prefetches the model.
     ImageSearch,
+    /// Text pipeline + OCR for scanned PDFs (M3-T10, design.md §5.10.4
+    /// "scanned-docs 随 M3 图像模态与 OCR 交付"): gte carries the chunks
+    /// whether they came from a text layer or through the OCR hop; the
+    /// pdf route is the chain `[pdf-text, pdf-ocr]` (text-native → text,
+    /// scan-dominant → OCR — mixed documents auto-split to the text
+    /// member); init prefetches BOTH models (gte + PP-OCRv5 mobile ~20 MiB).
+    ScannedDocs,
 }
 
 impl Preset {
@@ -74,6 +83,11 @@ impl Preset {
     /// M2 gte precedent: base tier, Apache-2.0, in the built-in table;
     /// so400m is a one-line swap once a table row + license audit land).
     pub const DEFAULT_IMAGE_MODEL: &'static str = "siglip2-base-patch16-224";
+
+    /// The M3-T10 default OCR model (the §0 2026-11-07 adjudication:
+    /// PP-OCRv5 mobile, det 4.60 MiB + rec 15.77 MiB, Apache-2.0 — pinned
+    /// by the pdf-ocr kind; the const lives there, one source of truth).
+    pub const DEFAULT_OCR_MODEL: &'static str = crate::pipeline::extract::pdf_ocr::BUILTIN_MODEL;
 
     /// Does this preset's embedder expect the model on disk at init time
     /// (no download)? Air-gapped = true by definition (§5.10.4 offline).
@@ -90,6 +104,7 @@ impl Preset {
             Preset::TextRag => &[Self::DEFAULT_MODEL],
             Preset::Multimodal => &[Self::DEFAULT_MODEL, Self::DEFAULT_IMAGE_MODEL],
             Preset::ImageSearch => &[Self::DEFAULT_IMAGE_MODEL],
+            Preset::ScannedDocs => &[Self::DEFAULT_MODEL, Self::DEFAULT_OCR_MODEL],
         }
     }
 
@@ -252,6 +267,54 @@ merge = \"rrf\"
 ",
                 image_model = Self::DEFAULT_IMAGE_MODEL
             ),
+            Preset::ScannedDocs => format!(
+                "\
+# scanned-docs preset (design.md §5.10.4, M3-T10): text pipeline + OCR for
+# scanned PDFs — gte carries the chunks whether they came from a text layer
+# or through the OCR hop (PaddleOCR PP-OCRv5 mobile, det+rec ~20 MiB, on
+# this server's own onnxruntime).
+[embedder.text]
+kind = \"ort\"
+model = \"{model}\"
+
+[extractor.pdf]
+kind = \"pdf-text\"
+
+# the OCR member (dpi 300 = the OCR digitization standard: the recognizer
+# wants native-resolution 48-px text lines, not display-grade pages)
+[extractor.ocr]
+kind = \"pdf-ocr\"
+
+[extractor.md]
+kind = \"md\"
+
+[extractor.t]
+kind = \"txt\"
+
+[ingest.docs]
+# include/exclude omitted = the whole source bucket (design-v3.md R5).
+# pdf is a two-member chain: the probe->affinity router sends text-native
+# documents to pdf-text and scan-dominant ones to pdf-ocr (mixed documents
+# fall to pdf-text, whose text layer outranks OCR); md/txt/default stay the
+# standard text chain.
+extract = {{ pdf = [\"pdf\", \"ocr\"], md = \"md\", default = \"t\" }}
+chunk = {{ kind = \"token-window\", size = 512, overlap = 64 }}
+embedders = [\"text\"]
+merge = \"rrf\"
+# OCR is seconds-per-page CPU work (PP-OCRv5 mobile ~= 0.6-2 s/page): the
+# default 120 s extract timeout fits only ~60-200 page scans; 600 s raises
+# the ceiling for fatter volumes (chunker/embedding stay as fast as ever).
+extract_timeout_secs = 600
+# Lexical search (exact-term/BM25 via `vf search --mode keyword|hybrid`) is
+# OFF by default (M3 superset content, §7). To enable (then run
+# `vectorfs optimize` to build the FTS index):
+#   fts = true
+#   # fts-tokenizer = \"icu\"    # default: dictionary zh/en word segmentation
+#   # fts-tokenizer = \"ngram\"  # 2,2 bigram: best CJK recall, but Latin words
+#   #                         are bigrammed too (substring matches fire)
+",
+                model = Self::DEFAULT_MODEL
+            ),
         }
     }
 }
@@ -264,6 +327,7 @@ impl std::fmt::Display for Preset {
             Preset::AirGapped => "air-gapped",
             Preset::Multimodal => "multimodal",
             Preset::ImageSearch => "image-search",
+            Preset::ScannedDocs => "scanned-docs",
         };
         f.write_str(s)
     }
@@ -428,10 +492,12 @@ mod tests {
         assert_eq!(Preset::AirGapped.to_string(), "air-gapped");
         assert_eq!(Preset::Multimodal.to_string(), "multimodal");
         assert_eq!(Preset::ImageSearch.to_string(), "image-search");
+        assert_eq!(Preset::ScannedDocs.to_string(), "scanned-docs");
         assert!(Preset::AirGapped.offline());
         assert!(!Preset::TextRag.offline());
         assert!(!Preset::Multimodal.offline());
         assert!(!Preset::ImageSearch.offline());
+        assert!(!Preset::ScannedDocs.offline());
         // models cache resolution: explicit wins, default stays in the
         // reserved prefix
         assert_eq!(
@@ -556,9 +622,77 @@ mod tests {
         assert_ne!(fm, fs);
     }
 
+    // ---- M3-T10 scanned-docs tier ----
+
+    #[test]
+    fn scanned_docs_parses_and_passes_the_availability_gate() {
+        let (dir, text) = materialize(Preset::ScannedDocs, None);
+        let cfg = load_pipeline_config(&text).unwrap();
+        // one gte embedder, four extractor instances (pdf/ocr/md/t)
+        assert_eq!(cfg.embedders.len(), 1);
+        assert_eq!(
+            cfg.embedders["text"].describe(),
+            "ort(model=gte-multilingual-base)"
+        );
+        assert_eq!(cfg.extractors.len(), 4);
+        assert_eq!(
+            cfg.extractors["ocr"].describe(),
+            "pdf-ocr",
+            "default dpi: the bare label"
+        );
+        let ingest = &cfg.ingest["docs"];
+        assert_eq!(ingest.embedders, ["text"]);
+        // the pdf route is the [pdf-text, pdf-ocr] chain; md/default as
+        // text-rag; the OCR-appropriate extract timeout is materialized
+        assert_eq!(
+            ingest.extract["pdf"],
+            ExtractValue::Chain(vec!["pdf".into(), "ocr".into()])
+        );
+        assert_eq!(ingest.extract["default"], ExtractValue::Single("t".into()));
+        assert_eq!(ingest.extract_timeout_secs, 600);
+        // online + empty cache: OK — load-time prefetch is allowed
+        cfg.validate_model_availability(dir.path()).unwrap();
+        // no --models-dir passed: the top-level key must NOT be written
+        assert!(!text.contains("models_dir"), "{text}");
+        // --models-dir explicit: the container-volume key IS written (the
+        // model-carrying-tier rule)
+        let vol = tempfile::tempdir().unwrap();
+        let (_, text) = materialize(Preset::ScannedDocs, Some(vol.path()));
+        assert!(text.contains(&format!("models_dir = \"{}\"", vol.path().display())));
+    }
+
+    #[test]
+    fn scanned_docs_fingerprint_is_stable_and_distinct() {
+        // the text-rag stability acceptance, extended: stable across
+        // materializations, and distinct from text-rag AND multimodal
+        // (same bucket name, different pipelines)
+        let (_, t1) = materialize(Preset::ScannedDocs, None);
+        let (_, t2) = materialize(Preset::ScannedDocs, None);
+        let f1 = load_pipeline_config(&t1)
+            .unwrap()
+            .fingerprint("docs")
+            .unwrap();
+        let f2 = load_pipeline_config(&t2)
+            .unwrap()
+            .fingerprint("docs")
+            .unwrap();
+        assert_eq!(f1, f2);
+        assert_eq!(f1.len(), crate::pipeline::config::FINGERPRINT_HEX_LEN);
+        for other in [Preset::TextRag, Preset::Multimodal] {
+            let (_, to) = materialize(other, None);
+            let fo = load_pipeline_config(&to)
+                .unwrap()
+                .fingerprint("docs")
+                .unwrap();
+            assert_ne!(f1, fo, "scanned-docs must not share {other}'s fingerprint");
+        }
+    }
+
     /// The prefetch table the init CLI walks (its own view of the tiers —
     /// a preset shipping an embedder whose model nobody prefetches would
-    /// break the five-minute promise silently).
+    /// break the five-minute promise silently). The scanned-docs tier's
+    /// OCR model rides this table even though no EMBEDDER names it — its
+    /// extractor does.
     #[test]
     fn prefetch_models_cover_every_nonoffline_embedder() {
         assert!(Preset::Dev.prefetch_models().is_empty());
@@ -572,9 +706,18 @@ mod tests {
             Preset::ImageSearch.prefetch_models(),
             [Preset::DEFAULT_IMAGE_MODEL]
         );
+        assert_eq!(
+            Preset::ScannedDocs.prefetch_models(),
+            [Preset::DEFAULT_MODEL, Preset::DEFAULT_OCR_MODEL]
+        );
         // every named model is a built-in table entry (prefetch can only
         // fetch built-ins)
-        for preset in [Preset::TextRag, Preset::Multimodal, Preset::ImageSearch] {
+        for preset in [
+            Preset::TextRag,
+            Preset::Multimodal,
+            Preset::ImageSearch,
+            Preset::ScannedDocs,
+        ] {
             for name in preset.prefetch_models() {
                 assert!(
                     crate::pipeline::models::builtin(name).is_some(),

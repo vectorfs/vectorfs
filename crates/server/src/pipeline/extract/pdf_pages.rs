@@ -333,8 +333,10 @@ pub(crate) mod tests {
     /// xref-exact N-page PDF with a SHARED empty content stream (the
     /// hand-assembly discipline of pdf_inspector::tests; sharing one content
     /// object keeps the builder O(N) bytes — the page-count guard tests need
-    /// shape validity, not per-page content).
-    fn blank_multipage_pdf(pages: usize) -> Vec<u8> {
+    /// shape validity, not per-page content). `pub(crate)`: the pdf-ocr
+    /// kind's page-cap test reuses the same specimen (same guard, same
+    /// shape).
+    pub(crate) fn blank_multipage_pdf(pages: usize) -> Vec<u8> {
         let kids = (0..pages)
             .map(|i| format!("{} 0 R", 4 + i))
             .collect::<Vec<_>>()

@@ -602,13 +602,14 @@ pub fn init_with(data_dir: &Path, force: bool, opts: &InitOptions) -> Result<Ini
         embedder: None,
         ingest: None,
         // top-level models_dir key: ONLY the model-carrying presets' container
-        // path needs it (text-rag / multimodal / image-search — all resolve
-        // models through the cache root; air-gapped embeds the path; dev has
-        // no models at all)
+        // path needs it (text-rag / multimodal / image-search / scanned-docs
+        // — all resolve models through the cache root; air-gapped embeds the
+        // path; dev has no models at all)
         models_dir: match (opts.preset, &opts.models_dir) {
-            (Preset::TextRag | Preset::Multimodal | Preset::ImageSearch, Some(dir)) => {
-                Some(dir.display().to_string())
-            }
+            (
+                Preset::TextRag | Preset::Multimodal | Preset::ImageSearch | Preset::ScannedDocs,
+                Some(dir),
+            ) => Some(dir.display().to_string()),
             _ => None,
         },
     };
@@ -773,6 +774,15 @@ fn preset_note(outcome: &InitOutcome) -> String {
              \x20   vf search --image photo.png docs\n\
              Text queries also work (siglip2's text tower); non-image files\n\
              are not claimed in this preset.\n\
+             \n"
+        .to_string(),
+        Preset::ScannedDocs => "\n\
+             File layer (scanned-docs): text and SCANNED PDFs in one bucket:\n\
+             \x20   vf put scan.pdf docs/   (scan-dominant -> OCR -> text index)\n\
+             \x20   vf put doc.pdf docs/    (text-native -> text layer)\n\
+             \x20   vf search \"<your query>\" docs\n\
+             OCR runs on this server's CPU (PaddleOCR PP-OCRv5 mobile,\n\
+             ~0.6-2 s per page) — fat scan volumes ingest in the background.\n\
              \n"
         .to_string(),
     }

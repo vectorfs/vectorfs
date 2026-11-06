@@ -1,0 +1,9 @@
+{
+  "model_type": "tiny-ppocr-fixture",
+  "det_input": "x [1,3,h,w] -> prob [1,1,h,w] constant ~1.0",
+  "rec_input": "x [1,3,48,w] -> logits [1,ceil(w/8),9], class 2 wins",
+  "dict_entries": 7,
+  "classes": 9,
+  "decoded_line": "B",
+  "license": "CC0-1.0 (vectorfs test fixture, generated in-repo)"
+}

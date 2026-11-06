@@ -440,6 +440,37 @@ impl PipelineConfig {
                 }
             }
         }
+        // M3-T10: the pdf-ocr extractor carries a local model pair too
+        // (det.onnx + rec.onnx + dict.yml). A `path` must already be
+        // complete (never prefetched); the builtin default resolves
+        // through the cache and load-time prefetch (IngestCore::load), so
+        // "not ready yet" is OK here — the same online semantics as the
+        // embedders above.
+        for (name, kind) in &self.extractors {
+            if let crate::pipeline::extract::ExtractorKind::PdfOcr(cfg) = kind
+                && let Some(p) = &cfg.path
+            {
+                let dir = std::path::PathBuf::from(p);
+                let files = crate::pipeline::extract::pdf_ocr::MODEL_FILES;
+                let missing: Vec<&str> = files
+                    .iter()
+                    .filter(|f| !dir.join(f).is_file())
+                    .copied()
+                    .collect();
+                if !missing.is_empty() {
+                    return Err(PipelineError::config(
+                        format!(
+                            "[extractor.{name}]: path {} does not contain {} (a path is \
+                             never prefetched — point it at a complete model directory: {})",
+                            dir.display(),
+                            missing.join(", "),
+                            files.join(" + ")
+                        ),
+                        self.section_line(&format!("extractor.{name}")),
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 }

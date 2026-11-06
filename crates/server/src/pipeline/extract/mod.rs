@@ -9,7 +9,12 @@
 //! coexist behind the one `pdf` short key, selection is explicit),
 //! `pdf-pages` (M3-T3, the third PDF kind and the first IMAGE-output kind:
 //! pdfium renders each page to a PNG Part — same short key again, the
-//! two-kinds-one-key precedent extended to a text/image pair), `image`
+//! two-kinds-one-key precedent extended to a text/image pair), `pdf-ocr`
+//! (M3-T10, the fourth PDF kind: PaddleOCR PP-OCRv5 mobile det+rec over
+//! the tree's own ort sessions — renders each page at its own dpi, OCRs
+//! det→rec, and emits one TEXT Part per page in page order; the scan route
+//! of the `scanned-docs` preset's `[pdf-text, pdf-ocr]` chain),
+//! `image`
 //! (M3-T4, the image FILE kind: one verbatim image Part behind the new
 //! `img` short key — the first family key carried by TWO mime rows,
 //! jpeg + png), `docx` + `html` (M3-T6, the text face: the Word
@@ -41,6 +46,7 @@ pub mod html;
 pub mod image;
 pub mod md;
 pub mod pdf_inspector;
+pub mod pdf_ocr;
 pub mod pdf_pages;
 pub mod pdf_text;
 pub mod txt;
@@ -54,6 +60,7 @@ use html::{HtmlConfig, HtmlExtractor};
 use image::{ImageConfig, ImageExtractor};
 use md::{MdConfig, MdExtractor};
 use pdf_inspector::{PdfInspectorConfig, PdfInspectorExtractor};
+use pdf_ocr::{PdfOcrConfig, PdfOcrExtractor};
 use pdf_pages::{PdfPagesConfig, PdfPagesExtractor};
 use pdf_text::{PdfTextConfig, PdfTextExtractor};
 use txt::{TxtConfig, TxtExtractor};
@@ -92,7 +99,7 @@ pub const MIME_TO_SHORT_KEY: &[(&str, &str)] = &[
 /// updates the enum but forgets the string fails there, not in a user's
 /// error message).
 pub const EXTRACTOR_KINDS: &str =
-    "txt, pdf-text, md, pdf-inspector, pdf-pages, image, docx, html, epub, zip, eml";
+    "txt, pdf-text, md, pdf-inspector, pdf-pages, pdf-ocr, image, docx, html, epub, zip, eml";
 
 /// Every production kind's config label, IN AVAILABILITY-LIST ORDER. This is
 /// the registry's identity anchor: `kind_label` (the exhaustive match the
@@ -106,6 +113,7 @@ pub const KIND_LABELS: &[&str] = &[
     "md",
     "pdf-inspector",
     "pdf-pages",
+    "pdf-ocr",
     "image",
     "docx",
     "html",
@@ -275,6 +283,12 @@ pub enum ExtractorKind {
     /// side; the third kind behind the `pdf` short key, the first whose
     /// output modality is not Text).
     PdfPages(PdfPagesConfig),
+    /// PaddleOCR PP-OCRv5 mobile det+rec over the tree's own ort sessions:
+    /// every page renders (own dpi knob, default 300) through det → DB
+    /// boxes → rec → CTC lines, ONE Text Part per page in page order
+    /// (`extract/pdf_ocr/`, M3-T10 — the OCR route for scanned PDFs; the
+    /// FOURTH kind behind the `pdf` short key, scan-dominant Preferred).
+    PdfOcr(PdfOcrConfig),
     /// Image FILE as a source: validate-decode then ONE image Part with the
     /// original bytes verbatim (`extract/image.rs`, M3-T4 — the user-facing
     /// supply side of the image chain, behind the `img` short key).
@@ -455,6 +469,16 @@ impl ExtractorKind {
                     .map_err(|m| PipelineError::config(format!("[{section}]: {m}"), line))?;
                 Ok(ExtractorKind::PdfPages(cfg))
             }
+            "pdf-ocr" => {
+                let cfg: PdfOcrConfig = raw.clone().try_into().map_err(|e: toml::de::Error| {
+                    super::config::stage2_error(section, Some(&kind), e.message(), line)
+                })?;
+                // same dpi domain discipline as pdf-pages (the T3 constants
+                // verbatim — same risk class, same numbers)
+                cfg.validate()
+                    .map_err(|m| PipelineError::config(format!("[{section}]: {m}"), line))?;
+                Ok(ExtractorKind::PdfOcr(cfg))
+            }
             "image" => {
                 let cfg: ImageConfig = raw.clone().try_into().map_err(|e: toml::de::Error| {
                     super::config::stage2_error(section, Some(&kind), e.message(), line)
@@ -516,7 +540,8 @@ impl ExtractorKind {
             | ExtractorKind::Md(_)
             | ExtractorKind::PdfInspector(_)
             | ExtractorKind::Docx(_)
-            | ExtractorKind::Html(_) => &[Modality::Text],
+            | ExtractorKind::Html(_)
+            | ExtractorKind::PdfOcr(_) => &[Modality::Text],
             ExtractorKind::PdfPages(_) | ExtractorKind::Image(_) => &[Modality::Image],
             // Container kinds (M3-T7): children re-enter user routing, so
             // the OUTPUT modality is whatever the user's chains produce —
@@ -552,6 +577,7 @@ impl ExtractorKind {
             ExtractorKind::Md(_) => "md",
             ExtractorKind::PdfInspector(_) => "pdf-inspector",
             ExtractorKind::PdfPages(_) => "pdf-pages",
+            ExtractorKind::PdfOcr(_) => "pdf-ocr",
             ExtractorKind::Image(_) => "image",
             ExtractorKind::Docx(_) => "docx",
             ExtractorKind::Html(_) => "html",
@@ -597,6 +623,22 @@ impl ExtractorKind {
                     format!("pdf-pages(dpi={})", cfg.dpi)
                 }
             }
+            // same discipline at the OCR default (300); a `path` model
+            // directory is load-relevant and always shown (the embedder
+            // summary precedent)
+            ExtractorKind::PdfOcr(cfg) => {
+                let mut s = String::from("pdf-ocr");
+                if cfg.dpi != pdf_ocr::DEFAULT_DPI {
+                    s.push_str(&format!("(dpi={}", cfg.dpi));
+                    if let Some(p) = &cfg.path {
+                        s.push_str(&format!(", path={p}"));
+                    }
+                    s.push(')');
+                } else if let Some(p) = &cfg.path {
+                    s.push_str(&format!("(path={p})"));
+                }
+                s
+            }
             #[cfg(test)]
             ExtractorKind::TestContainer(_) => "test-container".to_string(),
             #[cfg(test)]
@@ -626,6 +668,11 @@ impl Extractor for ExtractorKind {
             // call (cheap path checks); the pdfium bind itself is
             // process-global (pdf_text::bind_pdfium)
             ExtractorKind::PdfPages(cfg) => PdfPagesExtractor::new(cfg).extract(bytes, mime),
+            // the OCR pair: model dir + pdfium + two ort sessions, all
+            // lazy on first use (see the kind module docs); an unhydrated
+            // bare-config instance refuses loudly instead of guessing a
+            // models cache
+            ExtractorKind::PdfOcr(cfg) => PdfOcrExtractor::new(cfg)?.extract(bytes, mime),
             // configless: the kind IS the extractor (validate-decode, then
             // one verbatim image Part — see extract/image.rs)
             ExtractorKind::Image(_) => ImageExtractor.extract(bytes, mime),
@@ -670,6 +717,11 @@ impl Extractor for ExtractorKind {
             ExtractorKind::Md(_) => md::affinity(class),
             ExtractorKind::PdfInspector(_) => pdf_inspector::affinity(class),
             ExtractorKind::PdfPages(_) => pdf_pages::affinity(class),
+            // the OCR declaration: scan-dominant is Preferred territory
+            // (OCR is the main route for scans); mixed/text-native Capable
+            // (a text member outranks OCR where a text layer exists);
+            // no-text Refused (blank pages carry nothing to OCR)
+            ExtractorKind::PdfOcr(_) => pdf_ocr::affinity(class),
             // undeclared (the trait default, spelled out): the image kind
             // declares no fit — its family has no classification probe, so
             // no class ever routes it; reached through its own `img` route
@@ -710,6 +762,7 @@ impl Extractor for ExtractorKind {
             | ExtractorKind::Md(_)
             | ExtractorKind::PdfInspector(_)
             | ExtractorKind::PdfPages(_)
+            | ExtractorKind::PdfOcr(_)
             | ExtractorKind::Image(_)
             | ExtractorKind::Docx(_)
             | ExtractorKind::Html(_) => Ok(None),
@@ -739,6 +792,7 @@ impl ExtractorKind {
             ExtractorKind::Md(_) => md::refusal_note(class),
             ExtractorKind::PdfInspector(_) => pdf_inspector::refusal_note(class),
             ExtractorKind::PdfPages(_) => pdf_pages::refusal_note(class),
+            ExtractorKind::PdfOcr(_) => pdf_ocr::refusal_note(class),
             // unreachable in practice (the image kind is Capable for every
             // class, so the router never quotes a refusal)
             ExtractorKind::Image(_) => {
@@ -789,6 +843,7 @@ impl serde::Serialize for ExtractorKind {
             ExtractorKind::Md(c) => c.serialize(serializer),
             ExtractorKind::PdfInspector(c) => c.serialize(serializer),
             ExtractorKind::PdfPages(c) => c.serialize(serializer),
+            ExtractorKind::PdfOcr(c) => c.serialize(serializer),
             ExtractorKind::Image(c) => c.serialize(serializer),
             ExtractorKind::Docx(c) => c.serialize(serializer),
             ExtractorKind::Html(c) => c.serialize(serializer),
@@ -1050,6 +1105,32 @@ mod tests {
             Extractor::affinity(&pages, ContentClass::NoText),
             Fit::Refuses
         );
+        // pdf-ocr (M3-T10): the OCR mirror — scan-dominant Preferred (OCR
+        // is the scan route), mixed/text-native Capable (a text member
+        // outranks OCR where a text layer exists), no-text refused (the
+        // ContentClass::remedy no-text vocabulary: OCR included can't help)
+        let ocr = kind("pdf-ocr");
+        assert_eq!(
+            Extractor::affinity(&ocr, ContentClass::ScanDominant),
+            Fit::Preferred
+        );
+        assert_eq!(
+            Extractor::affinity(&ocr, ContentClass::MixedTextScan),
+            Fit::Capable
+        );
+        assert_eq!(
+            Extractor::affinity(&ocr, ContentClass::TextNative),
+            Fit::Capable
+        );
+        assert_eq!(
+            Extractor::affinity(&ocr, ContentClass::NoText),
+            Fit::Refuses
+        );
+        assert!(
+            ocr.refusal_note(ContentClass::NoText)
+                .contains("nothing to OCR"),
+            "the pdf-ocr no-text refusal names the blank-page reality"
+        );
         // text family: text-native preferred only
         for s in ["txt", "md"] {
             let k = kind(s);
@@ -1125,6 +1206,14 @@ mod tests {
                 pdf_pages::tests::HELLO_PDF_MINIMAL,
                 "application/pdf",
             ),
+            // the OCR kind needs its model directory at extract time (its
+            // own module tests carry that half); the leaf pin only needs
+            // the UNPACK verdict, which never touches models
+            (
+                "pdf-ocr",
+                pdf_pages::tests::HELLO_PDF_MINIMAL,
+                "application/pdf",
+            ),
             ("image", image::tests::static_png(), "image/png"),
             ("docx", docx::tests::static_docx(), docx::tests::DOCX_MIME),
             ("html", html::tests::static_html(), "text/html"),
@@ -1187,7 +1276,7 @@ mod tests {
         );
         assert!(
             err.to_string().contains(
-                "available kinds: txt, pdf-text, md, pdf-inspector, pdf-pages, image, \
+                "available kinds: txt, pdf-text, md, pdf-inspector, pdf-pages, pdf-ocr, image, \
                            docx, html, epub, zip, eml"
             ),
             "{err}"
@@ -1234,9 +1323,12 @@ mod tests {
             ("pdf-text", "dpi = 300"),
             ("md", "gfm = true"),
             ("pdf-inspector", "dpi = 300"),
-            // dpi is LEGAL on pdf-pages — the unknown-field probe needs a
-            // field this kind does not have
+            // dpi is LEGAL on pdf-pages/pdf-ocr — the unknown-field probe
+            // needs a field these kinds do not have (pdf-ocr's lang knob is
+            // deliberately absent: the PP-OCRv5 rec model is one model for
+            // 简中/繁中/英/日/拼音, §5.10.8 minimalism)
             ("pdf-pages", "format = \"jpeg\""),
+            ("pdf-ocr", "lang = \"ch\""),
             // the image kind is knob-free (preprocessing belongs to the
             // embedder); the M3-T6 text-face kinds are knob-free too (the
             // format intelligence IS the kind); the M3-T7 container kinds
@@ -1255,7 +1347,8 @@ mod tests {
             assert!(
                 err.to_string().contains("unknown field 'dpi'")
                     || err.to_string().contains("unknown field 'gfm'")
-                    || err.to_string().contains("unknown field 'format'"),
+                    || err.to_string().contains("unknown field 'format'")
+                    || err.to_string().contains("unknown field 'lang'"),
                 "{kind_str}: {err}"
             );
         }

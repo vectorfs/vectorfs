@@ -1,0 +1,12 @@
+Global:
+  model_name: tiny-ppocr-fixture
+PostProcess:
+  name: CTCLabelDecode
+  character_dict:
+  - A
+  - B
+  - C
+  - D
+  - E
+  - F
+  - '-'

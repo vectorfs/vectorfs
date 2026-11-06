@@ -34,7 +34,10 @@
 //! own table row + license audit when its milestone lands); SigLIP2
 //! Apache-2.0 LANDED as the M3-T2 siglip2 kind's model (below; the 38
 //! google checkpoints are all Apache-2.0, HF API verified in
-//! research/2026-11-multimodal-embedding.md §B1).
+//! research/2026-11-multimodal-embedding.md §B1); PP-OCRv5 mobile
+//! Apache-2.0 LANDED as the M3-T10 pdf-ocr kind's det+rec pair (below —
+//! official PaddlePaddle ONNX repos, HF tags verified 2026-11-07 in
+//! research/2026-11-ocr-reranker-selection.md).
 //!
 //! # gte-multilingual-base facts (verified 2026-11-05, step-0 research)
 //!
@@ -78,6 +81,11 @@ pub struct ModelFile {
     /// Pinned sha256 (lowercase hex) — the trust root, same discipline as the
     /// .so pins (§5.10.7).
     pub sha256: &'static str,
+    /// Per-file HF repo override: `None` = the row's `hf_repo`. Multi-repo
+    /// models keep ONE row + one local directory (M3-T10: PP-OCRv5 det and
+    /// rec are SIBLING repos — `PP-OCRv5_mobile_{det,rec}_onnx` — but the
+    /// pdf-ocr kind loads one flat `det.onnx + rec.onnx + dict.yml` dir).
+    pub repo: Option<&'static str>,
 }
 
 /// A built-in model entry. `dim` is the DECLARED dimension the ort kind's
@@ -112,16 +120,19 @@ pub static BUILTIN_MODELS: &[BuiltinModel] = &[
                 remote: "onnx/model.onnx",
                 local: "model.onnx",
                 sha256: "5b9f03fdc40350a78fa064b4cfb6bf9a229a7c40aa87736f537e3ebd00aa2b86",
+                repo: None,
             },
             ModelFile {
                 remote: "tokenizer.json",
                 local: "tokenizer.json",
                 sha256: "3a56def25aa40facc030ea8b0b87f3688e4b3c39eb8b45d5702b3a1300fe2a20",
+                repo: None,
             },
             ModelFile {
                 remote: "config.json",
                 local: "config.json",
                 sha256: "6ef2538d4286a7cd18d05225f659d8a1bceca7adb01c186868e53dbd4f822e17",
+                repo: None,
             },
         ],
         dim: 768,
@@ -147,27 +158,73 @@ pub static BUILTIN_MODELS: &[BuiltinModel] = &[
                 remote: "onnx/vision_model.onnx",
                 local: "vision.onnx",
                 sha256: "c0573e3f4140c3a7c4e9cc5912bd6b26a033b46a6a8e8af26cbea262b163bcad",
+                repo: None,
             },
             ModelFile {
                 remote: "onnx/text_model.onnx",
                 local: "text.onnx",
                 sha256: "baf12d941beabafafb14f7b4adb38dc15be18681b964a84410ec53d9d65e6293",
+                repo: None,
             },
             ModelFile {
                 remote: "tokenizer.json",
                 local: "tokenizer.json",
                 sha256: "cb9140fae3ac5122c972d37adf83e1248471a38147ad76f8215c8872c6fd8322",
+                repo: None,
             },
             ModelFile {
                 remote: "config.json",
                 local: "config.json",
                 sha256: "e43a9f7692d3819886a82cb2097048258d444f123c67d37ec825f9345b019cf2",
+                repo: None,
             },
         ],
         dim: 768,
         license: "Apache-2.0",
         // from the artifact's preprocessor_config.json size (pin-time fact)
         image_size: Some((224, 224)),
+    },
+    // PP-OCRv5 mobile, the pdf-ocr kind's det+rec pair (M3-T10, the §0
+    // 2026-11-07 adjudication). Facts verified 2026-11-07 against the
+    // actual artifacts: BOTH repos official PaddlePaddle, Apache-2.0
+    // (HF tags); det 4,826,518 B + rec 16,534,782 B (4.60 + 15.77 MiB);
+    // det input `x` [1,3,H,W] dynamic 32..4000, BGR + ImageNet
+    // normalize, DBPostProcess thresh 0.3 / box_thresh 0.6 / unclip 1.5 /
+    // max_candidates 1000 (det inference.yml); rec input `x` [b,3,48,W]
+    // dynamic W 160..3200, `(v/255−0.5)/0.5` BGR, and the dictionary
+    // EMBEDDED in the rec repo's inference.yml (`PostProcess.
+    // character_dict`, 18,383 entries incl. 简中/繁中/英/日/拼音 — the
+    // rec file's 148,345 B IS the dict file; stored here as dict.yml).
+    // sha256s: LFS content hashes for the onnx pair (HF API ?blobs=true),
+    // content hash for the non-LFS yml (computed at pin time). The dim
+    // field is unused by an OCR model (no embedding vector); the class
+    // count the rec graph must agree with is probed by the kind.
+    BuiltinModel {
+        name: "ppocr-v5-mobile",
+        hf_repo: "PaddlePaddle/PP-OCRv5_mobile_det_onnx",
+        files: &[
+            ModelFile {
+                remote: "inference.onnx",
+                local: "det.onnx",
+                sha256: "a431985659dc921974177a95adcfbb90fd9e51989a5e04d70d0b75f597b6e61d",
+                repo: None,
+            },
+            ModelFile {
+                remote: "inference.onnx",
+                local: "rec.onnx",
+                sha256: "da72dc72ca4dc220df0dfde68c1dedc31c58d3e76a25871122e5056227d50092",
+                repo: Some("PaddlePaddle/PP-OCRv5_mobile_rec_onnx"),
+            },
+            ModelFile {
+                remote: "inference.yml",
+                local: "dict.yml",
+                sha256: "5dfeb2777f6d0db8177d8128a8acfcf6e6276dc4ac73ea3bf0dc06d6a5e85d8e",
+                repo: Some("PaddlePaddle/PP-OCRv5_mobile_rec_onnx"),
+            },
+        ],
+        dim: 0,
+        license: "Apache-2.0",
+        image_size: None,
     },
 ];
 
@@ -330,8 +387,14 @@ pub async fn prefetch_model(
         }
         // HF blob URL shape: /<repo>/resolve/<ref>/<path>. The ref is pinned
         // `main` (the only branch the built-in table's sha256s are taken
-        // against; a moving tag would detach the pin).
-        let url = format!("{}/{}/resolve/main/{}", base, model.hf_repo, file.remote);
+        // against; a moving tag would detach the pin). The repo is the
+        // row's, unless the file overrides it (the multi-repo OCR pair).
+        let url = format!(
+            "{}/{}/resolve/main/{}",
+            base,
+            file.repo.unwrap_or(model.hf_repo),
+            file.remote
+        );
         let (status, total, resp) = super::embed::http::get_following_redirects(&client, &url, 5)
             .await
             .map_err(PipelineError::io)?;
@@ -524,6 +587,7 @@ pub(crate) mod tests {
                     remote,
                     local,
                     sha256: Box::leak(sha_of(&fake_file(remote)).into_boxed_str()),
+                    repo: None,
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -606,6 +670,7 @@ pub(crate) mod tests {
                     remote: "onnx/model-corrupted.onnx",
                     local: "model.onnx",
                     sha256: Box::leak(sha_of(b"expected-but-different").into_boxed_str()),
+                    repo: None,
                 }]
                 .into_boxed_slice(),
             ),
@@ -662,6 +727,7 @@ pub(crate) mod tests {
                     remote: "onnx/model.onnx",
                     local: "model.onnx",
                     sha256: "0".repeat(64).leak(),
+                    repo: None,
                 }]
                 .into_boxed_slice(),
             ),
@@ -714,6 +780,40 @@ pub(crate) mod tests {
             ["vision.onnx", "text.onnx", "tokenizer.json", "config.json"]
         );
         for f in s.files {
+            assert_eq!(f.sha256.len(), 64);
+            assert!(f.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+        // the ppocr row (M3-T10): the det+rec pair from TWO sibling repos
+        // into one flat directory, plus the rec dict yml
+        let o = builtin("ppocr-v5-mobile").expect("ppocr model present");
+        assert_eq!(o.license, "Apache-2.0");
+        assert_eq!(o.image_size, None);
+        let rows: Vec<(&str, &str, &str)> = o
+            .files
+            .iter()
+            .map(|f| (f.local, f.remote, f.repo.unwrap_or(o.hf_repo)))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "det.onnx",
+                    "inference.onnx",
+                    "PaddlePaddle/PP-OCRv5_mobile_det_onnx"
+                ),
+                (
+                    "rec.onnx",
+                    "inference.onnx",
+                    "PaddlePaddle/PP-OCRv5_mobile_rec_onnx"
+                ),
+                (
+                    "dict.yml",
+                    "inference.yml",
+                    "PaddlePaddle/PP-OCRv5_mobile_rec_onnx"
+                ),
+            ]
+        );
+        for f in o.files {
             assert_eq!(f.sha256.len(), 64);
             assert!(f.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
         }
