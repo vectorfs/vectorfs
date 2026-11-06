@@ -45,7 +45,7 @@
 
 **vectorfs：单二进制、自托管、Docker 友好的「S3 Vectors 兼容向量存储 + 文件即向量化」——文件放进来，语义检索出结果；指向本地目录/内存时是即开即用的 s3vectors 开发与 CI 模拟器。**
 
-- 英文一句话（README/发布物用）：*Store files, search by meaning — S3 Vectors-compatible, single binary, Docker-friendly.*
+- 英文一句话（README/发布物用）：*Store files, search semantically — S3 Vectors-compatible, single binary, Docker-friendly.*
 - 两层结构：底层 = 后端无关的 S3 Vectors 兼容实现（§4，21 op 双 SDK conformance 全绿）；上层 = 文件层（§5.10）：`Source → Extract → Chunk → Embed → PutVectors`，查询经 metadata 回源原文件，RAG 形态。**上层是下层的第一个内部客户**（摄取经 ops 层写入，不旁路）。
 - 内置可插拔嵌入管线（本地 ort：gte-multilingual-base 文本默认（换 bge-m3 一行）+ SigLIP2 图像默认（M3）；openai 兼容远端 provider）；不做模型托管平台。
 

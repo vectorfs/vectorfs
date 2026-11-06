@@ -1,6 +1,6 @@
 # vectorfs
 
-**Store files, search by meaning — S3 Vectors-compatible, single binary, Docker-friendly.**
+**Store files, search semantically — S3 Vectors-compatible, single binary, Docker-friendly.**
 
 [中文文档](README_ZH.md)
 
