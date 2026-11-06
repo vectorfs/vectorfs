@@ -213,6 +213,11 @@ endpoint bucket root                <data-dir>/.vectorfs/ (daemon home)
 docker compose -f deploy/docker-compose.yml up        # data + models volumes, healthcheck on /health
 ```
 
+Local builds: `scripts/docker_build.sh` (or `scripts/docker_build_cn.sh` on
+mainland networks — Docker Hub / Debian / crates.io / GitHub-release mirrors
+and an `HF_ENDPOINT=hf-mirror.com` default, all env-overridable; see its
+header) stages prebuilt binaries and builds the host arch.
+
 Image: `ghcr.io/vectorfs/vectorfs` (multi-arch linux/amd64+arm64, debian-slim,
 non-root, binaries + pinned onnxruntime/pdfium `.so`; models stay on the volume,
 never in image layers). `VF_PRESET=text-rag` materializes the config on first

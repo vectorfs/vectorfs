@@ -1,0 +1,150 @@
+# vectorfs container image — 中国大陆网络变体 (CN mirror build).
+#
+# This is Dockerfile + 国内镜像源替换, staged by scripts/docker_build_cn.sh
+# (which copies it into the staging dir AS "Dockerfile", so the staging
+# contract is IDENTICAL to the upstream one — see Dockerfile's header for the
+# full contract: prebuilt binaries under amd64//arm64/, entrypoint.sh,
+# runtime_lib_pins.sh; the image NEVER COMPILES).
+#
+# Every mainland-unfriendly origin this image would otherwise touch is
+# rerouted through a mirror, each as an ARG with a sensible CN default that
+# the script (or any caller) can override — set one to "" to go direct:
+#
+#   DEBIAN_IMAGE  docker.io base image ref           (default: direct
+#                 debian:bookworm-slim; the script prefixes a registry
+#                 mirror, e.g. docker.m.daocloud.io/library/…)
+#   APT_MIRROR    hostname carrying /debian AND /debian-security
+#                 (default mirrors.ustc.edu.cn; tuna/aliyun work too)
+#   GH_PROXY      prefix prepended to github.com release URLs
+#                 (default https://ghfast.top/ — these services rotate;
+#                 mirror.ghproxy.com etc. also fit)
+#   HF_ENDPOINT   runtime model-prefetch mirror (default hf-mirror.com)
+#
+# Integrity note: the .so layer still verifies EVERY downloaded artifact
+# against the sha256 table in runtime_lib_pins.sh — mirroring only changes
+# the transport, never the trust root. An empty-string HF_ENDPOINT at
+# `docker run` time cleanly falls back to huggingface.co (models.rs
+# hf_endpoint() filters empty values).
+
+# Base image for BOTH stages (ARG before the first FROM is in scope for
+# every FROM below); the script points it at a registry mirror.
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+
+# ---------------------------------------------------------------------------
+# Stage 1 — fetch the PINNED dynamic-load runtime libraries (identical to
+# Dockerfile stage 1 except: apt mirror + GH proxy). The pin table is
+# scripts/runtime_lib_pins.sh — the SAME file scripts/fetch_runtime_libs.sh
+# sources for dev/CI — so the image and the dev tree can never drift onto
+# different ort/pdfium builds (ort's loader refuses mismatched minors).
+# curl + ca-certificates live ONLY in this stage.
+# ---------------------------------------------------------------------------
+FROM ${DEBIAN_IMAGE} AS libs
+ARG TARGETARCH
+ARG APT_MIRROR=mirrors.ustc.edu.cn
+ARG GH_PROXY=https://ghfast.top/
+# hostname swap only: bookworm's deb822 /etc/apt/sources.list.d/debian.sources
+# keeps its suite paths (/debian, /debian-security) — ustc/tuna/aliyun all
+# serve both, so replacing deb.debian.org AND security.debian.org with one
+# host is correct. http stays http (minimal delta; mirrors serve both).
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" \
+            /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY runtime_lib_pins.sh /tmp/runtime_lib_pins.sh
+# curl hardening: --retry + --http1.1 (GitHub release CDNs AND the gh proxies
+# intermittently drop HTTP/2 streams; a pin-verified artifact redeems itself
+# on retry). GH_PROXY prepends to the pinned URL; sha256 -c still gates.
+RUN set -eux; \
+    mkdir -p /out; \
+    . /tmp/runtime_lib_pins.sh; \
+    for lib in pdfium onnxruntime; do \
+        set -- $(runtime_lib_spec_docker "$lib" "${TARGETARCH}"); \
+        url="${GH_PROXY}$1"; sha="$2"; member="$3"; out="$4"; \
+        echo "fetching ${url}"; \
+        curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --http1.1 \
+            "$url" -o /tmp/lib.tgz; \
+        echo "${sha}  /tmp/lib.tgz" | sha256sum -c -; \
+        member="${member#./}"; \
+        tar -xzf /tmp/lib.tgz -C /tmp "$member"; \
+        mv "/tmp/$member" "/out/$out"; \
+    done; \
+    ls -la /out
+
+# ---------------------------------------------------------------------------
+# Stage 2 — the runtime image (identical to Dockerfile stage 2 except:
+# mirrored base image + apt, HF mirror default).
+# ---------------------------------------------------------------------------
+FROM ${DEBIAN_IMAGE}
+ARG APT_MIRROR=mirrors.ustc.edu.cn
+
+# ca-certificates: outbound HTTPS (openai embedder, S3 backends, the
+# first-boot model prefetch). The daemon's own TLS is rustls with bundled
+# webpki roots, so this is belt-and-braces for anything that reads the
+# system store.
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" \
+            /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    # non-root runtime user (uid/gid 1000, fixed for volume ownership)
+    && groupadd --gid 1000 vectorfs \
+    && useradd --uid 1000 --gid vectorfs --create-home vectorfs \
+    && mkdir -p /vectorfs/data /vectorfs/models /usr/local/lib/vectorfs \
+    && chown -R vectorfs:vectorfs /vectorfs
+
+# Prebuilt binaries from the staging context, selected per platform.
+ARG TARGETARCH
+COPY amd64/ /stage/amd64/
+COPY arm64/ /stage/arm64/
+RUN cp "/stage/${TARGETARCH}/vectorfs" "/stage/${TARGETARCH}/vf" /usr/local/bin/ \
+    && chmod 0755 /usr/local/bin/vectorfs /usr/local/bin/vf \
+    && rm -rf /stage
+
+# Pinned runtime libraries (stage 1), pinned to explicit paths the
+# load-dynamic resolvers honor (VF_ORT_PATH / VF_PDFIUM_PATH).
+COPY --from=libs /out/ /usr/local/lib/vectorfs/
+
+# Container contract (§5.10.7):
+#   VF_LISTEN=0.0.0.0  host-only form: -p port mapping reaches the daemon;
+#                      the port itself still follows VF_PORT / --port
+#   VF_DATA_DIR        default data root = the /vectorfs/data volume
+#   HF_ENDPOINT        CN default: first-boot text-rag init downloads the
+#                      ~1.17 GiB gte model from HF — unreachable without a
+#                      mirror on mainland networks. models.rs hf_endpoint()
+#                      already honors it; `docker run -e HF_ENDPOINT=`
+#                      (empty) restores huggingface.co.
+ENV VF_ORT_PATH=/usr/local/lib/vectorfs/libonnxruntime.so \
+    VF_PDFIUM_PATH=/usr/local/lib/vectorfs/libpdfium.so \
+    VF_LISTEN=0.0.0.0 \
+    VF_DATA_DIR=/vectorfs/data \
+    HF_ENDPOINT=https://hf-mirror.com
+
+COPY --chmod=0755 entrypoint.sh /usr/local/bin/vectorfs-entrypoint
+
+USER vectorfs
+WORKDIR /vectorfs/data
+# Models live in a VOLUME, never in an image layer (§5.10.7; the ~1.17 GiB
+# gte model would bloat every pull and pin the license artifact to the
+# image). air-gapped derivations mount their own model set here.
+VOLUME ["/vectorfs/data", "/vectorfs/models"]
+EXPOSE 8787
+
+# Zero-extra-dependency healthcheck: `vf` is already in the image and probes
+# the no-auth GET /health (credential-less by design — §5.10.7 "healthcheck =
+# GET /health"; vf status degrades to the health-only probe without
+# VF_ACCESS_KEY). Shell form so the port follows VF_PORT.
+# start-period only covers daemon startup — a first-boot text-rag init
+# (model download) legitimately stays "starting"/unhealthy until it finishes.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD vf status --endpoint "http://127.0.0.1:${VF_PORT:-8787}" >/dev/null || exit 1
+
+# exec-form entrypoint: the script `exec`s the daemon, so `vectorfs` runs as
+# PID 1 and receives SIGTERM directly (tokio's signal handler drains ingest
+# and shuts down inside Docker's 10s grace — §5.10.5). No tini needed: no
+# orphan-reaping responsibility exists for a single-process container.
+ENTRYPOINT ["/usr/local/bin/vectorfs-entrypoint"]
