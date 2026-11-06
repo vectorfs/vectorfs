@@ -250,10 +250,12 @@ pub async fn embedder_contract<E: Embedder + ?Sized>(e: &E) {
         super::Chunk {
             index: 0,
             text: "first chunk".to_string(),
+            image: None,
         },
         super::Chunk {
             index: 1,
             text: "第二个块".to_string(),
+            image: None,
         },
     ];
     let docs = e
@@ -501,7 +503,12 @@ mod tests {
     #[async_trait::async_trait]
     impl Embedder for ShaEmbedder {
         async fn embed_query(&self, q: &Query) -> Result<Vec<f32>, PipelineError> {
-            let Query::Text(t) = q;
+            // a THIRD-PARTY canary: text-only implementations refuse
+            // non-text queries loudly (the M3-T1 seam — same refusal shape
+            // as the built-in kinds, via the shared helper)
+            let Query::Text(t) = q else {
+                return Err(crate::pipeline::embed::query_modality_refusal(q));
+            };
             Ok(pseudo(t, 0, self.dim))
         }
 

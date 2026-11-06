@@ -74,6 +74,7 @@ impl Extractor for TxtExtractor {
         Ok(vec![Part {
             modality: Modality::Text,
             text: text.to_owned(),
+            image: None,
         }])
     }
 }

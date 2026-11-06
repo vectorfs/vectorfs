@@ -403,6 +403,11 @@ fn short_key_of(object_key: &str) -> Option<&'static str> {
         // exists only under cfg(test) and ships in no production binary.
         #[cfg(test)]
         "ctn" => Some("ctn"),
+        // M3-T1 TEST SCAFFOLD, same ruling: the image modality mechanism is
+        // proven with a cfg(test) kind; the production png/jpeg family keys
+        // land with the real T2/T3 image kinds and their mime-table rows.
+        #[cfg(test)]
+        "img" => Some("img"),
         _ => crate::pipeline::extract::short_key_for_extension(&ext),
     }
 }
@@ -442,10 +447,16 @@ pub(crate) fn mime_for(object_key: &str) -> &'static str {
 // ---------------------------------------------------------------------------
 
 /// Does an `Ok` extraction carry content? "Non-empty" means at least one
-/// Part whose text is not blank (whitespace-only counts as nothing — the
-/// same bar every built-in kind's own "no extractable text" refusal uses).
+/// Part with a content channel that is not blank: text whose trimming
+/// leaves nothing counts as no content (the same bar every built-in kind's
+/// own "no extractable text" refusal uses), and an image payload IS content
+/// regardless of the (always empty) text channel (M3-T1: an image-only
+/// extraction must WIN its chain, not yield as "empty").
 fn has_extracted_content(parts: &[Part]) -> bool {
-    !parts.is_empty() && parts.iter().any(|p| !p.text.trim().is_empty())
+    !parts.is_empty()
+        && parts
+            .iter()
+            .any(|p| p.image.is_some() || !p.text.trim().is_empty())
 }
 
 /// The inner message of an extractor error, without the `PipelineError`
@@ -650,6 +661,84 @@ fn chain_try_order(members: &[(String, ExtractorKind)], routing: &Routing) -> Ve
         Routing::Order(order) => order.clone(),
         Routing::Refused(_) => Vec::new(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// M3-T1: doc-side modality routing (§5.10.1 fan-out gate, pure decision core)
+// ---------------------------------------------------------------------------
+
+/// The doc-side modality gate of the fan-out (§5.10.1: a Part modality fans
+/// out to EVERY accepting embedder — and to NOBODY when no listed embedder
+/// accepts it). Pure decision core, unit-tested below; the worker parks the
+/// file with the returned aggregate reason (a deterministic dead end:
+/// retrying cannot change a declared modality — the same shape as the
+/// all-refuse route verdict).
+///
+/// `None` (covered) when every modality present in the chunk set is accepted
+/// by at least one fanned-out embedder, OR when the fan-out list is empty —
+/// the pure-protocol face (no embedders listed) embeds nothing by design and
+/// skips this gate exactly like the config-time carry-over check does
+/// (§5.10.3).
+///
+/// The refusal message mirrors the all-refuse chain aggregate: it counts the
+/// stranded chunks by modality, lists what every listed embedder DOES accept
+/// (so the mismatch is visible without opening the config), and quotes the
+/// modality's remedy ([`Modality::remedy`] — phrased BY the modality, the
+/// [`ContentClass::remedy`] precedent).
+fn modality_gap_reason(chunks: &[Chunk], fanned: &[(&String, &LoadedEmbedder)]) -> Option<String> {
+    if fanned.is_empty() {
+        return None;
+    }
+    // BTreeSet: enum order (Text < Image), deterministic message
+    let uncovered: BTreeSet<Modality> = chunks
+        .iter()
+        .map(Chunk::modality)
+        .filter(|m| !fanned.iter().any(|(_, e)| e.doc_modalities().contains(m)))
+        .collect();
+    if uncovered.is_empty() {
+        return None;
+    }
+    let gaps: Vec<String> = uncovered
+        .iter()
+        .map(|m| {
+            let n = chunks.iter().filter(|c| c.modality() == *m).count();
+            format!("{n} {m} chunk(s)")
+        })
+        .collect();
+    let roster: Vec<String> = fanned
+        .iter()
+        .map(|(name, e)| {
+            format!(
+                "{name} (doc modalities: {})",
+                e.doc_modalities()
+                    .iter()
+                    .map(Modality::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect();
+    let remedies: Vec<&str> = uncovered.iter().map(|m| m.remedy()).collect();
+    Some(format!(
+        "{} with no embedder that accepts them on its doc side — listed embedder(s): {} — {}",
+        gaps.join("; "),
+        roster.join("; "),
+        remedies.join("; ")
+    ))
+}
+
+/// Per-modality chunk counts for the completion marker. `text` is always
+/// present (byte-stable with the pre-image marker shape); other modalities
+/// appear only when they have chunks — a `("image", 0)` row on every
+/// text-only source would churn every existing marker for no information.
+fn chunk_counts(chunks: Option<&[Chunk]>) -> BTreeMap<String, u32> {
+    let mut counts = BTreeMap::from([("text".to_string(), 0u32)]);
+    if let Some(chunks) = chunks {
+        for c in chunks {
+            *counts.entry(c.modality().to_string()).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 /// What the extract segment reports upward for the progress line: the
@@ -1647,8 +1736,9 @@ impl IngestRuntime {
             }
         }
 
-        let chunk_count = cached_chunks.as_ref().map(|c| c.len()).unwrap_or(0);
-        let chunks_map = Some(BTreeMap::from([("text".to_string(), chunk_count as u32)]));
+        // per-modality counts ("text" always, "image" only when present —
+        // M3-T1; byte-stable with the pre-image marker for text-only files)
+        let chunks_map = Some(chunk_counts(cached_chunks.as_deref()));
         let all_done = succeeded.len() == plan.embedders.len();
         let outcome = if let Some(reason) = parked {
             Outcome::Parked(reason)
@@ -1879,22 +1969,62 @@ impl IngestRuntime {
         };
 
         // ---- fan-out (§5.10.1: every doc-modality-matching embedder) ----
+        // Resolve the FULL fan-out list first: the modality gate below and
+        // each embedder's chunk scoping read the SAME doc-modality
+        // declarations.
+        let mut fanned: Vec<(&String, &LoadedEmbedder)> = Vec::with_capacity(plan.embedders.len());
         for name in &plan.embedders {
-            if succeeded.contains(name) {
-                continue;
-            }
             let loaded = self
                 .shared
                 .core
                 .embedder(name)
                 .ok_or_else(|| AttemptErr::Fail(format!("embedder '{name}' not loaded")))?;
+            fanned.push((name, loaded));
+        }
+        // Modality gate (M3-T1, the routing rule of §5.10.1: a Part fans
+        // out to every doc-modality-matching embedder — and to NOBODY when
+        // no listed embedder accepts its modality). A gap is a loud FAILED
+        // with the aggregate reason + remedy, never a silent skip or an
+        // empty-yield success; deterministic, so it parks (retrying cannot
+        // change a declared modality — the all-refuse route verdict shape).
+        // The gate reads the FULL list, not the not-yet-succeeded subset:
+        // coverage is a configured-pipeline property, and on a retry after
+        // a partial success an already-succeeded embedder still counts as
+        // its modality's taker.
+        if let Some(reason) = modality_gap_reason(chunks, &fanned) {
+            return Err(AttemptErr::Parked(reason));
+        }
+        for (name, loaded) in fanned {
+            if succeeded.contains(name) {
+                continue;
+            }
+            let accepts = loaded.doc_modalities();
+            // Per-embedder modality scoping: an embedder sees only the
+            // chunks its doc side accepts. The all-accepted fast path hands
+            // the ORIGINAL slice over (today's text-only pipelines are
+            // byte-identical, zero copies); a scoped path materializes the
+            // subset — an embedder with nothing to accept embeds nothing,
+            // writes no rows, and still counts as done.
+            let scoped_storage: Option<Vec<Chunk>> =
+                if chunks.iter().all(|c| accepts.contains(&c.modality())) {
+                    None
+                } else {
+                    Some(
+                        chunks
+                            .iter()
+                            .filter(|c| accepts.contains(&c.modality()))
+                            .cloned()
+                            .collect(),
+                    )
+                };
+            let scoped: &[Chunk] = scoped_storage.as_deref().unwrap_or(chunks);
             let spec = &plan.derived[name];
             let vectors = self
-                .embed_gated(loaded, chunks)
+                .embed_gated(loaded, scoped)
                 .await
                 .map_err(|e| AttemptErr::Fail(format!("embedder '{name}' failed: {e}")))?;
 
-            let rows = build_rows(plan, job, spec, chunks, &vectors)?;
+            let rows = build_rows(plan, job, spec, scoped, &vectors)?;
             for batch in split_batches(rows, spec.dim) {
                 // domain check + commit under the write lock: the check is
                 // load-then-(maybe)-create, and racing it against another
@@ -2138,7 +2268,10 @@ struct BatchRow {
 /// Chunk metadata (§5.10.1 complete key set): `x-vf-src-uri` (key hash,
 /// filterable, the GC join key), `x-vf-src-name` (full key, non-filterable),
 /// `x-vf-modality`, `x-vf-model`, `x-vf-chunk-text` (default on, droppable
-/// via `store_chunk_text = false`).
+/// via `store_chunk_text = false`). Per-chunk modality (M3-T1): both the
+/// metadata value and the chunk-key namespace come from the CHUNK, so image
+/// atoms land in the `image` namespace (`{hash}-image-{i}`) with
+/// `x-vf-modality = image` — text chunks are byte-identical to before.
 fn build_rows(
     plan: &BucketPlan,
     job: &Job,
@@ -2149,10 +2282,11 @@ fn build_rows(
     assert_eq!(chunks.len(), vectors.len(), "one vector per chunk");
     let mut rows = Vec::with_capacity(chunks.len());
     for (chunk, vector) in chunks.iter().zip(vectors) {
+        let modality = chunk.modality();
         let mut metadata = serde_json::json!({
             "x-vf-src-uri": job.key_hash,
             "x-vf-src-name": job.object_key,
-            "x-vf-modality": Modality::Text.to_string(),
+            "x-vf-modality": modality.to_string(),
             "x-vf-model": spec.model,
         });
         if plan.store_chunk_text {
@@ -2173,7 +2307,7 @@ fn build_rows(
             )));
         }
         rows.push(BatchRow {
-            key: marker::chunk_key(&job.key_hash, "text", chunk.index),
+            key: marker::chunk_key(&job.key_hash, &modality.to_string(), chunk.index),
             vector: vector.clone(),
             metadata,
         });
@@ -4124,7 +4258,7 @@ pub(crate) mod tests {
     #[test]
     fn chain_single_member_passes_the_message_through_verbatim() {
         // a one-member chain (every pre-M2.1 route, and `auto`) keeps the
-        // member's own message byte-stable — no wrapper to describe
+        // member's own message byte-stable — no wrapper to describe a chain
         let members = vec![("only".to_string(), Err(PipelineError::extract("boom")))];
         assert_eq!(
             pick_from_chain("txt", members).unwrap_err().to_string(),
@@ -4134,6 +4268,117 @@ pub(crate) mod tests {
         let msg = pick_from_chain("txt", members).unwrap_err().to_string();
         assert!(msg.contains("produced no extractable content"), "{msg}");
         assert!(!msg.contains("chain"), "no wrapper on one member: {msg}");
+    }
+
+    // ---- M3-T1: doc-side modality routing (gate + counts, pure cores) ----
+
+    #[test]
+    fn image_parts_count_as_extracted_content() {
+        // an image-only extraction must WIN its chain (an image Part's text
+        // channel is empty by construction — the pre-image content bar
+        // would have yielded it as "empty")
+        assert!(has_extracted_content(&[Part::image(
+            "image/png",
+            &b"\x89PNG\r\n\x1a\n"[..]
+        )]));
+        // mixed: the image alone rescues an otherwise-blank extraction
+        assert!(has_extracted_content(&[
+            Part::text("  \n\t "),
+            Part::image("image/png", &b"\x89PNG\r\n\x1a\n"[..])
+        ]));
+        // and the old bars stand: empty/blank text alone is still nothing
+        assert!(!has_extracted_content(&[]));
+        assert!(!has_extracted_content(&[Part::text("")]));
+        assert!(!has_extracted_content(&[Part::text(" \n\t ")]));
+    }
+
+    #[test]
+    fn chunk_counts_per_modality_text_always_image_only_when_present() {
+        let text = |i: u32| Chunk {
+            index: i,
+            text: format!("t{i}"),
+            image: None,
+        };
+        let image = |i: u32| Chunk {
+            index: i,
+            text: String::new(),
+            image: Some(crate::pipeline::ImagePayload {
+                bytes: bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\n"),
+                mime: "image/png".to_string(),
+            }),
+        };
+        // the pre-image marker shape, byte-stable: text-only file
+        assert_eq!(
+            chunk_counts(Some(&[text(0), text(1)])),
+            BTreeMap::from([("text".to_string(), 2u32)])
+        );
+        // no chunks at all (never-completed path): still just text=0
+        assert_eq!(
+            chunk_counts(None),
+            BTreeMap::from([("text".to_string(), 0u32)])
+        );
+        // mixed: image appears ONLY when nonzero
+        assert_eq!(
+            chunk_counts(Some(&[text(0), image(1), image(2)])),
+            BTreeMap::from([("text".to_string(), 1u32), ("image".to_string(), 2u32)])
+        );
+    }
+
+    /// The gate against the REAL loaded tiny embedder (the .so fixture the
+    /// module banner promises; both M2 kinds declare &[Text], so the tiny
+    /// instance IS the "text-only world" the M3-T1 gate must refuse).
+    #[tokio::test]
+    async fn modality_gap_reason_shapes_the_loud_refusal() {
+        let (_text, cfg) = tiny_config("");
+        let core = IngestCore::load(&cfg, Path::new("/nonexistent-models"))
+            .await
+            .expect("fixture embedder loads");
+        let tiny = core.embedder("tiny").expect("tiny declared");
+        let name = "tiny".to_string();
+        let fanned = vec![(&name, tiny)];
+
+        let text = |i: u32| Chunk {
+            index: i,
+            text: format!("t{i}"),
+            image: None,
+        };
+        let image = |i: u32| Chunk {
+            index: i,
+            text: String::new(),
+            image: Some(crate::pipeline::ImagePayload {
+                bytes: bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\n"),
+                mime: "image/png".to_string(),
+            }),
+        };
+
+        // text-only chunks: covered (the M2 world — gate silent)
+        assert_eq!(modality_gap_reason(&[text(0), text(1)], &fanned), None);
+        // empty chunk set: nothing to strand
+        assert_eq!(modality_gap_reason(&[], &fanned), None);
+        // the pure-protocol face (no embedders listed): the gate skips,
+        // same carve-out as the config-time carry-over check
+        assert_eq!(modality_gap_reason(&[image(0)], &[]), None);
+
+        // an image chunk with a text-only fan-out: the loud aggregate —
+        // counts by modality, the roster of what IS accepted, and the
+        // remedy phrased by the modality
+        let reason =
+            modality_gap_reason(&[text(0), image(1), image(2)], &fanned).expect("image stranded");
+        assert!(reason.contains("2 image chunk(s)"), "{reason}");
+        assert!(
+            reason.contains("no embedder that accepts them on its doc side"),
+            "{reason}"
+        );
+        assert!(reason.contains("tiny (doc modalities: text)"), "{reason}");
+        assert!(
+            reason.contains("add an embedder that accepts image documents"),
+            "{reason}"
+        );
+        // deterministic (BTreeSet ordering: no roster/aggregate flapping)
+        assert_eq!(
+            modality_gap_reason(&[text(0), image(1), image(2)], &fanned),
+            Some(reason.clone())
+        );
     }
 
     #[test]
@@ -4949,6 +5194,146 @@ pub(crate) mod tests {
         assert!(
             texts.iter().any(|t| t.contains("gz child body content")),
             "{texts:?}"
+        );
+    }
+
+    // ---- M3-T1: image modality through the REAL worker ----
+
+    /// A valid 1x1 PNG (67 bytes) — the e2e image source. Only its magic is
+    /// ever sniffed in T1 (no decoder exists yet; the sniff guard and the
+    /// modality gate are the mechanism under test).
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x62, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    /// The image e2e fixture: tiny (text-only) embedder + an `img` placeholder
+    /// extractor instance routed under the cfg(test) `img` short key (the
+    /// runtime patch swaps the placeholder for the scripted image kind).
+    fn img_config() -> PipelineConfig {
+        let text = format!(
+            "[extractor.img]\nkind = \"txt\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = \
+             true\n\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ img = \"img\" }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"tiny\"]\nscan_interval_secs = 1",
+            fixture_dir().display().to_string(),
+        );
+        crate::pipeline::config::load_pipeline_config(&text).unwrap()
+    }
+
+    /// THE M3-T1 mechanism e2e: a PNG source is claimed, extracted as an
+    /// image Part by the cfg(test) image kind (image-only extractions carry
+    /// content and WIN the chain), atomically chunked by the axis bypass
+    /// (sniff guard passes a real PNG) — and then REFUSED LOUDLY by the
+    /// doc-modality gate: the only listed embedder is text-only, so the
+    /// file lands FAILED with the aggregate reason + remedy, no retry
+    /// budget burned, no vectors written, no derived index created. Note
+    /// the config-time carry-over check CANNOT catch this (the placeholder
+    /// kind declares text; the runtime output is image) — exactly why the
+    /// runtime gate exists.
+    #[tokio::test]
+    async fn image_source_with_no_taker_fails_loud_with_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("photo.img"), TINY_PNG).unwrap();
+
+        let cfg = img_config();
+        let (rt, _h, state) = runtime_patched(dir.path(), &cfg, |plan| {
+            plan.extractors.insert(
+                "img".to_string(),
+                crate::pipeline::extract::ExtractorKind::TestImage(
+                    crate::pipeline::extract::TestImageSpec {
+                        mime: "image/png".to_string(),
+                    },
+                ),
+            );
+        })
+        .await;
+
+        rt.scan_once().await;
+        rt.drain_queue().await;
+
+        // claimed as a source (the cfg(test) img short key) and FAILED —
+        // parked, not retried: the reason is the modality gate's aggregate
+        let m = status_of(&state, "docs", "docs/photo.img").await;
+        assert_eq!(m.status, SourceStatus::Failed, "{m:?}");
+        assert!(m.retries_exhausted, "a parked gap is deterministic: {m:?}");
+        let reason = m
+            .status_reason
+            .clone()
+            .expect("the gate reason on the marker");
+        assert!(reason.contains("1 image chunk(s)"), "{reason}");
+        assert!(
+            reason.contains("no embedder that accepts them on its doc side"),
+            "{reason}"
+        );
+        assert!(reason.contains("tiny (doc modalities: text)"), "{reason}");
+        assert!(
+            reason.contains("add an embedder that accepts image documents"),
+            "the guidance must ride along: {reason}"
+        );
+        // loud, not silent: no completion evidence, nothing embedded, no
+        // derived index created for the gated file
+        assert_eq!(m.chunks, None, "failed sources carry no chunk evidence");
+        assert!(m.content_hash.is_empty(), "{m:?}");
+        let spec = rt.shared.core.buckets["docs"].derived["tiny"].clone();
+        assert!(
+            state
+                .storage
+                .load_index("docs", &spec.index_name)
+                .await
+                .unwrap()
+                .is_none(),
+            "no index may be created for a gated source"
+        );
+    }
+
+    /// The bypass's sniff guard runs inside the REAL worker too: a garbage
+    /// ".img" file (no image magic) fails as a CHUNK error — with the
+    /// no-magic message, NOT the missing-embedder remedy (which would
+    /// misdirect on a corrupt file).
+    #[tokio::test]
+    async fn garbage_image_source_fails_on_the_sniff_not_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("garbage.img"), b"definitely not an image").unwrap();
+
+        let cfg = img_config();
+        let (rt, _h, state) = runtime_patched(dir.path(), &cfg, |plan| {
+            plan.extractors.insert(
+                "img".to_string(),
+                crate::pipeline::extract::ExtractorKind::TestImage(
+                    crate::pipeline::extract::TestImageSpec {
+                        mime: "image/png".to_string(),
+                    },
+                ),
+            );
+        })
+        .await;
+
+        rt.scan_once().await;
+        rt.drain_queue().await;
+
+        let m = status_of(&state, "docs", "docs/garbage.img").await;
+        assert_eq!(m.status, SourceStatus::Failed, "{m:?}");
+        let reason = m
+            .status_reason
+            .clone()
+            .expect("chunk refusal on the marker");
+        assert!(
+            reason.contains("no known image-container magic"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("no embedder that accepts"),
+            "garbage is a chunk refusal, not a missing-embedder gap: {reason}"
         );
     }
 

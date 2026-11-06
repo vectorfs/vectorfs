@@ -189,6 +189,7 @@ impl Extractor for PdfInspectorExtractor {
         Ok(vec![Part {
             modality: Modality::Text,
             text,
+            image: None,
         }])
     }
 }

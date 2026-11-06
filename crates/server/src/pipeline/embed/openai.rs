@@ -353,7 +353,10 @@ trait Realigned {
 #[async_trait::async_trait]
 impl Embedder for OpenAiEmbedder {
     async fn embed_query(&self, q: &Query) -> Result<Vec<f32>, PipelineError> {
-        let Query::Text(t) = q;
+        let Query::Text(t) = q else {
+            // text-only kind (query_modalities = [text]); M3-T1 seam
+            return Err(super::query_modality_refusal(q));
+        };
         self.post_batch(std::slice::from_ref(t))
             .await
             .map(|mut v| v.swap_remove(0))
@@ -362,6 +365,9 @@ impl Embedder for OpenAiEmbedder {
     async fn embed_documents(&self, chunks: &[Chunk]) -> Result<Vec<Vec<f32>>, PipelineError> {
         if chunks.is_empty() {
             return Ok(Vec::new());
+        }
+        if let Some(c) = chunks.iter().find(|c| c.image.is_some()) {
+            return Err(super::image_chunk_refusal(c));
         }
         let mut out = Vec::with_capacity(chunks.len());
         for batch in chunks.chunks(POOL_SIZE) {
@@ -536,6 +542,7 @@ pub(crate) mod tests {
             .map(|(i, t)| Chunk {
                 index: i as u32,
                 text: t.to_string(),
+                image: None,
             })
             .collect();
         let out = e.embed_documents(&docs).await.unwrap();
@@ -561,6 +568,47 @@ pub(crate) mod tests {
         assert_eq!(fake.seen.lock().unwrap().len(), 2);
     }
 
+    /// M3-T1: both text-only kinds refuse non-text inputs LOUDLY — an image
+    /// query errors (never an empty/garbage vector), and an image chunk on
+    /// the doc side errors (never the empty text channel embedded as if it
+    /// were content). The openai kind is the hermetic proof; ort shares the
+    /// exact refusal helpers.
+    #[tokio::test]
+    async fn image_inputs_are_refused_loudly_not_silently_embedded() {
+        let (base, fake) = fake_openai().await;
+        let e = OpenAiEmbedder::new(&fake_config(base)).unwrap();
+        // query side: text-only query_modalities => Err, message says the
+        // embedder does not accept image queries and points at the fix
+        let err = e
+            .embed_query(&Query::Image(
+                vec![0x89, 0x50, 0x4E, 0x47],
+                "image/png".to_string(),
+            ))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("does not accept an image query"), "{msg}");
+        assert!(msg.contains("text-only"), "{msg}");
+        assert!(msg.contains("image-capable embedder"), "{msg}");
+        // doc side: an image chunk is a routing bug, refused before any
+        // request leaves (nothing hits the wire)
+        let err = e
+            .embed_documents(&[Chunk {
+                index: 0,
+                text: String::new(),
+                image: Some(crate::pipeline::ImagePayload {
+                    bytes: bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\n"),
+                    mime: "image/png".to_string(),
+                }),
+            }])
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("chunk 0 is an image chunk"), "{msg}");
+        assert!(msg.contains("text documents only"), "{msg}");
+        assert!(fake.seen.lock().unwrap().is_empty(), "no HTTP call");
+    }
+
     #[tokio::test]
     async fn batches_are_pooled_at_64() {
         let (base, fake) = fake_openai().await;
@@ -569,6 +617,7 @@ pub(crate) mod tests {
             .map(|i| Chunk {
                 index: i,
                 text: format!("t{i}"),
+                image: None,
             })
             .collect();
         let out = e.embed_documents(&chunks).await.unwrap();
@@ -594,6 +643,7 @@ pub(crate) mod tests {
             .embed_documents(&[Chunk {
                 index: 0,
                 text: "x".into(),
+                image: None,
             }])
             .await
             .unwrap();
@@ -616,6 +666,7 @@ pub(crate) mod tests {
             .embed_documents(&[Chunk {
                 index: 0,
                 text: "x".into(),
+                image: None,
             }])
             .await
             .unwrap_err();
@@ -635,6 +686,7 @@ pub(crate) mod tests {
             .embed_documents(&[Chunk {
                 index: 0,
                 text: "x".into(),
+                image: None,
             }])
             .await
             .unwrap_err();

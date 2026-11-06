@@ -183,6 +183,9 @@ impl Chunker for TokenWindowChunker {
                 out.push(Chunk {
                     index,
                     text: chars[s..e].iter().collect(),
+                    // text windows never carry the image channel (the axis
+                    // dispatch materializes image chunks; see chunk/mod.rs)
+                    image: None,
                 });
                 index += 1;
             }
@@ -200,6 +203,7 @@ mod tests {
         c.chunk(&[Part {
             modality: Modality::Text,
             text: text.to_string(),
+            image: None,
         }])
         .unwrap()
         .into_iter()

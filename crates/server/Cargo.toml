@@ -197,6 +197,21 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # has the rationale). MIT.
 text-splitter = { version = "0.33", default-features = false }
 
+# M3-T1 image modality (design.md §5.10.2 modality axis): the T1 mechanism
+# use is the magic sniff in ImagePayload::validate (image::guess_format —
+# header bytes only, nothing decoded), the fail-loud guard at the chunker
+# bypass; T2/T3 grow the real uses (siglip2 preprocessing, pdf-pages
+# rendering). default-features = false drops the default decoder/encoder
+# grab-bag (gif/webp/avif/qoi/dds/… + rayon): codecs are declared per need —
+# jpeg+png are today's ingest surface (pdfium renders png/jpeg, T3), and a
+# codec joins only when a kind actually emits it. Binary-size ruling is
+# settled (§0 2026-11-06: server has NO hard cap, 175 MiB is a warn-only
+# signal line), so codec growth needs no per-feature adjudication. MIT OR
+# Apache-2.0; zero C code in the enabled set. Known tree cost (cargo tree
+# -d): png pins miniz_oxide 0.8 alongside flate2's 0.9 — one duplicated
+# small pure-Rust crate, upstream's pin, accepted.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
 # ---- M2 T5 embedder kinds (design.md §5.7 "文件层" row, §5.10.2 Embedder) ----
 
 # ort embedder: ONNX Runtime bindings, DYNAMIC loading only (the §5.7 ruling:

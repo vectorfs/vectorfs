@@ -137,6 +137,7 @@ impl Extractor for MdExtractor {
         Ok(vec![Part {
             modality: Modality::Text,
             text,
+            image: None,
         }])
     }
 }

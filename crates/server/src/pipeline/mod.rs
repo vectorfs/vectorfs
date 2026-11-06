@@ -65,11 +65,11 @@
 //!
 //! # Modality is a closed enum (§5.10.1)
 //!
-//! [`Modality`] deliberately has ONE variant in M2 (`Text`). Adding values
-//! in M3+ (`PageImage`, `Image`, `Audio`) is a DESIGNED-FOR event: the
-//! compiler walks every exhaustive match and the ingest router fans Parts
-//! out by modality with zero routing-config changes. Video is NOT a modality
-//! (video extractors demux into the three existing ones).
+//! [`Modality`] carries `Text` (M2) and `Image` (M3-T1). Adding values
+//! (`PageImage`, `Audio`) is a DESIGNED-FOR event: the compiler walks every
+//! exhaustive match and the ingest router fans Parts out by modality with
+//! zero routing-config changes. Video is NOT a modality (video extractors
+//! demux into the three existing ones).
 
 pub mod chunk;
 pub mod config;
@@ -90,17 +90,48 @@ use std::collections::BTreeMap;
 
 /// Content modality of a [`Part`] / capability declaration of an
 /// [`Embedder`]. Closed enum by design (see module docs); `M3+ adds values`
-/// is in-design behavior, not a breaking change.
+/// is in-design behavior, not a breaking change. `Image` landed in M3-T1
+/// (mechanism ground only — the siglip2 embedder and pdf-pages/image
+/// extractor kinds are T2/T3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Modality {
     /// Plain UTF-8 text (the only M2 modality).
     Text,
+    /// A raster image (jpeg/png today): carried by [`Part::image`] /
+    /// [`Query::Image`], chunked atomically (§5.10.2: the chunker axis
+    /// serves text only), fanned out to embedders declaring Image.
+    Image,
 }
 
 impl std::fmt::Display for Modality {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             Modality::Text => f.write_str("text"),
+            Modality::Image => f.write_str("image"),
+        }
+    }
+}
+
+impl Modality {
+    /// The remedy line the ingest fan-out gate quotes when NO listed
+    /// embedder accepts this modality on its doc side — what capability is
+    /// missing, phrased BY the modality (the [`ContentClass::remedy`]
+    /// precedent: the vocabulary that is missing names the capability to
+    /// add, so a future non-image modality cannot inherit an image-specific
+    /// hint).
+    pub fn remedy(self) -> &'static str {
+        match self {
+            Modality::Image => {
+                "add an embedder that accepts image documents to this pipeline's embedders \
+                 list (the planned siglip2 kind, M3-T2), or keep image sources out of it"
+            }
+            // every built-in embedder kind accepts text documents, so an
+            // all-text-kind pipeline with text chunks never reaches this
+            // aggregate; only a custom kind accepting nothing could
+            Modality::Text => {
+                "every built-in embedder kind accepts text documents — this aggregate is \
+                 reachable only through custom kinds that accept no modalities at all"
+            }
         }
     }
 }
@@ -189,12 +220,37 @@ pub enum Fit {
     Refuses,
 }
 
-/// One extracted payload. M2 carries text only; the struct grows image/audio
-/// payloads in M3/M4 alongside the new [`Modality`] values (additive).
+/// One extracted payload: a modality plus its content channels. `text` is
+/// the M2 shape and stays exactly that for `Modality::Text` parts; image
+/// parts (M3-T1) carry their bytes in [`Part::image`] with an EMPTY text
+/// channel — audio (M4) grows its own field the same additive way.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Part {
     pub modality: Modality,
     pub text: String,
+    /// Image payload, present iff the part is `Modality::Image` (the
+    /// constructors keep the pair consistent; the chunker bypass enforces
+    /// it loudly at the mechanism seam). `Option` + a never-touched `text`
+    /// field is deliberately additive: every existing text-part literal and
+    /// assertion keeps compiling and passing unchanged.
+    pub image: Option<ImagePayload>,
+}
+
+/// The image content channel of a [`Part`] (M3-T1): raw container bytes
+/// plus the mime the EXTRACTOR declared for them (`image/jpeg` / `image/png`
+/// / …). The mime rides along because embedder preprocessing keys off it
+/// (resize/crop/normalize differ per container) — it is validated against
+/// the bytes' magic at the chunker bypass ([`ImagePayload::validate`]), so
+/// a wrong declaration fails loudly instead of surfacing as wrong
+/// preprocessing inside a T2 embedder.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImagePayload {
+    /// Raw image-container bytes (`bytes::Bytes`: payloads are handed
+    /// around by reference inside one CPU segment, never re-read).
+    pub bytes: bytes::Bytes,
+    /// The declared container mime; must be the container's CANONICAL mime
+    /// (see [`ImagePayload::validate`]).
+    pub mime: String,
 }
 
 /// A child document unpacked from a container (zip/mime-multipart/tar…): the
@@ -235,29 +291,114 @@ impl ChildDoc {
 }
 
 impl Part {
-    /// Convenience constructor for the M2 text-only shape.
+    /// Convenience constructor for the M2 text-only shape (image channel
+    /// `None`).
     pub fn text(s: impl Into<String>) -> Self {
         Part {
             modality: Modality::Text,
             text: s.into(),
+            image: None,
         }
+    }
+
+    /// Convenience constructor for an image part: empty text channel, the
+    /// payload in the image channel. Infallible by design (it only moves
+    /// values); the bytes-vs-mime honesty check happens at the mechanism
+    /// seam ([`ImagePayload::validate`], called by the chunker bypass).
+    pub fn image(mime: impl Into<String>, bytes: impl Into<bytes::Bytes>) -> Self {
+        Part {
+            modality: Modality::Image,
+            text: String::new(),
+            image: Some(ImagePayload {
+                bytes: bytes.into(),
+                mime: mime.into(),
+            }),
+        }
+    }
+}
+
+impl ImagePayload {
+    /// Mechanism guard at the chunker bypass (M3-T1): sniff the container
+    /// magic (`image::guess_format`, header bytes only — nothing is decoded
+    /// here) and require it to BE the declared mime, canonically. Two loud
+    /// refusals, both `PipelineError::chunk` (the stage refusing them):
+    ///
+    /// * bytes with NO known image magic — garbage must not enter the index
+    ///   as an "image chunk" (the no-taker embedder gate would then mislead
+    ///   with an "add an image embedder" remedy for what is a corrupt file);
+    /// * magic ≠ declared mime (or a non-canonical alias like `image/jpg`)
+    ///   — the declared mime drives embedder preprocessing, so a mismatch
+    ///   fails HERE, at the seam, naming both values.
+    pub fn validate(&self) -> Result<(), PipelineError> {
+        let sniffed = image::guess_format(&self.bytes).map_err(|_| {
+            PipelineError::chunk(format!(
+                "image payload carries no known image-container magic (jpeg/png today) — \
+                 refusing to index {} non-image bytes as an image chunk",
+                self.bytes.len()
+            ))
+        })?;
+        let canonical = sniffed.to_mime_type();
+        if canonical != self.mime {
+            return Err(PipelineError::chunk(format!(
+                "image payload mime mismatch: the bytes sniff as {canonical} but the part \
+                 declares '{}' — the declared mime drives embedder preprocessing; use the \
+                 container's canonical mime",
+                self.mime
+            )));
+        }
+        Ok(())
     }
 }
 
 /// A chunker product: the file-layer view of one future vector row.
 /// `index` is assigned sequentially by the mechanism across all parts of one
-/// source, so chunk keys stay stable and ordered.
+/// source (text windows AND atomic image chunks share the one sequence,
+/// §5.10.2), so chunk keys stay stable and ordered.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
     pub index: u32,
     pub text: String,
+    /// Image payload, present iff this is an atomic image chunk (the
+    /// chunker-axis bypass materializes image Parts one-to-one). Empty for
+    /// text windows — same additive shape and reasoning as [`Part::image`].
+    pub image: Option<ImagePayload>,
 }
 
-/// Query-side input. `Image`/`Audio` variants land with their modality
-/// (M3/M4); the enum shape is already the router's dispatch point.
+impl Chunk {
+    /// The chunk's modality: `Image` iff it carries an image payload, else
+    /// `Text`. Derived, not stored — a chunk IS an image chunk exactly when
+    /// it carries the payload, so the two can never disagree; consumers
+    /// (ingest routing, `x-vf-modality` metadata, per-modality chunk keys)
+    /// all read this one verdict.
+    pub fn modality(&self) -> Modality {
+        match self.image {
+            Some(_) => Modality::Image,
+            None => Modality::Text,
+        }
+    }
+}
+
+/// Query-side input. `Image` (M3-T1: raw bytes + mime, the query-side twin
+/// of [`ImagePayload`]) is the dispatch point the search face will route by
+/// query modality (§5.10.1 symmetric fan-out); `Audio` lands in M4.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Query {
     Text(String),
+    /// Image query: container bytes + declared mime. Text-only embedders
+    /// REFUSE it loudly (their `embed_query` errors; the kind set grows an
+    /// image-query taker in T2).
+    Image(Vec<u8>, String),
+}
+
+impl Query {
+    /// Noun phrase for error/progress lines ("a text query", "an image
+    /// query (mime image/png)") — modality-first, never the bytes.
+    pub fn describe(&self) -> String {
+        match self {
+            Query::Text(_) => "a text query".to_string(),
+            Query::Image(_, mime) => format!("an image query (mime {mime})"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -411,9 +552,12 @@ pub trait Extractor: Send + Sync {
 
 /// `&[Part] -> Vec<Chunk>`: split extracted payloads into embeddable chunks.
 ///
-/// The mechanism layer guarantees only TEXT parts are fed (image-class parts
-/// go to their embedders atomically, §5.10.2); implementations still skip
-/// non-Text parts defensively — a routing bug must not corrupt chunk text.
+/// The CHUNKER AXIS serves text only (§5.10.2): the axis dispatch
+/// ([`crate::pipeline::chunk::ChunkerKind::chunk`]) performs the modality
+/// split in the mechanism layer — image parts never reach a kind, they
+/// become atomic chunks there — so implementations see text parts.
+/// Implementations still skip non-Text parts defensively: a routing bug
+/// must not corrupt chunk text.
 pub trait Chunker: Send + Sync {
     fn chunk(&self, parts: &[Part]) -> Result<Vec<Chunk>, PipelineError>;
 }
@@ -662,5 +806,124 @@ mod tests {
                 .to_string()
                 .starts_with("extract failed")
         );
+    }
+
+    // ---- M3-T1 image modality mechanism ground ----
+
+    #[test]
+    fn modality_display_and_remedy_vocabulary() {
+        // the closed vocabulary's two views (Display feeds progress lines,
+        // chunk keys and x-vf-modality metadata; remedy feeds the no-taker
+        // gate) — same pinning style as content_class_and_fit_vocabulary
+        let all = [(Modality::Text, "text"), (Modality::Image, "image")];
+        for (m, s) in all {
+            assert_eq!(m.to_string(), s);
+        }
+        for (m, _) in all {
+            let r = m.remedy();
+            assert!(!r.is_empty(), "{m}");
+        }
+        // the image remedy names the missing capability (an image-accepting
+        // embedder), the text remedy explains the aggregate is built-in
+        // unreachable — phrased BY the modality, never by a specific kind
+        assert!(Modality::Image.remedy().contains("image documents"));
+        assert!(Modality::Image.remedy().contains("embedder"));
+        assert!(Modality::Text.remedy().contains("built-in embedder"));
+    }
+
+    #[test]
+    fn part_constructors_pin_the_channel_pairing() {
+        // text parts: the M2 shape byte-for-byte, image channel None
+        let t = Part::text("hello");
+        assert_eq!(t.modality, Modality::Text);
+        assert_eq!(t.text, "hello");
+        assert_eq!(t.image, None);
+        // image parts: payload in the image channel, EMPTY text channel,
+        // modality Image (the constructors keep the pair consistent)
+        let i = Part::image("image/png", &b"\x89PNG\r\n\x1a\n"[..]);
+        assert_eq!(i.modality, Modality::Image);
+        assert_eq!(i.text, "");
+        let payload = i.image.as_ref().expect("image part carries payload");
+        assert_eq!(payload.mime, "image/png");
+        assert_eq!(&payload.bytes[..], b"\x89PNG\r\n\x1a\n");
+        // the pairing invariant the chunker bypass enforces loudly
+        assert!(Part::text("x").image.is_none());
+        assert!(Part::image("image/jpeg", Vec::<u8>::new()).image.is_some());
+    }
+
+    #[test]
+    fn chunk_modality_is_derived_from_the_payload_channel() {
+        let text_window = Chunk {
+            index: 0,
+            text: "window".to_string(),
+            image: None,
+        };
+        let atomic = Chunk {
+            index: 1,
+            text: String::new(),
+            image: Some(ImagePayload {
+                bytes: bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\n"),
+                mime: "image/png".to_string(),
+            }),
+        };
+        assert_eq!(text_window.modality(), Modality::Text);
+        assert_eq!(atomic.modality(), Modality::Image);
+        // the Display form is what chunk keys and metadata carry
+        assert_eq!(atomic.modality().to_string(), "image");
+    }
+
+    #[test]
+    fn query_image_variant_and_describe() {
+        assert_eq!(
+            Query::Text("q".into()).describe(),
+            "a text query",
+            "describe never leaks the text"
+        );
+        let q = Query::Image(vec![0x89, 0x50], "image/png".to_string());
+        assert_eq!(q.describe(), "an image query (mime image/png)");
+        // structural equality carries bytes + mime (the dispatch payload)
+        assert_eq!(q, Query::Image(vec![0x89, 0x50], "image/png".into()));
+        assert_ne!(q, Query::Image(vec![0x89, 0x50], "image/jpeg".into()));
+    }
+
+    #[test]
+    fn image_payload_validate_sniffs_magic_and_mime() {
+        // PNG magic + canonical png mime: passes
+        ImagePayload {
+            bytes: bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\nrest-not-decoded"),
+            mime: "image/png".to_string(),
+        }
+        .validate()
+        .expect("png magic + png mime");
+        // JPEG magic (FF D8 FF) + canonical jpeg mime: passes
+        ImagePayload {
+            bytes: bytes::Bytes::from_static(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            mime: "image/jpeg".to_string(),
+        }
+        .validate()
+        .expect("jpeg magic + jpeg mime");
+        // no image magic at all: loud, says "no known image-container magic"
+        let e = ImagePayload {
+            bytes: bytes::Bytes::from_static(b"not an image at all"),
+            mime: "image/png".to_string(),
+        }
+        .validate()
+        .unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("no known image-container magic"), "{msg}");
+        assert!(msg.starts_with("chunk failed"), "{msg}");
+        // magic present but the DECLARED mime disagrees (or is a
+        // non-canonical alias): loud, names both values
+        for wrong in ["image/jpeg", "image/jpg", "application/octet-stream"] {
+            let e = ImagePayload {
+                bytes: bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\n"),
+                mime: wrong.to_string(),
+            }
+            .validate()
+            .unwrap_err();
+            let msg = e.to_string();
+            assert!(msg.contains("sniff as image/png"), "{msg}");
+            assert!(msg.contains(wrong), "{msg}");
+        }
     }
 }

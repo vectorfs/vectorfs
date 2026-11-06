@@ -561,7 +561,10 @@ fn normalize(v: &[f32]) -> Vec<f32> {
 #[async_trait::async_trait]
 impl Embedder for OrtEmbedder {
     async fn embed_query(&self, q: &Query) -> Result<Vec<f32>, PipelineError> {
-        let Query::Text(t) = q;
+        let Query::Text(t) = q else {
+            // text-only kind (query_modalities = [text]); M3-T1 seam
+            return Err(super::query_modality_refusal(q));
+        };
         // no query prefix for the gte family (verified; module docs)
         self.embed_texts(vec![t.clone()])
             .await
@@ -571,6 +574,9 @@ impl Embedder for OrtEmbedder {
     async fn embed_documents(&self, chunks: &[Chunk]) -> Result<Vec<Vec<f32>>, PipelineError> {
         if chunks.is_empty() {
             return Ok(Vec::new());
+        }
+        if let Some(c) = chunks.iter().find(|c| c.image.is_some()) {
+            return Err(super::image_chunk_refusal(c));
         }
         let texts = chunks.iter().map(|c| c.text.clone()).collect();
         self.embed_texts(texts).await
@@ -682,10 +688,12 @@ pub(crate) mod tests {
             Chunk {
                 index: 0,
                 text: "first chunk".into(),
+                image: None,
             },
             Chunk {
                 index: 1,
                 text: "第二个块".into(),
+                image: None,
             },
         ];
         let docs = e.embed_documents(&chunks).await.unwrap();
@@ -890,10 +898,12 @@ pub(crate) mod tests {
                 Chunk {
                     index: 0,
                     text: "The giant panda is a bear species endemic to China.".into(),
+                    image: None,
                 },
                 Chunk {
                     index: 1,
                     text: "大熊猫是中国特有的熊科动物。".into(),
+                    image: None,
                 },
             ])
             .await

@@ -33,9 +33,38 @@ pub mod http;
 pub mod openai;
 pub mod ort;
 
-use super::{Modality, PipelineError};
+use super::{Chunk, Modality, PipelineError, Query};
 use openai::{OpenAiConfig, OpenAiEmbedder};
 use ort::{OrtConfig, OrtEmbedder};
+
+/// The loud refusal every text-only kind returns from `embed_query` for a
+/// non-text query (M3-T1): the query-side twin of the ingest worker's
+/// doc-modality gate. Called from the `else` arms of the kinds' `Text`
+/// matches — the message must say THIS embedder does not take image
+/// queries, because silently embedding nothing (or the empty text channel)
+/// would corrupt the search fan-out.
+pub(crate) fn query_modality_refusal(q: &Query) -> PipelineError {
+    PipelineError::embed(format!(
+        "this embedder does not accept {} — its query side is text-only; an image query needs \
+         an image-capable embedder kind (planned: siglip2, M3-T2)",
+        q.describe()
+    ))
+}
+
+/// The loud refusal a text-only kind returns from `embed_documents` when an
+/// image chunk reaches it (M3-T1 defensive seam, the token-window
+/// defensive-skip discipline): the ingest router fans image chunks to
+/// doc-modality-matching embedders only, so an image chunk here is a
+/// routing bug — and embedding its empty text channel would silently
+/// produce garbage vectors, which is worse than failing.
+pub(crate) fn image_chunk_refusal(chunk: &Chunk) -> PipelineError {
+    PipelineError::embed(format!(
+        "chunk {} is an image chunk but this embedder embeds text documents only — the ingest \
+         router must fan image chunks to an image-capable embedder; an image chunk reaching a \
+         text-only kind is a routing bug, and embedding its empty text silently would be worse",
+        chunk.index
+    ))
+}
 
 /// The available-kind list embedded in unknown-kind errors.
 pub const EMBEDDER_KINDS: &str = "ort, openai";

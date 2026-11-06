@@ -124,6 +124,32 @@ pub enum ExtractorKind {
     /// tests inject the variant into a loaded plan directly).
     #[cfg(test)]
     TestContainer(TestContainerSpec),
+    /// Scripted IMAGE kind for the M3-T1 modality-mechanism tests (the
+    /// real image/pdf-pages extractor kinds are T2/T3). Same discipline as
+    /// [`Self::TestContainer`]: cfg(test) only, no `from_config` arm, tests
+    /// inject the variant into a loaded plan.
+    #[cfg(test)]
+    TestImage(TestImageSpec),
+}
+
+/// The cfg(test) spec of the scripted image kind: one image Part over the
+/// input bytes, declared as `mime` (the M3-T1 worker e2e fixture — it
+/// proves image extractions carry content, atom into chunks, and hit the
+/// doc-modality gate, without any real image kind existing yet).
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestImageSpec {
+    /// The mime the extracted Part declares (must be the bytes' canonical
+    /// container mime or the chunker bypass's sniff guard refuses it).
+    pub mime: String,
+}
+
+#[cfg(test)]
+impl TestImageSpec {
+    /// One image Part carrying the WHOLE input as the payload.
+    fn extract(&self, bytes: &[u8]) -> Result<Vec<Part>, PipelineError> {
+        Ok(vec![Part::image(self.mime.clone(), bytes.to_vec())])
+    }
 }
 
 /// The programmable proof kind for the container-unpacking mechanism
@@ -248,6 +274,10 @@ impl ExtractorKind {
             // text (txt/md chains)
             #[cfg(test)]
             ExtractorKind::TestContainer(_) => &[Modality::Text],
+            // the cfg(test) image kind emits exactly what M3's real image
+            // kinds will (the declaration the M3-T1 worker tests rely on)
+            #[cfg(test)]
+            ExtractorKind::TestImage(_) => &[Modality::Image],
         }
     }
 
@@ -264,6 +294,8 @@ impl ExtractorKind {
             ExtractorKind::PdfInspector(_) => "pdf-inspector",
             #[cfg(test)]
             ExtractorKind::TestContainer(_) => "test-container",
+            #[cfg(test)]
+            ExtractorKind::TestImage(_) => "test-image",
         }
     }
 
@@ -284,6 +316,8 @@ impl ExtractorKind {
             }
             #[cfg(test)]
             ExtractorKind::TestContainer(_) => "test-container".to_string(),
+            #[cfg(test)]
+            ExtractorKind::TestImage(_) => "test-image".to_string(),
         }
     }
 }
@@ -314,6 +348,9 @@ impl Extractor for ExtractorKind {
                 "test-container is a container kind: it unpacks, never extracts — the worker \
                  re-routes its children; extract() here is a routing bug",
             )),
+            // the scripted image kind: one atomic image Part over the bytes
+            #[cfg(test)]
+            ExtractorKind::TestImage(spec) => spec.extract(bytes),
         }
     }
 
@@ -336,6 +373,8 @@ impl Extractor for ExtractorKind {
             // config order around it, exactly like any undeclared leaf.
             #[cfg(test)]
             ExtractorKind::TestContainer(_) => Fit::Capable,
+            #[cfg(test)]
+            ExtractorKind::TestImage(_) => Fit::Capable,
         }
     }
 
@@ -354,6 +393,9 @@ impl Extractor for ExtractorKind {
             | ExtractorKind::PdfInspector(_) => Ok(None),
             #[cfg(test)]
             ExtractorKind::TestContainer(spec) => spec.unpack(_bytes, _mime),
+            // the scripted image kind is a leaf
+            #[cfg(test)]
+            ExtractorKind::TestImage(_) => Ok(None),
         }
     }
 }
@@ -375,6 +417,12 @@ impl ExtractorKind {
             ExtractorKind::TestContainer(_) => {
                 "a scripted test container (no affinity declaration)".to_string()
             }
+            // same unreachability (the scripted image kind is Capable
+            // everywhere)
+            #[cfg(test)]
+            ExtractorKind::TestImage(_) => {
+                "a scripted image kind (no affinity declaration)".to_string()
+            }
         }
     }
 }
@@ -389,11 +437,13 @@ impl serde::Serialize for ExtractorKind {
             ExtractorKind::PdfText(c) => c.serialize(serializer),
             ExtractorKind::Md(c) => c.serialize(serializer),
             ExtractorKind::PdfInspector(c) => c.serialize(serializer),
-            // fingerprints serialize CONFIG-loaded kinds only; the test kind
-            // never enters a PipelineConfig (from_config has no arm), so this
-            // arm exists purely to keep the closed set exhaustive.
+            // fingerprints serialize CONFIG-loaded kinds only; the test kinds
+            // never enter a PipelineConfig (from_config has no arm), so these
+            // arms exist purely to keep the closed set exhaustive.
             #[cfg(test)]
             ExtractorKind::TestContainer(_) => serializer.serialize_str("test-container"),
+            #[cfg(test)]
+            ExtractorKind::TestImage(_) => serializer.serialize_str("test-image"),
         }
     }
 }
