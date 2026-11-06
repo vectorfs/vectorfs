@@ -2154,10 +2154,13 @@ impl IngestRuntime {
                 m.status_reason = None;
                 m.engines = engines_now;
                 m.pipeline_fingerprint = self.shared.core.buckets[&job.vb].fingerprint.clone();
+                // ALL modalities, not just text (M3: image-only sources
+                // would otherwise log chunks=0 next to a real image chunk —
+                // their per-modality map carries text=0 by construction)
                 let count = m
                     .chunks
                     .as_ref()
-                    .and_then(|c| c.get("text").copied())
+                    .map(|c| c.values().sum::<u32>())
                     .unwrap_or(0);
                 match via {
                     // routing engaged: name the member that won and the

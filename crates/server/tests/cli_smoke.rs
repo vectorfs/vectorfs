@@ -996,6 +996,19 @@ fn cli_image_search_smoke() {
         );
     }
 
+    // daemon stderr's progress line counts ALL modalities (M3-T5 fix): an
+    // image-only source logs chunks=1 — the pre-multimodal "text entry only"
+    // read underreported them as chunks=0
+    {
+        let log = std::fs::read_to_string(&daemon.log).unwrap_or_default();
+        for key in ["docs/red.png", "docs/blue.png"] {
+            assert!(
+                log.contains(&format!("ingest: {key} -> INDEXED (chunks=1)")),
+                "progress line must count image chunks for {key}:\n{log}"
+            );
+        }
+    }
+
     // ---- 以图搜图: querying with red's own file hits red first (same
     // bytes -> same preprocessing -> distance ~0), 回源 in the table ----
     let o = vf(

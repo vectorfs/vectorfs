@@ -675,7 +675,14 @@ async fn put_cmd(args: PutArgs) {
         }
         match terminal {
             Some((status, v)) => {
-                let chunks = v["chunks"][0]["count"].as_u64().unwrap_or(0);
+                // sum EVERY modality's range (appendix E.2 chunks[{index,
+                // count}]) — chunks[0] alone reads whichever modality sorts
+                // first (BTreeMap order), undercounting mixed-modality
+                // sources and reading "text=0" for image-only ones
+                let chunks = v["chunks"]
+                    .as_array()
+                    .map(|cs| cs.iter().filter_map(|c| c["count"].as_u64()).sum::<u64>())
+                    .unwrap_or(0);
                 let reason = v["statusReason"].as_str().unwrap_or("");
                 eprintln!(
                     "vf: {} -> {} ({}, {:.1}s)",
@@ -952,7 +959,12 @@ async fn list_sources(
     );
     println!("{header}");
     for s in &rows {
-        let chunks = s["chunks"][0]["count"].as_u64().unwrap_or(0);
+        // same total-chunks semantics as put's terminal line (sum over the
+        // per-modality ranges, not whichever modality sorts first)
+        let chunks = s["chunks"]
+            .as_array()
+            .map(|cs| cs.iter().filter_map(|c| c["count"].as_u64()).sum::<u64>())
+            .unwrap_or(0);
         println!(
             "{:<40} {:<20} {:<8} {:<10} {}",
             truncate(s["key"].as_str().unwrap_or(""), 40),
