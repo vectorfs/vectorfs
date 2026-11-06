@@ -272,6 +272,11 @@ pub(crate) struct BucketPlan {
     retries: u32,
     extract_timeout: Duration,
     store_chunk_text: bool,
+    /// The normalize charset entry's fallback (M3-T7), resolved ONCE at
+    /// load from the config's canonical name (config.rs validated the
+    /// label at parse) and threaded to BOTH normalize call sites — the
+    /// document level and every container child.
+    charset_fallback: &'static encoding_rs::Encoding,
     scan_interval_secs: u64,
 }
 
@@ -425,11 +430,17 @@ fn short_key_of(object_key: &str) -> Option<&'static str> {
 /// M3-T6 text-face families (`docx`, `html`) stay OUT for the behavior-
 /// expansion half of the same ruling: an auto arm would make existing `auto`
 /// deployments START claiming .docx/.html files overnight — text modality
-/// or not, what a pipeline ingests is the operator's declaration.
+/// or not, what a pipeline ingests is the operator's declaration. The
+/// M3-T7 CONTAINER families (`epub`, `zip`, `eml`) stay OUT for BOTH
+/// halves at once: an auto arm would make every `auto` deployment start
+/// claiming AND EXPANDING archives overnight — containers re-route
+/// children through the user's chains, so silently adding them is a
+/// behavior expansion with a fan-out the operator never declared.
 /// Deployments that want the classify-first, no-.so engine, the page-image
-/// route, image files or the text face opt in explicitly (`extract = { pdf =
-/// "inspector-instance" }`, `pdf = "pages-instance"`, `img =
-/// "image-instance"`, `docx = "…"/`html = "…"`).
+/// route, image files, the text face or the containers opt in explicitly
+/// (`extract = { pdf = "pdf-inspector-instance" }`, `pdf =
+/// "pages-instance"`, `img = "image-instance"`, `docx = "…"/`html = "…"`,
+/// `epub = "…"/`zip = "…"/`eml = "…"`).
 /// M2.1 keeps `auto` a single-member chain: whether it should become a
 /// built-in chain (pdf → pdf-inspector → pdf-text, say) is an M3 ruling,
 /// taken when `pdf-ocr` actually exists to chain onto.
@@ -799,6 +810,18 @@ fn log_normalize(display: &str, outcome: &NormalizeOutcome) {
     }
 }
 
+/// The per-segment container-walk context (M3-T7 factored it out of the
+/// `run_member`/`walk_child` signatures — both need the same three pieces,
+/// and bundling them keeps the two functions at honest argument counts):
+/// the user's child-routing SNAPSHOT (owned: the spawn_blocking segment
+/// cannot borrow the plan), the per-child size gate, and the normalize
+/// charset fallback both normalize call sites share.
+struct WalkCtx {
+    routes: ChildRoutes,
+    max_child_bytes: u64,
+    charset_fallback: &'static encoding_rs::Encoding,
+}
+
 /// Run ONE chain member over ONE document or child (M2.1 step 3): a LEAF
 /// extracts (the pre-container path, byte-for-byte); a CONTAINER unpacks and
 /// re-routes every child through the USER-CONFIGURED chains
@@ -812,8 +835,7 @@ fn log_normalize(display: &str, outcome: &NormalizeOutcome) {
 /// falls to the next member, and the eventual document FAILED carries the
 /// child-level reasons in its aggregate.
 fn run_member(
-    routes: &ChildRoutes,
-    max_child_bytes: u64,
+    ctx: &WalkCtx,
     display: &str,
     name: &str,
     kind: &ExtractorKind,
@@ -821,6 +843,8 @@ fn run_member(
     mime: &str,
     depth: u32,
 ) -> Result<Vec<Part>, PipelineError> {
+    let (routes, max_child_bytes, charset_fallback) =
+        (&ctx.routes, ctx.max_child_bytes, ctx.charset_fallback);
     let children = match kind.unpack(bytes, mime) {
         // leaf: plain extract, exactly the pre-container member behavior
         Ok(None) => return Extractor::extract(kind, bytes, mime),
@@ -876,7 +900,12 @@ fn run_member(
         // a REASON on the container's aggregate, not a park (only the
         // document's own normalize parks) — the container keeps walking
         // its remaining children.
-        let outcome = match normalize(child.bytes.clone(), &child.mime, &child.name) {
+        let outcome = match normalize(
+            child.bytes.clone(),
+            &child.mime,
+            &child.name,
+            charset_fallback,
+        ) {
             Ok(o) => o,
             Err(e) => {
                 skipped.push(format!(
@@ -906,8 +935,7 @@ fn run_member(
                 child.name, outcome.mime
             )),
             Some(chain) => match walk_child(
-                routes,
-                max_child_bytes,
+                ctx,
                 &child_display,
                 &outcome.bytes,
                 &outcome.mime,
@@ -939,8 +967,7 @@ fn run_member(
 /// REASONS, not parks (the container keeps going; only the DOCUMENT-level
 /// all-refuse parks, and only the document's own chain can produce it).
 fn walk_child(
-    routes: &ChildRoutes,
-    max_child_bytes: u64,
+    ctx: &WalkCtx,
     display: &str,
     bytes: &[u8],
     mime: &str,
@@ -963,16 +990,7 @@ fn walk_child(
         let (name, kind) = &chain[i];
         (
             name.clone(),
-            run_member(
-                routes,
-                max_child_bytes,
-                display,
-                name,
-                kind,
-                bytes,
-                mime,
-                depth,
-            ),
+            run_member(ctx, display, name, kind, bytes, mime, depth),
         )
     });
     match pick_from_chain(short_key, members) {
@@ -1051,6 +1069,10 @@ impl IngestCore {
                     retries: icfg.retries,
                     extract_timeout: Duration::from_secs(icfg.extract_timeout_secs),
                     store_chunk_text: icfg.store_chunk_text,
+                    charset_fallback: encoding_rs::Encoding::for_label(
+                        icfg.charset_fallback.as_bytes(),
+                    )
+                    .expect("config parse canonicalized the label"),
                     scan_interval_secs: icfg.scan_interval_secs as u64,
                 },
             );
@@ -1824,8 +1846,11 @@ impl IngestRuntime {
                 // container member re-enter THIS bucket's extract table —
                 // snapshotted here (plus the per-child size guard) because
                 // the blocking segment cannot borrow the plan
-                let routes = plan.child_routes();
-                let max_child_bytes = plan.max_file_size_bytes;
+                let ctx = WalkCtx {
+                    routes: plan.child_routes(),
+                    max_child_bytes: plan.max_file_size_bytes,
+                    charset_fallback: plan.charset_fallback,
+                };
                 let display = job.object_key.clone();
                 let permit = self
                     .shared
@@ -1875,16 +1900,17 @@ impl IngestRuntime {
                     //   inside it), so this map stays the single place a
                     //   member's outcome is produced — laziness and the
                     //   yield vocabulary carry over unchanged.
-                    let outcome = normalize(bytes, &mime, &display).map_err(|e| {
-                        AttemptErr::Parked(format!("normalize: {}", inner_message(&e)))
-                    })?;
-                    if outcome.bytes.len() as u64 > max_child_bytes {
+                    let outcome =
+                        normalize(bytes, &mime, &display, ctx.charset_fallback).map_err(|e| {
+                            AttemptErr::Parked(format!("normalize: {}", inner_message(&e)))
+                        })?;
+                    if outcome.bytes.len() as u64 > ctx.max_child_bytes {
                         return Err(AttemptErr::Parked(format!(
                             "normalize expanded the content to {} bytes, exceeding the \
                              configured max_file_size_mb ({} MiB) — the expanded size is what \
                              the pipeline would have to carry",
                             outcome.bytes.len(),
-                            max_child_bytes / 1024 / 1024
+                            ctx.max_child_bytes / 1024 / 1024
                         )));
                     }
                     log_normalize(&display, &outcome);
@@ -1911,16 +1937,7 @@ impl IngestRuntime {
                         let (name, kind) = &chain[i];
                         (
                             name.clone(),
-                            run_member(
-                                &routes,
-                                max_child_bytes,
-                                &display,
-                                name,
-                                kind,
-                                &bytes,
-                                &mime,
-                                0,
-                            ),
+                            run_member(&ctx, &display, name, kind, &bytes, &mime, 0),
                         )
                     });
                     pick_from_chain(&short_key, members)
@@ -3306,28 +3323,40 @@ pub(crate) mod tests {
         handle.shutdown(SHUTDOWN_BUDGET).await;
     }
 
+    /// REPURPOSED by M3-T7 (the behavior change is the point): this file
+    /// (`\xff\xfe…` — invalid UTF-8, once a deterministic txt-chain failure
+    /// that parked the source) now rides the charset normalizer's BOM
+    /// identification (FF FE = UTF-16LE) and INDEXES as the UTF-8 it
+    /// transcodes into — the deterministic park/no-retry semantics this
+    /// test also covered remain pinned by
+    /// `corrupt_gz_document_parks_with_hint_name_reason` (normalize Err is
+    /// still a hard park).
     #[tokio::test]
-    async fn non_utf8_file_fails_with_reason_and_no_retry() {
+    async fn non_utf8_text_now_indexes_via_charset_normalize() {
         let dir = tempfile::tempdir().unwrap();
         let (rt, _h, state) = test_runtime(dir.path(), "retries = 0\n").await;
         let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
-        std::fs::write(docs.join("bad.txt"), b"\xff\xfe\xfa not utf8 \xff").unwrap();
+        // UTF-16LE BOM + real code units: the BOM mechanically names the
+        // encoding; decode is not a judgement call
+        let mut u16le = vec![0xff, 0xfe];
+        u16le.extend(
+            "not utf8 but utf16, transcode me"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        std::fs::write(docs.join("u16.txt"), u16le).unwrap();
 
         rt.scan_once().await;
         rt.drain_queue().await;
-        let m = status_of(&state, "docs", "docs/bad.txt").await;
-        assert_eq!(m.status, SourceStatus::Failed);
-        assert!(m.retries_exhausted);
-        let reason = m.status_reason.expect("reason");
-        assert!(reason.contains("UTF-8"), "{reason}");
-
-        // a later scan does NOT re-enqueue it (parked)
-        rt.scan_once().await;
-        rt.drain_queue().await;
-        let m2 = status_of(&state, "docs", "docs/bad.txt").await;
-        assert_eq!(m2.status, SourceStatus::Failed);
-        assert_eq!(m2.updated_at, m.updated_at, "untouched by the rescan");
+        let m = status_of(&state, "docs", "docs/u16.txt").await;
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
+        let plan = &rt.shared.core.buckets["docs"];
+        let texts = chunk_texts(&state, "docs", &plan.derived["tiny"].index_name).await;
+        assert!(
+            texts.iter().any(|t| t.contains("not utf8 but utf16")),
+            "the BOM-transcoded UTF-8 reached the chunks: {texts:?}"
+        );
     }
 
     #[tokio::test]
@@ -4817,16 +4846,23 @@ pub(crate) mod tests {
     ///   claiming .docx/.html files it never touched — the same silent
     ///   behavior-expansion the image ruling refuses. Operators opt in
     ///   with `extract = { docx = "…", html = "…" }`.
+    /// * `epub`/`zip`/`eml` (M3-T7, the CONTAINER families): BOTH rulings
+    ///   at once — an auto arm would make every `auto` deployment start
+    ///   claiming AND EXPANDING archives overnight (containers fan children
+    ///   out through the user's chains — a behavior expansion with a
+    ///   fan-out the operator never declared). Operators opt in with
+    ///   `extract = { epub = "…", zip = "…", eml = "…" }`.
     ///
     /// (The cfg(test) `ctn` scaffold key is also exempt: it is scanner-side
     /// claiming only, never an `auto` family.)
     #[test]
     fn auto_mapping_serves_every_mime_family() {
         for (_mime, key) in crate::pipeline::extract::MIME_TO_SHORT_KEY {
-            if matches!(*key, "img" | "docx" | "html") {
+            if matches!(*key, "img" | "docx" | "html" | "epub" | "zip" | "eml") {
                 assert!(
                     builtin_extractor(key).is_none(),
-                    "{key} must stay OUT of auto (the pdf-pages/image ruling): an auto arm \
+                    "{key} must stay OUT of auto (the pdf-pages/image ruling, the docx/html \
+                     behavior-expansion ruling, the container fan-out ruling): an auto arm \
                      would silently expand what every default = \"auto\" deployment claims"
                 );
                 continue;
@@ -6046,6 +6082,312 @@ pub(crate) mod tests {
         }
     }
 
+    // ---- M3-T7: containers + charset, all through the real worker over
+    // committed fixtures (the T6 discipline: production kinds only, no
+    // cfg(test) scaffold anywhere in these paths) ----
+
+    /// Committed container-fixture directory (a REAL .epub with a scrambled
+    /// spine, a REAL multipart .eml with a base64 attachment, a REAL
+    /// GBK-encoded .txt — hermetic, no network, no Office).
+    fn container_fixture(name: &str) -> std::path::PathBuf {
+        for p in ["vf/tests/fixtures/containers", "tests/fixtures/containers"] {
+            let d = std::path::PathBuf::from(p);
+            if d.join(name).is_file() {
+                return d.join(name);
+            }
+        }
+        panic!("container fixture {name} not found under tests/fixtures/containers/");
+    }
+
+    /// The M3-T7 e2e config: the three container instances + the chains
+    /// their children re-enter (txt/md/html/docx), plus the tiny fixture
+    /// embedder; the extract entries line and extra ingest keys are
+    /// parameterized.
+    fn container_config(extract_entries: &str, extra: &str) -> PipelineConfig {
+        let text = format!(
+            "[extractor.plain]\nkind = \"txt\"\n\n\
+             [extractor.m]\nkind = \"md\"\n\n\
+             [extractor.web]\nkind = \"html\"\n\n\
+             [extractor.doc]\nkind = \"docx\"\n\n\
+             [extractor.book]\nkind = \"epub\"\n\n\
+             [extractor.arc]\nkind = \"zip\"\n\n\
+             [extractor.mail]\nkind = \"eml\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = true\n\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ {extract_entries} }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"tiny\"]\nscan_interval_secs = 1\n{extra}",
+            fixture_dir().display().to_string(),
+        );
+        crate::pipeline::config::load_pipeline_config(&text).unwrap()
+    }
+
+    /// THE M3-T7 e2e #1 (epub — the task's core): the committed book.epub
+    /// stores its chapters ch1,ch2,ch3 on disk but declares the spine
+    /// ch2,ch3,ch1. The container unpacks spine-ordered text/html children,
+    /// each re-enters the USER's html chain (T6 — the receiving end by
+    /// construction), and the stored chunk SEQUENCE follows the SPINE, not
+    /// the zip entry order. Non-spine resources (css/nav/cover) produce
+    /// zero children — no chunk carries their content.
+    #[tokio::test]
+    async fn epub_chapters_follow_spine_order_through_the_html_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::copy(container_fixture("book.epub"), docs.join("book.epub")).unwrap();
+
+        let cfg = container_config("epub = \"book\", html = \"web\"", "");
+        let (rt, _h, state) = runtime_for(dir.path(), &cfg).await;
+        rt.scan_once().await;
+        rt.drain_queue().await;
+
+        let m = status_of(&state, "docs", "docs/book.epub").await;
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
+        assert!(
+            m.chunks
+                .as_ref()
+                .unwrap()
+                .get("text")
+                .is_some_and(|n| *n >= 3),
+            "three chapters, each over one window: {m:?}"
+        );
+
+        // THE order assertion: first occurrence positions of each chapter's
+        // body marker in the stored chunk sequence == spine order
+        let plan = &rt.shared.core.buckets["docs"];
+        let texts = chunk_texts(&state, "docs", &plan.derived["tiny"].index_name).await;
+        let pos = |marker: &str| {
+            texts
+                .iter()
+                .position(|t| t.contains(marker))
+                .unwrap_or_else(|| panic!("{marker} missing: {texts:?}"))
+        };
+        let (p1, p2, p3) = (pos("初始的内容"), pos("发展的事件"), pos("结束的旅程"));
+        assert!(
+            p2 < p3 && p3 < p1,
+            "chunk sequence follows the SPINE (ch2,ch3,ch1), not zip entry order: \
+             p1={p1} p2={p2} p3={p3}"
+        );
+        // the html CHAIN digested every chapter (its noise contract holds:
+        // titles live in <head><title> and never reach chunks; css/nav —
+        // XHTML-or-not resources OFF the spine — produce zero children)
+        for t in &texts {
+            assert!(!t.contains("STYLE-RESOURCE"), "css leaked: {t:?}");
+            assert!(
+                !t.contains("导航目录不应被索引"),
+                "the non-spine nav document leaked (XHTML, but NOT on the spine): {t:?}"
+            );
+        }
+    }
+
+    /// THE M3-T7 e2e #2 (zip): a mixed archive's entries each re-enter
+    /// THEIR own chain (txt/md/docx), contents do not cross-contaminate,
+    /// and the md discrimination proves the routing (the md kind strips
+    /// the heading marker a txt passthrough would keep).
+    #[tokio::test]
+    async fn mixed_zip_entries_route_their_own_chains() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        // built in-test with the same zip crate the kind reads (the archive
+        // here is the test's own input, not a format sample to preserve)
+        let docx = crate::pipeline::extract::docx::tests::minimal_docx(&[
+            "向量化管线测试文档：压缩包内的 Word 章节。",
+        ]);
+        let zip = crate::pipeline::extract::zip::tests::build_zip(&[
+            ("a.txt", b"the txt entry body, plain words here".as_slice()),
+            (
+                "b.md",
+                b"# Heading Mark\n\nthe md entry body follows".as_slice(),
+            ),
+            ("c.docx", docx.as_slice()),
+        ]);
+        std::fs::write(docs.join("bundle.zip"), zip).unwrap();
+
+        let cfg = container_config(
+            "zip = \"arc\", txt = \"plain\", md = \"m\", docx = \"doc\"",
+            "",
+        );
+        let (rt, _h, state) = runtime_for(dir.path(), &cfg).await;
+        rt.scan_once().await;
+        rt.drain_queue().await;
+
+        let m = status_of(&state, "docs", "docs/bundle.zip").await;
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
+        let plan = &rt.shared.core.buckets["docs"];
+        let texts = chunk_texts(&state, "docs", &plan.derived["tiny"].index_name).await;
+        // every entry's content arrived through its OWN chain
+        assert!(
+            texts.iter().any(|t| t.contains("txt entry body")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("md entry body")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("向量化管线测试文档")),
+            "the docx entry went through the docx chain: {texts:?}"
+        );
+        // routing proof: the md kind stripped the heading MARKER (the
+        // heading TEXT is content and stays; a txt passthrough over the
+        // same entry would have kept the literal '#')
+        assert!(
+            !texts.iter().any(|t| t.contains("# ")),
+            "the md kind processed the md entry: {texts:?}"
+        );
+    }
+
+    /// THE M3-T7 e2e #3 (zip-in-zip, the REAL-kind shape over the mechanism
+    /// depth gate — the gate itself is mechanism-tested in
+    /// `container_nested_two_levels_ok_third_refused`; this pins that real
+    /// zip children route by mime back into the zip chain): one nested
+    /// layer indexes; a third layer refuses with the depth reason.
+    #[tokio::test]
+    async fn zip_in_zip_one_layer_indexes_third_layer_refused() {
+        // ---- two levels: bundle.zip -> inner.zip -> a.txt ----
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        let inner = crate::pipeline::extract::zip::tests::build_zip(&[(
+            "a.txt",
+            b"deep leaf text body".as_slice(),
+        )]);
+        let outer =
+            crate::pipeline::extract::zip::tests::build_zip(&[("inner.zip", inner.as_slice())]);
+        std::fs::write(docs.join("bundle.zip"), outer).unwrap();
+
+        let cfg = container_config("zip = \"arc\", txt = \"plain\"", "");
+        let (rt, _h, state) = runtime_for(dir.path(), &cfg).await;
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let m = status_of(&state, "docs", "docs/bundle.zip").await;
+        assert_eq!(m.status, SourceStatus::Indexed, "two layers are allowed");
+        let plan = &rt.shared.core.buckets["docs"];
+        let texts = chunk_texts(&state, "docs", &plan.derived["tiny"].index_name).await;
+        assert!(
+            texts.iter().any(|t| t.contains("deep leaf text body")),
+            "{texts:?}"
+        );
+
+        // ---- three layers: the third container refuses with the depth reason
+        let dir3 = tempfile::tempdir().unwrap();
+        let docs3 = dir3.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs3).unwrap();
+        let leaf = crate::pipeline::extract::zip::tests::build_zip(&[(
+            "a.txt",
+            b"never reached".as_slice(),
+        )]);
+        let mid =
+            crate::pipeline::extract::zip::tests::build_zip(&[("inner.zip", leaf.as_slice())]);
+        let outermost =
+            crate::pipeline::extract::zip::tests::build_zip(&[("mid.zip", mid.as_slice())]);
+        std::fs::write(docs3.join("bomb.zip"), outermost).unwrap();
+
+        let cfg3 = container_config("zip = \"arc\", txt = \"plain\"", "retries = 0\n");
+        let (rt3, _h3, state3) = runtime_for(dir3.path(), &cfg3).await;
+        rt3.scan_once().await;
+        rt3.drain_queue().await;
+        let m3 = status_of(&state3, "docs", "docs/bomb.zip").await;
+        assert_eq!(m3.status, SourceStatus::Failed, "{m3:?}");
+        let reason = m3.status_reason.expect("reason");
+        assert!(
+            reason.contains("nesting depth 3"),
+            "the third layer refusal names its depth: {reason}"
+        );
+    }
+
+    /// THE M3-T7 e2e #4 (eml): the committed multipart message's body parts
+    /// re-enter their own chains (text/plain -> txt, text/html -> html),
+    /// the base64 attachment decodes through the txt chain, and the html
+    /// chain's noise contract holds end to end (title/style never indexed).
+    #[tokio::test]
+    async fn eml_parts_split_across_the_txt_and_html_chains() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::copy(container_fixture("message.eml"), docs.join("message.eml")).unwrap();
+
+        let cfg = container_config("eml = \"mail\", txt = \"plain\", html = \"web\"", "");
+        let (rt, _h, state) = runtime_for(dir.path(), &cfg).await;
+        rt.scan_once().await;
+        rt.drain_queue().await;
+
+        let m = status_of(&state, "docs", "docs/message.eml").await;
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
+        let plan = &rt.shared.core.buckets["docs"];
+        let texts = chunk_texts(&state, "docs", &plan.derived["tiny"].index_name).await;
+        // the plain body through the txt chain
+        assert!(
+            texts.iter().any(|t| t.contains("纯文本正文：会议改到周四")),
+            "{texts:?}"
+        );
+        // the html body through the html chain — its noise contract proves
+        // the CHAIN (not a passthrough) processed it
+        assert!(
+            texts.iter().any(|t| t.contains("HTML 正文：会议改到周四")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("会议通知")),
+            "the h1 survived: {texts:?}"
+        );
+        for t in &texts {
+            assert!(!t.contains("忽略标题"), "html head title leaked: {t:?}");
+            assert!(!t.contains("color: red"), "style body leaked: {t:?}");
+            assert!(!t.contains("<p>"), "tags leaked: {t:?}");
+        }
+        // the base64 attachment decoded and indexed through the txt chain
+        assert!(
+            texts.iter().any(|t| t.contains("请带笔记本电脑")),
+            "the base64 attachment body: {texts:?}"
+        );
+    }
+
+    /// THE M3-T7 e2e #5 (charset): the committed GBK-encoded .txt is
+    /// claimed as the text/plain source it is, the normalize table's
+    /// charset entry recodes it BEFORE routing (strict-UTF-8 check fails ⇒
+    /// configured fallback decodes), the txt chain extracts, and the stored
+    /// chunk text is the CORRECT UTF-8 Chinese — not mojibake, not
+    /// replacement characters.
+    #[tokio::test]
+    async fn gbk_txt_normalizes_to_utf8_and_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::copy(container_fixture("gbk.txt"), docs.join("legacy.txt")).unwrap();
+        // sanity: the fixture is genuinely GBK, not valid UTF-8
+        let raw = std::fs::read(docs.join("legacy.txt")).unwrap();
+        assert!(String::from_utf8(raw).is_err(), "fixture must be non-UTF-8");
+
+        let cfg = container_config("txt = \"plain\"", "");
+        let (rt, _h, state) = runtime_for(dir.path(), &cfg).await;
+        rt.scan_once().await;
+        rt.drain_queue().await;
+
+        let m = status_of(&state, "docs", "docs/legacy.txt").await;
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
+        let plan = &rt.shared.core.buckets["docs"];
+        let texts = chunk_texts(&state, "docs", &plan.derived["tiny"].index_name).await;
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("这是一份用 GBK 编码的中文文本")),
+            "the GBK recoding is CORRECT UTF-8: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("文件进来，语义检索出去")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("the quick brown fox")),
+            "the ASCII line survived verbatim: {texts:?}"
+        );
+        assert!(
+            texts.iter().all(|t| !t.contains('\u{fffd}')),
+            "no replacement characters: {texts:?}"
+        );
+    }
+
     /// The child three-state vocabulary on the failure side: a child with NO
     /// chain for its mime is skipped with a reason; a child whose (single)
     /// chain exhausts contributes its verbatim reason; when NO child
@@ -6069,12 +6411,12 @@ pub(crate) mod tests {
                     vec![
                         // off-table mime, no default configured: 无承接
                         ChildDoc::new("pic/logo.png", "image/png", b"\x89PNG-ish".as_slice()),
-                        // invalid UTF-8 under a single-member txt chain: 耗尽
-                        ChildDoc::new(
-                            "bad/note.txt",
-                            "text/plain",
-                            b"\xff\xfe not utf8".as_slice(),
-                        ),
+                        // EMPTY child under a single-member txt chain: 耗尽
+                        // (the empty-input refusal — the invalid-UTF-8 trigger
+                        // this test used before M3-T7 is now rescued by the
+                        // charset normalizer instead of exhausting the chain,
+                        // see non_utf8_text_now_indexes_via_charset_normalize)
+                        ChildDoc::new("bad/note.txt", "text/plain", b"".as_slice()),
                     ],
                 )),
             );
@@ -6091,7 +6433,7 @@ pub(crate) mod tests {
             reason.contains("no extractor chain for mime 'image/png'"),
             "{reason}"
         );
-        assert!(reason.contains("not valid UTF-8"), "{reason}");
+        assert!(reason.contains("empty input"), "{reason}");
         // nothing was indexed
         let spec = &rt.shared.core.buckets["docs"].derived["tiny"];
         assert!(

@@ -1,0 +1,26 @@
+From: 测试发件人 <qa@example.org>
+To: dev@example.org
+Subject: =?utf-8?B?5a655Zmo6ZO+6aqM5pS26YKu5Lu2?=
+Date: Fri, 06 Nov 2026 10:00:00 +0800
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="OUTER"
+
+--OUTER
+Content-Type: multipart/alternative; boundary="INNER"
+
+--INNER
+Content-Type: text/plain; charset=utf-8
+
+纯文本正文：会议改到周四下午三点。请查阅附件。
+--INNER
+Content-Type: text/html; charset=utf-8
+
+<html><head><title>忽略标题</title><style>body { color: red }</style></head><body><h1>会议通知</h1><p>HTML 正文：会议改到周四下午三点。</p></body></html>
+--INNER--
+--OUTER
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="notes.txt"
+
+6ZmE5Lu25YaF5a6577ya6K+35bim56yU6K6w5pys55S16ISR5Y+C5Yqg5Lya6K6u44CC
+--OUTER--

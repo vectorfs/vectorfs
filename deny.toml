@@ -54,9 +54,14 @@ allow = [
     #     GPL-compatible, no copyleft — same class as MIT/BSD.
     "BSL-1.0",
     # CDLA-Permissive-2.0: webpki-root-certs (root CA bundle data via
-    #     rustls-platform-verifier / reqwest). A permissive DATA license for the
-    #     certificate bundle, not code copyleft; redistribution allowed.
+    # rustls-platform-verifier / reqwest). A permissive DATA license for the
+    # certificate bundle, not code copyleft; redistribution allowed.
     "CDLA-Permissive-2.0",
+    # 0BSD (BSD Zero Clause, M3-T7): mailparse 0.18 + quoted_printable 0.5
+    # (the eml container kind's parse chain). OSI-approved permissive —
+    # BSD-3-Clause with the attribution clause removed; same class as
+    # MIT/BSD-2, no copyleft, no restrictions beyond retaining the notice.
+    "0BSD",
 ]
 private = { ignore = true }
 

@@ -112,6 +112,19 @@ struct IngestRaw {
     /// turning it off drops the key from written metadata entirely).
     #[serde(default = "default_store_chunk_text")]
     store_chunk_text: bool,
+    /// Charset the normalize table's charset→UTF-8 entry recodes
+    /// invalid-UTF-8 text/* bytes FROM (M3-T7; any WHATWG label — `gbk`,
+    /// `windows-1252`, `shift_jis`, …). Canonicalized to the encoding's
+    /// WHATWG name at parse; an unknown label fails fast with the line.
+    /// DEFAULT `gbk` — the project's center of gravity is Chinese
+    /// deployments (the default text model was chosen 中文良好, README_ZH
+    /// is first-class), GBK is the dominant legacy charset of that corpus,
+    /// and the fallback is only ever consulted for INVALID-UTF-8 bytes
+    /// (pure-ASCII content — the only overlap of GBK and windows-1252 —
+    /// is valid UTF-8 and never reaches the knob). Western deployments
+    /// set `charset_fallback = "windows-1252"` in one line.
+    #[serde(default = "default_charset_fallback")]
+    charset_fallback: String,
 }
 
 fn default_scan_interval_secs() -> usize {
@@ -128,6 +141,9 @@ fn default_extract_timeout_secs() -> u64 {
 }
 fn default_store_chunk_text() -> bool {
     true
+}
+fn default_charset_fallback() -> String {
+    "gbk".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +403,13 @@ pub struct IngestConfig {
     pub extract_timeout_secs: u64,
     /// Write `x-vf-chunk-text` metadata (default true).
     pub store_chunk_text: bool,
+    /// The normalize charset entry's fallback, CANONICAL WHATWG name
+    /// (default `GBK`; the raw label was resolved + canonicalized at parse
+    /// — same encoding under different spellings fingerprints identically).
+    /// Unlike the other ingest knobs this one CHANGES CHUNK BYTES, so it
+    /// enters the pipeline fingerprint ([`pipeline_fingerprint`], elided
+    /// at its default so pre-T7 fingerprints stay byte-stable).
+    pub charset_fallback: String,
 }
 
 impl PipelineConfig {
@@ -695,6 +718,7 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
                 retries: rawi.retries,
                 extract_timeout_secs: rawi.extract_timeout_secs,
                 store_chunk_text: rawi.store_chunk_text,
+                charset_fallback: canonical_charset(&rawi.charset_fallback, &section, line)?,
             },
         );
     }
@@ -839,6 +863,34 @@ fn toml_line(text: &str, err: &toml::de::Error) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
+// charset fallback resolution (M3-T7)
+// ---------------------------------------------------------------------------
+
+/// Resolve a configured `charset_fallback` label to its CANONICAL WHATWG
+/// name (`gbk`/`GBK`/`gb2312` → `GBK` — the Standard's label list, so
+/// Windows-only names like `cp936` are honestly rejected), failing fast
+/// with the section line on an unknown/empty label (the dpi domain
+/// discipline: bad values die at the config line that carries them).
+/// Canonicalization is what makes the fingerprint spelling-insensitive:
+/// same encoding ⇒ same fingerprint.
+fn canonical_charset(
+    label: &str,
+    section: &str,
+    line: Option<usize>,
+) -> Result<String, PipelineError> {
+    match encoding_rs::Encoding::for_label(label.as_bytes()) {
+        Some(enc) => Ok(enc.name().to_string()),
+        None => Err(PipelineError::config(
+            format!(
+                "[{section}]: charset_fallback '{label}' is not a known charset label (any \
+                 WHATWG label works: gbk, gb18030, windows-1252, shift_jis, utf-8, …)"
+            ),
+            line,
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // fingerprint (§5.10.5; T3 consumes: completion markers record it, a change
 // fails startup and demands an explicit `vf reindex`)
 // ---------------------------------------------------------------------------
@@ -847,17 +899,31 @@ fn toml_line(text: &str, err: &toml::de::Error) -> Option<usize> {
 /// [`FINGERPRINT_HEX_LEN`] hex chars of `sha256(canonical TOML)` over the
 /// RELEVANT instance configuration — the referenced extractor instances,
 /// the extract ROUTING (M2.1: chain composition AND order; see below), the
-/// chunker, and the listed embedder instances, all name-keyed and
-/// BTreeMap-normalized so key order and formatting in the source file do
-/// not matter. Query-side (`merge`) and claim-only fields (`include`,
-/// `exclude`, `index-prefix` — v3.1 R5) are deliberately EXCLUDED: they
-/// never change chunk identity, so changing them must not invalidate
-/// completion markers.
+/// chunker, the listed embedder instances, and the charset fallback
+/// (M3-T7) — all name-keyed and BTreeMap-normalized so key order and
+/// formatting in the source file do not matter. Query-side (`merge`) and
+/// claim-only fields (`include`, `exclude`, `index-prefix` — v3.1 R5) are
+/// deliberately EXCLUDED: they never change chunk identity, so changing
+/// them must not invalidate completion markers. The same logic puts
+/// `max_file_size_mb`/`retries`/`scan_interval_secs`/`store_chunk_text`
+/// outside — they gate or observe, never transform. The charset fallback
+/// is the deliberate exception (normalize.rs module docs): it rewrites
+/// chunk BYTES, so it fingerprints — with `skip_serializing_if` at the
+/// default keeping every pre-T7 deployment's fingerprint byte-stable (the
+/// implicit default and the explicit `gbk` behave identically and must
+/// fingerprint identically).
 pub fn pipeline_fingerprint(
     ingest: &IngestConfig,
     extractors: &BTreeMap<String, ExtractorKind>,
     embedders: &BTreeMap<String, EmbedderKind>,
 ) -> String {
+    /// `true` at the canonical default ("GBK") — the fingerprint elides the
+    /// field there (see fn docs: identical behavior must fingerprint
+    /// identically).
+    fn is_default_charset(s: &str) -> bool {
+        s == "GBK"
+    }
+
     #[derive(serde::Serialize)]
     struct Fp<'a> {
         extractors: BTreeMap<&'a str, &'a ExtractorKind>,
@@ -870,6 +936,10 @@ pub fn pipeline_fingerprint(
         extract_routes: BTreeMap<&'a str, Vec<&'a str>>,
         chunk: &'a ChunkerKind,
         embedders: BTreeMap<&'a str, &'a EmbedderKind>,
+        /// The normalize charset fallback, canonical WHATWG name — only
+        /// serialized when it departs from the default (fn docs).
+        #[serde(skip_serializing_if = "is_default_charset")]
+        charset_fallback: &'a str,
     }
 
     let mut fp_extractors: BTreeMap<&str, &ExtractorKind> = BTreeMap::new();
@@ -897,6 +967,7 @@ pub fn pipeline_fingerprint(
         extract_routes: fp_routes,
         chunk: &ingest.chunk,
         embedders: fp_embedders,
+        charset_fallback: &ingest.charset_fallback,
     })
     .expect("canonical TOML serialization of plain pipeline configs");
 
@@ -1031,7 +1102,7 @@ index-prefix = "docs"
             msg.contains(
                 "[ingest.d]: unknown field 'chunkder' (allowed: include, exclude, extract, \
                  chunk, embedders, merge, index-prefix, scan_interval_secs, max_file_size_mb, \
-                 retries, extract_timeout_secs, store_chunk_text)"
+                 retries, extract_timeout_secs, store_chunk_text, charset_fallback)"
             ),
             "{msg}"
         );
@@ -1049,11 +1120,13 @@ index-prefix = "docs"
         assert_eq!(d.retries, 3);
         assert_eq!(d.extract_timeout_secs, 120);
         assert!(d.store_chunk_text);
+        assert_eq!(d.charset_fallback, "GBK", "the default canonicalizes");
         // explicit overrides parse
         let cfg = parse(
             "[ingest.docs]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
              scan_interval_secs = 5\nmax_file_size_mb = 1\nretries = 0\n\
-             extract_timeout_secs = 7\nstore_chunk_text = false\n",
+             extract_timeout_secs = 7\nstore_chunk_text = false\ncharset_fallback = \
+             \"windows-1252\"\n",
         )
         .unwrap();
         let d = &cfg.ingest["docs"];
@@ -1062,6 +1135,7 @@ index-prefix = "docs"
         assert_eq!(d.retries, 0);
         assert_eq!(d.extract_timeout_secs, 7);
         assert!(!d.store_chunk_text);
+        assert_eq!(d.charset_fallback, "windows-1252");
         // zero-valued periods are refused (busy-loop guard)
         for bad in [
             "scan_interval_secs = 0",
@@ -1077,6 +1151,65 @@ index-prefix = "docs"
                 "{err}"
             );
         }
+    }
+
+    // ---- charset_fallback (M3-T7) -------------------------------------------
+
+    const FP_CFG: &str = r#"
+[extractor.plain]
+kind = "txt"
+
+[ingest.docs]
+include = ["docs/**"]
+extract = { txt = "plain" }
+chunk = { kind = "token-window", size = 32, overlap = 8 }
+"#;
+
+    #[test]
+    fn charset_fallback_labels_canonicalize_and_unknown_fail_fast() {
+        // every WHATWG spelling of the same encoding canonicalizes to ONE
+        // name (gbk ≡ GBK ≡ gb2312 — cp936 is a Windows name the Encoding
+        // Standard does not carry, and is honestly rejected below's way)
+        for label in ["gbk", "GBK", "gb2312"] {
+            let cfg = parse(&format!("{FP_CFG}charset_fallback = \"{label}\"\n")).unwrap();
+            assert_eq!(cfg.ingest["docs"].charset_fallback, "GBK", "{label}");
+        }
+        let cfg = parse(&format!("{FP_CFG}charset_fallback = \"Shift_JIS\"\n")).unwrap();
+        assert_eq!(cfg.ingest["docs"].charset_fallback, "Shift_JIS");
+        // unknown / empty labels die at the config line (the dpi discipline)
+        for bad in ["not-a-charset", ""] {
+            let err = parse(&format!("{FP_CFG}charset_fallback = \"{bad}\"\n")).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("charset_fallback"), "{msg}");
+            assert!(msg.contains("not a known charset label"), "{msg}");
+            assert!(msg.contains("at line"), "{msg}");
+        }
+    }
+
+    /// THE fingerprint verification the task ruling demanded (「charset
+    /// fallback 参数自然入指纹——验证」): a non-default fallback CHANGES the
+    /// fingerprint (it changes chunk bytes), while the DEFAULT and every
+    /// spelling of the default elide — a pre-T7 config, an explicit
+    /// `charset_fallback = "gbk"`, and a `"cp936"` all fingerprint
+    /// IDENTICALLY (identical behavior must fingerprint identically).
+    #[test]
+    fn charset_fallback_fingerprints_when_set_elides_at_default() {
+        let base = parse(FP_CFG).unwrap();
+        let explicit_default = parse(&format!("{FP_CFG}charset_fallback = \"gbk\"\n")).unwrap();
+        let alt_spelling = parse(&format!("{FP_CFG}charset_fallback = \"gb2312\"\n")).unwrap();
+        let changed = parse(&format!("{FP_CFG}charset_fallback = \"windows-1252\"\n")).unwrap();
+        let fp = |c: &PipelineConfig| c.fingerprint("docs").unwrap();
+        assert_eq!(fp(&base), fp(&explicit_default), "the default elides");
+        assert_eq!(
+            fp(&base),
+            fp(&alt_spelling),
+            "spellings of one encoding elide"
+        );
+        assert_ne!(
+            fp(&base),
+            fp(&changed),
+            "a non-default fallback rewrites chunks — the fingerprint MUST move"
+        );
     }
 
     #[test]

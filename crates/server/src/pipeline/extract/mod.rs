@@ -12,12 +12,16 @@
 //! two-kinds-one-key precedent extended to a text/image pair), `image`
 //! (M3-T4, the image FILE kind: one verbatim image Part behind the new
 //! `img` short key — the first family key carried by TWO mime rows,
-//! jpeg + png), and `docx` + `html` (M3-T6, the text face: the Word
+//! jpeg + png), `docx` + `html` (M3-T6, the text face: the Word
 //! document kind behind its own `docx` key — a LEAF per the §0 criterion,
 //! see extract/docx.rs — and the HTML document kind behind `html`,
 //! html5ever under the hood per the selection note in extract/html.rs; the
 //! html chain is also T7's epub-chapter route by construction, zero
-//! special-casing either side).
+//! special-casing either side), and `epub` + `zip` + `eml` (M3-T7, the
+//! first PRODUCTION container kinds: `unpack` is their one product path,
+//! children re-enter user routing — epub's format intelligence is the OPF
+//! spine ordering, zip's is the extension→mime inference, eml's is the
+//! MIME-multipart walk; see each kind module for its ruling).
 //! Since M2.1 step 2 every kind also declares its per-[`ContentClass`]
 //! affinity (kind module `affinity`/`refusal_note` free functions, dispatched
 //! exhaustively below) — the ingest router consumes those declarations to
@@ -31,6 +35,8 @@
 //! drift apart (single source of truth, pub for the T3 ingest worker).
 
 pub mod docx;
+pub mod eml;
+pub mod epub;
 pub mod html;
 pub mod image;
 pub mod md;
@@ -38,9 +44,12 @@ pub mod pdf_inspector;
 pub mod pdf_pages;
 pub mod pdf_text;
 pub mod txt;
+pub mod zip;
 
 use super::{ChildDoc, ContentClass, Extractor, Fit, Modality, Part, PipelineError};
 use docx::{DocxConfig, DocxExtractor};
+use eml::{EmlConfig, EmlExtractor};
+use epub::{EpubConfig, EpubExtractor};
 use html::{HtmlConfig, HtmlExtractor};
 use image::{ImageConfig, ImageExtractor};
 use md::{MdConfig, MdExtractor};
@@ -48,6 +57,7 @@ use pdf_inspector::{PdfInspectorConfig, PdfInspectorExtractor};
 use pdf_pages::{PdfPagesConfig, PdfPagesExtractor};
 use pdf_text::{PdfTextConfig, PdfTextExtractor};
 use txt::{TxtConfig, TxtExtractor};
+use zip::{ZipConfig, ZipExtractor};
 
 /// Canonical mime -> config short key, one row per declared mime. ORDER
 /// MATTERS only for human eyes — EXCEPT that a family with SEVERAL mimes
@@ -56,12 +66,20 @@ use txt::{TxtConfig, TxtExtractor};
 /// what the reporting face (`GetSource`/`GetSourceData`) shows for the
 /// whole family (routing itself is per-object and extension-exact). The
 /// table is the single mapping both directions consult.
+///
+/// The M3-T7 rows (`epub`/`zip`/`eml`) are CONTAINER families: their kinds
+/// `unpack`, and `auto` deliberately does NOT claim them (the
+/// img/docx/html exemption ruling — an auto arm would make every
+/// `default = "auto"` deployment start expanding archives overnight).
 pub const MIME_TO_SHORT_KEY: &[(&str, &str)] = &[
     ("application/pdf", "pdf"),
     (
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "docx",
     ),
+    ("application/epub+zip", "epub"),
+    ("application/zip", "zip"),
+    ("message/rfc822", "eml"),
     ("image/jpeg", "img"),
     ("image/png", "img"),
     ("text/html", "html"),
@@ -73,7 +91,8 @@ pub const MIME_TO_SHORT_KEY: &[(&str, &str)] = &[
 /// [`KIND_LABELS`] (the parity test pins the two together — a new kind that
 /// updates the enum but forgets the string fails there, not in a user's
 /// error message).
-pub const EXTRACTOR_KINDS: &str = "txt, pdf-text, md, pdf-inspector, pdf-pages, image, docx, html";
+pub const EXTRACTOR_KINDS: &str =
+    "txt, pdf-text, md, pdf-inspector, pdf-pages, image, docx, html, epub, zip, eml";
 
 /// Every production kind's config label, IN AVAILABILITY-LIST ORDER. This is
 /// the registry's identity anchor: `kind_label` (the exhaustive match the
@@ -90,6 +109,9 @@ pub const KIND_LABELS: &[&str] = &[
     "image",
     "docx",
     "html",
+    "epub",
+    "zip",
+    "eml",
 ];
 
 /// mime (parameters like `; charset=utf-8` tolerated) -> short key.
@@ -141,11 +163,90 @@ pub const EXTENSION_ALIASES: &[(&str, &str)] = &[
     ("docx", "docx"),
     ("html", "html"),
     ("htm", "html"),
+    // the M3-T7 container families: one spelling each (an archive IS its
+    // extension's format — claiming is all the extension does; expansion
+    // policy is the kind's, see extract/{epub,zip,eml}.rs)
+    ("epub", "epub"),
+    ("zip", "zip"),
+    ("eml", "eml"),
     ("md", "md"),
     ("markdown", "md"),
     ("txt", "txt"),
     ("text", "txt"),
 ];
+
+// ---------------------------------------------------------------------------
+// shared container plumbing (M3-T7): the constants + capped read loop the
+// zip-based container kinds (epub/zip) share — the docx.rs discipline
+// (entry-count bomb BEFORE any read; decompression ceiling WHILE reading)
+// factored once for its second and third consumers.
+// ---------------------------------------------------------------------------
+
+/// Entry-count bomb guard for container kinds: checked against the zip's
+/// entry listing BEFORE any entry is read (the docx MAX_ZIP_ENTRIES form,
+/// which is itself the ingest worker's MAX_CHILDREN=256 form — same
+/// number, same discipline, kind-side because the listing is read here).
+pub(crate) const CONTAINER_MAX_ENTRIES: usize = 256;
+
+/// Per-entry decompression ceiling while READING (the docx MAX_XML_BYTES
+/// form: zip headers lie about sizes, so the cap bounds what a bomb can
+/// make the process materialize BEFORE the worker's per-child
+/// max_file_size_mb gate sees the child). 256 MiB is 2x the default cap's
+/// headroom — mechanism constant, not policy (the §5.10.8 spirit).
+pub(crate) const ENTRY_DECOMPRESSION_CEILING: u64 = 256 * 1024 * 1024;
+
+/// Read one open zip entry to end, refusing past `ceiling` OUTPUT bytes
+/// (the amplification gate at the expansion point, §5.10.3 ruling ③).
+/// `kind` is the registry label and `name` the entry path, for the loud
+/// error. Generic over [`std::io::Read`] (a `ZipFile` is one; the generic
+/// also keeps THIS module's local `pub mod zip` kind module from shadowing
+/// the crate path), chunk-fed so the cap is enforced DURING the read, not
+/// after it.
+pub(crate) fn read_entry_capped(
+    entry: &mut impl std::io::Read,
+    ceiling: u64,
+    kind: &str,
+    name: &str,
+) -> Result<Vec<u8>, PipelineError> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    let mut read: u64 = 0;
+    loop {
+        let n = entry.read(&mut chunk).map_err(|e| {
+            PipelineError::extract(format!(
+                "{kind}: reading '{name}' failed (corrupt deflate stream): {e}"
+            ))
+        })?;
+        if n == 0 {
+            return Ok(out);
+        }
+        read += n as u64;
+        if read > ceiling {
+            return Err(PipelineError::extract(format!(
+                "{kind}: '{name}' decompresses past {ceiling} bytes — a decompression bomb is \
+                 refused at the expansion point (§5.10.3); if this is a legitimate entry, it is \
+                 too large for one child"
+            )));
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// Display name -> canonical mime through the ONE extension table; unknown
+/// or absent extension ⇒ `application/octet-stream` — the honest "cannot
+/// tell" (the gzip normalizer's `infer_mime`, factored for its siblings:
+/// the zip kind's per-entry inference and the eml kind's attachment
+/// octet-stream cross-check ride the same single source the scanner
+/// routes by).
+pub(crate) fn infer_mime_from_name(name: &str) -> String {
+    let file = name.rsplit('/').next().unwrap_or(name);
+    let ext = file.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    ext.as_deref()
+        .and_then(short_key_for_extension)
+        .and_then(mime_for_short_key)
+        .unwrap_or("application/octet-stream")
+        .to_string()
+}
 
 /// Extension lookup over [`EXTENSION_ALIASES`] (exact, case-normalized by
 /// the caller).
@@ -186,15 +287,35 @@ pub enum ExtractorKind {
     /// HTML document file: html5ever (WHATWG-compliant) parse, strip
     /// script/style/head noise, block-level line breaks, ONE text Part
     /// (`extract/html.rs`, M3-T6). LEAF kind — one html file IS one
-    /// document; the same chain will serve T7's epub chapters by plain
+    /// document; the same chain serves T7's epub chapters by plain
     /// child re-routing, no special-casing on either side.
     Html(HtmlConfig),
+    /// EPUB book file: the FIRST production CONTAINER kind (M3-T7,
+    /// `extract/epub.rs`). `unpack` walks container.xml → OPF → spine and
+    /// produces spine-ordered XHTML chapter children (`text/html`); the
+    /// reading order is the kind's format intelligence — zip entry order is
+    /// NOT it. Non-spine resources produce nothing. `unpack` is the kind's
+    /// one product path (`extract` refuses loudly — a container never
+    /// extracts).
+    Epub(EpubConfig),
+    /// Generic zip archive: CONTAINER kind (M3-T7, `extract/zip.rs`).
+    /// `unpack` produces one child per file entry with the mime inferred
+    /// from the entry-name extension through the one table; unknown
+    /// extensions ride as honest `application/octet-stream` (downstream
+    /// routing decides — module docs for the adjudication).
+    Zip(ZipConfig),
+    /// RFC 5322 email message: CONTAINER kind (M3-T7, `extract/eml.rs`).
+    /// `unpack` walks the MIME part tree: text bodies by their part mime,
+    /// attachments by Content-Type (octet-stream cross-checked against the
+    /// filename extension), embedded messages as re-routable
+    /// `message/rfc822` children.
+    Eml(EmlConfig),
     /// Scripted CONTAINER kind for the M2.1 step 3 mechanism tests — see
-    /// [`TestContainerSpec`]. `cfg(test)` only: the PRODUCTION enum stays at
-    /// leaf kinds only (seven since M3-T6's `docx`/`html`; the first
-    /// production container kind — epub — is T7 work), and
-    /// no test kind is parseable from config (`from_config` has no arm —
-    /// tests inject the variant into a loaded plan directly).
+    /// [`TestContainerSpec`]. `cfg(test)` only: the PRODUCTION registry
+    /// gained its first real container kinds in M3-T7 (`Epub`/`Zip`/`Eml`
+    /// above — the role this scaffold proved); no test kind is parseable
+    /// from config (`from_config` has no arm — tests inject the variant
+    /// into a loaded plan directly).
     #[cfg(test)]
     TestContainer(TestContainerSpec),
     /// Scripted IMAGE kind for the M3-T1 modality-mechanism tests (the
@@ -352,6 +473,24 @@ impl ExtractorKind {
                 })?;
                 Ok(ExtractorKind::Html(cfg))
             }
+            "epub" => {
+                let cfg: EpubConfig = raw.clone().try_into().map_err(|e: toml::de::Error| {
+                    super::config::stage2_error(section, Some(&kind), e.message(), line)
+                })?;
+                Ok(ExtractorKind::Epub(cfg))
+            }
+            "zip" => {
+                let cfg: ZipConfig = raw.clone().try_into().map_err(|e: toml::de::Error| {
+                    super::config::stage2_error(section, Some(&kind), e.message(), line)
+                })?;
+                Ok(ExtractorKind::Zip(cfg))
+            }
+            "eml" => {
+                let cfg: EmlConfig = raw.clone().try_into().map_err(|e: toml::de::Error| {
+                    super::config::stage2_error(section, Some(&kind), e.message(), line)
+                })?;
+                Ok(ExtractorKind::Eml(cfg))
+            }
             other => Err(PipelineError::config(
                 format!(
                     "[{section}]: unknown extractor kind '{other}' (available kinds: \
@@ -379,6 +518,17 @@ impl ExtractorKind {
             | ExtractorKind::Docx(_)
             | ExtractorKind::Html(_) => &[Modality::Text],
             ExtractorKind::PdfPages(_) | ExtractorKind::Image(_) => &[Modality::Image],
+            // Container kinds (M3-T7): children re-enter user routing, so
+            // the OUTPUT modality is whatever the user's chains produce —
+            // unknowable at config time. The declaration is best-effort
+            // (Text: the ordinary corpus of chapters/bodies/attachments),
+            // exactly like the cfg(test) TestContainer's; the RUNTIME
+            // modality gate is the real bar (the M3-T1 precedent: a
+            // placeholder-declares-text runtime-emits-image shape is caught
+            // there, loudly, with the remedy).
+            ExtractorKind::Epub(_) | ExtractorKind::Zip(_) | ExtractorKind::Eml(_) => {
+                &[Modality::Text]
+            }
             // its children re-enter user routing; the tests' children are
             // text (txt/md chains)
             #[cfg(test)]
@@ -405,6 +555,9 @@ impl ExtractorKind {
             ExtractorKind::Image(_) => "image",
             ExtractorKind::Docx(_) => "docx",
             ExtractorKind::Html(_) => "html",
+            ExtractorKind::Epub(_) => "epub",
+            ExtractorKind::Zip(_) => "zip",
+            ExtractorKind::Eml(_) => "eml",
             #[cfg(test)]
             ExtractorKind::TestContainer(_) => "test-container",
             #[cfg(test)]
@@ -422,6 +575,11 @@ impl ExtractorKind {
             // knob-free kinds (M3-T6): the label is the whole summary
             ExtractorKind::Docx(_) => "docx".to_string(),
             ExtractorKind::Html(_) => "html".to_string(),
+            // knob-free kinds (M3-T7), same discipline: the label is the
+            // whole summary
+            ExtractorKind::Epub(_) => "epub".to_string(),
+            ExtractorKind::Zip(_) => "zip".to_string(),
+            ExtractorKind::Eml(_) => "eml".to_string(),
             // the knob shows only when it departs from the pdf-text-aligned
             // default, keeping summary lines short
             ExtractorKind::PdfInspector(cfg) => {
@@ -474,6 +632,14 @@ impl Extractor for ExtractorKind {
             // configless (M3-T6): the format intelligence IS the kind
             ExtractorKind::Docx(_) => DocxExtractor.extract(bytes, mime),
             ExtractorKind::Html(_) => HtmlExtractor.extract(bytes, mime),
+            // the container kinds (M3-T7): the module extractors carry the
+            // loud role-separation refusal (a container NEVER extracts —
+            // the worker short-circuits extract for kinds whose unpack
+            // yields children, so reaching extract is a routing bug, and
+            // it must fail visibly instead of guessing)
+            ExtractorKind::Epub(_) => EpubExtractor.extract(bytes, mime),
+            ExtractorKind::Zip(_) => ZipExtractor.extract(bytes, mime),
+            ExtractorKind::Eml(_) => EmlExtractor.extract(bytes, mime),
             // role separation made loud: a container NEVER extracts — the
             // worker short-circuits extract for kinds whose unpack yields
             // children, so reaching this arm is a mechanism bug, and it
@@ -516,6 +682,12 @@ impl Extractor for ExtractorKind {
             // both kinds)
             ExtractorKind::Docx(_) => Fit::Capable,
             ExtractorKind::Html(_) => Fit::Capable,
+            // undeclared, same ruling (M3-T7): epub/zip/eml sources probe
+            // Unknown (no family probe exists) — config order is the whole
+            // truth around them (each kind module's docs)
+            ExtractorKind::Epub(_) => Fit::Capable,
+            ExtractorKind::Zip(_) => Fit::Capable,
+            ExtractorKind::Eml(_) => Fit::Capable,
             // undeclared (the trait default, spelled out): a container that
             // declares no fit is Capable everywhere — routing degenerates to
             // config order around it, exactly like any undeclared leaf.
@@ -526,13 +698,11 @@ impl Extractor for ExtractorKind {
         }
     }
 
-    /// Container-role dispatch (M2.1 step 3): the four PRODUCTION kinds are
-    /// leaves (the trait default, spelled out at the dispatch site so the
-    /// closed set stays honest — a new production kind lands here with the
-    /// compiler walking it); the test container runs its script. (The
-    /// underscore names silence the unused-parameter lint that the leaf-only
-    /// production build would otherwise raise — only the cfg(test) arm reads
-    /// them.)
+    /// Container-role dispatch (M2.1 step 3): the LEAF kinds (the trait
+    /// default, spelled out at the dispatch site so the closed set stays
+    /// honest — a new production kind lands here with the compiler walking
+    /// it), the three M3-T7 PRODUCTION containers (epub/zip/eml — the role
+    /// the cfg(test) scaffold proved), and the test container's script.
     fn unpack(&self, _bytes: &[u8], _mime: &str) -> Result<Option<Vec<ChildDoc>>, PipelineError> {
         match self {
             ExtractorKind::Txt(_)
@@ -543,6 +713,11 @@ impl Extractor for ExtractorKind {
             | ExtractorKind::Image(_)
             | ExtractorKind::Docx(_)
             | ExtractorKind::Html(_) => Ok(None),
+            // the production containers: expansion is their one product
+            // path (each module's docs carry its ruling)
+            ExtractorKind::Epub(_) => EpubExtractor.unpack(_bytes, _mime),
+            ExtractorKind::Zip(_) => ZipExtractor.unpack(_bytes, _mime),
+            ExtractorKind::Eml(_) => EmlExtractor.unpack(_bytes, _mime),
             #[cfg(test)]
             ExtractorKind::TestContainer(spec) => spec.unpack(_bytes, _mime),
             // the scripted image kind is a leaf
@@ -576,6 +751,17 @@ impl ExtractorKind {
             ExtractorKind::Html(_) => {
                 "an html kind (no affinity declaration — never refuses)".to_string()
             }
+            // same unreachability (M3-T7: all three containers are Capable
+            // everywhere)
+            ExtractorKind::Epub(_) => {
+                "an epub kind (no affinity declaration — never refuses)".to_string()
+            }
+            ExtractorKind::Zip(_) => {
+                "a zip kind (no affinity declaration — never refuses)".to_string()
+            }
+            ExtractorKind::Eml(_) => {
+                "an eml kind (no affinity declaration — never refuses)".to_string()
+            }
             // unreachable in practice (the test container is Capable for
             // every class, so the router never quotes a refusal)
             #[cfg(test)]
@@ -606,6 +792,9 @@ impl serde::Serialize for ExtractorKind {
             ExtractorKind::Image(c) => c.serialize(serializer),
             ExtractorKind::Docx(c) => c.serialize(serializer),
             ExtractorKind::Html(c) => c.serialize(serializer),
+            ExtractorKind::Epub(c) => c.serialize(serializer),
+            ExtractorKind::Zip(c) => c.serialize(serializer),
+            ExtractorKind::Eml(c) => c.serialize(serializer),
             // fingerprints serialize CONFIG-loaded kinds only; the test kinds
             // never enter a PipelineConfig (from_config has no arm), so these
             // arms exist purely to keep the closed set exhaustive.
@@ -682,8 +871,14 @@ mod tests {
         assert_eq!(short_key_for_extension("docx"), Some("docx"));
         assert_eq!(short_key_for_extension("html"), Some("html"));
         assert_eq!(short_key_for_extension("htm"), Some("html"));
+        // the M3-T7 container families claim (T7 landed: epub is no longer
+        // the unknown-extension example it was in M3-T6)
+        assert_eq!(short_key_for_extension("epub"), Some("epub"));
+        assert_eq!(short_key_for_extension("zip"), Some("zip"));
+        assert_eq!(short_key_for_extension("eml"), Some("eml"));
         // unknown extensions claim nothing
-        assert_eq!(short_key_for_extension("epub"), None);
+        assert_eq!(short_key_for_extension("mobi"), None);
+        assert_eq!(short_key_for_extension("exe"), None);
         assert_eq!(short_key_for_extension(""), None);
     }
 
@@ -719,6 +914,11 @@ mod tests {
         // kinds with knobs (pdf-inspector, pdf-pages) serialize their
         // defaulted fields too — the fingerprint form is per-kind, not
         // uniformly `kind = "…"`.
+        //
+        // This sweep walks the LEAF kinds (it asserts extract() output); the
+        // M3-T7 container kinds are swept by
+        // `container_kinds_dispatch_unpack_through_the_enum` (their extract
+        // deliberately refuses — the role separation).
         type Case = (
             &'static str,
             &'static [u8],
@@ -862,9 +1062,9 @@ mod tests {
         // image: the UNDECLARED default — Capable for every class (its
         // family has no probe, so no class ever routes it; the dispatch
         // spells the trait default out, pinned here). The M3-T6 text-face
-        // kinds (docx/html) are undeclared for the same reason — the
-        // ContentClass vocabulary is PDF-shaped and their sources probe
-        // Unknown.
+        // kinds (docx/html) and the M3-T7 containers (epub/zip/eml) are
+        // undeclared for the same reason — the ContentClass vocabulary is
+        // PDF-shaped and their sources probe Unknown.
         let img = kind("image");
         for class in [
             ContentClass::TextNative,
@@ -874,7 +1074,7 @@ mod tests {
         ] {
             assert_eq!(Extractor::affinity(&img, class), Fit::Capable, "{class}");
         }
-        for s in ["docx", "html"] {
+        for s in ["docx", "html", "epub", "zip", "eml"] {
             let k = kind(s);
             assert_eq!(
                 Extractor::affinity(&k, ContentClass::TextNative),
@@ -900,11 +1100,13 @@ mod tests {
 
     #[test]
     fn production_kinds_are_leaves_unpack_none() {
-        // M2.1 step 3 zero-impact pin: every PRODUCTION kind's unpack is the
-        // trait-default leaf verdict `Ok(None)` — the dispatch spells the
+        // M2.1 step 3 zero-impact pin: every LEAF production kind's unpack
+        // is the trait-default verdict `Ok(None)` — the dispatch spells the
         // default out for the closed set, and this test is what keeps a
         // future kind from silently landing as a container (a container
-        // variant must update this list DELIBERATELY, with its own unpack).
+        // variant must land in its own dispatch arm + the container sweep
+        // below, DELIBERATELY). The M3-T7 container kinds (epub/zip/eml)
+        // are covered by `container_kinds_dispatch_unpack_through_the_enum`.
         let cases: &[(&str, &[u8], &str)] = &[
             ("txt", b"plain text", "text/plain"),
             (
@@ -938,20 +1140,55 @@ mod tests {
         }
     }
 
+    /// The container sweep (the M3-T7 mirror of the leaf pin above): all
+    /// three production containers dispatch through the ENUM to their
+    /// module unpacks — the verdict is `Ok(Some(children))` (never the leaf
+    /// `Ok(None)`), the children carry real bytes, and the extract() arm is
+    /// the loud role-separation refusal (never a silent Ok).
+    #[test]
+    fn container_kinds_dispatch_unpack_through_the_enum() {
+        let epub_bytes = epub::tests::build_epub(&["ch2", "ch3", "ch1"], &[]);
+        let zip_bytes = zip::tests::build_zip(&[("a.txt", b"body".as_slice())]);
+        let eml_bytes = b"From: a@b.c\r\nSubject: s\r\n\r\nplain body";
+        for (kind_str, bytes, mime, want_len) in [
+            ("epub", epub_bytes.as_slice(), epub::EPUB_MIME, 3usize),
+            ("zip", zip_bytes.as_slice(), zip::ZIP_MIME, 1),
+            ("eml", eml_bytes, eml::EML_MIME, 1),
+        ] {
+            let raw: toml::Value = toml::from_str(&format!("kind = \"{kind_str}\"")).unwrap();
+            let k = ExtractorKind::from_config("extractor.x", &raw, None).unwrap();
+            let children = Extractor::unpack(&k, bytes, mime)
+                .unwrap_or_else(|e| panic!("{kind_str} dispatches: {e}"))
+                .unwrap_or_else(|| panic!("{kind_str} must be a container"));
+            assert_eq!(children.len(), want_len, "{kind_str}");
+            assert!(
+                children.iter().all(|c| !c.bytes.is_empty()),
+                "{kind_str} children carry bytes"
+            );
+            // and the extract() arm refuses loudly (the role separation)
+            let err = Extractor::extract(&k, bytes, mime).unwrap_err();
+            assert!(
+                err.to_string().contains("container kind: it unpacks"),
+                "{kind_str}: {err}"
+            );
+        }
+    }
+
     #[test]
     fn from_config_unknown_kind_lists_available() {
-        // epub is T7's container kind — unknown TODAY, and the error must
-        // list every kind that DOES exist (docx/html included since M3-T6)
-        let raw: toml::Value = toml::from_str("kind = \"epub\"").unwrap();
+        // mobi is a real-world format with NO kind — the error must list
+        // every kind that DOES exist (the container trio included since
+        // M3-T7; epub was the M3-T6-era example and has since landed)
+        let raw: toml::Value = toml::from_str("kind = \"mobi\"").unwrap();
         let err = ExtractorKind::from_config("extractor.d", &raw, Some(3)).unwrap_err();
         assert!(
-            err.to_string().contains("unknown extractor kind 'epub'"),
+            err.to_string().contains("unknown extractor kind 'mobi'"),
             "{err}"
         );
         assert!(
             err.to_string().contains(
                 "available kinds: txt, pdf-text, md, pdf-inspector, pdf-pages, image, \
-                           docx, html"
+                           docx, html, epub, zip, eml"
             ),
             "{err}"
         );
@@ -1002,10 +1239,15 @@ mod tests {
             ("pdf-pages", "format = \"jpeg\""),
             // the image kind is knob-free (preprocessing belongs to the
             // embedder); the M3-T6 text-face kinds are knob-free too (the
-            // format intelligence IS the kind)
+            // format intelligence IS the kind); the M3-T7 container kinds
+            // are knob-free for the container-role reason (their expansion
+            // policy is a format fact, their routing is the user's)
             ("image", "dpi = 72"),
             ("docx", "dpi = 300"),
             ("html", "dpi = 72"),
+            ("epub", "dpi = 300"),
+            ("zip", "dpi = 72"),
+            ("eml", "dpi = 300"),
         ] {
             let raw: toml::Value =
                 toml::from_str(&format!("kind = \"{kind_str}\"\n{extra}")).unwrap();

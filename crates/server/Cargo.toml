@@ -223,6 +223,30 @@ zip = { version = "9.4", default-features = false, features = ["deflate-flate2"]
 # OOXML is the contract. MIT.
 quick-xml = { version = "0.41", default-features = false }
 
+# eml container kind (M3-T7): RFC 5322 / MIME multipart parsing for the
+# `eml` unpack kind (message/rfc822 -> text/plain + text/html body parts +
+# attachment children). mailparse 0.18 is pure Rust, zero features to trim
+# (no default feature set), and its charset handling rides the `charset`
+# crate -> the SAME encoding_rs 0.8.44 the tree already locks (verified via
+# cargo tree above: no second copy; base64 rides the tree's 0.22). New
+# transitive crates are exactly three small pure-Rust ones — charset 0.1.5
+# (Apache-2.0 OR MIT), data-encoding 2.11 (MIT) and quoted_printable 0.5
+# (Apache-2.0 OR MIT) — all permissive, deny green. mailparse itself is
+# 0BSD: permissive, same class as MIT/BSD (recorded for the deny review).
+mailparse = "0.18"
+
+# charset->UTF-8 normalizer (M3-T7, pipeline/normalize.rs): encoding_rs is
+# the WHATWG Encoding Standard implementation (the Firefox engine, all of
+# GBK/Shift_JIS/windows-1252/UTF-16/…, decode-never-panics semantics).
+# 0.8.44 is ALREADY locked in this tree as a transitive dep of
+# lindera-dictionary / lopdf / reqwest — declaring it directly adds ZERO
+# new crates (the percent-encoding/sha2 discipline). default-features =
+# false drops the `serde` support (we match labels through for_label, never
+# serialize an Encoding) — the `alloc` default feature rides the explicit
+# feature list, keeping the dependency surface at exactly what decode needs.
+# (Apache-2.0 OR MIT) AND BSD-3-Clause (the WHATWG data tables); deny green.
+encoding_rs = { version = "0.8", default-features = false, features = ["alloc"] }
+
 # html extractor (M3-T6): the WHATWG-compliant HTML5 parser (servo lineage).
 # Parser CHOICE was settled empirically (the selection note in
 # extract/html.rs has the bench): real-world HTML is tag soup by

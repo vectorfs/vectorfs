@@ -24,16 +24,36 @@
 //!   know "this is an epub, order its spine" would smuggle a strategy axis
 //!   into what must stay mechanism.
 //!
-//! # Not a configuration axis (§5.10.8 discipline)
+//! # Not a configuration axis (§5.10.8 discipline) — and the one-parameter
+//! ruling of M3-T7
 //!
-//! The table is compiled-in and NOT configurable. A "configurable
-//! preprocessor axis" was explicitly considered and rejected: no user
-//! evidence exists for needing to reorder or disable a mechanical
-//! transform, and v2.1 cut five strategy axes to four on exactly this
-//! discipline. The `&dyn Normalizer` table below is a PRIVATE fixed list,
-//! not a plugin seam — the closed-enum registration model
-//! (§5.10.2) governs the strategy axes only. Revisit as an M4+ OPTION if
-//! evidence arrives (the note lives here so the decision is findable).
+//! The table's MEMBERSHIP and ORDER are compiled-in and NOT configurable.
+//! A "configurable preprocessor axis" was explicitly considered and
+//! rejected: no user evidence exists for needing to reorder or disable a
+//! mechanical transform, and v2.1 cut five strategy axes to four on
+//! exactly this discipline. The `&dyn Normalizer` entries below are a
+//! PRIVATE fixed list, not a plugin seam — the closed-enum registration
+//! model (§5.10.2) governs the strategy axes only. Revisit as an M4+
+//! OPTION if evidence arrives (the note lives here so the decision is
+//! findable).
+//!
+//! M3-T7 adds the table's SECOND entry, charset→UTF-8, and with it ONE
+//! scalar parameter — the fallback charset invalid-UTF-8 text bytes are
+//! recoded from. The parameter does NOT reopen the axis ruling (no
+//! reordering, no disabling, no new members from config); it is the dpi
+//! precedent applied to the stage instead of a kind: pdf-pages is a fixed
+//! registry member whose ONE knob rides its config, the charset entry is
+//! a fixed table member whose ONE knob rides the ingest section (per
+//! bucket — both normalize call sites have the plan). The alternative
+//! reading of §0 (「指纹零变化（机制非配置）」— the M2 sentence about the
+//! knob-less gunzip table) would leave the fallback nowhere honest to
+//! live: chardetng-style GUESSING was explicitly rejected by the task
+//! ruling (机械恒对 demands a declared answer, not a heuristic), and a
+//! compiled-in constant would silently mis-serve every non-Chinese
+//! corpus. The knob therefore EXISTS, and because it changes chunk bytes
+//! it ENTERS THE PIPELINE FINGERPRINT (unlike `max_file_size_mb`, which
+//! only gates) — see config.rs, which elides the field from the
+//! fingerprint at its default so pre-T7 markers stay valid.
 //!
 //! # Table semantics (the ruled execution model)
 //!
@@ -41,7 +61,7 @@
 //! * [`Normalized::Same`] continues down the table with the state intact.
 //! * [`Normalized::Transformed`] REPLACES the state (bytes + mime + name)
 //!   and ALSO continues down the table — the point of a table, not a
-//!   chain-of-one: a future charset recoding can sit AFTER gunzip and see
+//!   chain-of-one: the charset recoding sits AFTER gunzip and sees
 //!   decompressed bytes (the "gz wrapping re-encoded text" combination),
 //!   with no fixpoint loop, no re-entry, one pass.
 //! * Table exhausted ⇒ the state is TERMINAL ([`NormalizeOutcome`]).
@@ -57,22 +77,29 @@
 //!   `NormalizeError` is an alias of [`PipelineError`] rather than a new
 //!   type: same seam, different severity contract.
 //!
-//! # Fingerprint: zero impact
+//! # Fingerprint
 //!
-//! normalize is mechanism, not configuration — it must not appear in the
-//! pipeline fingerprint (the §5.10.5 stance that already keeps probe/route
-//! out). Fixing a normalizer bug changes extracted content the way an
-//! engine upgrade would; re-embedding stays the explicit operator action.
+//! The TABLE is mechanism (fixed membership and order, zero fingerprint
+//! presence — the §5.10.5 stance that already keeps probe/route out);
+//! fixing a normalizer bug changes extracted content the way an engine
+//! upgrade would, and re-embedding stays the explicit operator action.
+//! The charset FALLBACK is the one exception by the ruling above: it is
+//! per-bucket configuration that changes chunk bytes, so it fingerprints
+//! (config.rs), while eliding at its default keeps every pre-T7
+//! deployment's fingerprint byte-stable.
 //!
-//! # The M2 table: `[GzNormalizer]`
+//! # The M3 table: `[GzNormalizer, CharsetNormalizer]`
 //!
-//! One real transform ships today (gzip; flate2 was already in the tree,
-//! zero new crates). Scan-time claiming cooperates with it: a `.gz` /
-//! `.gzip` suffix is a compression WRAPPER, not a content type, so the
-//! ingest scanner's extension guess sees through one wrapper layer
-//! ([`unwrap_compression`]) — `notes.txt.gz` is claimed as the text/plain
-//! source it decompresses into, under the user's existing txt route, with
-//! zero configuration.
+//! Two real transforms ship (M3-T7): gzip first (flate2 was already in
+//! the tree), charset→UTF-8 second — the order IS the semantics
+//! (`x.txt.gz` holding GBK text decompresses first, then the decompressed
+//! bytes are checked and recoded; §0's 「normalize 是每级第一个触碰字节
+//! 的东西」+ the table's ordered execution). Scan-time claiming cooperates
+//! with the gz half: a `.gz` / `.gzip` suffix is a compression WRAPPER,
+//! not a content type, so the ingest scanner's extension guess sees
+//! through one wrapper layer ([`unwrap_compression`]) — `notes.txt.gz` is
+//! claimed as the text/plain source it decompresses into, under the
+//! user's existing txt route, with zero configuration.
 
 use std::io::Read;
 
@@ -80,7 +107,7 @@ use bytes::Bytes;
 
 use super::ChildDoc;
 use super::PipelineError;
-use super::extract::{mime_for_short_key, short_key_for_extension};
+use super::extract::infer_mime_from_name;
 
 /// What ONE normalizer did to the current state (the per-transform
 /// vocabulary; the table's execution model lives on it — see module docs).
@@ -123,13 +150,24 @@ trait Normalizer {
     fn run(&self, bytes: &[u8], mime: &str, hint_name: &str) -> Result<Normalized, NormalizeError>;
 }
 
-/// The fixed, ordered, compiled-in table (M2: gunzip). Order is mechanism:
-/// entries see the state left by their predecessors (module docs). Under
-/// cfg(test) a record-only second entry sits AFTER the real transform —
-/// see [`RecordingNormalizer`] below (same production entry first, so the
-/// table-order proof runs over the real thing).
+/// The fixed, ordered, compiled-in table (M3: gunzip THEN charset — the
+/// order is the semantics, module docs). Membership and order are
+/// compiled-in (§5.10.8); the charset entry's fallback is the ONE
+/// parameter, threaded by the caller (both normalize call sites hold the
+/// bucket plan). Constructed per call — GzNormalizer is a ZST and
+/// CharsetNormalizer one reference wide, so the "table" costs nothing.
 #[cfg(not(test))]
-const TABLE: &[&dyn Normalizer] = &[&GzNormalizer];
+fn table(charset: &CharsetNormalizer) -> [&dyn Normalizer; 2] {
+    [&GzNormalizer, charset]
+}
+
+/// The test build's table: the two REAL entries first, the record-only
+/// [`RecordingNormalizer`] LAST — the table-order proof (below) runs over
+/// the real production entries, not mocks of them.
+#[cfg(test)]
+fn table(charset: &CharsetNormalizer) -> [&dyn Normalizer; 3] {
+    [&GzNormalizer, charset, &RecordingNormalizer]
+}
 
 /// The TERMINAL state after the whole table has run (module docs: each
 /// transform once, in order, `Transformed` continues, table end = terminal).
@@ -166,13 +204,21 @@ pub fn unwrap_compression(name: &str) -> &str {
 /// The single entry point: run the fixed table over one state. See
 /// [`NormalizeOutcome`] and the module docs for the execution model;
 /// `Err` is a hard, document-level failure reason (a corrupt input the
-/// stage refuses to guess around).
-pub fn normalize(bytes: Bytes, mime: &str, name: &str) -> Result<NormalizeOutcome, NormalizeError> {
+/// stage refuses to guess around). `fallback` is the charset entry's one
+/// parameter (module docs: the invalid-UTF-8 recoding source, per bucket,
+/// fingerprint-visible in config.rs).
+pub fn normalize(
+    bytes: Bytes,
+    mime: &str,
+    name: &str,
+    fallback: &'static encoding_rs::Encoding,
+) -> Result<NormalizeOutcome, NormalizeError> {
+    let charset = CharsetNormalizer { fallback };
     let mut cur_bytes = bytes;
     let mut cur_mime = mime.to_string();
     let mut cur_name = name.to_string();
     let mut applied: Vec<&'static str> = Vec::new();
-    for entry in TABLE {
+    for entry in table(&charset) {
         match entry.run(&cur_bytes, &cur_mime, &cur_name)? {
             Normalized::Same => {}
             Normalized::Transformed { bytes, mime, name } => {
@@ -272,10 +318,11 @@ impl Normalizer for GzNormalizer {
         }
         // name/mime derive: ONE wrapper off the hint, then the ordinary
         // extension -> short key -> mime table (the same single source the
-        // scanner routes by).
+        // scanner routes by — extract::infer_mime_from_name, factored for
+        // its three consumers in M3-T7).
         let stem = unwrap_compression(hint_name);
         let name = (stem != hint_name).then(|| stem.to_string());
-        let mime = infer_mime(stem);
+        let mime = infer_mime_from_name(stem);
         Ok(Normalized::Transformed {
             bytes: Bytes::from(out),
             mime,
@@ -284,18 +331,91 @@ impl Normalizer for GzNormalizer {
     }
 }
 
-/// Extension (of a wrapper-stripped name) -> canonical mime, through the
-/// one mime/short-key table; unknown or absent extension ⇒
-/// `application/octet-stream` (the honest "cannot tell" — downstream
-/// routing treats it exactly like any off-table mime).
-fn infer_mime(stripped_name: &str) -> String {
-    let file = stripped_name.rsplit('/').next().unwrap_or(stripped_name);
-    let ext = file.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    ext.as_deref()
-        .and_then(short_key_for_extension)
-        .and_then(mime_for_short_key)
-        .unwrap_or("application/octet-stream")
-        .to_string()
+// ---------------------------------------------------------------------------
+// the M3 second transform: charset -> UTF-8
+// ---------------------------------------------------------------------------
+
+/// Recode TEXT-family bytes to UTF-8 (M3-T7). Mechanically always-correct
+/// by the module criterion, in three mechanical steps — NO format
+/// knowledge and NO guessing:
+///
+/// 1. **BOM identification** (mechanical): a UTF-8 BOM is STRIPPED (it is
+///    encoding metadata, not content — a txt extractor would otherwise
+///    index the zero-width no-break space); a UTF-16/UTF-32 BOM names its
+///    encoding, and decoding THAT is not a judgement call.
+/// 2. **Strict UTF-8 validation** (mechanical): legal UTF-8 passes through
+///    untouched ([`Normalized::Same`]) — ASCII and UTF-8 corpora never pay
+///    for this entry existing.
+/// 3. **Invalid bytes ⇒ recode from the CONFIGURED fallback** (parameter,
+///    not a guess — chardetng-style heuristic detection was explicitly
+///    rejected by the task ruling; a declared answer is mechanical, a
+///    detected one is policy pretending to be mechanism). WHATWG decoding
+///    never fails: bytes invalid in the fallback too surface as U+FFFD
+///    replacement characters — lossy but VISIBLE, the same posture as the
+///    html extractor's `from_utf8` lossy decode.
+///
+/// Applicability is the MIME: `text/*` only. Image bytes, pdf bytes, an
+/// epub's zip container — all routinely "invalid UTF-8" BY DESIGN, and
+/// transcoding them would be corruption. An empty mime (unspecified) is
+/// left alone for the same reason the extractor gates tolerate it: the
+/// honest answer without a family is "cannot tell". No-BOM UTF-16 is the
+/// known blind spot (mechanically indistinguishable from 8-bit text; a
+/// heuristic guess at it is exactly what this entry refuses to do).
+struct CharsetNormalizer {
+    /// The invalid-UTF-8 recoding source (the ingest section's
+    /// `charset_fallback`; module docs for the placement ruling).
+    fallback: &'static encoding_rs::Encoding,
+}
+
+impl Normalizer for CharsetNormalizer {
+    fn label(&self) -> &'static str {
+        "charset"
+    }
+
+    fn run(
+        &self,
+        bytes: &[u8],
+        mime: &str,
+        _hint_name: &str,
+    ) -> Result<Normalized, NormalizeError> {
+        if !mime.starts_with("text/") {
+            return Ok(Normalized::Same);
+        }
+        // (1) BOM first: it names its encoding mechanically
+        if let Some((enc, bom_len)) = encoding_rs::Encoding::for_bom(bytes) {
+            if enc == encoding_rs::UTF_8 {
+                // UTF-8 BOM: strip only (the bytes are UTF-8 by definition;
+                // a BOM-only file becomes empty and the extractor's own
+                // empty-input refusal is the honest verdict)
+                return Ok(Normalized::Transformed {
+                    bytes: Bytes::copy_from_slice(&bytes[bom_len..]),
+                    mime: mime.to_string(),
+                    name: None,
+                });
+            }
+            // UTF-16/UTF-32 BOM: the identified encoding decodes
+            let (text, _, _) = enc.decode(bytes);
+            return Ok(recoded(text, mime));
+        }
+        // (2) strict validation: legal UTF-8 is a passthrough
+        if std::str::from_utf8(bytes).is_ok() {
+            return Ok(Normalized::Same);
+        }
+        // (3) invalid bytes: recode from the configured fallback
+        let (text, _, _) = self.fallback.decode(bytes);
+        Ok(recoded(text, mime))
+    }
+}
+
+/// The Transformed verdict of a successful recoding (bytes → UTF-8; the
+/// mime is unchanged — the transform preserves the family it was gated
+/// on; the name too: a recoding rewrites no artifact name).
+fn recoded(text: std::borrow::Cow<'_, str>, mime: &str) -> Normalized {
+    Normalized::Transformed {
+        bytes: Bytes::from(text.into_owned().into_bytes()),
+        mime: mime.to_string(),
+        name: None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,12 +458,6 @@ impl Normalizer for RecordingNormalizer {
     }
 }
 
-/// The TABLE the test build runs: gunzip then recorder — the recorder sits
-/// AFTER the real transform so the table-order proof is over the REAL
-/// production entry, not a mock of it.
-#[cfg(test)]
-const TABLE: &[&dyn Normalizer] = &[&GzNormalizer, &RecordingNormalizer];
-
 // ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
@@ -352,6 +466,10 @@ const TABLE: &[&dyn Normalizer] = &[&GzNormalizer, &RecordingNormalizer];
 mod tests {
     use super::super::extract::MIME_TO_SHORT_KEY;
     use super::*;
+
+    /// The tests' fallback (the config default's encoding — "gbk"; the
+    /// config-side canonicalization tests live in config.rs).
+    const FALLBACK: &encoding_rs::Encoding = encoding_rs::GBK;
 
     /// Real gzip bytes (the same library the transform decodes with — the
     /// tests assert DECODE semantics, not encoder quirks).
@@ -365,10 +483,12 @@ mod tests {
     #[test]
     fn gz_transforms_in_place_with_inferred_mime_and_stripped_name() {
         // x.txt.gz -> decompressed bytes, text/plain, x.txt, one applied label
+        // (the payload is valid UTF-8: the charset entry passes it through)
         let out = normalize(
             Bytes::from(gz(b"hello normalize")),
             "text/plain",
             "x.txt.gz",
+            FALLBACK,
         )
         .unwrap();
         assert_eq!(out.bytes, Bytes::from_static(b"hello normalize"));
@@ -381,7 +501,13 @@ mod tests {
             ("notes.md.gzip", "text/markdown"),
             ("d/e/readme.txt.gz", "text/plain"),
         ] {
-            let out = normalize(Bytes::from(gz(b"payload")), "application/gzip", name).unwrap();
+            let out = normalize(
+                Bytes::from(gz(b"payload")),
+                "application/gzip",
+                name,
+                FALLBACK,
+            )
+            .unwrap();
             assert_eq!(out.mime, mime, "{name}");
             assert_eq!(
                 out.name,
@@ -395,6 +521,7 @@ mod tests {
             Bytes::from(gz(b"body")),
             "application/octet-stream",
             "chapter1",
+            FALLBACK,
         )
         .unwrap();
         assert_eq!(out.bytes, Bytes::from_static(b"body"));
@@ -408,7 +535,7 @@ mod tests {
         // state verbatim (bytes by reference, mime/name unchanged), and the
         // applied trace is empty (the worker logs nothing)
         let src = Bytes::from_static(b"just text");
-        let out = normalize(src.clone(), "text/plain", "docs/a.txt").unwrap();
+        let out = normalize(src.clone(), "text/plain", "docs/a.txt", FALLBACK).unwrap();
         assert_eq!(out.bytes, src);
         assert_eq!(out.mime, "text/plain");
         assert_eq!(out.name, "docs/a.txt");
@@ -421,6 +548,7 @@ mod tests {
             Bytes::from_static(b"plain inside"),
             "text/plain",
             "a.txt.gz",
+            FALLBACK,
         )
         .unwrap();
         assert_eq!(out.bytes, Bytes::from_static(b"plain inside"));
@@ -449,12 +577,155 @@ mod tests {
                 v
             }),
         ] {
-            let err =
-                normalize(Bytes::from(bad), "application/gzip", "docs/bad.txt.gz").unwrap_err();
+            let err = normalize(
+                Bytes::from(bad),
+                "application/gzip",
+                "docs/bad.txt.gz",
+                FALLBACK,
+            )
+            .unwrap_err();
             let msg = err.to_string();
             assert!(msg.contains("bad.txt.gz"), "{what}: {msg}");
             assert!(msg.contains("gunzip"), "{what}: {msg}");
         }
+    }
+
+    // ---- the M3-T7 second transform: charset -> UTF-8 ----------------------
+
+    /// GBK bytes of `s` (the same library the transform decodes with).
+    fn gbk(s: &str) -> Vec<u8> {
+        let (cow, enc, _) = encoding_rs::GBK.encode(s);
+        assert_eq!(enc, encoding_rs::GBK);
+        cow.into_owned()
+    }
+
+    #[test]
+    fn charset_recodes_invalid_utf8_from_the_configured_fallback() {
+        let bytes = gbk("汉字正文：编码转换测试。");
+        assert!(
+            std::str::from_utf8(&bytes).is_err(),
+            "the fixture is genuinely not UTF-8"
+        );
+        let out = normalize(
+            Bytes::from(bytes.clone()),
+            "text/plain",
+            "cn/old.txt",
+            FALLBACK,
+        )
+        .unwrap();
+        assert_eq!(
+            out.bytes,
+            Bytes::from("汉字正文：编码转换测试。".as_bytes())
+        );
+        assert_eq!(out.mime, "text/plain", "the family is preserved");
+        assert_eq!(out.name, "cn/old.txt", "a recoding rewrites no name");
+        assert_eq!(out.applied, vec!["charset"]);
+        // the fallback is a PARAMETER: the same invalid bytes under
+        // windows-1252 recode differently (this is the whole reason the
+        // knob exists — no encoding is right for every corpus)
+        let out = normalize(
+            Bytes::from(bytes),
+            "text/plain",
+            "cn/old.txt",
+            encoding_rs::WINDOWS_1252,
+        )
+        .unwrap();
+        assert_ne!(
+            out.bytes,
+            Bytes::from("汉字正文：编码转换测试。".as_bytes())
+        );
+        assert_eq!(out.applied, vec!["charset"]);
+        // valid UTF-8 is a pure passthrough — the entry costs nothing
+        let out = normalize(
+            Bytes::from_static(b"already utf-8"),
+            "text/plain",
+            "x.txt",
+            FALLBACK,
+        )
+        .unwrap();
+        assert_eq!(out.bytes, Bytes::from_static(b"already utf-8"));
+        assert!(out.applied.is_empty());
+    }
+
+    #[test]
+    fn charset_strips_utf8_bom_and_transcodes_utf16_bom() {
+        // UTF-8 BOM: strip only — the BOM is encoding metadata, not content
+        let mut with_bom = b"\xef\xbb\xbf".to_vec();
+        with_bom.extend_from_slice("正文".as_bytes());
+        let out = normalize(Bytes::from(with_bom), "text/plain", "bom.txt", FALLBACK).unwrap();
+        assert_eq!(out.bytes, Bytes::from("正文".as_bytes()));
+        assert_eq!(out.applied, vec!["charset"]);
+        // UTF-16LE BOM: the BOM names its encoding mechanically — decoding
+        // it is not a judgement call. (Hand-rolled code units: encoding_rs's
+        // `encode` answers in the WHATWG OUTPUT encoding, which for
+        // `UTF_16LE.encode()` is UTF-8 bytes — not what we want to feed.)
+        let mut u16le = vec![0xff, 0xfe]; // the BOM itself
+        u16le.extend(
+            "中文正文：十六位编码。"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        let out = normalize(Bytes::from(u16le), "text/plain", "u16.txt", FALLBACK).unwrap();
+        assert_eq!(out.bytes, Bytes::from("中文正文：十六位编码。".as_bytes()));
+        assert_eq!(out.applied, vec!["charset"]);
+        // a BOM-only text file becomes empty: the downstream empty-input
+        // refusal is the honest verdict (the entry does not pre-empt it)
+        let out = normalize(
+            Bytes::from_static(b"\xef\xbb\xbf"),
+            "text/plain",
+            "empty.txt",
+            FALLBACK,
+        )
+        .unwrap();
+        assert_eq!(out.bytes, Bytes::new());
+    }
+
+    #[test]
+    fn charset_leaves_non_text_families_and_unspecified_mimes_alone() {
+        // binary families are invalid UTF-8 BY DESIGN — recoding them would
+        // be corruption (a PNG's header bytes, an epub's zip container)
+        for mime in ["image/png", "application/pdf", "application/epub+zip"] {
+            let out = normalize(
+                Bytes::from_static(b"\x89PNG\r\n\x1a\n not text"),
+                mime,
+                "bin",
+                FALLBACK,
+            )
+            .unwrap();
+            assert_eq!(out.applied, Vec::<&str>::new(), "{mime}");
+            assert_eq!(out.bytes, Bytes::from_static(b"\x89PNG\r\n\x1a\n not text"));
+        }
+        // an unspecified mime is honestly "cannot tell" — same tolerance
+        // shape as the extractor gates
+        let out = normalize(Bytes::from(gbk("汉字")), "", "x", FALLBACK).unwrap();
+        assert!(out.applied.is_empty());
+        assert_eq!(out.bytes, Bytes::from(gbk("汉字")));
+    }
+
+    /// THE composition proof (the table's raison d'être): `x.txt.gz`
+    /// holding GBK text decompresses FIRST, then the decompressed bytes
+    /// are checked and recoded — two labels, one pass, the final bytes
+    /// are UTF-8.
+    #[test]
+    fn gunzip_then_charset_compose_in_table_order() {
+        let compressed = gz(&gbk("压缩包装的汉字正文。"));
+        let out = normalize(
+            Bytes::from(compressed),
+            "application/gzip",
+            "legacy/cn.txt.gz",
+            FALLBACK,
+        )
+        .unwrap();
+        assert_eq!(out.applied, vec!["gunzip", "charset"]);
+        assert_eq!(out.bytes, Bytes::from("压缩包装的汉字正文。".as_bytes()));
+        assert_eq!(
+            out.mime, "text/plain",
+            "gunzip inferred it; charset preserved it"
+        );
+        assert_eq!(
+            out.name, "legacy/cn.txt",
+            "gunzip stripped the wrapper; charset kept it"
+        );
     }
 
     /// THE table-order proof: with the recorder armed behind the real
@@ -501,6 +772,7 @@ mod tests {
                 Bytes::from(compressed.clone()),
                 "text/plain",
                 "ordered.txt.gz",
+                FALLBACK,
             )
             .unwrap()
         });
@@ -516,11 +788,18 @@ mod tests {
                 "recorder/text/plain/{} bytes/ordered.txt",
                 payload.len()
             )],
-            "the recorder ran AFTER gunzip and saw the TRANSFORMED state"
+            "the recorder ran AFTER gunzip AND charset (both real entries) and saw the \
+             TRANSFORMED state"
         );
 
         let (_, trace) = with_recording(|| {
-            normalize(Bytes::from_static(b"plain"), "text/markdown", "seq.md").unwrap()
+            normalize(
+                Bytes::from_static(b"plain"),
+                "text/markdown",
+                "seq.md",
+                FALLBACK,
+            )
+            .unwrap()
         });
         let mine: Vec<String> = trace
             .iter()
@@ -556,8 +835,12 @@ mod tests {
     /// a REPRESENTATIVE extension, asserting the inferred mime is that
     /// family's canonical row (the first), exactly what
     /// `mime_for_short_key` answers for a short-key-only consumer.
+    /// Since M3-T7 the fn lives in extract/ (three consumers: the gz
+    /// normalizer, the zip kind, the eml kind) — this is still its
+    /// table-driven proof.
     #[test]
     fn infer_mime_follows_the_short_key_table() {
+        let infer = super::super::extract::infer_mime_from_name;
         let mut seen: Vec<&str> = Vec::new();
         for (_mime, key) in MIME_TO_SHORT_KEY {
             if seen.contains(key) {
@@ -572,18 +855,18 @@ mod tests {
             };
             let name = format!("dir/file.{ext}");
             let canonical = super::super::extract::mime_for_short_key(key).unwrap();
-            assert_eq!(infer_mime(&name), canonical, "{name}");
+            assert_eq!(infer(&name), canonical, "{name}");
         }
         // the img family's aliases all infer the SAME canonical mime
         for ext in ["jpg", "jpeg", "png"] {
             assert_eq!(
-                infer_mime(&format!("dir/file.{ext}")),
+                infer(&format!("dir/file.{ext}")),
                 "image/jpeg",
                 "family canonical is the FIRST row"
             );
         }
-        assert_eq!(infer_mime("x.gz"), "application/octet-stream");
-        assert_eq!(infer_mime("no-extension"), "application/octet-stream");
-        assert_eq!(infer_mime("x.unknownext"), "application/octet-stream");
+        assert_eq!(infer("x.gz"), "application/octet-stream");
+        assert_eq!(infer("no-extension"), "application/octet-stream");
+        assert_eq!(infer("x.unknownext"), "application/octet-stream");
     }
 }

@@ -528,9 +528,15 @@ fn cli_full_command_smoke() {
     assert_eq!(v["ingest"]["buckets"][0]["bucket"], "docs");
     assert_eq!(v["ingest"]["buckets"][0]["counts"]["INDEXED"], 1);
 
-    // ---- FAILED path: non-UTF-8 source -> exit 1 + statusReason ----
-    let bad = work.join("bad.txt");
-    std::fs::write(&bad, b"\xff\xfe not utf8 \xff").unwrap();
+    // ---- FAILED path: corrupt gzip -> exit 1 + statusReason ----
+    // (M3-T7 update: the non-UTF-8 trigger this block used before — a
+    // \xff\xfe… file — now rides the charset normalizer's BOM
+    // identification and INDEXES; a corrupt gzip is the deterministic
+    // normalize dead end that still parks, same CLI contract.)
+    let bad = work.join("bad.txt.gz");
+    let mut gz_noise = vec![0x1f, 0x8b, 0x08, 0x00];
+    gz_noise.extend_from_slice(b"definitely not a deflate stream");
+    std::fs::write(&bad, &gz_noise).unwrap();
     let o = vf(
         port,
         &[
@@ -539,14 +545,18 @@ fn cli_full_command_smoke() {
             "--bucket",
             "docs",
             "--key",
-            "docs/bad.txt",
+            "docs/bad.txt.gz",
             "--timeout",
             "60",
         ],
         false,
     );
     assert_eq!(o.status.code(), Some(1), "FAILED exits 1: {}", out(&o));
-    assert!(out(&o).starts_with("FAILED\tdocs/bad.txt"), "{}", out(&o));
+    assert!(
+        out(&o).starts_with("FAILED\tdocs/bad.txt.gz"),
+        "{}",
+        out(&o)
+    );
     assert!(err(&o).contains("statusReason"), "{}", err(&o));
 
     // ---- no credentials: health-only degradation (M2 T8 container
