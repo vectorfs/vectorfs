@@ -30,8 +30,11 @@
 //! | Chinese-CLIP | weights unlicensed | rejected (no grant) |
 //!
 //! Accepted precedents: gte-multilingual-base Apache-2.0 (below),
-//! bge-m3 MIT, SigLIP2 Apache-2.0, jina-clip-v1 Apache-2.0 (M3 candidates —
-//! each gets its own table row + license audit when its milestone lands).
+//! bge-m3 MIT, jina-clip-v1 Apache-2.0 (future candidates — each gets its
+//! own table row + license audit when its milestone lands); SigLIP2
+//! Apache-2.0 LANDED as the M3-T2 siglip2 kind's model (below; the 38
+//! google checkpoints are all Apache-2.0, HF API verified in
+//! research/2026-11-multimodal-embedding.md §B1).
 //!
 //! # gte-multilingual-base facts (verified 2026-11-05, step-0 research)
 //!
@@ -78,7 +81,11 @@ pub struct ModelFile {
 }
 
 /// A built-in model entry. `dim` is the DECLARED dimension the ort kind's
-/// startup probe must agree with (§5.10.2: "探测 dim ≠ 声明 ⇒ 启动失败").
+/// startup probe must agree with (§5.10.2: "探测 dim ≠ 声明 ⇒ 启动失败");
+/// `image_size` is the DECLARED vision-tower input resolution for image
+/// models (the siglip2 kind's probe fallback + cross-check target — the
+/// pinned community export keeps H/W symbolic in the graph, so the ARTIFACT
+/// declares what the graph does not).
 pub struct BuiltinModel {
     /// Config-facing name (`[embedder.*] model = "…"` / prefetch argument).
     pub name: &'static str,
@@ -88,34 +95,81 @@ pub struct BuiltinModel {
     pub dim: usize,
     /// SPDX id recorded at audit time (red line above).
     pub license: &'static str,
+    /// Declared vision input (height, width) — image models only (the
+    /// siglip2 kind; None for text models).
+    pub image_size: Option<(u32, u32)>,
 }
 
 /// The built-in model table. Adding a row = a license audit (§5.10.5 red
 /// line) + verified file set; nothing else in the codebase hardcodes model
 /// names.
-pub static BUILTIN_MODELS: &[BuiltinModel] = &[BuiltinModel {
-    name: "gte-multilingual-base",
-    hf_repo: "onnx-community/gte-multilingual-base",
-    files: &[
-        ModelFile {
-            remote: "onnx/model.onnx",
-            local: "model.onnx",
-            sha256: "5b9f03fdc40350a78fa064b4cfb6bf9a229a7c40aa87736f537e3ebd00aa2b86",
-        },
-        ModelFile {
-            remote: "tokenizer.json",
-            local: "tokenizer.json",
-            sha256: "3a56def25aa40facc030ea8b0b87f3688e4b3c39eb8b45d5702b3a1300fe2a20",
-        },
-        ModelFile {
-            remote: "config.json",
-            local: "config.json",
-            sha256: "6ef2538d4286a7cd18d05225f659d8a1bceca7adb01c186868e53dbd4f822e17",
-        },
-    ],
-    dim: 768,
-    license: "Apache-2.0",
-}];
+pub static BUILTIN_MODELS: &[BuiltinModel] = &[
+    BuiltinModel {
+        name: "gte-multilingual-base",
+        hf_repo: "onnx-community/gte-multilingual-base",
+        files: &[
+            ModelFile {
+                remote: "onnx/model.onnx",
+                local: "model.onnx",
+                sha256: "5b9f03fdc40350a78fa064b4cfb6bf9a229a7c40aa87736f537e3ebd00aa2b86",
+            },
+            ModelFile {
+                remote: "tokenizer.json",
+                local: "tokenizer.json",
+                sha256: "3a56def25aa40facc030ea8b0b87f3688e4b3c39eb8b45d5702b3a1300fe2a20",
+            },
+            ModelFile {
+                remote: "config.json",
+                local: "config.json",
+                sha256: "6ef2538d4286a7cd18d05225f659d8a1bceca7adb01c186868e53dbd4f822e17",
+            },
+        ],
+        dim: 768,
+        license: "Apache-2.0",
+        image_size: None,
+    },
+    // SigLIP2 base, split-tower fp32 canonical (M3-T2). Facts verified
+    // 2026-11-06 against the actual artifacts (embed/siglip2.rs module docs
+    // carry the full story): split files vision_model/text_model (the FULL
+    // model.onnx needs image+text inputs together — unusable for one-modality
+    // runs); text input is input_ids ONLY; pooler_output IS the shared-space
+    // embedding (cos 1.000000 vs the full model's embeds, which only add the
+    // L2 norm); preprocessor mean=std=0.5, resample=2 (bilinear), exact
+    // 224×224 resize, no crop; text context 64 (tokenizer_config max_length).
+    // sha256s are the HF LFS content hashes (the same source the gte pins
+    // used — API `?blobs=true` lfs.sha256 == file-content sha256, verified
+    // against the gte pins at pin time).
+    BuiltinModel {
+        name: "siglip2-base-patch16-224",
+        hf_repo: "onnx-community/siglip2-base-patch16-224-ONNX",
+        files: &[
+            ModelFile {
+                remote: "onnx/vision_model.onnx",
+                local: "vision.onnx",
+                sha256: "c0573e3f4140c3a7c4e9cc5912bd6b26a033b46a6a8e8af26cbea262b163bcad",
+            },
+            ModelFile {
+                remote: "onnx/text_model.onnx",
+                local: "text.onnx",
+                sha256: "baf12d941beabafafb14f7b4adb38dc15be18681b964a84410ec53d9d65e6293",
+            },
+            ModelFile {
+                remote: "tokenizer.json",
+                local: "tokenizer.json",
+                sha256: "cb9140fae3ac5122c972d37adf83e1248471a38147ad76f8215c8872c6fd8322",
+            },
+            ModelFile {
+                remote: "config.json",
+                local: "config.json",
+                sha256: "e43a9f7692d3819886a82cb2097048258d444f123c67d37ec825f9345b019cf2",
+            },
+        ],
+        dim: 768,
+        license: "Apache-2.0",
+        // from the artifact's preprocessor_config.json size (pin-time fact)
+        image_size: Some((224, 224)),
+    },
+];
 
 /// Look up a built-in model by config name.
 pub fn builtin(name: &str) -> Option<&'static BuiltinModel> {
@@ -476,6 +530,7 @@ pub(crate) mod tests {
             ),
             dim: 8,
             license: "test-only",
+            image_size: None,
         }))
     }
 
@@ -556,6 +611,7 @@ pub(crate) mod tests {
             ),
             dim: 8,
             license: "test-only",
+            image_size: None,
         }));
         let dir = tempfile::tempdir().unwrap();
         let err = prefetch_model(model, dir.path()).await.unwrap_err();
@@ -611,6 +667,7 @@ pub(crate) mod tests {
             ),
             dim: 8,
             license: "test-only",
+            image_size: None,
         }));
         let dir = tempfile::tempdir().unwrap();
         let err = prefetch_model(model, dir.path()).await.unwrap_err();
@@ -638,9 +695,25 @@ pub(crate) mod tests {
         let m = builtin("gte-multilingual-base").expect("default model present");
         assert_eq!(m.dim, 768);
         assert_eq!(m.license, "Apache-2.0");
+        assert_eq!(m.image_size, None, "text model declares no image size");
         let locals: Vec<_> = m.files.iter().map(|f| f.local).collect();
         assert_eq!(locals, ["model.onnx", "tokenizer.json", "config.json"]);
         for f in m.files {
+            assert_eq!(f.sha256.len(), 64);
+            assert!(f.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+        // the siglip2 row (M3-T2): split towers + tokenizer, declared dim
+        // and the 224×224 the artifact's preprocessor pins
+        let s = builtin("siglip2-base-patch16-224").expect("siglip2 model present");
+        assert_eq!(s.dim, 768);
+        assert_eq!(s.license, "Apache-2.0");
+        assert_eq!(s.image_size, Some((224, 224)));
+        let locals: Vec<_> = s.files.iter().map(|f| f.local).collect();
+        assert_eq!(
+            locals,
+            ["vision.onnx", "text.onnx", "tokenizer.json", "config.json"]
+        );
+        for f in s.files {
             assert_eq!(f.sha256.len(), 64);
             assert!(f.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
         }

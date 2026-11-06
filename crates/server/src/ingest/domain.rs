@@ -63,12 +63,13 @@ pub fn derived_key(kind: &EmbedderKind, dim: usize) -> String {
 }
 
 /// Model identity string recorded in `x_vf_derived` and `x-vf-model`
-/// metadata. Delegates to the ort module's resolution matrix: for a
-/// path-only embedder the identity is the directory name (the artifact under
-/// `path` is what embeds; no built-in name was ever declared).
+/// metadata. Delegates to the kinds' resolution matrices: for a path-only
+/// embedder the identity is the directory name (the artifact under `path`
+/// is what embeds; no built-in name was ever declared).
 pub fn model_of(kind: &EmbedderKind) -> String {
     match kind {
         EmbedderKind::Ort(c) => super::super::pipeline::embed::ort::resolve_model_name(c),
+        EmbedderKind::Siglip2(c) => super::super::pipeline::embed::siglip2::resolve_model_name(c),
         EmbedderKind::OpenAi(c) => c.model.clone(),
     }
 }

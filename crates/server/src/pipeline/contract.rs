@@ -6,8 +6,10 @@
 //! be admitted — `#[cfg(test)]` below runs it against the built-ins
 //! (`txt`, `pdf-text`, `md`, `pdf-inspector`, `token-window`, the real `ort`
 //! kind over the committed tiny ONNX fixture + the real .so, the real
-//! `openai` kind over an in-process fake provider) and a local mock embedder
-//! kept as the LSP canary for third-party implementations.
+//! `openai` kind over an in-process fake provider, the real `siglip2` kind
+//! over its committed tiny fixture + the real .so via the image-route
+//! twin) and a local mock embedder kept as the LSP canary for third-party
+//! implementations.
 //!
 //! Assertions panic on violation (assertion-suite convention); callers wrap
 //! them in whatever test harness they use.
@@ -293,6 +295,94 @@ fn assert_finite(v: &[f32], route: &str) {
     }
 }
 
+/// Run the embedder contract against an IMAGE-document embedder (M3-T2:
+/// the `embedder_contract` twin for kinds whose doc side is not text —
+/// siglip2 today). `png` is a known-good sample image (any valid PNG the
+/// caller controls).
+///
+/// Everything `embedder_contract` asserts, through the image routes:
+///
+/// * image query twice → vectors of dimension exactly `e.dim()` (dimension
+///   identity, not bit-identical outputs);
+/// * image document batch → one vector per chunk, each `dim()`-dimensional,
+///   no NaN/Inf; determinism (CPU inference must be reproducible);
+/// * `embed_documents(&[])` is `Ok(vec![])`;
+/// * doc modality declares [`Modality::Image`]; query declares
+///   [`Modality::Image`] and, when it also declares Text (siglip2: the text
+///   tower ships with the kind), a TEXT query embeds at `dim()` too.
+pub async fn image_embedder_contract<E: Embedder + ?Sized>(e: &E, png: &[u8]) {
+    let dim = e.dim();
+    assert!(dim > 0, "declared dim must be positive");
+    assert!(
+        e.doc_modalities().contains(&Modality::Image),
+        "an image-document embedder must declare Image on its doc side"
+    );
+    assert!(
+        e.query_modalities().contains(&Modality::Image),
+        "an image embedder without an image query side cannot serve 以图搜图"
+    );
+
+    let q = Query::Image(png.to_vec(), "image/png".to_string());
+    let v1 = e.embed_query(&q).await.expect("image query must succeed");
+    assert_eq!(v1.len(), dim, "image query dim != declared dim");
+    assert_finite(&v1, "image query route");
+
+    let v2 = e
+        .embed_query(&q)
+        .await
+        .expect("image query (2nd) must succeed");
+    assert_eq!(v2.len(), dim, "image query dim flaps across calls");
+
+    let chunks = vec![
+        super::Chunk {
+            index: 0,
+            text: String::new(),
+            image: Some(super::ImagePayload {
+                bytes: bytes::Bytes::copy_from_slice(png),
+                mime: "image/png".to_string(),
+            }),
+        },
+        super::Chunk {
+            index: 1,
+            text: String::new(),
+            image: Some(super::ImagePayload {
+                bytes: bytes::Bytes::copy_from_slice(png),
+                mime: "image/png".to_string(),
+            }),
+        },
+    ];
+    let docs = e
+        .embed_documents(&chunks)
+        .await
+        .expect("image documents must embed");
+    assert_eq!(docs.len(), chunks.len(), "one vector per image chunk");
+    for (i, v) in docs.iter().enumerate() {
+        assert_eq!(v.len(), dim, "image doc dim != declared (chunk {i})");
+        assert_finite(v, "image document route");
+    }
+    // determinism on CPU inference (stronger than the contract's dim-only
+    // requirement, same pin as the mock embedder below)
+    let again = e.embed_documents(&chunks).await.unwrap();
+    assert_eq!(docs, again, "CPU image inference must be reproducible");
+
+    let empty = e
+        .embed_documents(&[])
+        .await
+        .expect("empty batch must be Ok");
+    assert!(empty.is_empty(), "empty batch must return no vectors");
+
+    // the text-query half when the query side declares Text (siglip2's text
+    // tower): 文字搜图 through the same declared dim
+    if e.query_modalities().contains(&Modality::Text) {
+        let t = e
+            .embed_query(&Query::Text("contract probe".to_string()))
+            .await
+            .expect("a Text-declaring query side must embed text queries");
+        assert_eq!(t.len(), dim, "text query dim != declared dim");
+        assert_finite(&t, "text query route");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Merge (query option)
 // ---------------------------------------------------------------------------
@@ -407,6 +497,7 @@ mod tests {
     use super::super::chunk::token_window::TokenWindowChunker;
     use super::super::embed::openai;
     use super::super::embed::ort;
+    use super::super::embed::siglip2;
     use super::super::extract::md::MdExtractor;
     use super::super::extract::pdf_inspector::PdfInspectorExtractor;
     use super::super::extract::pdf_text;
@@ -476,6 +567,28 @@ mod tests {
         let e = super::super::embed::openai::OpenAiEmbedder::new(&openai::tests::fake_config(base))
             .unwrap();
         embedder_contract(&e).await;
+    }
+
+    /// A solid-color PNG encoded in-test (the contract's known-good image
+    /// sample — no committed image bytes needed).
+    fn contract_png() -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(16, 12, image::Rgb([200, 30, 90]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    #[tokio::test]
+    async fn siglip2_kind_passes_image_embedder_contract() {
+        // the REAL siglip2 kind against the committed tiny fixture + the
+        // real .so — through the IMAGE routes (the text-contract twin above
+        // assumes text documents; siglip2 refuses them loudly by design)
+        let e = siglip2::tests::embedder_or_panic().await;
+        image_embedder_contract(&e, &contract_png()).await;
+        // modality declarations, pinned as the admission-suite view (doc =
+        // Image; query = Image + Text — the text tower ships with the kind)
+        assert_eq!(e.doc_modalities(), &[Modality::Image]);
+        assert_eq!(e.query_modalities(), &[Modality::Image, Modality::Text]);
     }
 
     /// Deterministic pseudo-embedding: sha256(dim_index + text) -> one f32

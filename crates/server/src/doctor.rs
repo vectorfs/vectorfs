@@ -671,6 +671,71 @@ async fn check_models(cfg: &StorageConfig) -> Check {
                     }
                 }
             },
+            crate::pipeline::embed::EmbedderKind::Siglip2(c) => match &c.path {
+                Some(p) => {
+                    let dir = std::path::PathBuf::from(p);
+                    let missing: Vec<&str> = ["vision.onnx", "text.onnx", "tokenizer.json"]
+                        .iter()
+                        .filter(|f| !dir.join(f).is_file())
+                        .copied()
+                        .collect();
+                    if missing.is_empty() {
+                        note(
+                            CheckStatus::Pass,
+                            format!(
+                                "{name}: siglip2 path {} (vision.onnx + text.onnx + \
+                                 tokenizer.json)",
+                                dir.display()
+                            ),
+                        );
+                    } else {
+                        note(
+                            CheckStatus::Fail,
+                            format!(
+                                "{name}: path {} missing {}",
+                                dir.display(),
+                                missing.join(", ")
+                            ),
+                        );
+                    }
+                }
+                None => {
+                    let mname = crate::pipeline::embed::siglip2::resolve_model_name(c);
+                    match crate::pipeline::models::builtin(&mname) {
+                        None => note(
+                            CheckStatus::Fail,
+                            format!("{name}: unknown model '{mname}' (not a built-in; set path)"),
+                        ),
+                        Some(builtin) => {
+                            let dir = models_dir.join(&mname);
+                            if crate::pipeline::models::is_ready(&dir, builtin) {
+                                note(
+                                    CheckStatus::Pass,
+                                    format!("{name}: {mname} ready under {}", dir.display()),
+                                );
+                            } else if c.offline {
+                                note(
+                                    CheckStatus::Fail,
+                                    format!(
+                                        "{name}: {mname} absent under {} and offline = true (serve \
+                                         refuses to start)",
+                                        dir.display()
+                                    ),
+                                );
+                            } else {
+                                note(
+                                    CheckStatus::Warn,
+                                    format!(
+                                        "{name}: {mname} absent under {} — serve prefetches it at \
+                                         startup (network)",
+                                        dir.display()
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            },
             crate::pipeline::embed::EmbedderKind::OpenAi(c) => {
                 // endpoint shape: mirrors pipeline/embed/openai.rs's
                 // construction gates; the key is only RESOLVED, never sent.

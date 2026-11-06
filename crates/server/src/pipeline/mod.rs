@@ -91,8 +91,8 @@ use std::collections::BTreeMap;
 /// Content modality of a [`Part`] / capability declaration of an
 /// [`Embedder`]. Closed enum by design (see module docs); `M3+ adds values`
 /// is in-design behavior, not a breaking change. `Image` landed in M3-T1
-/// (mechanism ground only — the siglip2 embedder and pdf-pages/image
-/// extractor kinds are T2/T3).
+/// (mechanism ground); the siglip2 embedder (M3-T2) is its first taker —
+/// the pdf-pages/image extractor kinds are T3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Modality {
     /// Plain UTF-8 text (the only M2 modality).
@@ -123,7 +123,7 @@ impl Modality {
         match self {
             Modality::Image => {
                 "add an embedder that accepts image documents to this pipeline's embedders \
-                 list (the planned siglip2 kind, M3-T2), or keep image sources out of it"
+                 list (the siglip2 kind does), or keep image sources out of it"
             }
             // every built-in embedder kind accepts text documents, so an
             // all-text-kind pipeline with text chunks never reaches this

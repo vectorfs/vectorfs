@@ -2062,15 +2062,16 @@ impl IngestRuntime {
         Ok(())
     }
 
-    /// CPU gate: LOCAL inference holds the thread (ort wraps itself in
-    /// spawn_blocking); remote HTTP embeds are I/O-bound and stay ungated.
+    /// CPU gate: LOCAL inference holds the thread (ort and siglip2 wrap
+    /// themselves in spawn_blocking); remote HTTP embeds are I/O-bound and
+    /// stay ungated.
     async fn embed_gated(
         &self,
         loaded: &LoadedEmbedder,
         chunks: &[Chunk],
     ) -> Result<Vec<Vec<f32>>, PipelineError> {
         match loaded {
-            LoadedEmbedder::Ort(_) => {
+            LoadedEmbedder::Ort(_) | LoadedEmbedder::Siglip2(_) => {
                 let permit = self
                     .shared
                     .core
@@ -5335,6 +5336,247 @@ pub(crate) mod tests {
             !reason.contains("no embedder that accepts"),
             "garbage is a chunk refusal, not a missing-embedder gap: {reason}"
         );
+    }
+
+    // ---- M3-T2: image sources EMBED through the real siglip2 kind ----
+
+    /// The siglip2 fixture dir (tiny towers + WordLevel tokenizer; the same
+    /// hermetic discipline as the ort tiny-embedder fixture).
+    fn siglip2_fixture_dir() -> std::path::PathBuf {
+        for p in [
+            "vf/tests/fixtures/tiny-siglip2",
+            "tests/fixtures/tiny-siglip2",
+        ] {
+            let d = std::path::PathBuf::from(p);
+            if d.join("vision.onnx").is_file() {
+                return d;
+            }
+        }
+        panic!("tiny-siglip2 fixture not found — run its generate.py");
+    }
+
+    /// A GENUINELY decodable small PNG (in-test encoder). T1's TINY_PNG
+    /// only ever had its magic SNIFFED — its deflate stream is not valid
+    /// for a real decoder, and the siglip2 kind decodes for preprocessing.
+    fn valid_png() -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(12, 9, image::Rgb([30, 180, 90]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    /// The image-EMBEDDING e2e config: an `img` placeholder extractor (the
+    /// runtime patch swaps it for the cfg(test) image kind) + the siglip2
+    /// fixture embedder via `path` (no network, no models dir). The tiny
+    /// text embedder rides along because the config-time modality
+    /// carry-over check (correctly) refuses a text-outputting placeholder
+    /// extractor with no text-accepting embedder listed — which also makes
+    /// every run of this shape prove per-embedder modality SCOPING.
+    fn sig_config(extract_entries: &str) -> PipelineConfig {
+        let text = format!(
+            "[extractor.img]\nkind = \"txt\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = \
+             true\n\n\
+             [embedder.sig]\nkind = \"siglip2\"\npath = {:?}\noffline = true\n\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ {extract_entries} }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"tiny\", \"sig\"]\nscan_interval_secs = 1",
+            fixture_dir().display().to_string(),
+            siglip2_fixture_dir().display().to_string(),
+        );
+        crate::pipeline::config::load_pipeline_config(&text).unwrap()
+    }
+
+    /// The cfg(test) image-kind patch (the T1 twin of every patched test).
+    fn patch_img_extractor(plan: &mut BucketPlan) {
+        plan.extractors.insert(
+            "img".to_string(),
+            crate::pipeline::extract::ExtractorKind::TestImage(
+                crate::pipeline::extract::TestImageSpec {
+                    mime: "image/png".to_string(),
+                },
+            ),
+        );
+    }
+
+    /// THE M3-T2 e2e (the T1 gate's green twin): a PNG source is claimed,
+    /// extracted as an image Part, atomically chunked — and EMBEDDED by the
+    /// real siglip2 kind over the real .so: INDEXED, one vector in the sig
+    /// derived index, `x-vf-modality = image`, the `image` chunk-key
+    /// namespace, the fixture's 8-dim unit-norm vector on the row — while
+    /// the text embedder, scoped to zero chunks, writes NOTHING (no index
+    /// of its own is ever created).
+    #[tokio::test]
+    async fn image_source_embeds_through_siglip2() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("photo.img"), valid_png()).unwrap();
+
+        let cfg = sig_config("img = \"img\"");
+        let (rt, _h, state) = runtime_patched(dir.path(), &cfg, patch_img_extractor).await;
+
+        rt.scan_once().await;
+        rt.drain_queue().await;
+
+        let m = status_of(&state, "docs", "docs/photo.img").await;
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
+        assert_eq!(
+            m.chunks.as_ref().unwrap().get("image"),
+            Some(&1u32),
+            "one atomic image chunk: {:?}",
+            m.chunks
+        );
+
+        // the sig derived index holds exactly one IMAGE row with the full
+        // metadata contract and a unit-norm 8-dim vector
+        let spec = rt.shared.core.buckets["docs"].derived["sig"].clone();
+        let rows = state
+            .storage
+            .scan_vectors("docs", &spec.index_name, None)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "one image atom in the derived index");
+        let row = &rows[0];
+        assert!(
+            row.key.ends_with("-image-0"),
+            "image atoms live in the image key namespace: {}",
+            row.key
+        );
+        let meta = row.metadata.as_ref().unwrap();
+        assert_eq!(meta["x-vf-modality"], "image");
+        assert_eq!(meta["x-vf-src-name"], "docs/photo.img");
+        assert_eq!(
+            meta["x-vf-model"], "tiny-siglip2",
+            "path-only identity is the directory name"
+        );
+        assert_eq!(row.vector.len(), 8, "fixture dim");
+        assert!(row.vector.iter().all(|x| x.is_finite()));
+        let norm: f32 = row.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "unit norm: {norm}");
+
+        // per-embedder modality scoping, the zero-chunk half: the text
+        // embedder saw no acceptable chunk, so it wrote nothing and its
+        // derived index was never created
+        let tiny_spec = rt.shared.core.buckets["docs"].derived["tiny"].clone();
+        assert!(
+            state
+                .storage
+                .load_index("docs", &tiny_spec.index_name)
+                .await
+                .unwrap()
+                .is_none(),
+            "the text embedder must not materialize an index for an image-only source"
+        );
+    }
+
+    /// A garbage image payload still fails AT DECODE inside the real kind
+    /// (not the gate, not silently): the sniff guard passes a real PNG
+    /// header but a TRUNCATED png body must fail loud as an embed error.
+    #[tokio::test]
+    async fn truncated_png_fails_at_siglip2_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        // magic sniff needs the header; the decoder needs the IDAT — cut both
+        std::fs::write(docs.join("cut.img"), &valid_png()[..24]).unwrap();
+
+        let cfg = sig_config("img = \"img\"");
+        let (rt, _h, state) = runtime_patched(dir.path(), &cfg, patch_img_extractor).await;
+
+        rt.scan_once().await;
+        rt.drain_queue().await;
+
+        // the text embedder SUCCEEDED (its scoped set was empty), so the
+        // marker is PARTIALLY indexed with the sig failure as the reason —
+        // the loud-embed-failure shape, never a silent skip
+        let m = status_of(&state, "docs", "docs/cut.img").await;
+        assert_eq!(m.status, SourceStatus::PartiallyIndexed, "{m:?}");
+        assert!(
+            m.retries_exhausted,
+            "decode failure is deterministic: {m:?}"
+        );
+        let reason = m.status_reason.clone().expect("reason");
+        assert!(reason.contains("decoding image"), "{reason}");
+    }
+
+    /// Mixed-modality source set over DUAL embedders (the §5.10.1 fan-out
+    /// through real kinds): text files embed through the tiny ort kind,
+    /// image files through siglip2 — each derived index receives ONLY its
+    /// own modality's rows, both sources INDEXED, each row's
+    /// `x-vf-modality`/`x-vf-model` naming the embedder that produced it.
+    #[tokio::test]
+    async fn mixed_sources_fan_out_to_dual_embedders() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        let body = "the quick brown fox jumps over the lazy dog again and again";
+        std::fs::write(docs.join("note.txt"), body).unwrap();
+        std::fs::write(docs.join("photo.img"), valid_png()).unwrap();
+
+        // text (tiny ort fixture) + image (siglip2 fixture) embedders, both
+        // listed; the fan-out scopes chunks by each one's doc modalities
+        let text = format!(
+            "[extractor.plain]\nkind = \"txt\"\n\n\
+             [extractor.img]\nkind = \"txt\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = \
+             true\n\n\
+             [embedder.sig]\nkind = \"siglip2\"\npath = {:?}\noffline = true\n\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ txt = \"plain\", img = \"img\" \
+             }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"tiny\", \"sig\"]\nscan_interval_secs = 1",
+            fixture_dir().display().to_string(),
+            siglip2_fixture_dir().display().to_string(),
+        );
+        let cfg = crate::pipeline::config::load_pipeline_config(&text).unwrap();
+        let (rt, _h, state) = runtime_patched(dir.path(), &cfg, patch_img_extractor).await;
+
+        rt.scan_once().await;
+        rt.drain_queue().await;
+
+        // both sources INDEXED (the T1 aggregate gate cannot fire: every
+        // emitted modality has a taker)
+        for key in ["docs/note.txt", "docs/photo.img"] {
+            let m = status_of(&state, "docs", key).await;
+            assert_eq!(m.status, SourceStatus::Indexed, "{key}: {m:?}");
+        }
+
+        // tiny's index: ONLY text rows; sig's: ONLY the image row
+        let tiny_spec = rt.shared.core.buckets["docs"].derived["tiny"].clone();
+        let sig_spec = rt.shared.core.buckets["docs"].derived["sig"].clone();
+        let tiny_rows = state
+            .storage
+            .scan_vectors("docs", &tiny_spec.index_name, None)
+            .await
+            .unwrap();
+        let sig_rows = state
+            .storage
+            .scan_vectors("docs", &sig_spec.index_name, None)
+            .await
+            .unwrap();
+        assert!(!tiny_rows.is_empty(), "the text source embedded");
+        assert_eq!(sig_rows.len(), 1, "one image atom");
+        for row in &tiny_rows {
+            assert!(
+                !row.key.contains("-image-"),
+                "no image atoms in the text embedder's index: {}",
+                row.key
+            );
+            assert_eq!(row.metadata.as_ref().unwrap()["x-vf-modality"], "text");
+            assert_eq!(row.metadata.as_ref().unwrap()["x-vf-model"], "tiny-fixture");
+        }
+        let sig_row = &sig_rows[0];
+        assert!(sig_row.key.ends_with("-image-0"), "{}", sig_row.key);
+        let meta = sig_row.metadata.as_ref().unwrap();
+        assert_eq!(meta["x-vf-modality"], "image");
+        assert_eq!(meta["x-vf-src-name"], "docs/photo.img");
+        assert_eq!(meta["x-vf-model"], "tiny-siglip2");
+        assert_eq!(sig_row.vector.len(), 8);
+        // dims differ per index (8-dim fixture text vs 8-dim fixture image —
+        // both fixtures are 8; the SEPARATION is the assertion, and each
+        // index only ever saw its own embedder's vectors)
+        assert_eq!(tiny_rows[0].vector.len(), 8, "text index keeps its own dim");
     }
 
     /// The child three-state vocabulary on the failure side: a child with NO

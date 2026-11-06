@@ -261,9 +261,11 @@ impl PipelineConfig {
     /// side-effect-free). `data_dir` resolves the models cache when the
     /// config does not override `models_dir`.
     ///
-    /// Per ort embedder (§5.10.4 semantics):
-    /// * `path` set: the directory must already hold `model.onnx` +
-    ///   `tokenizer.json` (a `path` is never prefetched);
+    /// Per local-artifact embedder — ort and siglip2 (openai needs none;
+    /// §5.10.4 semantics):
+    /// * `path` set: the directory must already hold the kind's model files
+    ///   (ort: `model.onnx` + `tokenizer.json`; siglip2: `vision.onnx` +
+    ///   `text.onnx` + `tokenizer.json`) — a `path` is never prefetched;
     /// * builtin name, `offline = true`: the prefetched cache dir must be
     ///   ready — no network will fix it (§5.10.4 air-gapped variant);
     /// * builtin name, online, cache not ready: OK — load-time prefetch
@@ -279,15 +281,30 @@ impl PipelineConfig {
             .clone()
             .unwrap_or_else(|| super::models::default_models_dir(data_dir));
         for (name, kind) in &self.embedders {
-            let EmbedderKind::Ort(cfg) = kind else {
-                continue; // openai needs no local artifacts
-            };
+            // (local artifacts layout, path, offline, resolved model name)
+            // per kind — the shape is shared, the FILE SET is the kind's
+            let (path, offline, files, resolved): (Option<&String>, bool, &[&str], String) =
+                match kind {
+                    EmbedderKind::Ort(cfg) => (
+                        cfg.path.as_ref(),
+                        cfg.offline,
+                        &["model.onnx", "tokenizer.json"],
+                        crate::pipeline::embed::ort::resolve_model_name(cfg),
+                    ),
+                    EmbedderKind::Siglip2(cfg) => (
+                        cfg.path.as_ref(),
+                        cfg.offline,
+                        &["vision.onnx", "text.onnx", "tokenizer.json"],
+                        crate::pipeline::embed::siglip2::resolve_model_name(cfg),
+                    ),
+                    EmbedderKind::OpenAi(_) => continue, // no local artifacts
+                };
             let section = format!("embedder.{name}");
             let line = self.section_line(&section);
-            match &cfg.path {
+            match path {
                 Some(p) => {
                     let dir = std::path::PathBuf::from(p);
-                    let missing: Vec<&str> = ["model.onnx", "tokenizer.json"]
+                    let missing: Vec<&str> = files
                         .iter()
                         .filter(|f| !dir.join(f).is_file())
                         .copied()
@@ -296,37 +313,35 @@ impl PipelineConfig {
                         return Err(PipelineError::config(
                             format!(
                                 "[{section}]: path {} does not contain {} (a path is never \
-                                 prefetched — point it at a complete model directory: \
-                                 model.onnx + tokenizer.json)",
+                                 prefetched — point it at a complete model directory: {})",
                                 dir.display(),
-                                missing.join(", ")
+                                missing.join(", "),
+                                files.join(" + ")
                             ),
                             line,
                         ));
                     }
                 }
                 None => {
-                    // name-only (or default) resolution: the model MUST be a
-                    // built-in table entry (that is what can be prefetched).
-                    let name = crate::pipeline::embed::ort::resolve_model_name(cfg);
-                    let Some(builtin) = super::models::builtin(&name) else {
+                    // name-only resolution: the model MUST be a built-in
+                    // table entry (that is what can be prefetched).
+                    let Some(builtin) = super::models::builtin(&resolved) else {
                         return Err(PipelineError::config(
                             format!(
-                                "[{section}]: unknown model '{}' (built-in models: {})",
-                                name,
+                                "[{section}]: unknown model '{resolved}' (built-in models: {})",
                                 super::models::builtin_names().join(", ")
                             ),
                             line,
                         ));
                     };
-                    let dir = models_dir.join(&name);
-                    if cfg.offline && !super::models::is_ready(&dir, builtin) {
+                    let dir = models_dir.join(&resolved);
+                    if offline && !super::models::is_ready(&dir, builtin) {
                         return Err(PipelineError::config(
                             format!(
-                                "[{section}]: offline = true but model '{}' is not present under \
-                                 {} — prefetch on a connected machine (vectorfs init --preset \
-                                 text-rag) or set path = \"…\"; the network will not be used",
-                                name,
+                                "[{section}]: offline = true but model '{resolved}' is not \
+                                 present under {} — prefetch on a connected machine (vectorfs \
+                                 init --preset text-rag) or set path = \"…\"; the network will \
+                                 not be used",
                                 dir.display()
                             ),
                             line,
@@ -509,19 +524,31 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
         section_lines.insert(section.clone(), line.expect("line computed above"));
         let kind = EmbedderKind::from_config(&section, sv.get_ref(), line)?;
         // §5.10.5 license red line: the BUILT-IN table is permissive-only.
-        // ANY `path` means a self-managed artifact (even a gte-named one —
+        // ANY `path` means a self-managed artifact (even a table-named one —
         // the table's pins are not what loads), so the license audit moves
-        // to the operator. Warn, never reject.
-        if let EmbedderKind::Ort(cfg) = &kind
-            && let Some(p) = &cfg.path
-        {
+        // to the operator. Warn, never reject. (Local-artifact kinds only:
+        // ort and siglip2.)
+        let selfmanaged: Option<(String, String)> = match &kind {
+            EmbedderKind::Ort(cfg) => cfg.path.as_ref().map(|p| {
+                (
+                    p.clone(),
+                    crate::pipeline::embed::ort::resolve_model_name(cfg),
+                )
+            }),
+            EmbedderKind::Siglip2(cfg) => cfg.path.as_ref().map(|p| {
+                (
+                    p.clone(),
+                    crate::pipeline::embed::siglip2::resolve_model_name(cfg),
+                )
+            }),
+            EmbedderKind::OpenAi(_) => None,
+        };
+        if let Some((p, resolved)) = selfmanaged {
             warnings.push(format!(
                 "embedder '{name}' loads a self-managed model via path {p} — outside the \
                  built-in table{}; its license is your audit (built-ins are \
                  permissive-only, §5.10.5)",
-                if super::models::builtin(&crate::pipeline::embed::ort::resolve_model_name(cfg))
-                    .is_some()
-                {
+                if super::models::builtin(&resolved).is_some() {
                     " (the built-in pins are bypassed)"
                 } else {
                     ""
@@ -1443,6 +1470,70 @@ index-prefix = "docs"
             .validate_model_availability(data.path())
             .unwrap_err();
         assert!(err.to_string().contains("unknown model 'bge-m3'"), "{err}");
+    }
+
+    /// The siglip2 arm of the same gate: the SPLIT-TOWER file set (a
+    /// missing text tower or tokenizer is named), the built-in name
+    /// resolving through the prefetch chain, and the offline rule.
+    #[test]
+    fn model_availability_gate_siglip2_rules() {
+        let data = tempfile::tempdir().unwrap();
+        // a dir with only the vision tower: the missing files are named
+        let half = tempfile::tempdir().unwrap();
+        std::fs::write(half.path().join("vision.onnx"), b"x").unwrap();
+        let cfg = parse(&format!(
+            "[embedder.s]\nkind = \"siglip2\"\npath = \"{}\"",
+            half.path().display()
+        ))
+        .unwrap();
+        let err = cfg.validate_model_availability(data.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("text.onnx"), "{msg}");
+        assert!(msg.contains("tokenizer.json"), "{msg}");
+        assert!(
+            msg.contains("vision.onnx + text.onnx + tokenizer.json"),
+            "{msg}"
+        );
+
+        // complete fixture-shaped path passes (the committed tiny fixture;
+        // cargo runs from either root or member dir — try both prefixes)
+        for fixture in [
+            "crates/server/tests/fixtures/tiny-siglip2",
+            "tests/fixtures/tiny-siglip2",
+        ] {
+            if std::path::Path::new(fixture).join("vision.onnx").is_file() {
+                let cfg = parse(&format!(
+                    "[embedder.s]\nkind = \"siglip2\"\npath = \"{fixture}\""
+                ))
+                .unwrap();
+                assert!(cfg.validate_model_availability(data.path()).is_ok());
+            }
+        }
+
+        // name-only: the built-in resolves (online + empty cache = OK —
+        // load-time prefetch); offline + empty cache refuses
+        let base = "[embedder.s]\nkind = \"siglip2\"\nmodel = \"siglip2-base-patch16-224\"\n";
+        assert!(
+            parse(base)
+                .unwrap()
+                .validate_model_availability(data.path())
+                .is_ok()
+        );
+        let cfg = parse(&format!("{base}offline = true\n")).unwrap();
+        let err = cfg.validate_model_availability(data.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("offline = true but model 'siglip2-base-patch16-224'"),
+            "{err}"
+        );
+
+        // unknown siglip2 model name without path: the built-in list names it
+        let cfg = parse("[embedder.s]\nkind = \"siglip2\"\nmodel = \"siglip2-so400m\"").unwrap();
+        let err = cfg.validate_model_availability(data.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown model 'siglip2-so400m'"),
+            "{err}"
+        );
     }
 
     #[test]

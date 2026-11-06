@@ -1,0 +1,7 @@
+{
+  "model_type": "tiny-siglip2-fixture",
+  "projection_dim": 8,
+  "image_size": 8,
+  "text_vocab_size": 16,
+  "license": "CC0-1.0 (vectorfs test fixture, generated in-repo)"
+}

@@ -23,19 +23,24 @@
 //! [`http`]. This module sees only the two config structs and the two
 //! runtime structs.
 //!
-//! # Kinds (M2)
+//! # Kinds (M2/M3)
 //!
 //! * `ort` — local ONNX Runtime inference (dynamic .so; gte family defaults).
 //! * `openai` — remote OpenAI-compatible /embeddings API over hand-rolled
 //!   HTTP.
+//! * `siglip2` — local ONNX Runtime image embedder, SigLIP 2 split towers
+//!   (embed/siglip2.rs, M3-T2: doc side Image, query side Image + Text —
+//!   the first doc modality ≠ Text kind).
 
 pub mod http;
 pub mod openai;
 pub mod ort;
+pub mod siglip2;
 
 use super::{Chunk, Modality, PipelineError, Query};
 use openai::{OpenAiConfig, OpenAiEmbedder};
 use ort::{OrtConfig, OrtEmbedder};
+use siglip2::{Siglip2Config, Siglip2Embedder};
 
 /// The loud refusal every text-only kind returns from `embed_query` for a
 /// non-text query (M3-T1): the query-side twin of the ingest worker's
@@ -46,7 +51,7 @@ use ort::{OrtConfig, OrtEmbedder};
 pub(crate) fn query_modality_refusal(q: &Query) -> PipelineError {
     PipelineError::embed(format!(
         "this embedder does not accept {} — its query side is text-only; an image query needs \
-         an image-capable embedder kind (planned: siglip2, M3-T2)",
+         an image-capable embedder kind (the siglip2 kind accepts image queries)",
         q.describe()
     ))
 }
@@ -66,8 +71,28 @@ pub(crate) fn image_chunk_refusal(chunk: &Chunk) -> PipelineError {
     ))
 }
 
+/// The loud refusal an image-only kind returns from `embed_documents` when
+/// a text chunk reaches it (M3-T2, the twin of [`image_chunk_refusal`]):
+/// the worker scopes chunks by doc modality, so a text chunk at the siglip2
+/// kind is a routing bug — and there is no honest image to preprocess.
+pub(crate) fn text_chunk_refusal(chunk: &Chunk) -> PipelineError {
+    PipelineError::embed(format!(
+        "chunk {} is a text chunk but this embedder embeds image documents only — the ingest \
+         router scopes chunks by doc modality, so a text chunk here is a routing bug (a text \
+         chunk has no image payload to preprocess; failing loudly beats embedding garbage)",
+        chunk.index
+    ))
+}
+
 /// The available-kind list embedded in unknown-kind errors.
-pub const EMBEDDER_KINDS: &str = "ort, openai";
+pub const EMBEDDER_KINDS: &str = "ort, openai, siglip2";
+
+/// Every kind's config label, IN AVAILABILITY-LIST ORDER — the embedder
+/// axis twin of the extractor axis's `KIND_LABELS` anchor: `kind_label`
+/// (the exhaustive match the compiler walks on a new variant) and the
+/// parity test below pin the three views together (enum variants /
+/// `from_config` arms / this table + [`EMBEDDER_KINDS`]).
+pub const KIND_LABELS: &[&str] = &["ort", "openai", "siglip2"];
 
 /// Registered embedder kinds (the CONFIG object; see module docs).
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +101,8 @@ pub enum EmbedderKind {
     Ort(OrtConfig),
     /// Remote OpenAI-compatible provider (embed/openai.rs).
     OpenAi(OpenAiConfig),
+    /// Local SigLIP 2 image embedder, split towers (embed/siglip2.rs).
+    Siglip2(Siglip2Config),
 }
 
 impl EmbedderKind {
@@ -103,6 +130,27 @@ impl EmbedderKind {
                 })?;
                 Ok(EmbedderKind::OpenAi(cfg))
             }
+            "siglip2" => {
+                let cfg: Siglip2Config = raw.clone().try_into().map_err(|e: toml::de::Error| {
+                    super::config::stage2_error(section, Some(&kind), e.message(), line)
+                })?;
+                // fail-fast at PARSE time: the siglip2 kind deliberately has
+                // no default tier (which model becomes the preset default is
+                // M3-T4's adjudication), so a bare kind = "siglip2" must
+                // name the built-in rather than silently pick one
+                if cfg.model.is_none() && cfg.path.is_none() {
+                    return Err(PipelineError::config(
+                        format!(
+                            "[{section}]: the siglip2 kind requires model = \"{}\" (or another \
+                             built-in name) or path = \"…\" — which tier becomes the default is \
+                             deliberately not baked in (M3-T4 preset adjudication)",
+                            siglip2::BUILTIN
+                        ),
+                        line,
+                    ));
+                }
+                Ok(EmbedderKind::Siglip2(cfg))
+            }
             other => Err(PipelineError::config(
                 format!(
                     "[{section}]: unknown embedder kind '{other}' (available kinds: \
@@ -113,12 +161,25 @@ impl EmbedderKind {
         }
     }
 
+    /// The kind's REGISTRY label — the `kind = "…"` config string, one per
+    /// variant, exhaustively matched so a new kind MUST land here (the
+    /// extractor-axis `kind_label` discipline; the parity test below pins
+    /// the table views to it).
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            EmbedderKind::Ort(_) => "ort",
+            EmbedderKind::OpenAi(_) => "openai",
+            EmbedderKind::Siglip2(_) => "siglip2",
+        }
+    }
+
     /// Modalities accepted on the DOCUMENT side — drives the §5.10.3
-    /// modality carry-over check at config time. Both M2 kinds are text-only;
-    /// M3's image/audio kinds add values next to these arms.
+    /// modality carry-over check at config time. The M2 kinds are text-only;
+    /// siglip2 (M3-T2) is the first image-document kind.
     pub fn doc_modalities(&self) -> &'static [Modality] {
         match self {
             EmbedderKind::Ort(_) | EmbedderKind::OpenAi(_) => &[Modality::Text],
+            EmbedderKind::Siglip2(_) => &[Modality::Image],
         }
     }
 
@@ -126,6 +187,9 @@ impl EmbedderKind {
     pub fn query_modalities(&self) -> &'static [Modality] {
         match self {
             EmbedderKind::Ort(_) | EmbedderKind::OpenAi(_) => &[Modality::Text],
+            // 以图搜图 (vision tower) + 文字搜图 (text tower; the tokenizers
+            // investigation came back clean — see siglip2.rs module docs)
+            EmbedderKind::Siglip2(_) => &[Modality::Image, Modality::Text],
         }
     }
 
@@ -151,6 +215,16 @@ impl EmbedderKind {
                 "openai(model={}, dim={}, endpoint={})",
                 c.model, c.dim, c.endpoint
             ),
+            EmbedderKind::Siglip2(c) => match &c.path {
+                Some(p) => format!("siglip2(path={p})"),
+                None => {
+                    format!(
+                        "siglip2(model={}{})",
+                        siglip2::resolve_model_name(c),
+                        if c.offline { ", offline" } else { "" }
+                    )
+                }
+            },
         }
     }
 
@@ -167,6 +241,9 @@ impl EmbedderKind {
                 OrtEmbedder::new(cfg, models_dir).await?,
             )),
             EmbedderKind::OpenAi(cfg) => Ok(LoadedEmbedder::OpenAi(OpenAiEmbedder::new(cfg)?)),
+            EmbedderKind::Siglip2(cfg) => Ok(LoadedEmbedder::Siglip2(
+                Siglip2Embedder::new(cfg, models_dir).await?,
+            )),
         }
     }
 }
@@ -180,6 +257,7 @@ impl EmbedderKind {
 pub enum LoadedEmbedder {
     Ort(OrtEmbedder),
     OpenAi(OpenAiEmbedder),
+    Siglip2(Siglip2Embedder),
 }
 
 impl LoadedEmbedder {
@@ -188,6 +266,7 @@ impl LoadedEmbedder {
         match self {
             LoadedEmbedder::Ort(_) => "ort".to_string(),
             LoadedEmbedder::OpenAi(_) => "openai".to_string(),
+            LoadedEmbedder::Siglip2(_) => "siglip2".to_string(),
         }
     }
 }
@@ -198,6 +277,7 @@ impl super::Embedder for LoadedEmbedder {
         match self {
             LoadedEmbedder::Ort(e) => e.embed_query(q).await,
             LoadedEmbedder::OpenAi(e) => e.embed_query(q).await,
+            LoadedEmbedder::Siglip2(e) => e.embed_query(q).await,
         }
     }
 
@@ -208,6 +288,7 @@ impl super::Embedder for LoadedEmbedder {
         match self {
             LoadedEmbedder::Ort(e) => e.embed_documents(chunks).await,
             LoadedEmbedder::OpenAi(e) => e.embed_documents(chunks).await,
+            LoadedEmbedder::Siglip2(e) => e.embed_documents(chunks).await,
         }
     }
 
@@ -215,6 +296,7 @@ impl super::Embedder for LoadedEmbedder {
         match self {
             LoadedEmbedder::Ort(e) => e.dim(),
             LoadedEmbedder::OpenAi(e) => e.dim(),
+            LoadedEmbedder::Siglip2(e) => e.dim(),
         }
     }
 
@@ -222,6 +304,7 @@ impl super::Embedder for LoadedEmbedder {
         match self {
             LoadedEmbedder::Ort(e) => e.doc_modalities(),
             LoadedEmbedder::OpenAi(e) => e.doc_modalities(),
+            LoadedEmbedder::Siglip2(e) => e.doc_modalities(),
         }
     }
 
@@ -229,6 +312,7 @@ impl super::Embedder for LoadedEmbedder {
         match self {
             LoadedEmbedder::Ort(e) => e.query_modalities(),
             LoadedEmbedder::OpenAi(e) => e.query_modalities(),
+            LoadedEmbedder::Siglip2(e) => e.query_modalities(),
         }
     }
 }
@@ -241,6 +325,7 @@ impl serde::Serialize for EmbedderKind {
         match self {
             EmbedderKind::Ort(c) => c.serialize(serializer),
             EmbedderKind::OpenAi(c) => c.serialize(serializer),
+            EmbedderKind::Siglip2(c) => c.serialize(serializer),
         }
     }
 }
@@ -285,8 +370,68 @@ mod tests {
         let err = EmbedderKind::from_config("embedder.x", &raw, Some(3)).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("unknown embedder kind 'fastembed'"), "{msg}");
-        assert!(msg.contains("available kinds: ort, openai"), "{msg}");
+        assert!(
+            msg.contains("available kinds: ort, openai, siglip2"),
+            "{msg}"
+        );
         assert!(msg.contains("at line 3"), "{msg}");
+    }
+
+    /// THE embedder-axis parity test (plugin-axis hardening, the extractor
+    /// axis's `kind_registry_views_agree` twin): the availability string,
+    /// the label table, the exhaustive `kind_label` match and `from_config`
+    /// are four views of one registry — a new kind that updates some but not
+    /// all of them fails HERE instead of drifting in production error
+    /// messages. Modality declarations ride along: the view that ROUTES
+    /// (doc/query modalities) is pinned next to the identity views.
+    #[test]
+    fn kind_registry_views_agree() {
+        assert_eq!(EMBEDDER_KINDS, KIND_LABELS.join(", "));
+        let minimal = |label: &str| -> toml::Value {
+            // the least config each kind parses with (siglip2 has no default
+            // tier, so its minimal form names the built-in; openai has
+            // required endpoint/model/dim)
+            match label {
+                "siglip2" => toml::from_str(&format!(
+                    "kind = \"{label}\"\nmodel = \"{}\"",
+                    siglip2::BUILTIN
+                ))
+                .unwrap(),
+                "openai" => toml::from_str(
+                    "kind = \"openai\"\nendpoint = \"https://e/v1\"\nmodel = \"m\"\ndim = 8",
+                )
+                .unwrap(),
+                other => toml::from_str(&format!("kind = \"{other}\"")).unwrap(),
+            }
+        };
+        for label in KIND_LABELS {
+            let k = EmbedderKind::from_config("x", &minimal(label), None)
+                .unwrap_or_else(|e| panic!("KIND_LABELS entry {label} must parse: {e}"));
+            assert_eq!(k.kind_label(), *label);
+            assert!(k.describe().starts_with(label), "{}", k.describe());
+        }
+        // the closed modality matrix (the routing view): text kinds stay
+        // text/text; siglip2 is image-doc, image+text-query
+        let ort = EmbedderKind::from_config("x", &minimal("ort"), None).unwrap();
+        assert_eq!(ort.doc_modalities(), &[Modality::Text]);
+        assert_eq!(ort.query_modalities(), &[Modality::Text]);
+        let sig = EmbedderKind::from_config("x", &minimal("siglip2"), None).unwrap();
+        assert_eq!(sig.doc_modalities(), &[Modality::Image]);
+        assert_eq!(sig.query_modalities(), &[Modality::Image, Modality::Text]);
+    }
+
+    /// The siglip2 no-default-tier rule is a PARSE-time error with the
+    /// section line (fail-fast, §5.10.3) — not a load-time surprise.
+    #[test]
+    fn bare_siglip2_without_model_or_path_is_shaped_with_line() {
+        let raw: toml::Value = toml::from_str("kind = \"siglip2\"").unwrap();
+        let err = EmbedderKind::from_config("embedder.img", &raw, Some(5)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("[embedder.img]"), "{msg}");
+        assert!(msg.contains("requires model"), "{msg}");
+        assert!(msg.contains(siglip2::BUILTIN), "{msg}");
+        assert!(msg.contains("M3-T4"), "{msg}");
+        assert!(msg.contains("at line 5"), "{msg}");
     }
 
     #[test]

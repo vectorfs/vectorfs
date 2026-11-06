@@ -65,8 +65,9 @@ use std::sync::Arc;
 use super::super::{Chunk, Embedder, Modality, PipelineError, Query};
 use tokenizers as _;
 
-/// Guidance line shared by runtime + test locator failures.
-const FETCH_HINT: &str =
+/// Guidance line shared by runtime + test locator failures (pub(crate):
+/// the siglip2 kind — the other ort-family member — quotes it too).
+pub(crate) const FETCH_HINT: &str =
     "run scripts/fetch_runtime_libs.sh onnxruntime (or point VF_ORT_PATH at the library)";
 
 /// Where the ONNX Runtime dylib for this process comes from.
@@ -219,8 +220,11 @@ static ENV: std::sync::OnceLock<Result<ort::environment::Environment, String>> =
 /// Resolve the environment: bind the dylib (explicit path or system chain)
 /// on first use, then reuse. The returned clone keeps the process-global
 /// alive regardless (sessions do not outlive it inside this function's
-/// caller).
-fn ort_environment(source: &LibrarySource) -> Result<ort::environment::Environment, PipelineError> {
+/// caller). pub(crate): shared with the siglip2 kind — the ort FAMILY binds
+/// ONE environment per process however many ort-family embedders load.
+pub(crate) fn ort_environment(
+    source: &LibrarySource,
+) -> Result<ort::environment::Environment, PipelineError> {
     ENV.get_or_init(|| match source {
         LibrarySource::File(p) => {
             let builder = ort::init_from(p).map_err(|e| {
@@ -242,6 +246,20 @@ fn ort_environment(source: &LibrarySource) -> Result<ort::environment::Environme
     })
     .clone()
     .map_err(|m| PipelineError::embed(format!("onnxruntime unavailable: {m}")))
+}
+
+/// Commit a session from a model file (the builder + commit + error-shape
+/// discipline; pub(crate) so the siglip2 kind loads its towers through the
+/// exact same path — one ort-family loading story).
+pub(crate) fn commit_session(
+    env: &ort::environment::Environment,
+    model_path: &str,
+) -> Result<ort::session::Session, PipelineError> {
+    let mut builder = ort::session::Session::builder(env)
+        .map_err(|e| PipelineError::embed(format!("session builder: {e}")))?;
+    builder
+        .commit_from_file(model_path)
+        .map_err(|e| PipelineError::embed(format!("loading ONNX model {model_path}: {e}")))
 }
 
 /// Cap for tokenized length. gte's `max_position_embeddings` is 8192; the
@@ -353,11 +371,7 @@ impl OrtEmbedder {
             }))
             .map_err(|e| PipelineError::embed(format!("configuring truncation: {e}")))?;
 
-        let mut builder = ort::session::Session::builder(&env)
-            .map_err(|e| PipelineError::embed(format!("session builder: {e}")))?;
-        let session = builder
-            .commit_from_file(model_path)
-            .map_err(|e| PipelineError::embed(format!("loading ONNX model {model_path}: {e}")))?;
+        let session = commit_session(&env, model_path)?;
 
         // ---- dim probe: static last dim of output[0] ----
         let dim = probe_dim(&session)?;
@@ -549,8 +563,11 @@ fn probe_dim(session: &ort::session::Session) -> Result<usize, PipelineError> {
 }
 
 /// In-place L2 normalization; a zero vector stays zero (only reachable for a
-/// degenerate model — the finite check below still passes).
-fn normalize(v: &[f32]) -> Vec<f32> {
+/// degenerate model — the finite check below still passes). pub(crate):
+/// shared with the siglip2 kind (both towers L2-normalize — the full-model
+/// exports normalize; the split-tower exports the siglip2 kind loads do not,
+/// verified against the pinned artifact).
+pub(crate) fn normalize(v: &[f32]) -> Vec<f32> {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm == 0.0 {
         return v.to_vec();
