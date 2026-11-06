@@ -15,6 +15,7 @@
 use std::io::{Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const AK: &str = "VFTESTKEY";
@@ -218,13 +219,30 @@ fn wait_healthy(port: u16, deadline: Instant) {
     panic!("serve never became healthy on port {port}");
 }
 
+/// An EMPTY XDG_CONFIG_HOME for [`vf`]: the config-file layer must find
+/// nothing. Without this the strip_creds probe mixes sources (endpoint from
+/// env, credentials falling through to a developer's real
+/// ~/.config/vectorfs/config.toml → 403 against the test daemon's own AK
+/// namespace). CI never sees it — it has no config; dev machines do.
+fn empty_config_home() -> PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("vf-cli-smoke-no-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("create empty XDG_CONFIG_HOME");
+        d
+    })
+    .clone()
+}
+
 /// One `vf` invocation with the endpoint/credentials environment set.
 fn vf(port: u16, args: &[&str], strip_creds: bool) -> Output {
     let mut cmd = Command::new(vf_bin());
     cmd.args(args)
         .env("VF_ENDPOINT", format!("http://127.0.0.1:{port}"))
         .env("VF_ACCESS_KEY", AK)
-        .env("VF_SECRET_KEY", SK);
+        .env("VF_SECRET_KEY", SK)
+        .env("XDG_CONFIG_HOME", empty_config_home());
     if strip_creds {
         cmd.env_remove("VF_ACCESS_KEY").env_remove("VF_SECRET_KEY");
     }
