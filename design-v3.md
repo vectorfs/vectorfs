@@ -32,7 +32,7 @@
 |---|---|---|
 | vector bucket 名 3–63、小写/数字/连字符（**不允许点**）、首尾字母数字——严于通用 S3 桶规则 | 真 | AWS API 参考（Length Constraints）+ user guide |
 | S3 Vectors **不暴露落点**：向量数据由服务托管写入 S3，用户面不可见、不可配；wire API（CreateVectorBucket）无任何放置参数 | 真（v3.0 曾误引不存在的 `s3Prefix` 字段，已纠正） | CreateVectorBucket 响应仅 `{vectorBucketArn}`；VectorBucket 类型成员无落点字段 |
-| 下划线桶名：AWS S3 / R2 / **MinIO** / **SeaweedFS** 均拒绝（MinIO 无放宽开关）；**Ceph 默认拒绝**（需 `rgw_relaxed_s3_bucket_names` opt-in）。**PR2 实测回填（2026-11-06）**：SeaweedFS **4.50** 对下划线桶名实测返回 400 InvalidBucketName——本表原行"仅 SeaweedFS 默认宽容"过时（审查 A 引的是源码 IsValidBucketName 的 lax 注释，属 3.x 旧况；**以 4.50 实测为准**，目标后端全集拒下划线，R6 单一规则再无例外） | 真 | S3 命名规则、R2 文档、minio#9088、Ceph bucketops、SeaweedFS **4.50 实测**（PR2 dockerized conformance） |
+| 下划线桶名：AWS S3 / R2 / **MinIO** / **SeaweedFS** 均拒绝（MinIO 无放宽开关）；**Ceph 默认拒绝**（需 `rgw_relaxed_s3_bucket_names` opt-in）。**PR2 实测回填（2026-11-06）**：SeaweedFS **4.50** 对下划线桶名实测返回 400 InvalidBucketName——本表原行"仅 SeaweedFS 默认宽容"过时（审查 A 引的是源码 IsValidBucketName 的 lax 注释，属 3.x 旧况；**以 4.50 实测为准**，目标后端全集拒下划线，R6 单一规则再无例外）。**M3 后端矩阵实测回填（2026-11-07）**：Ceph RGW 19.2.7（sqlite dbstore 单容器形态）实测 **400 InvalidBucketName**（默认拒，与文档一致）；Garage v2.0.0 实测 **400 InvalidRequest**（错误码不同、HTTP 状态同 400）——全集拒下划线结论不变 | 真 | S3 命名规则、R2 文档、minio#9088、Ceph bucketops、SeaweedFS **4.50 实测**（PR2 dockerized conformance）、Ceph/Garage 实测（M3 后端矩阵扩展） |
 | DeleteVectorBucket 对非空桶（含 index）返回 **ConflictException**（409） | 真 | AWS API 参考 + 实测记录；与 design.md 附录A（Delete 特有错误=Conflict）一致 |
 | CreateVectorBucket 对已存在名字返回 **ConflictException**（含自有桶重放） | 真 | AWS API 参考 |
 | Ceph RGW S3Vectors：默认 vector bucket 落在与 S3 桶分离的命名空间；opt-in 1:1 落进**预建**同名桶，落点**创建时钉死** | 真 | Ceph docs |
@@ -186,10 +186,11 @@ limits 对照表偏离行（合计三条）：①vb 名上限 63−len(bucket_su
 
 | 风险 | 处置 |
 |---|---|
-| raw 管理面逐后端差异（CreateBucket 幂等分岔：us-east-1 200 / 409 BucketAlreadyOwnedByYou / MinIO 409） | R8 conformance 矩阵逐后端钉死；代码按"创建后 HeadBucket+marker 判定"收敛。**PR2 实测回填**：SeaweedFS 实测=**409 BucketAlreadyOwnedByYou**（4.50，自有桶重建；s3admin 折叠为 AlreadyExists） |
+| raw 管理面逐后端差异（CreateBucket 幂等分岔：us-east-1 200 / 409 BucketAlreadyOwnedByYou / MinIO 409） | R8 conformance 矩阵逐后端钉死；代码按"创建后 HeadBucket+marker 判定"收敛。**PR2 实测回填**：SeaweedFS 实测=**409 BucketAlreadyOwnedByYou**（4.50，自有桶重建；s3admin 折叠为 AlreadyExists）。**M3 后端矩阵扩展实测回填（2026-11-07，两后端 layer1+layer2 全绿）**：Ceph RGW（19.2.7，sqlite dbstore 单容器形态）re-create 自有桶=**200**（us-east-1 幂等风格——R8 的"创建后 HeadBucket 收敛"分支正是为此设计，实测走通）；Garage v2.0.0 re-create 自有桶=**200**，且**他人 key 所建同名桶 re-create 亦 200**（桶名全局命名空间、无 409 分岔；后续对该桶的写会被 IAM 拒，fail-loud 不越权）。另记：Garage 对含特殊字符（如 `!`）的桶名在**签名层**先拒（403 AccessDenied "Invalid signature"——其 SigV4 再规范化保留原始路径，与我们的 %21 通用编码分歧），到不了名字校验（400）层；conformance 测试面按既有 per-backend 旋钮先例加 `VF_S3CP_INVALID_NAME_403=1` 记录该形态，产品零影响（vf 在 s3admin 调用前已做名字校验） |
 | 桶数上限（AWS S3 账号软限 1000；每 vb ≤2 桶） | 文档注明主战场=自托管端点；惰性源桶把纯协议用户降为 1 桶 |
-| ListBuckets 权限（部分后端需显式授权） | doctor 探针覆盖；文档部署前置条件。**PR2 实测回填**：SeaweedFS 4.50 桶列表**账号作用域**——匿名端点（未配 IAM）ListBuckets **恒返回空**，不报错也不见桶 ⇒ **R9 s3 枚举需凭据**：部署必须配置 IAM 用户/凭据（README/compose 部署前置条件），匿名端点 `vf` 枚举=空列表且 marker 校验无从发生 |
+| ListBuckets 权限（部分后端需显式授权） | doctor 探针覆盖；文档部署前置条件。**PR2 实测回填**：SeaweedFS 4.50 桶列表**账号作用域**——匿名端点（未配 IAM）ListBuckets **恒返回空**，不报错也不见桶 ⇒ **R9 s3 枚举需凭据**：部署必须配置 IAM 用户/凭据（README/compose 部署前置条件），匿名端点 `vf` 枚举=空列表且 marker 校验无从发生。**M3 实测回填（2026-11-07）**：Ceph RGW 与 Garage 均凭据作用域且强制签名（错凭据 403：Ceph=SignatureDoesNotMatch、Garage=AccessDenied——`VF_S3CP_LIST_403` 行两后端可开）。**Garage 三条额外部署前置**：① key 默认**无 CreateBucket 权**——需 `garage key allow --create-bucket <key>`（否则 CreateBucket 403 AccessDenied）；② ListBuckets 按 **key 作用域**（只见本 key 有 owner 权的桶；CLI 预建桶须给 vf key owner 权才会被 R9 枚举见到）；③ SigV4 **region 强校验**——garage.toml `s3_region` 必须与 daemon 签名 region（S3BackendConfig 硬省缺 us-east-1）对齐，否则 400 AuthorizationHeaderMalformed（部署侧把 `s3_region = "us-east-1"` 写进 garage.toml 即可，零产品改动） |
 | ListBuckets 全端点扫描 + 逐候选 HeadBucket 的往返放大（500 桶 ⇒ 500+ 次远端往返） | ListVectorBuckets 上限 500/页本就存在；文档注明大端点部署的枚举成本 |
+| **条件写（LOCK CAS 底座：put-if-absent `If-None-Match:*` / put-if-match `If-Match`）逐后端不一**：M3 实测（2026-11-07，对既有 key 的 If-None-Match:\* PUT 与 stale-etag If-Match PUT 双向探测）——SeaweedFS 4.50 **强制**（两向均 412 PreconditionFailed，真 CAS）；**Ceph RGW sqlite dbstore 单容器形态忽略**（19.2.7 与 20.2.5 均实测 200 直写——Tentacle 的增强条件操作落在 RADOS 后端，dbstore 未跟进）；**Garage 结构性不支持**（官方 known-issues：无共识机制，明确不做） | 后端能力边界，非双桶模型断裂：单 daemon 生命周期不受影响（两后端 layer2 全路径 conformance 实测全绿——LOCK 获取/心跳退化为普通写，功能等价），但 **§5.3-4 单写者不变式在这两后端的存储层不可强制**（多 daemon 拓扑本就要求不相交桶集 + 文档写明外部分流，风险受既有裁决约束）。处置：本表钉死事实 + 部署文档注明"多 daemon 强隔离勿依赖 LOCK CAS 的后端清单"；doctor 条件写探针为候选后续（M3 裁决：不加产品探针——R2 use_constant_size_upload_parts 先例是"不特判即坏"，此处"不特判仍绿"，纯告知性信息不进代码） |
 | `_`/`.` 后缀回潮 | §2 事实行 + R6 单一可移植校验规则双重钉死 |
 
 ## 10. 验收门
@@ -269,3 +270,10 @@ PR2（生命周期边缘 + s3 conformance）：
 8. **fingerprint_gate 对尚无系统桶的 vb 短路通过**：s3 新部署先在 vectorfs.toml 名 `[ingest.X]` 后跑 CreateVectorBucket 时，ListObjects 对不存在桶答 **404 NoSuchBucket**（file 后端同态=空目录列表）——不短路则 init→serve 在全新端点**必然拒启**。实施：`system_bucket_exists(vb)` 探测不存在 ⇒ 该桶无 marker 可漂移，gate 平凡放行（启动锁跳过与扫描 no-listing 守卫本就容忍缺失桶，§5.1）。
 9. **`VF_TEST_CRASH` 崩溃注入缝**（store.rs，**test-only**）：`VF_TEST_CRASH=<切点名>` 命中即进程硬 abort——真崩溃语义（无优雅停机、无 LOCK 释放），在存储上留下恰为 §5.2 行 3/4 的现场供重放矩阵消费（tests/lifecycle_crash_replay.rs）。两个切点名：`create_after_raw_create`（raw CreateBucket 已成、marker 未写）与 `delete_after_marker`（marker+LOCK 已删、raw DeleteBucket 未发）。生产不设此 env 时成本 = 每次生命周期 op 一次 env 查找（create/delete 是低频管理动词，非每请求路径）。
 10. **MinIO 无社区发行版**：docker hub pull denied（与 spike/REPORT.md 的 MinIO 社区版归档记录一致）⇒ R8 conformance 矩阵 **MinIO 行待 CI 端点**（矩阵行保留不删；G2 以 dockerized SeaweedFS 4.50 首行落地，PR3 起进 ci.yml）。
+
+M3 后端矩阵扩展（2026-11-07，Ceph RGW + Garage 两行落地，§7 M3 项）：
+
+11. **Ceph 容器形态选型 = RGW sqlite dbstore 单容器**（非 demo 全集群）：`quay.io/ceph/ceph:v19`（实测 19.2.7，1.34GB 镜像、单进程轻跑）+ ceph.conf 三键（`rgw_backend_store = dbstore`、`rgw_config_store = dbstore`、`dbstore_db_dir`）+ beast 前端；`radosgw-admin` 直接对同一 conf 建用户（无需 mon/osd）。备选弃用原因：ceph-demo 镜像停更（v15 时代）、cephadm 单机全集群 ≥3 容器资源不现实。对照实测 v20.2.5（Tentacle）管理面行为与 v19 全同；条件写差异见 §9 新行。
+12. **Garage 容器形态 + IAM 三步**（`dxflrs/garage:v2.0.0`，25.8MB）：`garage layout assign` + `garage key create` + `garage key allow --create-bucket`（v2.0.0 实测 key 默认无建桶权，见 §9 回填行）；garage.toml 需 `s3_region = "us-east-1"` 对齐 daemon 签名 region。
+13. **conformance 测试面新增 per-backend 旋钮 `VF_S3CP_INVALID_NAME_403=1`**（沿 VF_S3CP_UNDERSCORE/VF_S3CP_LIST_403 先例）：Garage 对含 `!` 等特殊字符桶名在签名层先拒（403），默认断言（400 InvalidBucketName）不适用于该形态。产品代码零改动。
+14. **两后端 layer1+layer2 全绿，CI 接线两 job**（s3-conformance-garage / s3-conformance-ceph，对齐 SeaweedFS job 形态）；Garage job 常驻（25.8MB 轻镜像），Ceph job 接线成功（镜像 1.34GB 但单容器轻跑、quay 拉取可靠，未触发"资源现实优先"豁免）。
