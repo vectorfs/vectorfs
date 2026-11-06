@@ -419,9 +419,13 @@ fn short_key_of(object_key: &str) -> Option<&'static str> {
 /// is an OPINIONATED default — a new kind landing must not silently
 /// re-route every `extract = { default = "auto" }` deployment (image-output
 /// `pdf-pages` doubly so: it would change the pipeline's modality needs).
-/// Deployments that want the classify-first, no-.so engine or the page-image
-/// route opt in explicitly (`extract = { pdf = "inspector-instance" }`,
-/// `pdf = "pages-instance"`).
+/// The `img` family (M3-T4) stays OUT of `auto` for exactly that second
+/// reason: an auto arm would make every existing `auto` deployment start
+/// claiming image files into pipelines whose embedders are text-only.
+/// Deployments that want the classify-first, no-.so engine, the page-image
+/// route or image files opt in explicitly (`extract = { pdf =
+/// "inspector-instance" }`, `pdf = "pages-instance"`, `img =
+/// "image-instance"`).
 /// M2.1 keeps `auto` a single-member chain: whether it should become a
 /// built-in chain (pdf → pdf-inspector → pdf-text, say) is an M3 ruling,
 /// taken when `pdf-ocr` actually exists to chain onto.
@@ -4798,11 +4802,23 @@ pub(crate) mod tests {
     /// every family the mime table declares must resolve under `auto` — a
     /// table row without a [`builtin_extractor`] arm would silently strand
     /// every `extract = { default = "auto" }` deployment for that family.
-    /// (The cfg(test) `ctn` scaffold key is deliberately exempt: it is
-    /// scanner-side claiming only, never an `auto` family.)
+    /// EXEMPTION (M3-T4): `img` is the one deliberate exception — pulling
+    /// image files into every existing `auto` deployment would change their
+    /// modality needs overnight (pdf-pages stayed out of `auto` for the
+    /// same reason); operators opt in with `extract = { img = "…" }`.
+    /// (The cfg(test) `ctn` scaffold key is also exempt: it is scanner-side
+    /// claiming only, never an `auto` family.)
     #[test]
     fn auto_mapping_serves_every_mime_family() {
         for (_mime, key) in crate::pipeline::extract::MIME_TO_SHORT_KEY {
+            if *key == "img" {
+                assert!(
+                    builtin_extractor(key).is_none(),
+                    "img must stay OUT of auto (the pdf-pages ruling): an auto arm would \
+                     silently re-route every default = \"auto\" deployment into image ingesting"
+                );
+                continue;
+            }
             assert!(
                 builtin_extractor(key).is_some(),
                 "auto has no built-in extractor for family {key} — every MIME_TO_SHORT_KEY \

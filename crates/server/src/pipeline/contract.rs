@@ -4,8 +4,8 @@
 //! These are PUBlic assertion suites, not just our own tests: any future
 //! implementation (community kind, wasm plugin in v2) runs the SAME suite to
 //! be admitted — `#[cfg(test)]` below runs it against the built-ins
-//! (`txt`, `pdf-text`, `md`, `pdf-inspector`, `pdf-pages` through the
-//! image-extractor twin, `token-window`, the real `ort`
+//! (`txt`, `pdf-text`, `md`, `pdf-inspector`, `pdf-pages` and `image`
+//! through the image-extractor twin, `token-window`, the real `ort`
 //! kind over the committed tiny ONNX fixture + the real .so, the real
 //! `openai` kind over an in-process fake provider, the real `siglip2` kind
 //! over its committed tiny fixture + the real .so via the image-route
@@ -634,6 +634,20 @@ mod tests {
             (
                 super::super::extract::pdf_pages::tests::HELLO_PDF_MINIMAL,
                 "application/pdf",
+            ),
+        );
+    }
+
+    #[test]
+    fn image_kind_passes_image_extractor_contract() {
+        // the M3-T4 image FILE kind through the same twin (configless, no
+        // .so — the pure-Rust image crate); the sample is an in-test PNG so
+        // the truncation half is genuinely undecodable
+        image_extractor_contract(
+            &super::super::extract::image::ImageExtractor,
+            (
+                super::super::extract::image::tests::static_png(),
+                "image/png",
             ),
         );
     }

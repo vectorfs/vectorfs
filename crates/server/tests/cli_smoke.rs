@@ -879,3 +879,263 @@ fn cli_serve_reindex_flow() {
     );
     daemon.kill();
 }
+
+// ---------------------------------------------------------------------------
+// M3-T4: 以图搜图 over the REAL daemon + REAL vf — the image FILE extractor
+// + tiny-siglip2 pipeline (the image-search preset shape), put PNG sources,
+// `vf search --image` same-image hit, text query onto the image index, and
+// the CLI error faces.
+// ---------------------------------------------------------------------------
+
+/// tiny-siglip2 fixture (the siglip2 kind's committed hermetic model).
+fn siglip2_fixture_dir() -> PathBuf {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-siglip2");
+    assert!(
+        p.join("vision.onnx").is_file(),
+        "fixture missing: {}",
+        p.display()
+    );
+    p
+}
+
+fn image_config_toml(data_dir: &Path) -> String {
+    format!(
+        r#"version = 1
+region = "us-east-1"
+account_id = "000000000000"
+access_key_id = "{AK}"
+secret_access_key = "{SK}"
+models_dir = "{models}"
+
+[extractor.imgs]
+kind = "image"
+
+[embedder.clip]
+kind = "siglip2"
+model = "tiny-siglip2"
+path = "{fixture}"
+offline = true
+
+[ingest.docs]
+include = ["docs/**"]
+extract = {{ img = "imgs" }}
+chunk = {{ kind = "token-window", size = 32, overlap = 8 }}
+embedders = ["clip"]
+scan_interval_secs = 1
+"#,
+        models = data_dir.join(".vectorfs/models").display(),
+        fixture = siglip2_fixture_dir().display(),
+    )
+}
+
+/// Solid-color 8x8 PNGs (deterministic hand-encoded fixtures — the CLI
+/// reads a PATH, so the test writes these to the work dir).
+const RED_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x08, 0x08, 0x02, 0x00, 0x00, 0x00, 0x4b, 0x6d, 0x29,
+    0xdc, 0x00, 0x00, 0x00, 0x11, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xf8, 0xcf, 0xc0, 0x80,
+    0x15, 0x31, 0x0c, 0x2d, 0x09, 0x00, 0x28, 0xff, 0x3f, 0xc1, 0xce, 0x77, 0xc8, 0x4f, 0x00, 0x00,
+    0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+const BLUE_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x08, 0x08, 0x02, 0x00, 0x00, 0x00, 0x4b, 0x6d, 0x29,
+    0xdc, 0x00, 0x00, 0x00, 0x10, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x60, 0x60, 0xf8, 0x8f,
+    0x03, 0x0d, 0x29, 0x09, 0x00, 0xa9, 0x70, 0x3f, 0xc1, 0xfc, 0xcb, 0x45, 0xfc, 0x00, 0x00, 0x00,
+    0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+#[test]
+fn cli_image_search_smoke() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let work = tmp.path().join("work");
+    let data_dir = work.join("data");
+    std::fs::create_dir_all(data_dir.join(".vectorfs")).unwrap();
+    std::fs::write(
+        data_dir.join(".vectorfs/vectorfs.toml"),
+        image_config_toml(&data_dir),
+    )
+    .unwrap();
+
+    let red = work.join("red.png");
+    std::fs::write(&red, RED_PNG).unwrap();
+    let blue = work.join("blue.png");
+    std::fs::write(&blue, BLUE_PNG).unwrap();
+
+    let port = free_port();
+    let daemon = Daemon::spawn(&data_dir, port, "image-serve.log");
+    wait_healthy(port, Instant::now() + Duration::from_secs(60));
+
+    // ---- put two PNG sources: the image FILE route indexes each as one
+    // atomic image chunk ----
+    for (path, key) in [(&red, "docs/red.png"), (&blue, "docs/blue.png")] {
+        let o = vf(
+            port,
+            &[
+                "put",
+                path.to_str().unwrap(),
+                "--bucket",
+                "docs",
+                "--key",
+                key,
+                "--timeout",
+                "120",
+            ],
+            false,
+        );
+        assert!(
+            o.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            out(&o),
+            err(&o)
+        );
+        assert!(
+            out(&o).starts_with(&format!("INDEXED\t{key}")),
+            "{}",
+            out(&o)
+        );
+    }
+
+    // ---- 以图搜图: querying with red's own file hits red first (same
+    // bytes -> same preprocessing -> distance ~0), 回源 in the table ----
+    let o = vf(
+        port,
+        &[
+            "search",
+            "--image",
+            red.to_str().unwrap(),
+            "docs",
+            "--top-k",
+            "2",
+        ],
+        false,
+    );
+    assert!(
+        o.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        out(&o),
+        err(&o)
+    );
+    assert!(out(&o).contains("docs/red.png"), "{}", out(&o));
+    assert!(
+        out(&o).contains("docs/blue.png"),
+        "both sources rank: {}",
+        out(&o)
+    );
+
+    // the --json contract: IMAGE content type, image chunk key, the image
+    // query echoed by local identity (path + mime), single-route distance
+    let o = vf(
+        port,
+        &[
+            "search",
+            "--image",
+            red.to_str().unwrap(),
+            "docs",
+            "--top-k",
+            "1",
+            "--json",
+        ],
+        false,
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(v["schema_version"], 1, "{}", out(&o));
+    assert_eq!(v["query"]["image"]["mime"], "image/png", "{}", out(&o));
+    assert!(
+        v["query"]["image"]["path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("red.png")),
+        "{}",
+        out(&o)
+    );
+    let hits = v["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{}", out(&o));
+    let hit = &hits[0];
+    assert_eq!(hit["location"]["key"], "docs/red.png", "{}", out(&o));
+    assert_eq!(hit["content"]["type"], "IMAGE", "{}", out(&o));
+    assert!(hit["content"].get("text").is_none(), "{}", out(&o));
+    assert!(
+        hit["key"].as_str().unwrap().contains("-image-"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(hit["metadata"]["x-vf-modality"], "image", "{}", out(&o));
+    assert!(
+        hit["score"].as_f64().unwrap() > 0.99,
+        "identical bytes => distance ~0: {}",
+        out(&o)
+    );
+
+    // ---- 文字搜图: a TEXT query reaches the IMAGE index through siglip2's
+    // text tower (the declared [Image, Text] query side, exercised for
+    // real) and returns image chunks ----
+    let o = vf(
+        port,
+        &["search", "hello vectorfs", "docs", "--top-k", "2", "--json"],
+        false,
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    let hits = v["hits"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !hits.is_empty(),
+        "text query must hit the image index: {}",
+        out(&o)
+    );
+    for h in &hits {
+        assert_eq!(h["content"]["type"], "IMAGE", "{}", out(&o));
+        assert_eq!(h["metadata"]["x-vf-modality"], "image", "{}", out(&o));
+    }
+
+    // ---- CLI error faces (structured, exit-coded) ----
+    // unsupported extension: usage error BEFORE any network
+    let gif = work.join("photo.gif");
+    std::fs::write(&gif, b"GIF89a").unwrap();
+    let o = vf(
+        port,
+        &["search", "--image", gif.to_str().unwrap(), "docs"],
+        false,
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(
+        err(&o).contains("not a supported image extension"),
+        "{}",
+        err(&o)
+    );
+    // missing file: read error, exit 1
+    let o = vf(
+        port,
+        &[
+            "search",
+            "--image",
+            work.join("nope.png").to_str().unwrap(),
+            "docs",
+        ],
+        false,
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(err(&o).contains("READ_FAILED"), "{}", err(&o));
+    assert!(err(&o).contains("cannot read"), "{}", err(&o));
+    // text + --image: mutually exclusive usage error (two positionals
+    // beside --image are an unambiguous text query AND an image query)
+    let o = vf(
+        port,
+        &[
+            "search",
+            "some text",
+            "docs",
+            "--image",
+            red.to_str().unwrap(),
+        ],
+        false,
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(err(&o).contains("mutually exclusive"), "{}", err(&o));
+    // no query at all: usage error naming both forms
+    let o = vf(port, &["search", "--bucket", "docs"], false);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(err(&o).contains("no query given"), "{}", err(&o));
+
+    daemon.dump_log_tail("end of image smoke (informational)");
+}

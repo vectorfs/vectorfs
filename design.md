@@ -380,7 +380,7 @@ index-prefix = "docs"                 # 派生 index 名前缀（可选）
 # exclude = ["**.tmp"]
 ```
 
-preset = 内建 TOML 模板；`vectorfs init --preset X` **预取模型**（进度条、sha256 校验、tmp+rename 原子落盘、`HF_ENDPOINT` 镜像可配）并物化配置。M2 交付三档：`dev`（无模型纯协议面）/ `text-rag` / `air-gapped`；`multimodal` / `image-search` / `scanned-docs` 随 M3 图像模态与 OCR 交付。
+preset = 内建 TOML 模板；`vectorfs init --preset X` **预取模型**（进度条、sha256 校验、tmp+rename 原子落盘、`HF_ENDPOINT` 镜像可配）并物化配置。M2 交付三档：`dev`（无模型纯协议面）/ `text-rag` / `air-gapped`；M3-T4 增 `multimodal`（gte+siglip2 双塔，pdf 两段链 pdf-text→pdf-pages 按 probe→affinity 分流，img 走 image kind）与 `image-search`（siglip2 单塔，仅 img 路由——pdf 页图属 multimodal/scanned-docs 语义，刻意不含）；`scanned-docs`（OCR）属 T8+。
 
 #### 5.10.5 健壮性（v2.1 修订）
 
@@ -604,7 +604,7 @@ ghcr multi-arch（amd64/arm64 对齐发布矩阵）debian-slim non-root，内含
 | GetSourceData | POST /x-vf/GetSourceData | bucket, key → 原始字节流（透传读源桶对象） | `vf get` 底层（回源下载；s3 后端也可直接 GetObject） |
 | ListSources | POST /x-vf/ListSources | bucket, status?, maxResults(1–1000, 默认 500), nextToken → sources[] | 标记 × 实时列表 join；`vf sources list` 底层 |
 | DeleteSource | POST /x-vf/DeleteSource | bucket, key → **202** `{status:"DELETING"}` | = 删对象（经 object_store）+ 异步 GC chunk——与 S3 直接删除等价的便捷包装；对齐 KB `DeleteKnowledgeBaseDocuments` 的 202+轮询 |
-| **Search** | POST /x-vf/Search | bucket, query{text\|image\|audio(M4)}, topK(1–1000), filter?（**$ 短名语法**，§4.6 同款）, returnText? → hits[] | **旗舰超集 op**：fan-out + merge + 回源；hits 形状对齐 KB Retrieve 的 KnowledgeBaseRetrievalResult（下） |
+| **Search** | POST /x-vf/Search | bucket, query{text\|image\|audio(M4)}, topK(1–1000), filter?（**$ 短名语法**，§4.6 同款）, returnText? → hits[] | **旗舰超集 op**：fan-out + merge + 回源；hits 形状对齐 KB Retrieve 的 KnowledgeBaseRetrievalResult（下）。`query.image`（M3-T4 定形）：`{bytes: base64(STANDARD), mime}`，服务端按 magic 嗅探与声明 mime 交叉校验（同 `ImagePayload::validate` 纪律）；query 与 image 模态互斥、audio 属 M4 |
 | Reindex | POST /x-vf/Reindex | bucket → **202** `{jobId}` | 显式重嵌（指纹变更后），进度经 GetIngestStatus；KB 无对应 op（其 chunking 不可变，换管线=重建 KB） |
 | GetIngestStatus | POST /x-vf/GetIngestStatus | bucket? → 状态计数 + **统计块（字段名对齐 KB IngestionJobStatistics）**：numberOfDocumentsScanned / numberOfNewDocumentsIndexed / numberOfModifiedDocumentsIndexed / numberOfDocumentsDeleted / numberOfDocumentsFailed + pendingCount；最近对账、active 管线指纹、reindex{jobId, status, progress} | `vf status` 底层 |
 

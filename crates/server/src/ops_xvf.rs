@@ -90,11 +90,35 @@ struct ListSourcesInput {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchQueryInput {
-    /// M2: the only supported modality (image M3, audio M4 — presence of
-    /// those members is a ValidationException, appendix E.2).
+    /// Text query (M2). Exactly one of `text` / `image` must be present —
+    /// a query is ONE modality (audio arrives in M4 and is a
+    /// ValidationException until then, appendix E.2).
     text: Option<String>,
-    image: Option<serde_json::Value>,
+    /// Image query (M3-T4, 以图搜图): `{bytes, mime}` — see [`SearchImageInput`].
+    image: Option<SearchImageInput>,
     audio: Option<serde_json::Value>,
+}
+
+/// The image member of a Search query (M3-T4). Field shape, appendix E.2
+/// leaves the byte transport open — decided as an OBJECT carrying both the
+/// base64 bytes and the declared mime, because:
+///
+/// * JSON has no native bytes; base64 is this op's existing binary-in-string
+///   convention (the opaque `nextToken` cursor is base64 of the same engine);
+/// * the DECLARED mime rides along (the CLI derives it from the file
+///   extension) so the server can run the same declared-vs-sniffed-magic
+///   honesty check [`crate::pipeline::ImagePayload::validate`] imposes on
+///   the ingest side — a mismatched label is a client bug that must fail
+///   HERE, with a field-addressable path, not inside an embedder's
+///   preprocessing.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchImageInput {
+    /// base64 (STANDARD alphabet) container bytes of the query image.
+    bytes: String,
+    /// Declared container mime — must be the bytes' CANONICAL container
+    /// mime (`image/jpeg` / `image/png`).
+    mime: String,
 }
 
 #[derive(Deserialize)]
@@ -682,17 +706,64 @@ pub async fn delete_source(
 // Search
 // ---------------------------------------------------------------------------
 
+/// Decode + honesty-check one image query member (M3-T4): base64 → bytes →
+/// sniffed container magic, all fail-fast with field-addressable
+/// ValidationExceptions. Returns `(bytes, mime)` for [`Query::Image`] — the
+/// mime is the sniffed CANONICAL one (the declared label was only consulted
+/// to be cross-checked, the exact [`crate::pipeline::ImagePayload::validate`]
+/// discipline the ingest-side chunker bypass runs).
+fn decode_image_query(img: &SearchImageInput) -> Result<(Vec<u8>, String), ApiError> {
+    let bad = |msg: String| ApiError::validation_field("query.image", msg);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(img.bytes.as_bytes())
+        .map_err(|e| bad(format!("bytes is not valid base64: {e}")))?;
+    if bytes.is_empty() {
+        return Err(bad(
+            "bytes is empty — an image query needs the image's container bytes \
+                        (jpeg/png)"
+                .to_string(),
+        ));
+    }
+    let sniffed = image::guess_format(&bytes)
+        .map_err(|_| {
+            bad(
+                "the bytes carry no known image-container magic (jpeg/png) — not an image"
+                    .to_string(),
+            )
+        })?
+        .to_mime_type()
+        .to_string();
+    if sniffed != img.mime {
+        return Err(bad(format!(
+            "mime mismatch: the bytes sniff as {sniffed} but the query declares '{}' — use \
+             the container's canonical mime (the declared mime drives embedder preprocessing)",
+            img.mime
+        )));
+    }
+    Ok((bytes, sniffed))
+}
+
 /// `POST /x-vf/Search` (appendix E.2) — the flagship superset op: embed the
-/// query once per text-capable embedder, query each derived index (topK,
-/// `$`-short-name filter, pre-filter pushdown — the same [`crate::filter`]
-/// engine QueryVectors runs), merge with the bucket's configured strategy
-/// (M2: rrf), and emit hits shaped like KB's KnowledgeBaseRetrievalResult
-/// plus the fan-out fields (`index`/`key`/`distance`).
+/// query once per QUERY-MODALITY-matching embedder, query each derived index
+/// (topK, `$`-short-name filter, pre-filter pushdown — the same
+/// [`crate::filter`] engine QueryVectors runs), merge with the bucket's
+/// configured strategy (M2: rrf), and emit hits shaped like KB's
+/// KnowledgeBaseRetrievalResult plus the fan-out fields
+/// (`index`/`key`/`distance`).
+///
+/// Query modalities (appendix E.2 `query{text|image|audio(M4)}`): text since
+/// M2; IMAGE since M3-T4 — `{bytes: base64, mime}` (see
+/// [`SearchImageInput`]), routed to embedders whose query side declares
+/// Image (siglip2's vision tower). A TEXT query still fans out to every
+/// text-query embedder — including siglip2's IMAGE index, 文字搜图 (the
+/// dual-tower default route; the merge treats it like any second list).
 ///
 /// Hit shape, field by field (appendix E.2):
-/// * `content{text?, type:"TEXT"}` — `text` = the stored `x-vf-chunk-text`,
-///   omitted when `returnText=false` or the pipeline ran with
-///   `store_chunk_text=false`;
+/// * `content{text?, type: "TEXT"|"IMAGE"}` — `type` follows the CHUNK's
+///   modality (`x-vf-modality`; image chunks answer IMAGE whatever the
+///   query's modality was); `text` = the stored `x-vf-chunk-text`, omitted
+///   when `returnText=false`, `store_chunk_text=false`, or the chunk is an
+///   image (image chunks store no text — the source file is the content);
 /// * `score` — the merged score. Single route: passthrough of
 ///   `1/(1+distance)` (monotone in distance, so thresholds stay meaningful —
 ///   rrf scores only make sense across lists). Multiple routes: the rrf sum;
@@ -709,23 +780,50 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
     let shared = handle.shared();
 
     let query = input.query.ok_or_else(|| {
-        ApiError::validation("query is required (M2: query.text; image arrives in M3, audio in M4)")
+        ApiError::validation("query is required (query.text or query.image; audio arrives in M4)")
     })?;
-    if query.image.is_some() || query.audio.is_some() {
+    if query.audio.is_some() {
         return Err(ApiError::validation_field(
             "query",
-            "M2 supports text queries only (query.text); query.image lands in M3 and \
-             query.audio in M4",
+            "audio queries are not supported yet (query.audio arrives in M4); use query.text \
+             or query.image",
         ));
     }
-    let text = match query.text {
-        Some(t) if !t.trim().is_empty() => t,
-        _ => {
+    // exactly one modality per query (a Query IS one modality — the
+    // pipeline's query enum has no mixed variant, and guessing a precedence
+    // between two given members would silently drop the other)
+    let query = match (query.text, query.image) {
+        (Some(_), Some(_)) => {
             return Err(ApiError::validation_field(
-                "query.text",
-                "query.text must be a non-empty string",
+                "query",
+                "pass exactly one of query.text / query.image — a search query is one \
+                 modality",
             ));
         }
+        (None, None) => {
+            return Err(ApiError::validation_field(
+                "query",
+                "query must carry query.text (a non-empty string) or query.image \
+                 ({bytes, mime})",
+            ));
+        }
+        (Some(t), None) => {
+            if t.trim().is_empty() {
+                return Err(ApiError::validation_field(
+                    "query.text",
+                    "query.text must be a non-empty string",
+                ));
+            }
+            Query::Text(t)
+        }
+        (None, Some(img)) => {
+            let (bytes, mime) = decode_image_query(&img)?;
+            Query::Image(bytes, mime)
+        }
+    };
+    let query_modality = match &query {
+        Query::Text(_) => Modality::Text,
+        Query::Image(_, _) => Modality::Image,
     };
 
     let top_k = match input.top_k {
@@ -759,7 +857,11 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
         )));
     }
 
-    // fan-out: query-modality-matching embedders, config order
+    // fan-out: query-modality-matching embedders, config order. A TEXT
+    // query fans out to every text-query embedder — which, since siglip2's
+    // query side declares [Image, Text], INCLUDES the image index (文字搜图,
+    // the research-file default dual route); an IMAGE query fans out to the
+    // image-query embedders only (a text tower cannot embed bytes).
     let mut lists: Vec<HitList> = Vec::new();
     let mut matched_any = false;
     // key -> (index name, distance, stored metadata); first route wins
@@ -768,8 +870,8 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
         let Some(loaded) = shared.embedder(name) else {
             continue;
         };
-        if !loaded.query_modalities().contains(&Modality::Text) {
-            continue; // not a text-query route (none in M2 — future-proof)
+        if !loaded.query_modalities().contains(&query_modality) {
+            continue; // not a route for THIS query's modality
         }
         matched_any = true;
         let Some(spec) = shared
@@ -805,12 +907,9 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
                 }
             }
         }
-        let qvec = loaded
-            .embed_query(&Query::Text(text.clone()))
-            .await
-            .map_err(|e| {
-                ApiError::internal(format!("embedder '{name}' failed to embed the query: {e}"))
-            })?;
+        let qvec = loaded.embed_query(&query).await.map_err(|e| {
+            ApiError::internal(format!("embedder '{name}' failed to embed the query: {e}"))
+        })?;
         if qvec.len() != meta.dimension as usize {
             return Err(ApiError::internal(format!(
                 "embedder '{name}' produced a {}-dim query vector but derived index {} has \
@@ -855,9 +954,9 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
     }
     if !matched_any {
         return Err(ApiError::validation(format!(
-            "no embedder of bucket {:?} accepts text queries — check the [embedder.*] \
-             query modalities in vectorfs.toml",
-            input.bucket
+            "no embedder of bucket {:?} accepts {} queries — check the [embedder.*] query \
+             modalities in vectorfs.toml (the siglip2 kind accepts image AND text queries)",
+            input.bucket, query_modality
         )));
     }
 
@@ -873,12 +972,25 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
                 .get(&h.key)
                 .cloned()
                 .expect("every merged key came from some route");
-            let mut content = json!({ "type": "TEXT" });
+            // content.type follows the CHUNK's modality (appendix E.2's
+            // mapping: page-image/image → IMAGE) — an image query (or a
+            // text query fanned out onto an image index) returns image
+            // chunks, and the display enum must say so
+            let is_image = metadata
+                .as_ref()
+                .and_then(|m| m.get("x-vf-modality"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|m| m == "image");
+            let mut content = json!({ "type": if is_image { "IMAGE" } else { "TEXT" } });
+            // empty text adds nothing and image chunks HAVE none (their
+            // stored x-vf-chunk-text is the empty string): omit the member
+            // — text chunks are never empty, so this only shapes image hits
             if return_text
                 && let Some(t) = metadata
                     .as_ref()
                     .and_then(|m| m.get("x-vf-chunk-text"))
                     .and_then(serde_json::Value::as_str)
+                    .filter(|t| !t.is_empty())
             {
                 content["text"] = json!(t);
             }
@@ -1081,6 +1193,21 @@ mod tests {
         panic!("tiny-embedder fixture not found under vf/tests/fixtures/");
     }
 
+    /// The committed tiny-SIGLIP2 fixture (the siglip2 kind's own suite
+    /// runs it; the M3-T4 image-search wire tests do too).
+    fn siglip2_fixture_dir() -> std::path::PathBuf {
+        for p in [
+            "vf/tests/fixtures/tiny-siglip2",
+            "tests/fixtures/tiny-siglip2",
+        ] {
+            let d = std::path::PathBuf::from(p);
+            if d.join("vision.onnx").is_file() {
+                return d;
+            }
+        }
+        panic!("tiny-siglip2 fixture not found under vf/tests/fixtures/");
+    }
+
     /// tiny-embedder pipeline: txt -> 32/8 token window, scope docs/** (the
     /// same hermetic shape ingest/mod.rs tests use).
     fn tiny_config() -> crate::pipeline::config::PipelineConfig {
@@ -1091,6 +1218,20 @@ mod tests {
              chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
              embedders = [\"tiny\"]\nscan_interval_secs = 1\n",
             fixture_dir().display().to_string()
+        );
+        load_pipeline_config(&text).unwrap()
+    }
+
+    /// The M3-T4 image pipeline: image FILE extractor + tiny siglip2 — the
+    /// in-tree twin of the `image-search` preset shape (img route only).
+    fn image_config() -> crate::pipeline::config::PipelineConfig {
+        let text = format!(
+            "[extractor.imgs]\nkind = \"image\"\n\n\
+             [embedder.clip]\nkind = \"siglip2\"\nmodel = \"tiny-siglip2\"\npath = {:?}\noffline = true\n\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ img = \"imgs\" }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"clip\"]\nscan_interval_secs = 1\n",
+            siglip2_fixture_dir().display().to_string()
         );
         load_pipeline_config(&text).unwrap()
     }
@@ -1106,8 +1247,12 @@ mod tests {
     }
 
     async fn fixture() -> Fixture {
+        fixture_with(tiny_config()).await
+    }
+
+    async fn fixture_with(cfg: crate::pipeline::config::PipelineConfig) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
-        let core = IngestCore::load(&tiny_config(), std::path::Path::new("/nonexistent-models"))
+        let core = IngestCore::load(&cfg, std::path::Path::new("/nonexistent-models"))
             .await
             .expect("fixture embedder loads");
         let handle = Arc::new(IngestHandle::new(IngestShared::new(core)));
@@ -1649,7 +1794,11 @@ mod tests {
         );
         assert_eq!(b["hits"][0]["content"]["type"], json!("TEXT"));
 
-        // M4 members are Validation
+        // ---- image-query error face (M3-T4): the additive member and its
+        // fail-fast refusals, all field-addressable where a field is at
+        // fault ----
+        // the member is an OBJECT {bytes, mime} — a bare string is a type
+        // error at the body parse (same shape every malformed body takes)
         let (st, _, b) = call_json(
             &f,
             "/x-vf/Search",
@@ -1657,7 +1806,90 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
-        assert!(b["message"].as_str().unwrap().contains("M2"), "{b}");
+        assert!(
+            b["message"]
+                .as_str()
+                .unwrap()
+                .contains("invalid request body"),
+            "{b}"
+        );
+        // exactly one modality: text AND image, and NEITHER
+        for q in [
+            json!({"text": "fox", "image": {"bytes": "", "mime": "image/png"}}),
+            json!({}),
+        ] {
+            let (st, _, b) = call_json(
+                &f,
+                "/x-vf/Search",
+                json!({"bucket":"docs","query":q,"topK":1}),
+            )
+            .await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+            assert!(
+                b["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("one of query.text / query.image")
+                    || b["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("query.text (a non-empty string) or query.image"),
+                "{b}"
+            );
+        }
+        // audio stays M4
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"audio":"x"},"topK":1}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert!(
+            b["message"].as_str().unwrap().contains("arrives in M4"),
+            "{b}"
+        );
+        // garbage base64 / empty bytes / non-image bytes / mime mismatch:
+        // all ValidationException with fieldList path query.image
+        let png = crate::pipeline::extract::image::tests::solid_png((8, 8), [7, 7, 7]);
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        // (WIRE bytes exactly as sent, mime, the phrase the refusal carries)
+        // — only the last three ride the encoder; the first must arrive as
+        // literal invalid base64
+        let cases: Vec<(String, &str, &str)> = vec![
+            ("%%%%".into(), "image/png", "not valid base64"),
+            (b64(b""), "image/png", "bytes is empty"),
+            (
+                b64(b"not an image at all"),
+                "image/png",
+                "no known image-container magic",
+            ),
+            (b64(&png), "image/jpeg", "sniff as image/png"),
+        ];
+        for (bytes, mime, why) in cases {
+            let (st, _, b) = call_json(
+                &f,
+                "/x-vf/Search",
+                json!({"bucket":"docs","query":{"image":{"bytes": bytes, "mime": mime}},"topK":1}),
+            )
+            .await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{why}: {b}");
+            assert!(b["message"].as_str().unwrap().contains(why), "{why}: {b}");
+            assert_eq!(b["fieldList"][0]["path"], json!("query.image"), "{why}");
+        }
+        // a WELL-FORMED image query against a text-only pipeline (the tiny
+        // ort fixture): no route takes it — the honest aggregate names the
+        // modality and the remedy
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"image":{"bytes": b64(&png), "mime": "image/png"}},"topK":1}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        let msg = b["message"].as_str().unwrap();
+        assert!(msg.contains("accepts image queries"), "{msg}");
+        assert!(msg.contains("siglip2"), "{msg}");
 
         // topK bounds
         let (st, _, b) = call_json(
@@ -1668,6 +1900,79 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
         assert_eq!(b["fieldList"][0]["path"], json!("topK"));
+    }
+
+    /// M3-T4 以图搜图 over the wire, in-process: the image FILE extractor +
+    /// tiny-siglip2 pipeline — put two PNG sources, then (a) an image query
+    /// of the SAME bytes hits its own source first (回源 + IMAGE content
+    /// type), (b) a TEXT query reaches the IMAGE index (文字搜图 — siglip2's
+    /// query side declares [Image, Text], the fan-out must actually happen).
+    #[tokio::test]
+    async fn search_image_query_round_trip_and_text_to_image() {
+        let f = fixture_with(image_config()).await;
+        let red = crate::pipeline::extract::image::tests::solid_png((8, 8), [255, 0, 0]);
+        let blue = crate::pipeline::extract::image::tests::solid_png((8, 8), [0, 0, 255]);
+        put_source_call(&f, "docs", "docs/red.png", red.clone()).await;
+        put_source_call(&f, "docs", "docs/blue.png", blue.clone()).await;
+        drive(&f).await;
+        for key in ["docs/red.png", "docs/blue.png"] {
+            let m = marker_of(&f, key).await.unwrap();
+            assert_eq!(m.status, SourceStatus::Indexed, "{key}");
+            assert_eq!(m.chunks.as_ref().unwrap()["image"], 1, "{key}");
+        }
+
+        let b64 = |b: &[u8]| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(b)
+        };
+
+        // (a) image query with red's exact bytes: rank 1 is red itself —
+        // same bytes, same preprocessing, distance ~0 on the single route
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"image":{"bytes": b64(&red), "mime": "image/png"}},"topK":2}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2, "both sources rank: {b}");
+        let top = &hits[0];
+        assert_eq!(top["location"]["key"], json!("docs/red.png"), "{b}");
+        assert_eq!(top["content"]["type"], json!("IMAGE"), "{b}");
+        assert!(
+            top["content"].get("text").is_none(),
+            "image chunks carry no text channel"
+        );
+        assert!(top["key"].as_str().unwrap().contains("-image-"), "{b}");
+        assert!(top["index"].as_str().unwrap().starts_with("clip-"), "{b}");
+        assert_eq!(top["metadata"]["x-vf-modality"], json!("image"), "{b}");
+        assert!(
+            top["score"].as_f64().unwrap() > 0.99,
+            "identical bytes must land distance ~0 (single-route passthrough): {b}"
+        );
+        // the other source ranks second — attribution + merge stay sane
+        assert_eq!(hits[1]["location"]["key"], json!("docs/blue.png"), "{b}");
+
+        // (b) 文字搜图: a TEXT query fans out onto the IMAGE index (siglip2
+        // declares Text on its query side) and returns image chunks — the
+        // dual-tower default route, asserted REAL, not just declared
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"hello vectorfs"},"topK":2}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        assert!(
+            !hits.is_empty(),
+            "the text query must reach the image index: {b}"
+        );
+        for h in hits {
+            assert_eq!(h["content"]["type"], json!("IMAGE"), "{b}");
+            assert_eq!(h["metadata"]["x-vf-modality"], json!("image"), "{b}");
+        }
     }
 
     // ---------------- Reindex + GetIngestStatus ----------------

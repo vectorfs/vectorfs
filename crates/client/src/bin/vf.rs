@@ -21,6 +21,9 @@
 //! status — plus `mcp`, the stdio MCP server that exposes the same verbs to
 //! agents (client/src/mcp.rs). API fields are camelCase, flags kebab-case,
 //! one to one (`--top-k` -> topK, `--max-results` -> maxResults).
+//! `vf search` takes its query as positional TEXT (M2) or `--image <file>`
+//! (M3-T4, 以图搜图: bytes+mime derived from the extension ride
+//! query.image; with --image the lone positional names the bucket).
 
 use std::time::{Duration, Instant};
 
@@ -56,8 +59,9 @@ enum Command {
     /// key `pre/a.txt`); `--bucket`/`--key` remain the explicit form
     Put(PutArgs),
     /// The one retrieval verb: fan-out + merge + 回源 over the bucket's
-    /// embedders. Bucket as a bare second positional (`vf search "q" docs`)
-    /// or via `--bucket`
+    /// embedders. Query = positional TEXT (`vf search "q" docs`) or a local
+    /// image file (`vf search --image photo.png docs`, 以图搜图 — exactly one
+    /// of the two). Bucket as a bare positional or via `--bucket`
     Search(SearchArgs),
     /// List ingested files / inspect one file's status (the verb forms; the
     /// `vf ls` shorthand covers listing)
@@ -166,8 +170,16 @@ struct SearchArgs {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Query text
-    text: String,
+    /// Query text (exactly one of this and --image; with --image the lone
+    /// positional is the BUCKET instead)
+    text: Option<String>,
+
+    /// Query IMAGE (以图搜图): a local jpeg/png file — the search uses its
+    /// pixels, matching the bucket's image index (siglip2). With --image,
+    /// `vf search --image <file> <bucket>` (the lone positional names the
+    /// bucket)
+    #[arg(long)]
+    image: Option<std::path::PathBuf>,
 
     /// Vector bucket to search (bare name positional, S3-CLI style)
     bucket_pos: Option<String>,
@@ -702,10 +714,100 @@ async fn put_cmd(args: PutArgs) {
 // search
 // ---------------------------------------------------------------------------
 
+/// Extension -> canonical container mime for `--image` (the img family's
+/// three spellings; the server re-checks the label against the sniffed
+/// magic, so this is the FAST fail — the wrong label never leaves the box).
+fn image_mime_of(path: &std::path::Path) -> Result<&'static str, Failure> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "jpg" | "jpeg" => Ok("image/jpeg"),
+        "png" => Ok("image/png"),
+        other => Err(Failure::new(
+            "USAGE",
+            format!("--image: '.{other}' is not a supported image extension"),
+            "supported: .jpg / .jpeg / .png (the daemon cross-checks the file's \
+             actual container; a renamed file with a listed extension still works)",
+        )),
+    }
+}
+
 async fn search_cmd(args: SearchArgs) {
     let conn = args.common.connect().unwrap_or_else(|f| f.fail(false, 2));
-    let bucket =
-        resolve_bucket_target(args.bucket_pos.as_deref(), args.bucket.as_deref(), "search");
+    // --image MODE reinterprets the LONE positional: `vf search --image
+    // p.png docs` reads docs as the BUCKET (the S3-CLI intuition — with no
+    // text query there is nothing else the positional could be). Two
+    // positionals beside --image stay a text+image conflict, refused below.
+    let (text, bucket_pos) = match (
+        args.text.clone(),
+        args.bucket_pos.clone(),
+        args.image.is_some(),
+    ) {
+        (Some(t), None, true) => (None, Some(t)),
+        (t, bp, _) => (t, bp),
+    };
+    let bucket = resolve_bucket_target(bucket_pos.as_deref(), args.bucket.as_deref(), "search");
+    // exactly one query modality: the positional text or --image (both is
+    // ambiguous — the wire takes exactly one; neither is no query at all)
+    let query_member = match (&text, &args.image) {
+        (Some(_), Some(_)) => Failure::new(
+            "USAGE",
+            "a positional query text and --image are mutually exclusive",
+            "pass either 'vf search \"text\" <bucket>' or 'vf search --image <file> <bucket>'",
+        )
+        .fail(args.json, 2),
+        (None, None) => Failure::new(
+            "USAGE",
+            "no query given",
+            "pass query text positionally or --image <file> (以图搜图)",
+        )
+        .fail(args.json, 2),
+        (Some(t), None) => {
+            if t.trim().is_empty() {
+                Failure::new(
+                    "USAGE",
+                    "query text must be a non-empty string",
+                    "pass the text positionally: vf search \"your query\" <bucket>",
+                )
+                .fail(args.json, 2);
+            }
+            json!({ "text": t })
+        }
+        (None, Some(path)) => {
+            let mime = image_mime_of(path).unwrap_or_else(|f| f.fail(args.json, 2));
+            let bytes = match tokio::fs::read(path).await {
+                Ok(b) => b,
+                Err(e) => Failure::new(
+                    "READ_FAILED",
+                    format!("cannot read {}: {e}", path.display()),
+                    "check the path and permissions; --image takes a local jpeg/png file",
+                )
+                .fail(args.json, 1),
+            };
+            if bytes.is_empty() {
+                Failure::new(
+                    "READ_FAILED",
+                    format!("{} is empty (0 bytes)", path.display()),
+                    "pass a real image file — an empty file has nothing to search with",
+                )
+                .fail(args.json, 1);
+            }
+            use base64::Engine as _;
+            json!({ "image": { "bytes": base64::engine::general_purpose::STANDARD.encode(bytes), "mime": mime } })
+        }
+    };
+    // the --json envelope's query echo: the text verbatim, the image by its
+    // local identity (path + derived mime — echoing megabytes of base64
+    // would bury the hits)
+    let query_echo = match (&text, &args.image) {
+        (Some(t), _) => json!({ "text": t }),
+        (None, Some(path)) => {
+            json!({ "image": { "path": path.display().to_string(), "mime": image_mime_of(path).ok() } })
+        }
+        _ => unreachable!("resolved above"),
+    };
     let filter: Option<Value> = match &args.filter {
         None => None,
         Some(f) => match serde_json::from_str(f) {
@@ -720,7 +822,7 @@ async fn search_cmd(args: SearchArgs) {
     };
     let mut body = json!({
         "bucket": bucket,
-        "query": { "text": args.text },
+        "query": query_member,
         "topK": args.top_k,
         "returnText": !args.no_text,
     });
@@ -738,7 +840,7 @@ async fn search_cmd(args: SearchArgs) {
             serde_json::to_string_pretty(&json!({
                 "schema_version": SCHEMA_VERSION,
                 "bucket": bucket,
-                "query": { "text": args.text },
+                "query": query_echo,
                 "topK": args.top_k,
                 "hits": hits,
             }))
@@ -746,7 +848,8 @@ async fn search_cmd(args: SearchArgs) {
         );
         return;
     }
-    // human table (deterministic: server order is score desc, key asc)
+    // human table (deterministic: server order is score desc, key asc);
+    // image hits have no text channel — the SOURCE column carries the 回源
     let header = format!(
         "{:<4} {:<9} {:<28} {:<22} {:<24} {}",
         "#", "SCORE", "KEY", "INDEX", "SOURCE", "TEXT"
@@ -758,6 +861,11 @@ async fn search_cmd(args: SearchArgs) {
             .unwrap_or("")
             .replace(['\n', '\r', '\t'], " ");
         let text: String = text.chars().take(60).collect();
+        let text = if h["content"]["type"] == json!("IMAGE") {
+            "〔image〕".to_string()
+        } else {
+            text
+        };
         println!(
             "{:<4} {:<9.4} {:<28} {:<22} {:<24} {}",
             i + 1,

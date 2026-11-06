@@ -509,9 +509,10 @@ pub fn generate_secret_key() -> String {
 /// serve/env hints and are deliberately NOT written to vectorfs.toml — the
 /// backend is per-invocation, §5.10.7 "env 覆盖收敛为标量项", and the bind
 /// address is a serve-time flag). `models_dir` is the CONTAINER volume path
-/// (§5.10.7): text-rag records it as the top-level `models_dir` key,
-/// air-gapped bakes it into the embedder `path`; bare-metal init leaves it
-/// unset and the derived default applies.
+/// (§5.10.7): the model-carrying presets (text-rag, multimodal, image-search)
+/// record it as the top-level `models_dir` key, air-gapped bakes it into the
+/// embedder `path`; bare-metal init leaves it unset and the derived default
+/// applies.
 #[derive(Debug, Default, Clone)]
 pub struct InitOptions {
     pub preset: Preset,
@@ -560,8 +561,8 @@ pub fn init(data_dir: &Path, force: bool) -> Result<InitOutcome, String> {
 /// site), never at the first `serve`. The model AVAILABILITY gate is
 /// deliberately NOT run by init: air-gapped is expected to fail it until
 /// the operator supplies the model (that fail-fast is `pipelines check`'s
-/// job), and text-rag satisfies it via the init-time prefetch the CLI
-/// performs next.
+/// job), and the model-carrying presets (text-rag, multimodal, image-search)
+/// satisfy it via the init-time prefetch the CLI performs next.
 pub fn init_with(data_dir: &Path, force: bool, opts: &InitOptions) -> Result<InitOutcome, String> {
     // The config lives at <data-dir>/.vectorfs/vectorfs.toml — creating its
     // parent dir covers both levels in one shot.
@@ -600,10 +601,14 @@ pub fn init_with(data_dir: &Path, force: bool, opts: &InitOptions) -> Result<Ini
         extractor: None,
         embedder: None,
         ingest: None,
-        // top-level models_dir key: ONLY the text-rag container path needs
-        // it (air-gapped embeds the path; dev has no models at all)
+        // top-level models_dir key: ONLY the model-carrying presets' container
+        // path needs it (text-rag / multimodal / image-search — all resolve
+        // models through the cache root; air-gapped embeds the path; dev has
+        // no models at all)
         models_dir: match (opts.preset, &opts.models_dir) {
-            (Preset::TextRag, Some(dir)) => Some(dir.display().to_string()),
+            (Preset::TextRag | Preset::Multimodal | Preset::ImageSearch, Some(dir)) => {
+                Some(dir.display().to_string())
+            }
             _ => None,
         },
     };
@@ -753,6 +758,23 @@ fn preset_note(outcome: &InitOutcome) -> String {
              \n",
             model_dir = outcome.models_dir.join(Preset::DEFAULT_MODEL).display()
         ),
+        Preset::Multimodal => "\n\
+             File layer (multimodal): text and images in ONE bucket:\n\
+             \x20   vf put a.pdf docs/    (text-native -> text index)\n\
+             \x20   vf put scan.pdf docs/  (scan-dominant -> page images -> image index)\n\
+             \x20   vf put photo.png docs/\n\
+             \x20   vf search \"<text query>\" docs        (searches BOTH indexes)\n\
+             \x20   vf search --image photo.png docs      (以图搜图)\n\
+             \n"
+        .to_string(),
+        Preset::ImageSearch => "\n\
+             File layer (image-search): 以图搜图 over the images you put:\n\
+             \x20   vf put photo.png docs/\n\
+             \x20   vf search --image photo.png docs\n\
+             Text queries also work (siglip2's text tower); non-image files\n\
+             are not claimed in this preset.\n\
+             \n"
+        .to_string(),
     }
 }
 

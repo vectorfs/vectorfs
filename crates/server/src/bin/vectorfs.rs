@@ -106,7 +106,10 @@ struct InitArgs {
     /// protocol face (default, identical to the pre-preset init);
     /// text-rag = gte text pipeline + model PREFETCH (~1.17 GiB, stderr
     /// progress, HF_ENDPOINT mirror honored); air-gapped = offline ort
-    /// embedder, no download — supply the model directory yourself
+    /// embedder, no download — supply the model directory yourself;
+    /// multimodal = gte + siglip2 dual embedders (text AND image queries,
+    /// prefetches both models, ~2.7 GiB); image-search = siglip2 only
+    /// (以图搜图, prefetches ~1.5 GiB)
     #[arg(long)]
     preset: Option<vectorfs_server::preset::Preset>,
 
@@ -124,9 +127,10 @@ struct InitArgs {
     backend: Option<String>,
 
     /// Models cache root (container deployments: the /vectorfs/models
-    /// VOLUME, §5.10.7 — text-rag records it as `models_dir`, air-gapped
-    /// bakes it into the embedder `path`; bare metal leaves it unset and
-    /// the <data-dir>/.vectorfs/models default applies)
+    /// VOLUME, §5.10.7 — the model-carrying presets record it as
+    /// `models_dir`, air-gapped bakes it into the embedder `path`; bare
+    /// metal leaves it unset and the <data-dir>/.vectorfs/models default
+    /// applies)
     #[arg(long)]
     models_dir: Option<String>,
 
@@ -543,9 +547,10 @@ fn print_pipeline_summary(cfg: &vectorfs_server::pipeline::config::PipelineConfi
 }
 
 /// `vectorfs init`: materialize credentials (+ preset pipeline sections,
-/// §5.10.4) and — for text-rag — PREFETCH the model (progress/sha256/
-/// tmp+rename/HF_ENDPOINT mirror: pipeline::models). Async solely for that
-/// download; everything else is local file IO.
+/// §5.10.4) and — for the model-carrying presets (text-rag, multimodal,
+/// image-search) — PREFETCH every model the preset names (progress/sha256/
+/// tmp+rename/HF_ENDPOINT mirror: pipeline::models). Async solely for those
+/// downloads; everything else is local file IO.
 async fn init(args: InitArgs) {
     let data_dir = args
         .data_dir
@@ -576,39 +581,41 @@ async fn init(args: InitArgs) {
             std::process::exit(1);
         }
     };
-    // text-rag: prefetch the default model into the resolved cache dir
-    // BEFORE printing the report (the §3 "model ready" five-minute promise
-    // happens here, at init, not at first serve). air-gapped deliberately
-    // downloads nothing (offline semantics); dev has no models at all.
-    if outcome.preset == vectorfs_server::preset::Preset::TextRag {
+    // model-carrying presets: prefetch every model the preset names into
+    // the resolved cache dir BEFORE printing the report (the §3 "model
+    // ready" five-minute promise happens here, at init, not at first
+    // serve). air-gapped deliberately downloads nothing (offline
+    // semantics); dev has no models at all. The list is the preset's own
+    // declaration (preset.prefetch_models) so a new tier wiring an embedder
+    // decides its prefetch in the same place.
+    let models = outcome.preset.prefetch_models().to_vec();
+    if !models.is_empty() {
         eprintln!(
-            "vectorfs init: preset text-rag: prefetching '{}' (3 files, ~1.17 GiB) into {} …",
-            vectorfs_server::preset::Preset::DEFAULT_MODEL,
+            "vectorfs init: preset {}: prefetching {} model(s) into {} …",
+            outcome.preset,
+            models.len(),
             outcome.models_dir.display()
         );
-        match vectorfs_server::pipeline::models::prefetch(
-            vectorfs_server::preset::Preset::DEFAULT_MODEL,
-            &outcome.models_dir,
-        )
-        .await
-        {
-            Ok(dir) => {
-                eprintln!(
-                    "vectorfs init: model ready at {} (sha256-verified, stamp .complete)",
-                    dir.display()
-                );
-            }
-            Err(e) => {
-                // the config IS materialized: serve retries the prefetch at
-                // embedder load (ort.rs), so the deployment stays fixable
-                // without re-init
-                eprintln!("vectorfs init: model prefetch FAILED: {e}");
-                eprintln!(
-                    "vectorfs init: hint: the config was written; fix the network (or set \
-                     HF_ENDPOINT to a mirror) and re-run with --force, or let `vectorfs serve` \
-                     retry the prefetch at startup"
-                );
-                std::process::exit(1);
+        for name in &models {
+            match vectorfs_server::pipeline::models::prefetch(name, &outcome.models_dir).await {
+                Ok(dir) => {
+                    eprintln!(
+                        "vectorfs init: model ready at {} (sha256-verified, stamp .complete)",
+                        dir.display()
+                    );
+                }
+                Err(e) => {
+                    // the config IS materialized: serve retries the prefetch
+                    // at embedder load (ort.rs / siglip2.rs), so the
+                    // deployment stays fixable without re-init
+                    eprintln!("vectorfs init: model prefetch FAILED ({name}): {e}");
+                    eprintln!(
+                        "vectorfs init: hint: the config was written; fix the network (or set \
+                         HF_ENDPOINT to a mirror) and re-run with --force, or let `vectorfs \
+                         serve` retry the prefetch at startup"
+                    );
+                    std::process::exit(1);
+                }
             }
         }
     }

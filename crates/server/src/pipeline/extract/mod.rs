@@ -6,10 +6,13 @@
 //! walks every match site in this tree. Available kinds: `txt`,
 //! `pdf-text`, `md`, `pdf-inspector` (the first kind added AFTER the M2
 //! set — the closed-set mechanism's first live exercise; two PDF kinds
-//! coexist behind the one `pdf` short key, selection is explicit), and
+//! coexist behind the one `pdf` short key, selection is explicit),
 //! `pdf-pages` (M3-T3, the third PDF kind and the first IMAGE-output kind:
 //! pdfium renders each page to a PNG Part — same short key again, the
-//! two-kinds-one-key precedent extended to a text/image pair).
+//! two-kinds-one-key precedent extended to a text/image pair), and `image`
+//! (M3-T4, the image FILE kind: one verbatim image Part behind the new
+//! `img` short key — the first family key carried by TWO mime rows,
+//! jpeg + png).
 //! Since M2.1 step 2 every kind also declares its per-[`ContentClass`]
 //! affinity (kind module `affinity`/`refusal_note` free functions, dispatched
 //! exhaustively below) — the ingest router consumes those declarations to
@@ -22,6 +25,7 @@
 //! the one table below so kind names, config keys and mime gates can never
 //! drift apart (single source of truth, pub for the T3 ingest worker).
 
+pub mod image;
 pub mod md;
 pub mod pdf_inspector;
 pub mod pdf_pages;
@@ -29,17 +33,24 @@ pub mod pdf_text;
 pub mod txt;
 
 use super::{ChildDoc, ContentClass, Extractor, Fit, Modality, Part, PipelineError};
+use image::{ImageConfig, ImageExtractor};
 use md::{MdConfig, MdExtractor};
 use pdf_inspector::{PdfInspectorConfig, PdfInspectorExtractor};
 use pdf_pages::{PdfPagesConfig, PdfPagesExtractor};
 use pdf_text::{PdfTextConfig, PdfTextExtractor};
 use txt::{TxtConfig, TxtExtractor};
 
-/// Canonical mime -> config short key, one row per M2 kind. ORDER MATTERS
-/// only for human eyes (lookups are exact); the table is the single mapping
-/// both directions consult.
+/// Canonical mime -> config short key, one row per declared mime. ORDER
+/// MATTERS only for human eyes — EXCEPT that a family with SEVERAL mimes
+/// (`img`: jpeg + png, M3-T4) must list its CANONICAL representative first:
+/// [`mime_for_short_key`] returns the first row of the key, and that mime is
+/// what the reporting face (`GetSource`/`GetSourceData`) shows for the
+/// whole family (routing itself is per-object and extension-exact). The
+/// table is the single mapping both directions consult.
 pub const MIME_TO_SHORT_KEY: &[(&str, &str)] = &[
     ("application/pdf", "pdf"),
+    ("image/jpeg", "img"),
+    ("image/png", "img"),
     ("text/markdown", "md"),
     ("text/plain", "txt"),
 ];
@@ -48,7 +59,7 @@ pub const MIME_TO_SHORT_KEY: &[(&str, &str)] = &[
 /// [`KIND_LABELS`] (the parity test pins the two together — a new kind that
 /// updates the enum but forgets the string fails there, not in a user's
 /// error message).
-pub const EXTRACTOR_KINDS: &str = "txt, pdf-text, md, pdf-inspector, pdf-pages";
+pub const EXTRACTOR_KINDS: &str = "txt, pdf-text, md, pdf-inspector, pdf-pages, image";
 
 /// Every production kind's config label, IN AVAILABILITY-LIST ORDER. This is
 /// the registry's identity anchor: `kind_label` (the exhaustive match the
@@ -56,7 +67,14 @@ pub const EXTRACTOR_KINDS: &str = "txt, pdf-text, md, pdf-inspector, pdf-pages";
 /// (the `kind_registry_views_agree` test walks it). A new kind lands here,
 /// in `kind_label`, and in `from_config` in one diff — everything else in
 /// this module is exhaustive dispatch the compiler already checks.
-pub const KIND_LABELS: &[&str] = &["txt", "pdf-text", "md", "pdf-inspector", "pdf-pages"];
+pub const KIND_LABELS: &[&str] = &[
+    "txt",
+    "pdf-text",
+    "md",
+    "pdf-inspector",
+    "pdf-pages",
+    "image",
+];
 
 /// mime (parameters like `; charset=utf-8` tolerated) -> short key.
 pub fn short_key_for_mime(mime: &str) -> Option<&'static str> {
@@ -67,8 +85,12 @@ pub fn short_key_for_mime(mime: &str) -> Option<&'static str> {
         .map(|(_, key)| *key)
 }
 
-/// short key -> canonical mime (the inverse; `default`/`auto` are ingest
-/// RESERVED words, never kind keys, and are absent here on purpose).
+/// short key -> canonical mime (the inverse, MANY-TO-ONE since M3-T4: the
+/// `img` family lists jpeg + png, and this returns the family's canonical
+/// representative — the FIRST row of the key, the honest answer a
+/// short-key-only consumer can give; per-object mimes come from the
+/// extension/bytes at the caller that has them. `default`/`auto` are
+/// ingest RESERVED words, never kind keys, and are absent here on purpose).
 pub fn mime_for_short_key(key: &str) -> Option<&'static str> {
     MIME_TO_SHORT_KEY
         .iter()
@@ -94,6 +116,11 @@ pub fn mime_for_short_key(key: &str) -> Option<&'static str> {
 /// [`builtin_extractor`] arm — three views, one anchor, zero drift.
 pub const EXTENSION_ALIASES: &[(&str, &str)] = &[
     ("pdf", "pdf"),
+    // the img family (M3-T4): all three spellings route to the one short
+    // key — the extractor sniffs the container, the extension only claims
+    ("jpg", "img"),
+    ("jpeg", "img"),
+    ("png", "img"),
     ("md", "md"),
     ("markdown", "md"),
     ("txt", "txt"),
@@ -127,6 +154,10 @@ pub enum ExtractorKind {
     /// side; the third kind behind the `pdf` short key, the first whose
     /// output modality is not Text).
     PdfPages(PdfPagesConfig),
+    /// Image FILE as a source: validate-decode then ONE image Part with the
+    /// original bytes verbatim (`extract/image.rs`, M3-T4 — the user-facing
+    /// supply side of the image chain, behind the `img` short key).
+    Image(ImageConfig),
     /// Scripted CONTAINER kind for the M2.1 step 3 mechanism tests — see
     /// [`TestContainerSpec`]. `cfg(test)` only: the PRODUCTION enum stays at
     /// leaf kinds only (five since M3-T3's `pdf-pages`; epub/docx/eml and
@@ -272,6 +303,12 @@ impl ExtractorKind {
                     .map_err(|m| PipelineError::config(format!("[{section}]: {m}"), line))?;
                 Ok(ExtractorKind::PdfPages(cfg))
             }
+            "image" => {
+                let cfg: ImageConfig = raw.clone().try_into().map_err(|e: toml::de::Error| {
+                    super::config::stage2_error(section, Some(&kind), e.message(), line)
+                })?;
+                Ok(ExtractorKind::Image(cfg))
+            }
             other => Err(PipelineError::config(
                 format!(
                     "[{section}]: unknown extractor kind '{other}' (available kinds: \
@@ -296,7 +333,7 @@ impl ExtractorKind {
             | ExtractorKind::PdfText(_)
             | ExtractorKind::Md(_)
             | ExtractorKind::PdfInspector(_) => &[Modality::Text],
-            ExtractorKind::PdfPages(_) => &[Modality::Image],
+            ExtractorKind::PdfPages(_) | ExtractorKind::Image(_) => &[Modality::Image],
             // its children re-enter user routing; the tests' children are
             // text (txt/md chains)
             #[cfg(test)]
@@ -320,6 +357,7 @@ impl ExtractorKind {
             ExtractorKind::Md(_) => "md",
             ExtractorKind::PdfInspector(_) => "pdf-inspector",
             ExtractorKind::PdfPages(_) => "pdf-pages",
+            ExtractorKind::Image(_) => "image",
             #[cfg(test)]
             ExtractorKind::TestContainer(_) => "test-container",
             #[cfg(test)]
@@ -333,6 +371,7 @@ impl ExtractorKind {
             ExtractorKind::Txt(_) => "txt".to_string(),
             ExtractorKind::PdfText(_) => "pdf-text".to_string(),
             ExtractorKind::Md(_) => "md".to_string(),
+            ExtractorKind::Image(_) => "image".to_string(),
             // the knob shows only when it departs from the pdf-text-aligned
             // default, keeping summary lines short
             ExtractorKind::PdfInspector(cfg) => {
@@ -379,6 +418,9 @@ impl Extractor for ExtractorKind {
             // call (cheap path checks); the pdfium bind itself is
             // process-global (pdf_text::bind_pdfium)
             ExtractorKind::PdfPages(cfg) => PdfPagesExtractor::new(cfg).extract(bytes, mime),
+            // configless: the kind IS the extractor (validate-decode, then
+            // one verbatim image Part — see extract/image.rs)
+            ExtractorKind::Image(_) => ImageExtractor.extract(bytes, mime),
             // role separation made loud: a container NEVER extracts — the
             // worker short-circuits extract for kinds whose unpack yields
             // children, so reaching this arm is a mechanism bug, and it
@@ -409,6 +451,12 @@ impl Extractor for ExtractorKind {
             ExtractorKind::Md(_) => md::affinity(class),
             ExtractorKind::PdfInspector(_) => pdf_inspector::affinity(class),
             ExtractorKind::PdfPages(_) => pdf_pages::affinity(class),
+            // undeclared (the trait default, spelled out): the image kind
+            // declares no fit — its family has no classification probe, so
+            // no class ever routes it; reached through its own `img` route
+            // or a default chain, where config order is the whole truth
+            // (extract/image.rs module docs)
+            ExtractorKind::Image(_) => Fit::Capable,
             // undeclared (the trait default, spelled out): a container that
             // declares no fit is Capable everywhere — routing degenerates to
             // config order around it, exactly like any undeclared leaf.
@@ -432,7 +480,8 @@ impl Extractor for ExtractorKind {
             | ExtractorKind::PdfText(_)
             | ExtractorKind::Md(_)
             | ExtractorKind::PdfInspector(_)
-            | ExtractorKind::PdfPages(_) => Ok(None),
+            | ExtractorKind::PdfPages(_)
+            | ExtractorKind::Image(_) => Ok(None),
             #[cfg(test)]
             ExtractorKind::TestContainer(spec) => spec.unpack(_bytes, _mime),
             // the scripted image kind is a leaf
@@ -454,6 +503,11 @@ impl ExtractorKind {
             ExtractorKind::Md(_) => md::refusal_note(class),
             ExtractorKind::PdfInspector(_) => pdf_inspector::refusal_note(class),
             ExtractorKind::PdfPages(_) => pdf_pages::refusal_note(class),
+            // unreachable in practice (the image kind is Capable for every
+            // class, so the router never quotes a refusal)
+            ExtractorKind::Image(_) => {
+                "an image kind (no affinity declaration — never refuses)".to_string()
+            }
             // unreachable in practice (the test container is Capable for
             // every class, so the router never quotes a refusal)
             #[cfg(test)]
@@ -481,6 +535,7 @@ impl serde::Serialize for ExtractorKind {
             ExtractorKind::Md(c) => c.serialize(serializer),
             ExtractorKind::PdfInspector(c) => c.serialize(serializer),
             ExtractorKind::PdfPages(c) => c.serialize(serializer),
+            ExtractorKind::Image(c) => c.serialize(serializer),
             // fingerprints serialize CONFIG-loaded kinds only; the test kinds
             // never enter a PipelineConfig (from_config has no arm), so these
             // arms exist purely to keep the closed set exhaustive.
@@ -500,11 +555,26 @@ mod tests {
     fn mime_short_key_table_round_trips() {
         for (mime, key) in MIME_TO_SHORT_KEY {
             assert_eq!(short_key_for_mime(mime), Some(*key), "{mime}");
-            assert_eq!(mime_for_short_key(key), Some(*mime), "{key}");
+            // MANY-TO-ONE since M3-T4 (the img family lists jpeg + png):
+            // the inverse returns the family's canonical representative —
+            // the FIRST row of the key — so the honest per-row assertion is
+            // "the key resolves back to a mime OF THE SAME FAMILY"
+            let canonical = mime_for_short_key(key).expect("key resolves");
+            assert!(
+                MIME_TO_SHORT_KEY
+                    .iter()
+                    .any(|(m, k)| *m == canonical && *k == *key),
+                "{mime}: inverse of {key} left the family ({canonical})"
+            );
         }
-        // parameters tolerated; unknown mimes have no short key; the ingest
-        // reserved words are NOT kind keys
+        // the family canonical is the FIRST row (the reporting face's
+        // answer for a short-key-only consumer — pinned so reordering the
+        // table cannot silently change GetSource's mime)
+        assert_eq!(mime_for_short_key("img"), Some("image/jpeg"));
+        // parameters tolerated (uniformly, image rows included); unknown
+        // mimes have no short key; the ingest reserved words are NOT kind
         assert_eq!(short_key_for_mime("text/plain; charset=utf-8"), Some("txt"));
+        assert_eq!(short_key_for_mime("image/png; name=x"), Some("img"));
         assert_eq!(short_key_for_mime("application/octet-stream"), None);
         assert_eq!(mime_for_short_key("default"), None);
         assert_eq!(mime_for_short_key("auto"), None);
@@ -513,10 +583,12 @@ mod tests {
     #[test]
     fn extension_alias_view_covers_every_family() {
         // every family row of the mime table has at least one alias mapping
-        // to it, and every alias routes back to its family's canonical mime:
+        // to it, and every alias routes back INTO its family (M3-T4: a
+        // family may carry several mimes — jpg/jpeg/png all land in img, and
+        // the canonical-mime round trip stays inside the family):
         // x.txt.gz / x.text.gz / x.md.gz all claim as the source they
         // decompress into (the scanner + normalizer contract)
-        for (mime, key) in MIME_TO_SHORT_KEY {
+        for (_mime, key) in MIME_TO_SHORT_KEY {
             let aliases = EXTENSION_ALIASES
                 .iter()
                 .filter(|(_, k)| *k == *key)
@@ -524,11 +596,17 @@ mod tests {
             assert!(!aliases.is_empty(), "family {key} has no extension alias");
             for (ext, _) in aliases {
                 assert_eq!(short_key_for_extension(ext), Some(*key), "{ext}");
-                assert_eq!(
-                    mime_for_short_key(short_key_for_extension(ext).unwrap()),
-                    Some(*mime)
-                );
+                let canonical = mime_for_short_key(short_key_for_extension(ext).unwrap())
+                    .expect("key resolves");
+                let in_family = MIME_TO_SHORT_KEY
+                    .iter()
+                    .any(|(m, k)| *m == canonical && *k == *key);
+                assert!(in_family, "{ext} routes outside the {key} family");
             }
+        }
+        // the img family's full extension set (all three spellings claim)
+        for ext in ["jpg", "jpeg", "png"] {
+            assert_eq!(short_key_for_extension(ext), Some("img"), "{ext}");
         }
         // unknown extensions claim nothing
         assert_eq!(short_key_for_extension("docx"), None);
@@ -610,6 +688,13 @@ mod tests {
                 &[Modality::Image],
                 "kind = \"pdf-pages\"\ndpi = 150",
             ),
+            (
+                "image",
+                image::tests::static_png(),
+                "image/png",
+                &[Modality::Image],
+                "kind = \"image\"",
+            ),
         ];
         for (kind_str, bytes, mime, modalities, canonical) in cases {
             let raw: toml::Value = toml::from_str(&format!("kind = \"{kind_str}\"")).unwrap();
@@ -686,6 +771,18 @@ mod tests {
             );
             assert_eq!(Extractor::affinity(&k, ContentClass::NoText), Fit::Refuses);
         }
+        // image: the UNDECLARED default — Capable for every class (its
+        // family has no probe, so no class ever routes it; the dispatch
+        // spells the trait default out, pinned here)
+        let img = kind("image");
+        for class in [
+            ContentClass::TextNative,
+            ContentClass::ScanDominant,
+            ContentClass::MixedTextScan,
+            ContentClass::NoText,
+        ] {
+            assert_eq!(Extractor::affinity(&img, class), Fit::Capable, "{class}");
+        }
         // refusal notes exist for every refusing cell (the router quotes them)
         assert!(
             pdf_text
@@ -727,6 +824,7 @@ mod tests {
                 pdf_pages::tests::HELLO_PDF_MINIMAL,
                 "application/pdf",
             ),
+            ("image", image::tests::static_png(), "image/png"),
         ];
         for (kind_str, bytes, mime) in cases {
             let raw: toml::Value = toml::from_str(&format!("kind = \"{kind_str}\"")).unwrap();
@@ -797,6 +895,9 @@ mod tests {
             // dpi is LEGAL on pdf-pages — the unknown-field probe needs a
             // field this kind does not have
             ("pdf-pages", "format = \"jpeg\""),
+            // the image kind is knob-free (preprocessing belongs to the
+            // embedder)
+            ("image", "dpi = 72"),
         ] {
             let raw: toml::Value =
                 toml::from_str(&format!("kind = \"{kind_str}\"\n{extra}")).unwrap();

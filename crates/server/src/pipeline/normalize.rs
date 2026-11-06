@@ -551,11 +551,36 @@ mod tests {
     /// The mime inference is TABLE-driven (single source with the
     /// scanner's routing), not a second map that can drift: everything the
     /// mime table knows infers; everything else is honestly octet-stream.
+    /// Since M3-T4 a family may carry SEVERAL mimes and extensions (img:
+    /// jpeg+png over jpg/jpeg/png) — the walk goes family by family through
+    /// a REPRESENTATIVE extension, asserting the inferred mime is that
+    /// family's canonical row (the first), exactly what
+    /// `mime_for_short_key` answers for a short-key-only consumer.
     #[test]
     fn infer_mime_follows_the_short_key_table() {
-        for (mime, key) in MIME_TO_SHORT_KEY {
-            let name = format!("dir/file.{key}");
-            assert_eq!(infer_mime(&name), *mime, "{name}");
+        let mut seen: Vec<&str> = Vec::new();
+        for (_mime, key) in MIME_TO_SHORT_KEY {
+            if seen.contains(key) {
+                continue; // one walk per family (the img family's second row)
+            }
+            seen.push(key);
+            let Some((ext, _)) = super::super::extract::EXTENSION_ALIASES
+                .iter()
+                .find(|(_, k)| *k == *key)
+            else {
+                panic!("family {key} has no extension alias");
+            };
+            let name = format!("dir/file.{ext}");
+            let canonical = super::super::extract::mime_for_short_key(key).unwrap();
+            assert_eq!(infer_mime(&name), canonical, "{name}");
+        }
+        // the img family's aliases all infer the SAME canonical mime
+        for ext in ["jpg", "jpeg", "png"] {
+            assert_eq!(
+                infer_mime(&format!("dir/file.{ext}")),
+                "image/jpeg",
+                "family canonical is the FIRST row"
+            );
         }
         assert_eq!(infer_mime("x.gz"), "application/octet-stream");
         assert_eq!(infer_mime("no-extension"), "application/octet-stream");

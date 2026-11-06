@@ -38,6 +38,11 @@ toml = "1"
 # client (types only — the TLS/proxy machinery stays inside common).
 http = "1"
 http-body-util = "0.1"
+# `vf search --image` (M3-T4): the image-query wire member carries the
+# container bytes as base64 (JSON has no native bytes; the /x-vf face's
+# existing binary-in-string convention — nextToken). The SAME 0.22 the
+# server's wire already pins — zero new subgraph, tiny; std has no base64.
+base64 = "0.22"
 
 # `vf mcp` (2026-11-06): the stdio MCP server for AGENT REMOTE mode — tool
 # calls proxy to the daemon through Connection's signed HTTP, so no engine
