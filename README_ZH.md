@@ -44,6 +44,12 @@ curl -fsSL https://raw.githubusercontent.com/vectorfs/vectorfs/main/scripts/inst
 # 或: install-cli.sh --version v0.1.0 --to /usr/local/bin
 ```
 
+Windows（原生、仅客户端 zip——守护进程仍是 linux 二进制；同样强制校验和）：
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/vectorfs/vectorfs/main/scripts/install-cli.ps1 | iex
+```
+
 然后配置一次——`vf config init` 写入 `~/.config/vectorfs/config.toml`
 （连接参数优先级 `--flag` > `VF_*` 环境变量 > 该文件）：
 

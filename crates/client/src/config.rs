@@ -48,10 +48,12 @@ impl FileConfig {
 
 /// XDG base-dir resolution (pure — the env reads live in [`config_path`] so
 /// this stays testable without mutating process env): `XDG_CONFIG_HOME` when
-/// absolute, else `HOME/.config`.
+/// absolute, else `<home>/.config`.
 fn xdg_config_dir(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
     match xdg {
-        Some(x) if x.starts_with('/') => Some(PathBuf::from(x)),
+        // is_absolute (not starts_with('/')) so a Windows-native
+        // `C:\Users\u\cfg` counts too
+        Some(x) if Path::new(x).is_absolute() => Some(PathBuf::from(x)),
         // relative or absent XDG_CONFIG_HOME: the spec falls back to HOME
         _ => home.map(|h| PathBuf::from(h).join(".config")),
     }
@@ -62,9 +64,14 @@ fn xdg_config_dir(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
 /// (verbs must not fail in, say, a stripped healthcheck container); only
 /// `init` turns it into an actionable error.
 pub fn config_path() -> Option<PathBuf> {
+    // HOME covers unix AND git-bash; USERPROFILE covers native Windows
+    // (PowerShell/cmd set no HOME) — same `<home>/.config` layout either way
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok();
     let dir = xdg_config_dir(
         std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
+        home.as_deref(),
     )?;
     Some(dir.join("vectorfs").join("config.toml"))
 }
@@ -227,6 +234,20 @@ mod tests {
         let rel = xdg_config_dir(Some("rel/path"), Some("/home/u"));
         assert_eq!(rel, Some(PathBuf::from("/home/u/.config")));
         assert_eq!(xdg_config_dir(None, None), None);
+    }
+
+    #[test]
+    #[cfg(windows)] // is_absolute() is HOST-platform semantics: a `C:\` path
+    //               is absolute only when compiled for windows — the same
+    //               binary's linux build sees it as relative (spec fallback)
+    fn xdg_dir_accepts_windows_absolute_paths() {
+        // a Windows-native drive-absolute XDG_CONFIG_HOME must count as
+        // absolute (is_absolute, not starts_with('/')) — the USERPROFILE
+        // fallback in config_path hands this fn native paths on Windows
+        let via_xdg = xdg_config_dir(Some(r"C:\Users\u\cfg"), Some(r"C:\Users\u"));
+        assert_eq!(via_xdg, Some(PathBuf::from(r"C:\Users\u\cfg")));
+        let via_home = xdg_config_dir(None, Some(r"C:\Users\u"));
+        assert_eq!(via_home, Some(PathBuf::from(r"C:\Users\u\.config")));
     }
 
     #[test]

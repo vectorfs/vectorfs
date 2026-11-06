@@ -43,9 +43,13 @@ OS="$(uname -s)"; ARCH="$(uname -m)"
 case "$OS:$ARCH" in
     Linux:x86_64)  TARGET="x86_64-unknown-linux-gnu" ;;
     Linux:aarch64|Linux:arm64) TARGET="aarch64-unknown-linux-gnu" ;;
-    Darwin:*) die "the release pipeline ships linux only (glibc); on macOS use: \
+    MINGW*_NT-*|MSYS*_NT-*|CYGWIN_NT-*)
+        die "this bash runs under Windows — use PowerShell instead: \
+iwr -useb https://raw.githubusercontent.com/$REPO/main/scripts/install-cli.ps1 | iex" ;;
+    Darwin:*) die "the release pipeline ships linux + windows only; on macOS use: \
 cargo install --git https://github.com/$REPO --profile release-prod vectorfs-client" ;;
-    *) die "unsupported platform $OS/$ARCH (release assets: linux x86_64/aarch64)" ;;
+    *) die "unsupported platform $OS/$ARCH (release assets: linux x86_64/aarch64 + \
+windows x86_64 client zip)" ;;
 esac
 
 # --- resolve the version tag (no API: follow the /releases/latest redirect) --

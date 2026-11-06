@@ -10,6 +10,15 @@
 #                        `vf` client is printed but not gated); artifacts
 #                        vectorfs-<version>-<target>.tar.gz (both binaries +
 #                        README copy) uploaded per target.
+#   release-windows    — CLIENT-ONLY release-prod build of vf.exe on
+#                        windows-latest (x86_64-pc-windows-msvc, crt-static
+#                        so the exe needs no vcruntime DLL). The server
+#                        crate is deliberately NOT built for MSVC (its
+#                        engine chain is a linux-verified surface; the
+#                        windows ask is an installable vf). size_guard.sh
+#                        runs in client-only mode; artifact
+#                        vectorfs-<version>-<target>.zip (vf.exe + README
+#                        copy), installed by scripts/install-cli.ps1.
 #   smoke-ubuntu-20-04 — unpacks the x86_64 tarball inside `docker run
 #                        ubuntu:20.04`, `vectorfs init && vectorfs serve`,
 #                        apt-installs python3+boto3 and drives a 5-step
@@ -19,8 +28,9 @@
 #                        its marker, the source bucket is lazy; delete
 #                        removes `X-vf/` entirely). This is the
 #                        glibc-compatibility gate for the release binary.
-#   publish            — needs BOTH green: merges artifacts, writes
-#                        sha256sums.txt, attaches everything via
+#   publish            — needs release + smoke + release-windows green:
+#                        merges artifacts, writes sha256sums.txt (tarballs
+#                        AND the windows zip), attaches everything via
 #                        softprops/action-gh-release.
 #
 # ---------------------------------------------------------------------------
@@ -48,6 +58,12 @@
 #      were added with the v3 bucket model (PR2) and have never run on
 #      hosted runners — the first tag push after v3 must confirm they pass
 #      here (design-v3.md §3-R1/D4).
+#   7. windows-msvc client build: aws-lc-sys on x86_64-pc-windows-msvc is
+#      expected to build with the runner's preinstalled cmake + its
+#      PREBUILT NASM objects (no NASM install); if it fails for missing
+#      NASM, add a choco nasm step. crt-static + strip on MSVC also first
+#      run here. install-cli.ps1 is PowerShell 5.1-compatible but was
+#      authored without a local pwsh — desk-checked only.
 # ---------------------------------------------------------------------------
 name: Release
 
@@ -304,9 +320,80 @@ jobs:
             --access-key "$AK" --secret-key "$SK" --data-dir dist/vfdata
           docker kill vf-smoke
 
+  release-windows:
+    name: build x86_64-pc-windows-msvc (vf client only, release-prod + size guard)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash # git-bash: same ${GITHUB_SHA::7}/grep idioms as the linux jobs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-prod-x86_64-pc-windows-msvc-client
+
+      - name: export VF_GIT_HASH (short sha)
+        run: echo "VF_GIT_HASH=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: resolve version (tag v<x> or Cargo.toml fallback)
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            # windows images may expose only `python` (no python3 shim)
+            PY="$(command -v python3 || command -v python)"
+            VERSION="$(cargo metadata --no-deps --format-version 1 \
+              | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "version: $VERSION"
+
+      # CLIENT-ONLY by design (2026-11-06 ruling: the windows ask is an
+      # INSTALLABLE vf): the small-client dependency tree (rmcp + the
+      # shared TLS leaf's aws-lc-rs + tokio) is the whole build — no
+      # lancedb/ort/pdfium/protoc enter, so no MSVC risk surface from the
+      # server's engine chain. crt-static => self-contained vf.exe (no
+      # vcruntime140.dll dependency on user machines); aws-lc-sys needs the
+      # runner's preinstalled cmake only (prebuilt NASM objects cover
+      # windows-msvc x64).
+      - name: build vf.exe (release-prod, crt-static)
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --profile release-prod -p vectorfs-client --target x86_64-pc-windows-msvc
+
+      - name: sanity + size guard (client-only mode)
+        run: |
+          set -euo pipefail
+          BIN="target/x86_64-pc-windows-msvc/release-prod/vf.exe"
+          "./$BIN" --version
+          "./$BIN" mcp --help >/dev/null && echo "vf mcp subcommand OK"
+          ./scripts/size_guard.sh none "$BIN"
+
+      - name: package (vf.exe + README copy, zip)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release-prod/vf.exe" package/
+          Copy-Item README.md package/
+          $zip = "vectorfs-$env:VERSION-x86_64-pc-windows-msvc.zip"
+          Compress-Archive -Path package/vf.exe, package/README.md -DestinationPath $zip -Force
+          Get-Item $zip | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vectorfs-x86_64-pc-windows-msvc
+          path: vectorfs-*.zip
+          if-no-files-found: error
+
   publish:
     name: attach artifacts + sha256sums to the release
-    needs: [release, smoke-ubuntu-20-04]
+    needs: [release, smoke-ubuntu-20-04, release-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -319,12 +406,13 @@ jobs:
           set -euo pipefail
           cd dist-out
           ls -la
-          sha256sum vectorfs-*.tar.gz > sha256sums.txt
+          sha256sum vectorfs-*.tar.gz vectorfs-*.zip > sha256sums.txt
           cat sha256sums.txt
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             dist-out/vectorfs-*.tar.gz
+            dist-out/vectorfs-*.zip
             dist-out/sha256sums.txt
           generate_release_notes: true

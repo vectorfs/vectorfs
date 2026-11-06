@@ -46,6 +46,13 @@ curl -fsSL https://raw.githubusercontent.com/vectorfs/vectorfs/main/scripts/inst
 # or: install-cli.sh --version v0.1.0 --to /usr/local/bin
 ```
 
+Windows (native, client-only zip — the daemon stays a linux binary; same
+checksum verification):
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/vectorfs/vectorfs/main/scripts/install-cli.ps1 | iex
+```
+
 Then configure once — `vf config init` writes `~/.config/vectorfs/config.toml`
 (connection knobs resolve `--flag` > `VF_*` env > that file):
 
