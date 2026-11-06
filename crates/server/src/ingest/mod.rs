@@ -268,6 +268,9 @@ pub(crate) struct BucketPlan {
     /// plan carries it so the protocol face can merge with the SAME policy
     /// the bucket was configured with (§5.10.4 `merge`).
     pub(crate) merge: Merge,
+    /// Per-embedder-instance weights for `merge = "weighted"` (M3-T8) —
+    /// same query-side carriage as `merge` itself.
+    pub(crate) merge_weights: BTreeMap<String, f64>,
     max_file_size_bytes: u64,
     retries: u32,
     extract_timeout: Duration,
@@ -1065,6 +1068,7 @@ impl IngestCore {
                     embedders: icfg.embedders.clone(),
                     derived,
                     merge: icfg.merge,
+                    merge_weights: icfg.merge_weights.clone(),
                     max_file_size_bytes: icfg.max_file_size_mb * 1024 * 1024,
                     retries: icfg.retries,
                     extract_timeout: Duration::from_secs(icfg.extract_timeout_secs),
@@ -2583,6 +2587,13 @@ impl IngestShared {
     /// Query-side merge strategy of one bucket (`/x-vf/Search`).
     pub fn merge_of(&self, bucket: &str) -> Option<Merge> {
         self.core.buckets.get(bucket).map(|p| p.merge)
+    }
+
+    /// The bucket's `merge-weights` map (M3-T8; empty for rrf buckets).
+    /// Consumers treat a missing per-instance entry as the neutral 1.0 —
+    /// see `pipeline::merge_hitlists_weighted`.
+    pub fn merge_weights_of(&self, bucket: &str) -> Option<&BTreeMap<String, f64>> {
+        self.core.buckets.get(bucket).map(|p| &p.merge_weights)
     }
 
     /// Derived-index specs of one bucket, config embedder order.

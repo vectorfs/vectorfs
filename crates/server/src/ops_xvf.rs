@@ -41,7 +41,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::ops::{ApiError, AppState};
-use crate::pipeline::{Embedder as _, HitList, Merge, Modality, Query, merge_hitlists};
+use crate::pipeline::{
+    Embedder as _, HitList, Merge, Modality, Query, merge_hitlists, merge_hitlists_weighted,
+};
 use crate::store::{QueryRoute, SourceMarker, SourceStatus};
 
 /// Hard body cap for `/x-vf/PutSource` (and the gate's read of a
@@ -766,7 +768,11 @@ fn decode_image_query(img: &SearchImageInput) -> Result<(Vec<u8>, String), ApiEr
 ///   image (image chunks store no text — the source file is the content);
 /// * `score` — the merged score. Single route: passthrough of
 ///   `1/(1+distance)` (monotone in distance, so thresholds stay meaningful —
-///   rrf scores only make sense across lists). Multiple routes: the rrf sum;
+///   fusion scores only make sense across lists). Multiple routes: the rrf
+///   sum, or with `merge = "weighted"` (M3-T8) the per-embedder-instance
+///   weight times each rank contribution — RANK-based either way, never raw
+///   distances (different embedders are dimensionally incomparable; see
+///   `pipeline::merge_hitlists_weighted`);
 /// * `distance` — emitted only for single-route queries (appendix E.2:
 ///   "单路查询时有意义"; a merged hit has no single distance);
 /// * `index`/`key` — derived index name + chunk key; attribution is the
@@ -863,6 +869,9 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
     // the research-file default dual route); an IMAGE query fans out to the
     // image-query embedders only (a text tower cannot embed bytes).
     let mut lists: Vec<HitList> = Vec::new();
+    // route identity parallel to `lists` (M3-T8): the embedder INSTANCE name
+    // of each list — the key merge-weights are looked up by
+    let mut routes: Vec<String> = Vec::new();
     let mut matched_any = false;
     // key -> (index name, distance, stored metadata); first route wins
     let mut attribution: HashMap<String, (String, f64, Option<serde_json::Value>)> = HashMap::new();
@@ -890,6 +899,7 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
             .await?
         else {
             lists.push(Vec::new());
+            routes.push(name.clone());
             continue;
         };
         if let Some(nf) = meta.non_filterable_metadata_keys.as_deref()
@@ -951,6 +961,7 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
             })
             .collect();
         lists.push(list);
+        routes.push(name.clone());
     }
     if !matched_any {
         return Err(ApiError::validation(format!(
@@ -962,8 +973,24 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
 
     let merge = shared.merge_of(&input.bucket).unwrap_or(Merge::Rrf);
     let single_route = lists.len() == 1;
-    let mut merged = merge_hitlists(merge, &lists);
-    merged.truncate(top_k); // rrf unions can exceed topK across routes
+    let mut merged = match merge {
+        Merge::Rrf => merge_hitlists(Merge::Rrf, &lists),
+        // weighted (M3-T8): per-embedder-instance weights on each rank
+        // contribution (pipeline::merge_hitlists_weighted documents why the
+        // fusion is RANK-based — raw distances of different embedders are
+        // dimensionally incomparable). Weightless instances count 1.0.
+        Merge::Weighted => {
+            let empty = std::collections::BTreeMap::new();
+            let weights = shared.merge_weights_of(&input.bucket).unwrap_or(&empty);
+            let named: Vec<(&str, &HitList)> = routes
+                .iter()
+                .map(String::as_str)
+                .zip(lists.iter())
+                .collect();
+            merge_hitlists_weighted(&named, weights)
+        }
+    };
+    merged.truncate(top_k); // fusions can exceed topK across route unions
 
     let hits: Vec<serde_json::Value> = merged
         .iter()
@@ -1972,6 +1999,137 @@ mod tests {
         for h in hits {
             assert_eq!(h["content"]["type"], json!("IMAGE"), "{b}");
             assert_eq!(h["metadata"]["x-vf-modality"], json!("image"), "{b}");
+        }
+    }
+
+    /// M3-T8 merge weighted over the wire, in-process: a DUAL-embedder
+    /// bucket (txt->tiny text index + img->clip image index, `merge =
+    /// "weighted"` with tiny=3.0 / clip=1.0). A TEXT query fans out to BOTH
+    /// routes (clip's query side declares Text), and the merged order+scores
+    /// must equal the weighted rank fusion computed INDEPENDENTLY from the
+    /// two routes' own engine-direct rankings (the oracle). The same fixture
+    /// under the default rrf must equal the uniform fusion — the regression
+    /// half.
+    #[tokio::test]
+    async fn search_weighted_merge_matches_independent_fusion() {
+        let dual_config = |merge_lines: &str| {
+            format!(
+                "[extractor.plain]\nkind = \"txt\"\n\n\
+                 [extractor.imgs]\nkind = \"image\"\n\n\
+                 [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\n\
+                 offline = true\n\n\
+                 [embedder.clip]\nkind = \"siglip2\"\nmodel = \"tiny-siglip2\"\npath = {:?}\n\
+                 offline = true\n\n\
+                 [ingest.docs]\ninclude = [\"docs/**\"]\n\
+                 extract = {{ txt = \"plain\", img = \"imgs\" }}\n\
+                 chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+                 embedders = [\"tiny\", \"clip\"]\n{merge_lines}scan_interval_secs = 1\n",
+                fixture_dir().display().to_string(),
+                siglip2_fixture_dir().display().to_string()
+            )
+        };
+
+        for (merge_lines, w_tiny, w_clip) in [
+            (
+                "merge = \"weighted\"\nmerge-weights = { tiny = 3.0, clip = 1.0 }\n",
+                3.0,
+                1.0,
+            ),
+            ("", 1.0, 1.0), // absent merge = rrf default (regression half)
+        ] {
+            let cfg = load_pipeline_config(&dual_config(merge_lines)).unwrap();
+            let f = fixture_with(cfg).await;
+            put_source_call(
+                &f,
+                "docs",
+                "docs/a.txt",
+                b"alpha body of the first".to_vec(),
+            )
+            .await;
+            put_source_call(
+                &f,
+                "docs",
+                "docs/b.txt",
+                b"beta body of the second".to_vec(),
+            )
+            .await;
+            let red = crate::pipeline::extract::image::tests::solid_png((8, 8), [255, 0, 0]);
+            let blue = crate::pipeline::extract::image::tests::solid_png((8, 8), [0, 0, 255]);
+            put_source_call(&f, "docs", "docs/red.png", red).await;
+            put_source_call(&f, "docs", "docs/blue.png", blue).await;
+            drive(&f).await;
+            for key in ["docs/a.txt", "docs/b.txt", "docs/red.png", "docs/blue.png"] {
+                assert_eq!(
+                    marker_of(&f, key).await.unwrap().status,
+                    SourceStatus::Indexed,
+                    "{key} ({merge_lines:?})"
+                );
+            }
+
+            // ---- the oracle: each route's ranking, engine-direct ----
+            let text = "hello weighted vectorfs";
+            let mut fused: Vec<(String, f64)> = Vec::new();
+            let specs = f.handle.shared().derived_specs("docs").unwrap();
+            for (name, weight) in [("tiny", w_tiny), ("clip", w_clip)] {
+                let spec = specs.iter().find(|s| s.embedder == name).unwrap();
+                let loaded = f.handle.shared().embedder(name).unwrap();
+                let qv = loaded
+                    .embed_query(&Query::Text(text.to_string()))
+                    .await
+                    .unwrap();
+                let out = f
+                    .state
+                    .storage
+                    .query_vectors(
+                        "docs",
+                        &spec.index_name,
+                        spec.dim as i32,
+                        "cosine",
+                        &qv,
+                        10,
+                        None,
+                        crate::store::QueryRoute::Pushdown,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!out.hits.is_empty(), "{name} route has hits");
+                for (rank0, h) in out.hits.iter().enumerate() {
+                    fused.push((h.key.clone(), weight / (60.0 + rank0 as f64 + 1.0)));
+                }
+            }
+            fused.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            fused.truncate(10);
+
+            // ---- the wire: Search must reproduce the oracle exactly ----
+            let (st, _, b) = call_json(
+                &f,
+                "/x-vf/Search",
+                json!({"bucket":"docs","query":{"text": text},"topK":10}),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{b}");
+            let hits = b["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), fused.len(), "{b}");
+            let mut indexes = std::collections::BTreeSet::new();
+            for (h, (key, score)) in hits.iter().zip(&fused) {
+                assert_eq!(h["key"].as_str().unwrap(), key, "{b}");
+                assert_eq!(
+                    &h["score"].as_f64().unwrap(),
+                    score,
+                    "exact fused score: {b}"
+                );
+                indexes.insert(h["index"].as_str().unwrap().split('-').next().unwrap());
+            }
+            // both routes really contributed (a merge over one list is no
+            // merge at all)
+            assert_eq!(
+                indexes,
+                std::collections::BTreeSet::from(["tiny", "clip"]),
+                "fan-out over both embedders: {b}"
+            );
+            // no `distance` on multi-route hits (appendix E.2)
+            assert!(hits.iter().all(|h| h.get("distance").is_none()), "{b}");
         }
     }
 

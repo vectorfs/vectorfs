@@ -18,6 +18,7 @@ pub mod lock;
 pub mod mcp;
 pub mod ops;
 pub mod ops_xvf;
+pub mod optimize;
 pub mod pipeline;
 pub mod preset;
 pub mod s3admin;

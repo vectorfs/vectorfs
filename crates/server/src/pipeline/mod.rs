@@ -597,22 +597,29 @@ pub struct Hit {
 pub type HitList = Vec<Hit>;
 
 /// Query-result merge strategy. Closed set like everything else in the
-/// plugin system: M2 registers exactly `rrf`; `weighted` / `first` land in
-/// M3 (§7 M3 fusion scope) by ADDING variants + parse arms — a config saying
-/// `merge = "weighted"` in M2 fails loudly instead of half-working.
+/// plugin system: M2 registered exactly `rrf`; M3-T8 adds `weighted` by the
+/// planned variant + parse arm (`first` is still M3+ — a config saying
+/// `merge = "first"` fails loudly instead of half-working).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Merge {
     /// Reciprocal Rank Fusion.
     Rrf,
+    /// Weighted rank fusion (M3-T8): [`merge_hitlists_weighted`] — RRF with a
+    /// per-embedder-instance weight on each rank contribution. RANK-based by
+    /// design: raw distances of different embedders are dimensionally
+    /// incomparable (cosine of one model space vs another's), so the only
+    /// cross-source currency the fusion mixes is the dimensionless rank.
+    Weighted,
 }
 
 impl Merge {
-    /// Parse the config string form. M2 accepts exactly `"rrf"`.
+    /// Parse the config string form (M3-T8: `rrf` | `weighted`).
     pub fn parse(s: &str) -> Result<Merge, String> {
         match s {
             "rrf" => Ok(Merge::Rrf),
+            "weighted" => Ok(Merge::Weighted),
             other => Err(format!(
-                "unknown merge strategy '{other}' (allowed: rrf; weighted/first land in M3)"
+                "unknown merge strategy '{other}' (allowed: rrf, weighted)"
             )),
         }
     }
@@ -622,6 +629,7 @@ impl std::fmt::Display for Merge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             Merge::Rrf => f.write_str("rrf"),
+            Merge::Weighted => f.write_str("weighted"),
         }
     }
 }
@@ -643,27 +651,90 @@ pub const RRF_K: u64 = 60;
 ///   order a pure function of the input: deterministic and reproducible.
 pub fn merge_hitlists(strategy: Merge, lists: &[HitList]) -> HitList {
     match strategy {
-        Merge::Rrf => {
-            if lists.len() == 1 {
-                return lists[0].clone();
-            }
-            let mut acc: BTreeMap<String, f64> = BTreeMap::new();
-            for list in lists {
-                for (rank0, hit) in list.iter().enumerate() {
-                    *acc.entry(hit.key.clone()).or_insert(0.0) +=
-                        1.0 / (RRF_K as f64 + rank0 as f64 + 1.0);
-                }
-            }
-            let mut merged: HitList = acc
-                .into_iter()
-                .map(|(key, score)| Hit { key, score })
-                .collect();
-            // total_cmp: a total order over f64 (no NaN by construction —
-            // sums of positive rationals), so sort is fully deterministic.
-            merged.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.key.cmp(&b.key)));
-            merged
+        // Weighted WITHOUT its weights is uniform (w=1) — numerically the
+        // rrf fusion (1.0·x is bit-exact x in IEEE 754); the
+        // configured-weights entry is [`merge_hitlists_weighted`]. The arm
+        // exists to keep the closed-set match total.
+        Merge::Rrf | Merge::Weighted => fuse_uniform(lists),
+    }
+}
+
+/// Shared uniform-weight body of [`merge_hitlists`] (see that function's
+/// docs; single-list passthrough + rank fusion + key tie-break).
+fn fuse_uniform(lists: &[HitList]) -> HitList {
+    if lists.len() == 1 {
+        return lists[0].clone();
+    }
+    let mut acc: BTreeMap<String, f64> = BTreeMap::new();
+    for list in lists {
+        for (rank0, hit) in list.iter().enumerate() {
+            *acc.entry(hit.key.clone()).or_insert(0.0) += 1.0 / (RRF_K as f64 + rank0 as f64 + 1.0);
         }
     }
+    let mut merged: HitList = acc
+        .into_iter()
+        .map(|(key, score)| Hit { key, score })
+        .collect();
+    // total_cmp: a total order over f64 (no NaN by construction —
+    // sums of positive rationals), so sort is fully deterministic.
+    merged.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.key.cmp(&b.key)));
+    merged
+}
+
+/// Weighted rank fusion (M3-T8): like RRF, but each list's contribution
+/// `1/(RRF_K + rank)` is scaled by that list's WEIGHT — `w / (RRF_K + rank)`
+/// — with weights keyed by list identity. The CALLER (ops_xvf Search) keys
+/// lists by EMBEDDER INSTANCE name: one list is one embedder's derived index.
+///
+/// # Why ranks, not scores (the normalization ruling)
+///
+/// Different embedders produce distances in incomparable units — cosine
+/// distance in one model's space vs another model's (or metric's) space.
+/// Neither alternative offered a honest fusion:
+/// * weighting RAW scores (`w · 1/(1+d)`) sums apples and oranges — a scalar
+///   weight cannot repair a missing unit;
+/// * min-max normalizing within each source manufactures a [0,1] band out of
+///   whatever the CURRENT top-k happened to return (one outlier distance or
+///   a different topK reshuffles every normalized score) — comparability by
+///   accident, not by semantics.
+///
+/// Rank is the only cross-source quantity that needs no unit: every list
+/// orders ITS OWN hits by ITS OWN metric, and `w_i` then expresses exactly
+/// what the operator means — "trust embedder i's ranking more". With every
+/// weight at 1.0 the fusion is bit-identical to rrf.
+///
+/// A list whose name has NO entry in `weights` weighs 1.0 (neutral): query
+/// modality filtering means not every configured embedder co-occurs in every
+/// query, so requiring a weight per embedder would over-configure. Weights
+/// are validated positive+finite at config parse (config.rs); this pure
+/// function does not second-guess its inputs.
+///
+/// Single list: passthrough identity — same rows, order, raw scores as rrf
+/// (with nothing to weigh, the weights are meaningless and the raw scores
+/// stay actionable). Ties break by key ascending; `total_cmp` keeps the
+/// order a pure function of the input.
+pub fn merge_hitlists_weighted(
+    lists: &[(&str, &HitList)],
+    weights: &BTreeMap<String, f64>,
+) -> HitList {
+    if lists.len() == 1 {
+        return lists[0].1.clone();
+    }
+    let mut acc: BTreeMap<String, f64> = BTreeMap::new();
+    for (name, list) in lists {
+        let w = weights.get(*name).copied().unwrap_or(1.0);
+        for (rank0, hit) in list.iter().enumerate() {
+            *acc.entry(hit.key.clone()).or_insert(0.0) += w / (RRF_K as f64 + rank0 as f64 + 1.0);
+        }
+    }
+    let mut merged: HitList = acc
+        .into_iter()
+        .map(|(key, score)| Hit { key, score })
+        .collect();
+    // no NaN by construction when weights are finite (config-validated);
+    // total_cmp still gives a total order regardless
+    merged.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.key.cmp(&b.key)));
+    merged
 }
 
 // ---------------------------------------------------------------------------
@@ -749,9 +820,123 @@ mod tests {
     #[test]
     fn merge_parse_closed_set() {
         assert_eq!(Merge::parse("rrf"), Ok(Merge::Rrf));
-        let err = Merge::parse("weighted").unwrap_err();
-        assert!(err.contains("unknown merge strategy 'weighted'"), "{err}");
-        assert!(err.contains("M3"), "{err}");
+        assert_eq!(Merge::parse("weighted"), Ok(Merge::Weighted));
+        // 'first' is still M3+: closed set, loud refusal
+        let err = Merge::parse("first").unwrap_err();
+        assert!(err.contains("unknown merge strategy 'first'"), "{err}");
+        assert!(err.contains("allowed: rrf, weighted"), "{err}");
+        assert_eq!(Merge::Weighted.to_string(), "weighted");
+    }
+
+    // ---- weighted (M3-T8) ----
+
+    fn w(weights: &[(&str, f64)]) -> BTreeMap<String, f64> {
+        weights.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn weighted_uniform_weights_are_bit_identical_to_rrf() {
+        // w=1 everywhere must reproduce rrf EXACTLY — same keys, same order,
+        // byte-identical scores (the additive-redline property: a deployment
+        // flipping merge=rrf -> weighted with equal weights sees no change).
+        let l1 = hits(&[("a", 0.9), ("b", 0.5)]);
+        let l2 = hits(&[("c", 0.8), ("a", 0.4), ("d", 0.1)]);
+        let rrf = merge_hitlists(Merge::Rrf, &[l1.clone(), l2.clone()]);
+        let wgt =
+            merge_hitlists_weighted(&[("e1", &l1), ("e2", &l2)], &w(&[("e1", 1.0), ("e2", 1.0)]));
+        assert_eq!(rrf.len(), wgt.len());
+        for (r, g) in rrf.iter().zip(&wgt) {
+            assert_eq!(r.key, g.key);
+            assert_eq!(r.score.to_bits(), g.score.to_bits(), "w=1 must be rrf");
+        }
+        // unkeyed names default to 1.0 — same bit-identity
+        let defaulted = merge_hitlists_weighted(&[("e1", &l1), ("e2", &l2)], &BTreeMap::new());
+        for (r, g) in rrf.iter().zip(&defaulted) {
+            assert_eq!(r.score.to_bits(), g.score.to_bits());
+        }
+    }
+
+    #[test]
+    fn weighted_scores_are_exact_weighted_rank_sums() {
+        let l1 = hits(&[("a", 5.0), ("b", 4.0)]);
+        let l2 = hits(&[("b", 3.0), ("a", 2.0)]);
+        let out = merge_hitlists_weighted(
+            &[("big", &l1), ("small", &l2)],
+            &w(&[("big", 3.0), ("small", 1.0)]),
+        );
+        // a: 3/61 + 1/62;  b: 3/62 + 1/61 — a wins under these weights
+        let a = 3.0 / 61.0 + 1.0 / 62.0;
+        let b = 3.0 / 62.0 + 1.0 / 61.0;
+        assert!((out[0].score - a).abs() < 1e-15);
+        assert_eq!(out[0].key, "a");
+        assert!((out[1].score - b).abs() < 1e-15);
+        assert_eq!(out[1].key, "b");
+        // same lists under rrf (uniform) have a = 1/61+1/62 = b -> tie,
+        // key ascending puts a first with EQUAL scores: the weight is what
+        // breaks the symmetry, not the tie-break
+        let rrf = merge_hitlists(
+            Merge::Rrf,
+            &[
+                hits(&[("a", 5.0), ("b", 4.0)]),
+                hits(&[("b", 3.0), ("a", 2.0)]),
+            ],
+        );
+        assert_eq!(rrf[0].score.to_bits(), rrf[1].score.to_bits());
+    }
+
+    #[test]
+    fn weighted_weight_reorders_the_fusion() {
+        // list a ranks x first, list b ranks y first (disjoint fillers so
+        // only the top keys compete). With b weighted 10x, y wins; with a
+        // weighted 10x, x wins — the weight is the only difference.
+        let l1 = hits(&[("x", 1.0), ("qa", 0.5)]);
+        let l2 = hits(&[("y", 1.0), ("qb", 0.5)]);
+        let y_first =
+            merge_hitlists_weighted(&[("a", &l1), ("b", &l2)], &w(&[("a", 1.0), ("b", 10.0)]));
+        assert_eq!(y_first[0].key, "y");
+        let x_first =
+            merge_hitlists_weighted(&[("a", &l1), ("b", &l2)], &w(&[("a", 10.0), ("b", 1.0)]));
+        assert_eq!(x_first[0].key, "x");
+    }
+
+    #[test]
+    fn weighted_single_list_is_identity_and_ties_break_by_key() {
+        // identity: raw scores survive, weight irrelevant
+        let one = hits(&[("a", 0.9), ("b", 0.5)]);
+        let out = merge_hitlists_weighted(&[("only", &one)], &w(&[("only", 7.0)]));
+        assert_eq!(out, one);
+        assert_eq!(out[0].score.to_bits(), 0.9f64.to_bits());
+        // tie discipline: same key-shape, symmetric weights -> equal scores
+        // -> key ascending
+        let l1 = hits(&[("zz", 1.0)]);
+        let l2 = hits(&[("aa", 1.0)]);
+        let out =
+            merge_hitlists_weighted(&[("e1", &l1), ("e2", &l2)], &w(&[("e1", 2.0), ("e2", 2.0)]));
+        assert_eq!(out[0].score.to_bits(), out[1].score.to_bits());
+        assert_eq!((out[0].key.as_str(), out[1].key.as_str()), ("aa", "zz"));
+        // determinism: same input, same output
+        let again = merge_hitlists_weighted(
+            &[("e1", &hits(&[("zz", 1.0)])), ("e2", &hits(&[("aa", 1.0)]))],
+            &w(&[("e1", 2.0), ("e2", 2.0)]),
+        );
+        assert_eq!(out, again);
+    }
+
+    #[test]
+    fn weighted_edges() {
+        assert!(merge_hitlists_weighted(&[], &BTreeMap::new()).is_empty());
+        let empty: HitList = Vec::new();
+        assert!(
+            merge_hitlists_weighted(&[("a", &empty)], &BTreeMap::new()).is_empty(),
+            "single EMPTY list is the single-list identity"
+        );
+        // union preserved across weighted lists, no duplicates
+        let lk = hits(&[("k", 1.0)]);
+        let lj = hits(&[("j", 1.0), ("k", 1.0)]);
+        let out = merge_hitlists_weighted(&[("a", &lk), ("b", &lj)], &w(&[("a", 2.0), ("b", 0.5)]));
+        let mut keys: Vec<&str> = out.iter().map(|h| h.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["j", "k"]);
     }
 
     #[test]

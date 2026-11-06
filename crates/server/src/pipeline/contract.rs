@@ -559,6 +559,113 @@ pub fn merge_contract() {
     assert!(super::merge_hitlists(Merge::Rrf, &[vec![], vec![]]).is_empty());
 }
 
+/// The M3-T8 weighted run of the merge contract against
+/// [`super::merge_hitlists_weighted`] — same assertions the rrf run makes
+/// (§5.10.2 contract minimums: single-route identity, deterministic total
+/// order with tie-break by key, union preserved, empty -> empty), plus the
+/// weighted-specific property: uniform/absent weights are BIT-identical to
+/// rrf (the additive red line in one assert).
+pub fn weighted_merge_contract() {
+    use std::collections::BTreeMap;
+
+    // identity on a single list (weight present but meaningless)
+    let one: HitList = vec![
+        Hit {
+            key: "a".into(),
+            score: 0.9,
+        },
+        Hit {
+            key: "b".into(),
+            score: 0.5000001,
+        },
+    ];
+    let out =
+        super::merge_hitlists_weighted(&[("e", &one)], &BTreeMap::from([("e".to_string(), 5.0)]));
+    assert_eq!(out.len(), one.len());
+    for (got, want) in out.iter().zip(&one) {
+        assert_eq!(got.key, want.key);
+        assert_eq!(got.score.to_bits(), want.score.to_bits());
+    }
+
+    // fusion + total order + union (asymmetric weights exercising the
+    // per-name lookup and the neutral 1.0 default)
+    let l1: HitList = vec![
+        Hit {
+            key: "shared".into(),
+            score: 9.0,
+        },
+        Hit {
+            key: "only1".into(),
+            score: 8.0,
+        },
+    ];
+    let l2: HitList = vec![
+        Hit {
+            key: "only2".into(),
+            score: 7.0,
+        },
+        Hit {
+            key: "shared".into(),
+            score: 6.0,
+        },
+    ];
+    let out = super::merge_hitlists_weighted(
+        &[("e1", &l1), ("e2", &l2)],
+        &BTreeMap::from([("e1".to_string(), 3.0)]), // e2 defaults to 1.0
+    );
+    let mut keys: Vec<&str> = out.iter().map(|h| h.key.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["only1", "only2", "shared"]);
+    // shared = 3/61 + 1/62 ≈ .0653; only1 = 3/62 ≈ .0484; only2 = 1/61 ≈
+    // .0164 — that order (the 3x weight lifts e1's rank-2 over e2's rank-1)
+    assert_eq!(
+        out.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+        ["shared", "only1", "only2"]
+    );
+    assert_total_order(&out);
+
+    // the additive red line: uniform weights (explicit 1.0 or absent) are
+    // byte-identical to the rrf fusion
+    let rrf = super::merge_hitlists(Merge::Rrf, &[l1.clone(), l2.clone()]);
+    for weights in [
+        BTreeMap::from([("e1".to_string(), 1.0), ("e2".to_string(), 1.0)]),
+        BTreeMap::new(),
+    ] {
+        let wgt = super::merge_hitlists_weighted(&[("e1", &l1), ("e2", &l2)], &weights);
+        assert_eq!(wgt.len(), rrf.len());
+        for (r, g) in rrf.iter().zip(&wgt) {
+            assert_eq!(r.key, g.key);
+            assert_eq!(r.score.to_bits(), g.score.to_bits());
+        }
+    }
+
+    // constructed tie: symmetric weights, rank-1 in disjoint lists -> equal
+    // scores -> key ascending decides
+    let lz: HitList = vec![Hit {
+        key: "zz".into(),
+        score: 1.0,
+    }];
+    let la: HitList = vec![Hit {
+        key: "aa".into(),
+        score: 1.0,
+    }];
+    let tie = super::merge_hitlists_weighted(
+        &[("e1", &lz), ("e2", &la)],
+        &BTreeMap::from([("e1".to_string(), 2.0), ("e2".to_string(), 2.0)]),
+    );
+    assert_eq!(tie[0].score.to_bits(), tie[1].score.to_bits());
+    assert_eq!(tie[0].key, "aa");
+    assert_eq!(tie[1].key, "zz");
+
+    // empty inputs
+    let empty: HitList = Vec::new();
+    assert!(super::merge_hitlists_weighted(&[], &BTreeMap::new()).is_empty());
+    assert!(
+        super::merge_hitlists_weighted(&[("e1", &empty), ("e2", &empty)], &BTreeMap::new())
+            .is_empty()
+    );
+}
+
 fn assert_total_order(hits: &[Hit]) {
     for w in hits.windows(2) {
         let ordered = w[0].score > w[1].score
@@ -816,5 +923,10 @@ mod tests {
     #[test]
     fn merge_function_passes_merge_contract() {
         merge_contract();
+    }
+
+    #[test]
+    fn weighted_merge_function_passes_merge_contract() {
+        weighted_merge_contract();
     }
 }

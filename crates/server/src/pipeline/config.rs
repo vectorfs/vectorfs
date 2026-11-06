@@ -92,6 +92,12 @@ struct IngestRaw {
     #[serde(default)]
     embedders: Vec<String>,
     merge: Option<String>,
+    /// M3-T8: per-embedder-instance query weights, TOML `merge-weights`
+    /// (kebab-case like `index-prefix`). Only meaningful together with
+    /// `merge = "weighted"`; validated below (positive, finite, known
+    /// instances).
+    #[serde(rename = "merge-weights", default)]
+    merge_weights: BTreeMap<String, f64>,
     /// TOML key is `index-prefix` (§5.10.4 spells it kebab-case).
     #[serde(rename = "index-prefix")]
     index_prefix: Option<String>,
@@ -389,8 +395,13 @@ pub struct IngestConfig {
     pub chunk: ChunkerKind,
     /// Embedder instance names (fan-out per §5.10.1 routing rules).
     pub embedders: Vec<String>,
-    /// Query-side merge strategy (defaults to `rrf`).
+    /// Query-side merge strategy (defaults to `rrf`; M3-T8 adds `weighted`).
     pub merge: Merge,
+    /// Per-embedder-instance query weights for `merge = "weighted"`
+    /// (M3-T8; empty for rrf). Query-side like `merge` itself — EXCLUDED
+    /// from the pipeline fingerprint (see [`pipeline_fingerprint`]):
+    /// changing a weight changes ranking policy, never chunk identity.
+    pub merge_weights: BTreeMap<String, f64>,
     /// Derived index name prefix (optional).
     pub index_prefix: Option<String>,
     /// Scanner period in seconds (default 30).
@@ -505,7 +516,10 @@ fn unknown_field_parts(message: &str) -> Option<(&str, String)> {
 ///   list is the pure-protocol face and is legal);
 /// * extractor output modalities are carried by the listed embedders' doc
 ///   modalities (§5.10.3 modality carry-over; live since T5);
-/// * `merge` parses (M2: exactly `rrf`).
+/// * `merge` parses (M3-T8: `rrf` | `weighted`) and `merge-weights` is
+///   consistent with it (`weighted` requires weights; weights on `rrf` are a
+///   dead knob and refused; every weight is positive, finite, and names a
+///   listed embedder instance);
 ///
 /// Parsing is side-effect free by contract: no network, no .so load, no
 /// credential reads — `pipelines check` must run on an air-gapped box
@@ -613,6 +627,67 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
         let merge = Merge::parse(rawi.merge.as_deref().unwrap_or("rrf"))
             .map_err(|m| PipelineError::config(format!("[{section}]: {m}"), line))?;
 
+        // merge-weights (M3-T8): dead knobs and bad values die here, at the
+        // config line that carries them. Positive finite floats only (a zero
+        // or negative weight is not "mute this embedder" — removing it from
+        // `embedders` is), and every key must be one of the listed instances
+        // (typo protection, same discipline as the embedders list itself).
+        if rawi.merge_weights.is_empty() {
+            if matches!(merge, Merge::Weighted) {
+                return Err(PipelineError::config(
+                    format!(
+                        "[{section}]: merge = \"weighted\" requires merge-weights — add e.g. \
+                         merge-weights = {{ {} = 2.0, … }} (a positive float per embedder \
+                         instance; instances without a weight count 1.0)",
+                        rawi.embedders
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("embedder")
+                    ),
+                    line,
+                ));
+            }
+        } else {
+            if !matches!(merge, Merge::Weighted) {
+                return Err(PipelineError::config(
+                    format!(
+                        "[{section}]: merge-weights is set but merge is {merge} — the weights \
+                         only apply to merge = \"weighted\" (drop merge-weights or set the \
+                         strategy)"
+                    ),
+                    line,
+                ));
+            }
+            for (name, weight) in &rawi.merge_weights {
+                if !rawi.embedders.iter().any(|e| e == name) {
+                    return Err(PipelineError::config(
+                        format!(
+                            "[{section}]: merge-weights key '{name}' is not a listed embedder of \
+                             this bucket (embedders: {})",
+                            names_or_none(
+                                &rawi
+                                    .embedders
+                                    .iter()
+                                    .map(String::as_str)
+                                    .collect::<Vec<_>>()
+                            )
+                        ),
+                        line,
+                    ));
+                }
+                if !weight.is_finite() || *weight <= 0.0 {
+                    return Err(PipelineError::config(
+                        format!(
+                            "[{section}]: merge-weights['{name}'] must be a positive finite \
+                             number, got {weight} — to drop an embedder from the fan-out remove \
+                             it from `embedders`, do not zero its weight"
+                        ),
+                        line,
+                    ));
+                }
+            }
+        }
+
         // extract references must resolve ("auto" = built-in mapping, T3;
         // array form = M2.1 fallback chain, see ExtractValue).
         for (mime_key, value) in &rawi.extract {
@@ -712,6 +787,7 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
                 chunk,
                 embedders: rawi.embedders,
                 merge,
+                merge_weights: rawi.merge_weights,
                 index_prefix: rawi.index_prefix,
                 scan_interval_secs: rawi.scan_interval_secs,
                 max_file_size_mb: rawi.max_file_size_mb,
@@ -901,7 +977,8 @@ fn canonical_charset(
 /// the extract ROUTING (M2.1: chain composition AND order; see below), the
 /// chunker, the listed embedder instances, and the charset fallback
 /// (M3-T7) — all name-keyed and BTreeMap-normalized so key order and
-/// formatting in the source file do not matter. Query-side (`merge`) and
+/// formatting in the source file do not matter. Query-side (`merge` and,
+/// since M3-T8, `merge-weights`) and
 /// claim-only fields (`include`, `exclude`, `index-prefix` — v3.1 R5) are
 /// deliberately EXCLUDED: they never change chunk identity, so changing
 /// them must not invalidate completion markers. The same logic puts
@@ -1101,8 +1178,9 @@ index-prefix = "docs"
         assert!(
             msg.contains(
                 "[ingest.d]: unknown field 'chunkder' (allowed: include, exclude, extract, \
-                 chunk, embedders, merge, index-prefix, scan_interval_secs, max_file_size_mb, \
-                 retries, extract_timeout_secs, store_chunk_text, charset_fallback)"
+                 chunk, embedders, merge, merge-weights, index-prefix, scan_interval_secs, \
+                 max_file_size_mb, retries, extract_timeout_secs, store_chunk_text, \
+                 charset_fallback)"
             ),
             "{msg}"
         );
@@ -1747,12 +1825,14 @@ index-prefix = "docs"
     fn merge_closed_set_with_line() {
         let err = parse(
             "[ingest.d]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
-                         merge = \"weighted\"\n",
+                         merge = \"first\"\n",
         )
         .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("unknown merge strategy 'weighted'") && msg.contains("at line 1"),
+            msg.contains("unknown merge strategy 'first'")
+                && msg.contains("allowed: rrf, weighted")
+                && msg.contains("at line 1"),
             "{msg}"
         );
         // absent merge defaults to rrf
@@ -1760,6 +1840,77 @@ index-prefix = "docs"
             parse("[ingest.ddd]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n")
                 .unwrap();
         assert_eq!(cfg.ingest["ddd"].merge, Merge::Rrf);
+        assert!(cfg.ingest["ddd"].merge_weights.is_empty());
+    }
+
+    // ---- merge weighted (M3-T8) ----
+
+    #[test]
+    fn weighted_requires_and_validates_merge_weights() {
+        let base = "[extractor.a]\nkind = \"txt\"\n\n[embedder.e1]\nkind = \"ort\"\nmodel = \
+                    \"gte-multilingual-base\"\n\n[embedder.e2]\nkind = \"siglip2\"\nmodel = \
+                    \"siglip2-base-patch16-224\"\n\n[ingest.ddd]\nchunk = { kind = \"token-window\", \
+                    size = 8, overlap = 2 }\nextract = { txt = \"a\" }\nembedders = [\"e1\", \
+                    \"e2\"]\n";
+
+        // weighted parses WITH weights; round-trips
+        let cfg = parse(&format!(
+            "{base}merge = \"weighted\"\nmerge-weights = {{ e1 = 2.5, e2 = 0.5 }}\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.ingest["ddd"].merge, Merge::Weighted);
+        assert_eq!(
+            cfg.ingest["ddd"].merge_weights,
+            BTreeMap::from([("e1".to_string(), 2.5), ("e2".to_string(), 0.5)])
+        );
+
+        // weighted WITHOUT weights: loud, with a fill-in hint
+        let err = parse(&format!("{base}merge = \"weighted\"\n")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("requires merge-weights"), "{msg}");
+        assert!(msg.contains("e1 = 2.0"), "{msg}");
+
+        // weights on rrf = dead knob, refused
+        let err = parse(&format!(
+            "{base}merge = \"rrf\"\nmerge-weights = {{ e1 = 2.0 }}\n"
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("merge-weights is set but merge is rrf"),
+            "{err}"
+        );
+        // same with merge ABSENT (defaults rrf)
+        let err = parse(&format!("{base}merge-weights = {{ e1 = 2.0 }}\n")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("merge-weights is set but merge is rrf"),
+            "{err}"
+        );
+
+        // zero / negative / NaN weights: refused with guidance
+        for bad in ["0.0", "-1.0", "nan", "inf"] {
+            let err = parse(&format!(
+                "{base}merge = \"weighted\"\nmerge-weights = {{ e1 = {bad} }}\n"
+            ))
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("must be a positive finite number"),
+                "{bad}: {msg}"
+            );
+            assert!(msg.contains("remove it from `embedders`"), "{bad}: {msg}");
+        }
+
+        // weight naming a non-listed instance: typo protection
+        let err = parse(&format!(
+            "{base}merge = \"weighted\"\nmerge-weights = {{ e1 = 2.0, typo = 1.0 }}\n"
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("'typo' is not a listed embedder"),
+            "{err}"
+        );
     }
 
     // ---- fingerprint ----
@@ -1780,12 +1931,22 @@ index-prefix = "docs"
     #[test]
     fn fingerprint_stable_across_key_order_and_irrelevant_fields() {
         let a = base_ingest();
-        // same semantics: map key order swapped, merge + claim-only fields
-        // (include/exclude/index-prefix) added — none enter the fingerprint
+        // same semantics: map key order swapped, merge + merge-weights +
+        // claim-only fields (include/exclude/index-prefix) added — none enter
+        // the fingerprint (query-side fields never change chunk identity,
+        // M3-T8 extended the merge ruling to the weights)
         let b = "[extractor.a]\nkind = \"txt\"\n\n[ingest.ddd]\nchunk = { kind = \"token-window\", \
                  size = 8, overlap = 2 }\nextract = { txt = \"a\" }\nmerge = \"rrf\"\n\
                  include = [\"x/**\"]\nexclude = [\"**.tmp\"]\nindex-prefix = \"x\"\n";
         assert_eq!(fp_of(&a), fp_of(&b));
+        let c = "[extractor.a]\nkind = \"txt\"\n\n[embedder.e]\nkind = \"ort\"\nmodel = \
+                 \"gte-multilingual-base\"\n\n[ingest.ddd]\nchunk = { kind = \"token-window\", \
+                 size = 8, overlap = 2 }\nextract = { txt = \"a\" }\nembedders = [\"e\"]\n\
+                 merge = \"weighted\"\nmerge-weights = { e = 3.0 }\n";
+        let d = "[extractor.a]\nkind = \"txt\"\n\n[embedder.e]\nkind = \"ort\"\nmodel = \
+                 \"gte-multilingual-base\"\n\n[ingest.ddd]\nchunk = { kind = \"token-window\", \
+                 size = 8, overlap = 2 }\nextract = { txt = \"a\" }\nembedders = [\"e\"]\n";
+        assert_eq!(fp_of(c), fp_of(d), "merge/weights are query-side");
         // repeated parse -> same value (no nondeterminism)
         assert_eq!(fp_of(&a), fp_of(&a));
     }

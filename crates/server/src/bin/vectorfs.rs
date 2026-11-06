@@ -1,6 +1,6 @@
 //! `vectorfs` — the SERVER CLI (design.md §0 command ruling + 附录E.4:
-//! init/serve/status/doctor/mcp; optimize/pipelines land with later tasks —
-//! no empty stubs).
+//! init/serve/status/doctor/optimize/pipelines/mcp — each landed when its
+//! milestone delivered it, no empty stubs; `optimize` since M3-T8).
 //!
 //! `vectorfs serve` is the fully functional s3vectors server harvested from
 //! the M0 spike, now on the unified backend (file/memory/S3), the flag > env
@@ -82,6 +82,21 @@ enum Command {
     ///
     ///   vectorfs mcp --data-dir ./vectorfs-data --tools ro
     Mcp(McpArgs),
+
+    /// Explicit index management (appendix E.4, M3-T8): build (train) the
+    /// IVF_PQ vector index of an index — or fold the rows written since the
+    /// last pass into an existing one. Never automatic, no config key: until
+    /// this verb runs, queries stay flat exact. Takes the data root's writer
+    /// lock for the duration (stop the daemon first).
+    ///
+    /// Examples:
+    ///
+    ///   vectorfs optimize --data-dir ./vectorfs-data
+    ///
+    ///   vectorfs optimize --data-dir ./vectorfs-data --bucket docs
+    ///
+    ///   vectorfs optimize --data-dir ./vectorfs-data --bucket docs --index tiny-ab12cd34
+    Optimize(OptimizeArgs),
 
     /// Inspect / validate the file-layer pipeline configuration
     /// (M2 T2: the [extractor.*] / [embedder.*] / [ingest.*] sections of
@@ -285,6 +300,30 @@ enum PipelinesCommand {
     Check(PipelinesCheckArgs),
 }
 
+/// `vectorfs optimize` arguments (appendix E.4: `optimize [--bucket]
+/// [--index]`, plus the common data-dir/backend flags every local verb
+/// carries).
+#[derive(Parser, Debug)]
+struct OptimizeArgs {
+    /// Data directory to optimize [env: VF_DATA_DIR] [default: ./vectorfs-data]
+    #[arg(long)]
+    data_dir: Option<String>,
+
+    /// Backend: file | memory | s3+http(s)://host:port/bucket[/prefix]
+    /// [env: VF_BACKEND] [default: file]
+    #[arg(long)]
+    backend: Option<String>,
+
+    /// Optimize only this vector bucket's indexes (default: every bucket)
+    #[arg(long)]
+    bucket: Option<String>,
+
+    /// Optimize only this index (requires --bucket — index names are
+    /// per-bucket)
+    #[arg(long, requires = "bucket")]
+    index: Option<String>,
+}
+
 /// `vectorfs pipelines check` arguments.
 #[derive(Parser, Debug)]
 struct PipelinesCheckArgs {
@@ -310,6 +349,7 @@ async fn main() {
         Some(Command::Status(args)) => status_cmd(args).await,
         Some(Command::Doctor(args)) => doctor_cmd(args).await,
         Some(Command::Mcp(args)) => mcp_cmd(args).await,
+        Some(Command::Optimize(args)) => optimize_cmd(args).await,
         Some(Command::Pipelines(args)) => pipelines_cmd(args),
         // Bare `vectorfs` already gets help from arg_required_else_help; this
         // arm is the explicit fallback for a None subcommand.
@@ -415,6 +455,111 @@ async fn mcp_cmd(args: McpArgs) {
             "check the data root (vectorfs doctor) and that stdin/stdout are a pipe pair",
         )
         .fail(false, 2),
+    }
+}
+
+/// `vectorfs optimize` (appendix E.4, M3-T8): the explicit IVF_PQ verb.
+/// A WRITE — takes the data root's local flock for the duration (refuses
+/// with DATA_ROOT_HELD if a daemon owns it, exactly like `vectorfs mcp`);
+/// on backends without a local flock home (memory/s3) it proceeds with an
+/// explicit warning: the maintenance window is then the operator's word.
+/// Exit 0 = ran (a sweep may contain SKIPPED lines — young buckets below
+/// the training gate are an expected state, printed loudly); 1 = a NAMED
+/// target was below the gate (the refusal is the answer) or a backend
+/// failure; 2/3 = usage/lock.
+async fn optimize_cmd(args: OptimizeArgs) {
+    let flags = storage_flags(&args.data_dir, &args.backend);
+    let cfg = config::resolve_storage(&flags).unwrap_or_else(|e| {
+        Failure::new("CONFIG", e, "fix the data dir / backend flags").fail(false, 2)
+    });
+    if cfg.is_file_backend() && !cfg.data_dir.exists() {
+        Failure::new(
+            "NO_DATA_ROOT",
+            format!("no data root at {}", cfg.data_dir.display()),
+            format!("run: vectorfs init --data-dir {}", cfg.data_dir.display()),
+        )
+        .fail(false, 1);
+    }
+    let backend = match cfg.backend() {
+        Ok(b) => b,
+        Err(e) => Failure::new(
+            "BACKEND_INVALID",
+            e,
+            "backend must be file | memory | s3+http(s)://…",
+        )
+        .fail(false, 2),
+    };
+    let storage = match cfg.storage() {
+        Ok(s) => std::sync::Arc::new(s),
+        Err(e) => Failure::new(
+            "BACKEND_INIT",
+            format!("cannot open backend {backend}: {e}"),
+            "check the data dir / S3 endpoint and credentials (VF_S3_*, AWS_*)",
+        )
+        .fail(false, 1),
+    };
+    eprintln!(
+        "vectorfs: optimizing data root at {} …",
+        cfg.data_dir.display()
+    );
+
+    // single-writer: hold the local flock for the whole pass (the same lock
+    // serve/mcp take). No local home on memory/s3 — proceed on the
+    // operator's maintenance window, but say so.
+    let _flock = match lock::take_flock(&backend) {
+        Ok(g) => Some(g),
+        Err(lock::LockError::Held(who)) => Failure::new(
+            "DATA_ROOT_HELD",
+            format!("refusing to optimize: another writer owns this data root ({who})"),
+            "stop the daemon (or the other writer) and re-run; optimize is a maintenance-window verb",
+        )
+        .fail(false, 3),
+        Err(lock::LockError::Backend(_)) => {
+            eprintln!(
+                "vectorfs: no local writer lock on this backend — make sure no daemon is \
+                 ingesting into these buckets while optimize runs"
+            );
+            None
+        }
+    };
+
+    // deployment identity exactly the way status/doctor resolve it (R9)
+    let (region, account) = config::read_config(&cfg.data_dir)
+        .ok()
+        .flatten()
+        .map(|c| (c.region, c.account_id))
+        .unwrap_or_else(|| {
+            (
+                config::DEFAULT_REGION.to_string(),
+                config::DEFAULT_ACCOUNT.to_string(),
+            )
+        });
+    let identity = storage.deployment_identity(&region, &account);
+
+    match vectorfs_server::optimize::run(
+        &storage,
+        &identity,
+        args.bucket.as_deref(),
+        args.index.as_deref(),
+    )
+    .await
+    {
+        Ok(report) => {
+            print!("{}", report.render());
+            if report.named_below_gate(args.bucket.as_deref(), args.index.as_deref()) {
+                Failure::new(
+                    "BELOW_TRAINING_GATE",
+                    format!(
+                        "the named target has fewer than {} rows — IVF_PQ needs that many to \
+                         train (PQ codes 256 centroids); queries stay flat exact",
+                        vectorfs_server::store::IVF_PQ_MIN_TRAIN_ROWS
+                    ),
+                    "ingest more data and re-run, or pick a larger index",
+                )
+                .fail(false, 1);
+            }
+        }
+        Err(f) => f.fail(false, 1),
     }
 }
 

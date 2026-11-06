@@ -75,6 +75,29 @@
 //! HTTP/SigV4 stack; the memory column is the spike-era path, M0 REPORT
 //! 遗留 1, kept as the reference route and A/B control). Debug-profile
 //! ratios were 1.9–2.6x on the same dataset.
+//!
+//! IVF_PQ 对照 (M3-T8, 2026-11-06, `cargo test --release -p
+//! vectorfs-server --lib perf_ivf_pq_vs_flat_1m -- --ignored --nocapture`,
+//! engine defaults — no knobs): 1,000,000 unit vectors dim=768 cosine, file
+//! backend, topK=10. ingest 32.5s, IVF_PQ train 36.7s, then 30 queries ×
+//! 30 iters per phase (P50/P99 ms):
+//!
+//! | phase | P50    | P99    | recall@10 |
+//! |-------|--------|--------|-----------|
+//! | flat (pre-index, exact) | 1191.5 | 1287.5 | 1.0 |
+//! | ivf_pq (engine defaults) | 12.7 | 15.4 | 0.047 |
+//!
+//! **94x P50 — the number that justifies M3's IVF_PQ scope.** The recall
+//! caveat is a DATA property, pinned by a same-scale contrast probe
+//! (deleted after the run; numbers recorded here): on CLUSTERED vectors
+//! (1000 centroids + noise — the shape real embedding corpora have) the
+//! SAME engine defaults scored recall@10 = 100/100 = 1.0 at 1M×768 with
+//! P50 12.0ms. Uniform-random 768-d vectors concentrate distances
+//! (max-min gaps shrink below PQ quantization error), so ANN ranking there
+//! is noise — raising nprobes 20→512 moved recall 3/50→2/50 only. Real
+//! deployments query embedding output (clustered), not noise; operators
+//! needing tuned recall on pathological data get the nprobes/refine knobs
+//! as the evidence-gated follow-up.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -1327,6 +1350,88 @@ impl Storage {
         let table = self.open_table(vb, ix).await?;
         table.count_rows(None).await.map_err(internal)
     }
+
+    /// Explicitly build (or fold new rows into) the IVF_PQ vector index of
+    /// one index — the engine side of `vectorfs optimize` (M3-T8). NEVER
+    /// called by the daemon on its own: IVF_PQ is an index PHYSICAL FORM,
+    /// not pipeline semantics — no config key, no fingerprint surface, no
+    /// background task. Until an operator runs the verb, queries stay on the
+    /// flat exact path (byte-identical to pre-T8; every existing test lives
+    /// here).
+    ///
+    /// Behavior:
+    /// * rows < [`IVF_PQ_MIN_TRAIN_ROWS`] → [`VectorIndexOutcome::BelowGate`]
+    ///   — LOUD skip, never a silent flat fallback masquerading as an index
+    ///   (the caller turns this into a visible SKIPPED line / exit code);
+    /// * no vector index yet → train+build IVF_PQ over `vector` with the
+    ///   ENGINE defaults (num_partitions auto-sized by row count,
+    ///   num_sub_vectors = dim/16 heuristic, 8-bit codes — deliberately zero
+    ///   knobs; expose any only with user evidence). The index's distance
+    ///   type is taken from the index's own metric so query and index agree;
+    /// * vector index present → fold the rows written since the last pass
+    ///   into the existing index (lancedb `optimize(Index)`), no retrain.
+    ///   Queries in the interim were still CORRECT — lancedb scans indexed
+    ///   and unindexed data in parallel — just slower on the delta. A full
+    ///   retrain after distribution drift is an evidence-gated knob for now.
+    ///
+    /// Approximation note: once an index exists, KNN over that table is
+    /// ANN (recall < 1.0 by construction of IVF+PQ). That is the trade the
+    /// operator opted into by running the verb at 1M-scale.
+    pub async fn optimize_vector_index(
+        &self,
+        vb: &str,
+        ix: &str,
+        metric: &str,
+    ) -> Result<VectorIndexOutcome, StoreError> {
+        // a missing table (index created, nothing ever ingested) is the
+        // zero-row case, not an error — same BelowGate verdict
+        let table = match self.open_table(vb, ix).await {
+            Ok(t) => t,
+            Err(e) => {
+                return if e.to_string().contains("Table not found")
+                    || e.to_string().contains("was not found")
+                {
+                    Ok(VectorIndexOutcome::BelowGate { rows: 0 })
+                } else {
+                    Err(e)
+                };
+            }
+        };
+        let rows = table.count_rows(None).await.map_err(internal)?;
+        if (rows as usize) < IVF_PQ_MIN_TRAIN_ROWS {
+            return Ok(VectorIndexOutcome::BelowGate { rows });
+        }
+        // vector column already indexed? (only WE build on "vector"; scalar
+        // mirror columns, if any ever exist, carry metadata names)
+        let indexed = table
+            .list_indices()
+            .await
+            .map_err(internal)?
+            .iter()
+            .any(|c| c.columns.iter().any(|col| col == "vector"));
+        if indexed {
+            table
+                .optimize(lancedb::table::OptimizeAction::Index(
+                    lancedb::table::OptimizeOptions::default(),
+                ))
+                .await
+                .map_err(internal)?;
+            Ok(VectorIndexOutcome::Folded { rows })
+        } else {
+            table
+                .create_index(
+                    &["vector"],
+                    lancedb::index::Index::IvfPq(
+                        lancedb::index::vector::IvfPqIndexBuilder::default()
+                            .distance_type(distance_type(metric)),
+                    ),
+                )
+                .execute()
+                .await
+                .map_err(internal)?;
+            Ok(VectorIndexOutcome::Trained { rows })
+        }
+    }
 }
 
 /// s3admin create errors → StoreError (§5.2): InvalidBucketName/400 becomes
@@ -1707,6 +1812,29 @@ pub struct QueryOutcome {
     pub version: u64,
 }
 
+/// Outcome of one explicit IVF_PQ pass ([`Storage::optimize_vector_index`],
+/// the engine side of `vectorfs optimize`, M3-T8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorIndexOutcome {
+    /// Trained + built IVF_PQ over `rows` rows (no vector index before).
+    Trained { rows: usize },
+    /// An existing vector index absorbed the delta written since the last
+    /// pass (no retrain — see `optimize_vector_index` docs).
+    Folded { rows: usize },
+    /// `rows` < [`IVF_PQ_MIN_TRAIN_ROWS`]: refused, loudly — IVF centroids
+    /// and PQ codebooks need enough rows to train on, and a silent flat
+    /// fallback would let an operator believe they have an index.
+    BelowGate { rows: usize },
+}
+
+/// Minimum rows before an IVF_PQ index can be trained (M3-T8 gate): the PQ
+/// stage quantizes each sub-vector to one of 256 (2^8) centroids — k-means
+/// with more centroids than training rows does not converge to anything
+/// meaningful. Below this the index is refused (queries stay flat exact,
+/// which at these sizes is fast anyway — §6's flat cost line only bites
+/// around 1M rows).
+pub const IVF_PQ_MIN_TRAIN_ROWS: usize = 256;
+
 /// Over-fetch margin for the pushdown route: the engine truncates its KNN at
 /// `limit` with ITS tie-break; our contract orders ties by key. Fetching a
 /// slack of extra rows lets the Rust re-sort apply the key tie-break for tie
@@ -2021,6 +2149,17 @@ mod tests {
     }
 
     async fn setup(name: &str, batches: Vec<Vec<VectorRow>>, dim: i32) -> Storage {
+        setup_metric(name, batches, dim, "euclidean").await
+    }
+
+    /// `setup` with an explicit distance metric — the IVF_PQ tests use
+    /// `cosine`, the metric every derived index carries.
+    async fn setup_metric(
+        name: &str,
+        batches: Vec<Vec<VectorRow>>,
+        dim: i32,
+        metric: &str,
+    ) -> Storage {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::file(dir.path());
         // leak the tempdir: keep the dataset alive for the test body (tests
@@ -2039,7 +2178,7 @@ mod tests {
                 creation_time_epoch: 0.0,
                 data_type: "float32".into(),
                 dimension: dim,
-                distance_metric: "euclidean".into(),
+                distance_metric: metric.into(),
                 non_filterable_metadata_keys: None,
                 index_mode: None,
                 x_vf_derived: None,
@@ -2050,6 +2189,244 @@ mod tests {
             storage.upsert_vectors("vb", name, dim, b).await.unwrap();
         }
         storage
+    }
+
+    /// A row whose vector is GIVEN (not LCG-derived) — the IVF_PQ tests'
+    /// needle rows.
+    fn row_with(key: &str, vector: Vec<f32>, meta: serde_json::Value) -> VectorRow {
+        let mut filterable = BTreeMap::new();
+        if let serde_json::Value::Object(map) = &meta {
+            for (k, v) in map {
+                let mv = match v {
+                    serde_json::Value::String(s) => MetaMirror::Str(s.clone()),
+                    serde_json::Value::Number(num) => {
+                        MetaMirror::Num(num.as_f64().expect("finite"))
+                    }
+                    serde_json::Value::Bool(b) => MetaMirror::Bool(*b),
+                    serde_json::Value::Array(_) => MetaMirror::List,
+                    _ => unreachable!("test data"),
+                };
+                filterable.insert(k.clone(), mv);
+            }
+        }
+        VectorRow {
+            key: key.to_string(),
+            vector,
+            metadata_json: if meta.is_null() {
+                None
+            } else {
+                Some(meta.to_string())
+            },
+            filterable,
+        }
+    }
+
+    // ---- IVF_PQ (M3-T8): explicit index physical form ----
+
+    /// The training gate: below [`IVF_PQ_MIN_TRAIN_ROWS`] the pass refuses
+    /// (BelowGate) and builds NOTHING — no silent flat fallback pretending
+    /// to be an index, and no half-trained centroid file on disk.
+    #[tokio::test]
+    async fn ivf_pq_training_gate_refuses_small_datasets() {
+        let dim = 16;
+        let ds: Vec<Vec<VectorRow>> = vec![consistency_dataset(100, dim)];
+        let storage = setup_metric("ixsmall", ds, dim, "cosine").await;
+        assert_eq!(
+            storage
+                .optimize_vector_index("vb", "ixsmall", "cosine")
+                .await
+                .unwrap(),
+            VectorIndexOutcome::BelowGate { rows: 100 }
+        );
+        // nothing was built
+        let table = storage.open_table("vb", "ixsmall").await.unwrap();
+        assert!(
+            table.list_indices().await.unwrap().is_empty(),
+            "below-gate datasets must not carry an index"
+        );
+        // queries still work (flat exact — the pre-T8 path unchanged)
+        let q: Vec<f32> = (0..dim).map(|d| 0.1 + d as f32 * 0.05).collect();
+        let out = storage
+            .query_vectors(
+                "vb",
+                "ixsmall",
+                dim,
+                "cosine",
+                &q,
+                5,
+                None,
+                QueryRoute::Pushdown,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.hits.len(), 5);
+    }
+
+    /// The full coexistence contract: build → query over the index → WRITE
+    /// after the build (delta rows must still surface — lancedb scans
+    /// indexed + unindexed data in parallel) → DELETE (index + deletion
+    /// vectors agree) → the GC join path (scan_vector_metadata) is untouched
+    /// → re-run folds instead of retraining.
+    #[tokio::test]
+    async fn ivf_pq_build_query_delta_delete_coexistence() {
+        let dim = 16;
+        let ds = consistency_dataset(300, dim);
+        let storage = setup_metric("ixivf", vec![ds], dim, "cosine").await;
+
+        // build: Trained, one vector index on "vector"
+        assert_eq!(
+            storage
+                .optimize_vector_index("vb", "ixivf", "cosine")
+                .await
+                .unwrap(),
+            VectorIndexOutcome::Trained { rows: 300 }
+        );
+        let table = storage.open_table("vb", "ixivf").await.unwrap();
+        let indices = table.list_indices().await.unwrap();
+        assert!(
+            indices
+                .iter()
+                .any(|c| c.columns.iter().any(|col| col == "vector")),
+            "a vector index exists: {indices:?}"
+        );
+
+        // queries run over the indexed table: order + truncation still hold
+        let q: Vec<f32> = (0..dim).map(|d| 0.1 + d as f32 * 0.05).collect();
+        let out = storage
+            .query_vectors(
+                "vb",
+                "ixivf",
+                dim,
+                "cosine",
+                &q,
+                10,
+                None,
+                QueryRoute::Pushdown,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.hits.len(), 10);
+        for w in out.hits.windows(2) {
+            assert!(w[0].distance <= w[1].distance, "ordered: {:?}", out.hits);
+        }
+        // filtered query through the indexed table (pushdown + post-filter)
+        let filter = Filter::compile(&json!({"ok": true})).unwrap();
+        let out = storage
+            .query_vectors(
+                "vb",
+                "ixivf",
+                dim,
+                "cosine",
+                &q,
+                10,
+                Some(&filter),
+                QueryRoute::Pushdown,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !out.hits.is_empty()
+                && out
+                    .hits
+                    .iter()
+                    .all(|h| h.metadata.as_ref().unwrap()["ok"] == json!(true))
+        );
+
+        // WRITE after the build: the needle (vector == query) is a DELTA row
+        // — it must still surface at rank 1 with distance ~0. This is the
+        // correctness pin for "ingest continues after optimize".
+        let needle = row_with("needle", q.clone(), json!({"i": 999999, "tag": "needle"}));
+        storage
+            .upsert_vectors("vb", "ixivf", dim, vec![needle])
+            .await
+            .unwrap();
+        let out = storage
+            .query_vectors(
+                "vb",
+                "ixivf",
+                dim,
+                "cosine",
+                &q,
+                10,
+                None,
+                QueryRoute::Pushdown,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out.hits[0].key,
+            "needle",
+            "delta row is searchable: {:?}",
+            &out.hits[..3]
+        );
+        assert!(
+            out.hits[0].distance < 1e-6,
+            "identical vector: {}",
+            out.hits[0].distance
+        );
+
+        // DELETE the needle + five more: gone from queries AND from the GC
+        // join path (scan_vector_metadata), with the index present
+        let doomed: Vec<String> = (0..5).map(|i| format!("k{:04}", i)).collect();
+        let mut gone = vec!["needle".to_string()];
+        gone.extend(doomed.clone());
+        storage.delete_vectors("vb", "ixivf", &gone).await.unwrap();
+        let out = storage
+            .query_vectors(
+                "vb",
+                "ixivf",
+                dim,
+                "cosine",
+                &q,
+                300,
+                None,
+                QueryRoute::Pushdown,
+                None,
+            )
+            .await
+            .unwrap();
+        let keys: Vec<&str> = out.hits.iter().map(|h| h.key.as_str()).collect();
+        assert!(!keys.contains(&"needle"), "deleted delta row is gone");
+        for k in &doomed {
+            assert!(!keys.contains(&k.as_str()), "deleted {k} is gone");
+        }
+        assert_eq!(out.hits.len(), 295);
+        let scanned = storage.scan_vector_metadata("vb", "ixivf").await.unwrap();
+        assert_eq!(scanned.len(), 295, "the GC join sees exactly the live rows");
+        assert!(
+            scanned.iter().all(|(k, _)| k != "needle"),
+            "no deleted key in the scan"
+        );
+
+        // re-run: FOLD into the existing index (no retrain), idempotent verb
+        assert_eq!(
+            storage
+                .optimize_vector_index("vb", "ixivf", "cosine")
+                .await
+                .unwrap(),
+            VectorIndexOutcome::Folded { rows: 295 }
+        );
+        // and the folded index still answers correctly
+        let out = storage
+            .query_vectors(
+                "vb",
+                "ixivf",
+                dim,
+                "cosine",
+                &q,
+                10,
+                None,
+                QueryRoute::Pushdown,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.hits.len(), 10);
+        assert!(out.hits.iter().all(|h| h.key != "needle"));
     }
 
     /// THE dual-path contract (task pin): the same assertion set must produce
@@ -2282,6 +2659,204 @@ mod tests {
         assert!(
             matches!(&err, Err(StoreError::Validation(m)) if m.contains("nextToken")),
             "{err:?}"
+        );
+    }
+
+    /// 1M×768 IVF_PQ vs flat reference (M3-T8 delivery numbers; run manually
+    /// — RELEASE profile, the M1 perf precedent is debug-only for its own
+    /// numbers, this one is too big for that):
+    ///
+    ///   cargo test --release -p vectorfs-server --lib perf_ivf_pq_vs_flat_1m -- --ignored --nocapture
+    ///
+    /// 口径: engine-direct `Storage::query_vectors` (no HTTP/SigV4 stack),
+    /// file backend on a temp dir, 1,000,000 random unit vectors dim=768
+    /// cosine (the derived-index metric), ingested in 500 batches of 2000,
+    /// topK=10, N=30 timed queries per phase (first discarded as warm-up).
+    /// Phase 1 (flat) runs BEFORE any index exists — the pre-T8 default
+    /// path; phase 2 after `optimize_vector_index` trains IVF_PQ (engine
+    /// defaults: num_partitions auto, num_sub_vectors=dim/16, 8-bit). The
+    /// phase-1 top-10s are kept as the ground truth for phase-2 recall@10.
+    /// Last run's numbers live in the module header ("IVF_PQ 对照" note) and
+    /// the M3-T8 delivery report — including the recall caveat: on this
+    /// UNIFORM-RANDOM dataset recall@10 is ~0.05 (distance concentration
+    /// makes PQ ranking noise on structure-free vectors; nprobes does not
+    /// fix it), while a same-scale CLUSTERED probe (embedding-like) scored
+    /// 1.0 with the same engine defaults.
+    #[tokio::test]
+    #[ignore = "manual perf run: 1M×768 ingest + IVF_PQ train (~minutes, ~3GB disk)"]
+    async fn perf_ivf_pq_vs_flat_1m() {
+        let dim: i32 = 768;
+        let total = 1_000_000usize;
+        let batch = 2_000usize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::file(dir.path());
+        std::mem::forget(dir);
+        storage
+            .create_bucket(&test_bucket_meta(&storage, "vb"))
+            .await
+            .unwrap();
+        storage
+            .create_index(&IndexMeta {
+                vector_bucket_name: "vb".into(),
+                index_name: "ix1m".into(),
+                index_arn: "arn:aws:s3vectors:us-east-1:0:bucket/vb/index/ix1m".into(),
+                creation_time_rfc3339: "2026-11-06T00:00:00.000Z".into(),
+                creation_time_epoch: 0.0,
+                data_type: "float32".into(),
+                dimension: dim,
+                distance_metric: "cosine".into(),
+                non_filterable_metadata_keys: None,
+                index_mode: None,
+                x_vf_derived: None,
+            })
+            .await
+            .unwrap();
+
+        // unit vectors: random direction, normalized once — cosine-friendly
+        // and no single dominant axis
+        let mut rng = lcg(20261106);
+        let unit = |rng: &mut dyn FnMut() -> u64| -> Vec<f32> {
+            let v: Vec<f32> = (0..dim)
+                .map(|_| (rng() % 20_000) as f32 / 10_000.0 - 1.0)
+                .collect();
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+            v.into_iter().map(|x| x / norm).collect()
+        };
+
+        let t0 = std::time::Instant::now();
+        for b in 0..total.div_ceil(batch) {
+            let rows: Vec<VectorRow> = (0..batch)
+                .map(|i| VectorRow {
+                    key: format!("k{:08}", b * batch + i),
+                    vector: unit(&mut rng),
+                    metadata_json: None,
+                    filterable: BTreeMap::new(),
+                })
+                .collect();
+            storage
+                .upsert_vectors("vb", "ix1m", dim, rows)
+                .await
+                .unwrap();
+            if b % 100 == 0 {
+                eprintln!(
+                    "ingest {}/{} ({:.0}s)",
+                    b * batch,
+                    total,
+                    t0.elapsed().as_secs()
+                );
+            }
+        }
+        eprintln!(
+            "ingest: {total} rows dim={dim} in {:.1}s",
+            t0.elapsed().as_secs_f64()
+        );
+
+        // 30 fixed query vectors (their flat top-10s are the recall truth)
+        let mut qrng = lcg(99);
+        let queries: Vec<Vec<f32>> = (0..30).map(|_| unit(&mut qrng)).collect();
+        let iters = 30usize;
+
+        // ---- phase 1: FLAT (no index; the pre-T8 default path) ----
+        let mut flat_ms = Vec::with_capacity(queries.len() * iters);
+        let mut truth: Vec<Vec<String>> = Vec::with_capacity(queries.len());
+        for (qi, q) in queries.iter().enumerate() {
+            for it in 0..=iters {
+                let t = std::time::Instant::now();
+                let out = storage
+                    .query_vectors(
+                        "vb",
+                        "ix1m",
+                        dim,
+                        "cosine",
+                        q,
+                        10,
+                        None,
+                        QueryRoute::Pushdown,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let dt = t.elapsed().as_secs_f64() * 1000.0;
+                if it > 0 {
+                    flat_ms.push(dt);
+                }
+                if it == 0 {
+                    // the first (warm-up) call doubles as the recall truth
+                    truth.push(out.hits.iter().map(|h| h.key.clone()).collect());
+                    let _ = qi;
+                }
+            }
+        }
+
+        // ---- build IVF_PQ (the explicit verb's engine call) ----
+        let t = std::time::Instant::now();
+        let outcome = storage
+            .optimize_vector_index("vb", "ix1m", "cosine")
+            .await
+            .unwrap();
+        eprintln!(
+            "ivf_pq train: {outcome:?} in {:.1}s",
+            t.elapsed().as_secs_f64()
+        );
+
+        // ---- phase 2: INDEXED ----
+        let mut idx_ms = Vec::with_capacity(iters);
+        let mut recall_hits = 0usize;
+        let mut recall_total = 0usize;
+        for (qi, q) in queries.iter().enumerate() {
+            for it in 0..=iters {
+                let t = std::time::Instant::now();
+                let out = storage
+                    .query_vectors(
+                        "vb",
+                        "ix1m",
+                        dim,
+                        "cosine",
+                        q,
+                        10,
+                        None,
+                        QueryRoute::Pushdown,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let dt = t.elapsed().as_secs_f64() * 1000.0;
+                if it > 0 {
+                    idx_ms.push(dt);
+                }
+                if it == 0 {
+                    let got: Vec<&str> = out.hits.iter().map(|h| h.key.as_str()).collect();
+                    recall_total += truth[qi].len();
+                    recall_hits += truth[qi]
+                        .iter()
+                        .filter(|k| got.contains(&k.as_str()))
+                        .count();
+                }
+            }
+        }
+        flat_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        idx_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let q = |v: &[f64], p: f64| v[((v.len() as f64 - 1.0) * p).round() as usize];
+        eprintln!(
+            "flat  P50 {:>7.1} ms  P99 {:>7.1} ms   ({} calls)",
+            q(&flat_ms, 0.50),
+            q(&flat_ms, 0.99),
+            flat_ms.len()
+        );
+        eprintln!(
+            "ivf_pq P50 {:>7.1} ms  P99 {:>7.1} ms   ({} calls)",
+            q(&idx_ms, 0.50),
+            q(&idx_ms, 0.99),
+            idx_ms.len()
+        );
+        eprintln!(
+            "speedup P50 {:.1}x / P99 {:.1}x — recall@10 {}/{} = {:.3}",
+            q(&flat_ms, 0.50) / q(&idx_ms, 0.50),
+            q(&flat_ms, 0.99) / q(&idx_ms, 0.99),
+            recall_hits,
+            recall_total,
+            recall_hits as f64 / recall_total as f64
         );
     }
 
