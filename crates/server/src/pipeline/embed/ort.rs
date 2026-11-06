@@ -250,6 +250,17 @@ fn ort_environment(source: &LibrarySource) -> Result<ort::environment::Environme
 /// family, not policy.
 const MAX_SEQ_TOKENS: usize = 8192;
 
+/// Upper bound on `rows × padded-seq` per `session.run` (MINI-BATCH budget).
+/// BERT-family attention materializes `[batch, heads, seq, seq]` scores:
+/// ~12.6 MB per 512-token row on gte (12 heads), quadratic in seq. One
+/// document's whole chunk set in a single run is an OOM — observed
+/// 2026-11-06: a ~2'000-chunk PDF pushed the daemon to 31.6 GB RSS and the
+/// kernel OOM-killed it mid-`put`. 8192 tokens ⇒ 16×512-token rows (~200 MB
+/// peak activations); a single long row still rides alone (up to
+/// [`MAX_SEQ_TOKENS`]). Fixed (not config): this is a machine-independent
+/// safety bound, not a tuning knob.
+const MAX_INFER_TOKENS: usize = 8192;
+
 impl OrtEmbedder {
     /// Load + probe. All §5.10.2 startup contract checks happen here:
     ///
@@ -328,11 +339,13 @@ impl OrtEmbedder {
         })?;
         // pad to batch-longest (right side, pad id 0 — the [PAD] slot in
         // every BERT-family vocab) and truncate at the model context cap;
-        // tokenizers' builder methods take &mut self (0.23 API shape)
-        tokenizer.with_padding(Some(tokenizers::PaddingParams {
-            strategy: tokenizers::PaddingStrategy::BatchLongest,
-            ..Default::default()
-        }));
+        // tokenizers' builder methods take &mut self (0.23 API shape).
+        // Padding is OFF: encodings carry TRUE lengths so run_batch can pack
+        // mini-batches under MAX_INFER_TOKENS and each batch pads only to
+        // its own longest row (run_group's flatten loop) — a global
+        // BatchLongest here would bill every short chunk the whole
+        // document's longest sequence.
+        tokenizer.with_padding(None);
         tokenizer
             .with_truncation(Some(tokenizers::TruncationParams {
                 max_length: MAX_SEQ_TOKENS,
@@ -372,29 +385,75 @@ impl OrtEmbedder {
         })
     }
 
-    /// The tokenize → run → CLS-pool → L2-normalize pipeline (blocking).
-    /// A free function over `&Inner` so `spawn_blocking` gets a 'static
-    /// closure via `Arc<Inner>` (the trait methods only hold `&self`).
+    /// The tokenize → mini-batch → run → CLS-pool → L2-normalize pipeline
+    /// (blocking). A free function over `&Inner` so `spawn_blocking` gets a
+    /// 'static closure via `Arc<Inner>` (the trait methods only hold `&self`).
+    ///
+    /// Rows are packed into mini-batches under [`MAX_INFER_TOKENS`] before
+    /// any `session.run` (see the const: a whole-document run OOMs). CLS
+    /// pooling is per-row and attention masks zero the pad columns, so the
+    /// split is invisible to callers — same vectors, same order, bounded
+    /// peak memory.
     fn run_batch(inner: &Inner, texts: Vec<String>) -> Result<Vec<Vec<f32>>, PipelineError> {
         let encodings = inner
             .tokenizer
             .encode_batch(texts, true)
             .map_err(|e| PipelineError::embed(format!("tokenizing batch: {e}")))?;
-        let batch = encodings.len();
-        let seq = encodings
-            .iter()
-            .map(|e| e.get_ids().len())
-            .max()
-            .unwrap_or(0);
+        if encodings.is_empty() {
+            return Ok(Vec::new());
+        }
+        // greedy packing: adding a row would push longest × rows over the
+        // budget ⇒ flush first. Lengths are TRUE tokenized lengths (the
+        // tokenizer runs padding OFF), so a short-chunk batch is not billed
+        // the document's longest sequence.
+        let mut groups: Vec<Vec<&tokenizers::Encoding>> = Vec::new();
+        let mut cur: Vec<&tokenizers::Encoding> = Vec::new();
+        let mut cur_longest = 0usize;
+        for e in &encodings {
+            let len = e.get_ids().len();
+            if !cur.is_empty() && cur_longest.max(len) * (cur.len() + 1) > MAX_INFER_TOKENS {
+                groups.push(std::mem::take(&mut cur));
+                cur_longest = 0;
+            }
+            cur_longest = cur_longest.max(len);
+            cur.push(e);
+        }
+        if !cur.is_empty() {
+            groups.push(cur);
+        }
+
+        let mut session = inner
+            .session
+            .lock()
+            .map_err(|_| PipelineError::embed("ort session lock poisoned"))?;
+        let mut out = Vec::with_capacity(encodings.len());
+        for group in &groups {
+            out.extend(Self::run_group(&mut session, inner.dim, group)?);
+        }
+        Ok(out)
+    }
+
+    /// One mini-batch through the session: flatten to `[batch, seq]` with
+    /// MANUAL padding to this batch's longest row, run, CLS-pool + L2
+    /// normalize. Split out of run_batch so the token-budget loop stays
+    /// readable; `dim` is the startup-probed dim every output row must match.
+    fn run_group(
+        session: &mut ort::session::Session,
+        dim: usize,
+        group: &[&tokenizers::Encoding],
+    ) -> Result<Vec<Vec<f32>>, PipelineError> {
+        let batch = group.len();
+        let seq = group.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
         if seq == 0 {
             return Err(PipelineError::embed(
                 "tokenizer produced an empty encoding (empty text?) — nothing to embed",
             ));
         }
-        // flatten to [batch, seq] row-major; tokenizers pads to batch-longest
+        // flatten to [batch, seq] row-major; pad each row to the batch's
+        // longest (ids 0, mask 0 — the model never attends to pad columns)
         let mut ids = Vec::with_capacity(batch * seq);
         let mut mask = Vec::with_capacity(batch * seq);
-        for e in &encodings {
+        for e in group {
             let eids = e.get_ids();
             let emask = e.get_attention_mask();
             for s in 0..seq {
@@ -405,10 +464,6 @@ impl OrtEmbedder {
 
         // feed exactly the inputs the graph declares; transformers-style
         // exports use input_ids + attention_mask (+ token_type_ids for BERT)
-        let mut session = inner
-            .session
-            .lock()
-            .map_err(|_| PipelineError::embed("ort session lock poisoned"))?;
         let mut inputs: Vec<(String, ort::value::DynValue)> = Vec::new();
         for outlet in session.inputs() {
             let name = outlet.name().to_string();
@@ -425,7 +480,7 @@ impl OrtEmbedder {
                 other => {
                     return Err(PipelineError::embed(format!(
                         "ONNX graph input '{other}' is not supported (transformers exports use \
-                         input_ids / attention_mask / token_type_ids)"
+                         input_ids / attention_mask / token_type_ids"
                     )));
                 }
             };
@@ -451,11 +506,10 @@ impl OrtEmbedder {
             )));
         }
         let out_dim = shape[2] as usize;
-        if out_dim != inner.dim {
+        if out_dim != dim {
             return Err(PipelineError::embed(format!(
-                "model output dim {out_dim} != probed startup dim {} — refusing (dim must not \
-                 flap across calls, §5.10.2)",
-                inner.dim
+                "model output dim {out_dim} != probed startup dim {dim} — refusing (dim must not \
+                 flap across calls, §5.10.2)"
             )));
         }
         // CLS pooling: token position 0 per row, then L2 normalize
@@ -651,6 +705,32 @@ pub(crate) mod tests {
 
         // empty batch: Ok(empty), no session run
         assert!(e.embed_documents(&[]).await.unwrap().is_empty());
+    }
+
+    /// Regression (2026-11-06 OOM): a request larger than MAX_INFER_TOKENS
+    /// must ride MULTIPLE session.run mini-batches, and each row's vector
+    /// must be IDENTICAL to embedding that row alone — grouping is a memory
+    /// bound, never a semantics change. Two 8192-truncated texts cannot share
+    /// a group (8192 + 8192 > MAX_INFER_TOKENS), so the split path is
+    /// guaranteed to fire.
+    #[tokio::test]
+    async fn mini_batch_split_is_row_invariant() {
+        let e = embedder_or_panic().await;
+        let long_a = "alpha ".repeat(9_000);
+        let long_b = "beta ".repeat(9_000);
+        let split = e
+            .embed_texts(vec![long_a.clone(), long_b.clone()])
+            .await
+            .unwrap();
+        let alone_a = e.embed_texts(vec![long_a]).await.unwrap();
+        let alone_b = e.embed_texts(vec![long_b]).await.unwrap();
+        assert_eq!(split.len(), 2, "one vector per row, batches concatenated");
+        assert_eq!(split[0], alone_a[0], "row 0 unchanged by group membership");
+        assert_eq!(split[1], alone_b[0], "row 1 unchanged by group membership");
+        assert!(
+            split.iter().flat_map(|v| v.iter()).all(|x| x.is_finite()),
+            "no NaN/Inf leakage across the group boundary"
+        );
     }
 
     #[tokio::test]
