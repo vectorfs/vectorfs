@@ -271,6 +271,11 @@ pub(crate) struct BucketPlan {
     /// Per-embedder-instance weights for `merge = "weighted"` (M3-T8) —
     /// same query-side carriage as `merge` itself.
     pub(crate) merge_weights: BTreeMap<String, f64>,
+    /// Cross-encoder rerank (M3-T11): the KEY of this bucket's loaded
+    /// reranker in [`IngestCore::rerankers`] (None = the axis is off).
+    /// Query-side ranking policy like `merge` — never chunk identity, so
+    /// it rides the plan WITHOUT entering the pipeline fingerprint.
+    pub(crate) rerank: Option<String>,
     max_file_size_bytes: u64,
     retries: u32,
     extract_timeout: Duration,
@@ -1028,6 +1033,11 @@ pub struct IngestCore {
     /// pub(crate): the serve binary summarizes via [`IngestCore::describe_buckets`].
     pub(crate) buckets: BTreeMap<String, BucketPlan>,
     embedders: BTreeMap<String, LoadedEmbedder>,
+    /// Loaded rerankers (M3-T11), keyed by the kind's canonical TOML — the
+    /// config is INLINE per ingest section (no instance names to dedupe
+    /// by), so two buckets spelling the same reranker share ONE session
+    /// (a 1.17 GiB model must not load twice for `rerank = true` twice).
+    rerankers: BTreeMap<String, crate::pipeline::rerank::cross_encoder::CrossEncoderReranker>,
     cpu: Arc<Semaphore>,
 }
 
@@ -1050,6 +1060,20 @@ impl IngestCore {
             })?;
             let loaded = kind.load(models_dir).await?;
             embedders.insert(name.clone(), loaded);
+        }
+
+        // rerankers (M3-T11): load ONE session per DISTINCT inline config
+        // across all buckets (the embedder-load discipline — startup gate +
+        // prefetch-when-online — applied to the fourth axis)
+        let mut rerankers = BTreeMap::new();
+        for icfg in cfg.ingest.values() {
+            let Some(kind) = &icfg.rerank else { continue };
+            let key = toml::to_string(kind)
+                .expect("canonical TOML serialization of plain reranker configs");
+            if let std::collections::btree_map::Entry::Vacant(slot) = rerankers.entry(key) {
+                let loaded = kind.load(models_dir).await?;
+                slot.insert(loaded);
+            }
         }
 
         // M3-T10: pdf-ocr extractor instances resolve their model directory
@@ -1088,6 +1112,10 @@ impl IngestCore {
                     derived,
                     merge: icfg.merge,
                     merge_weights: icfg.merge_weights.clone(),
+                    rerank: icfg.rerank.as_ref().map(|kind| {
+                        toml::to_string(kind)
+                            .expect("canonical TOML serialization of plain reranker configs")
+                    }),
                     max_file_size_bytes: icfg.max_file_size_mb * 1024 * 1024,
                     retries: icfg.retries,
                     extract_timeout: Duration::from_secs(icfg.extract_timeout_secs),
@@ -1109,6 +1137,7 @@ impl IngestCore {
         Ok(IngestCore {
             buckets,
             embedders,
+            rerankers,
             cpu: Arc::new(Semaphore::new(permits)),
         })
     }
@@ -2622,6 +2651,18 @@ impl IngestShared {
     /// `vectorfs optimize` skips its FTS pass.
     pub fn fts_of(&self, bucket: &str) -> Option<bool> {
         self.core.buckets.get(bucket).map(|p| p.fts)
+    }
+
+    /// The bucket's LOADED reranker (M3-T11): `None` = the axis is off for
+    /// this bucket (the §7 default) — `/x-vf/Search` then refuses the
+    /// per-request `rerank: true` for it (one config line is the fix).
+    pub fn reranker_of(
+        &self,
+        bucket: &str,
+    ) -> Option<&crate::pipeline::rerank::cross_encoder::CrossEncoderReranker> {
+        let plan = self.core.buckets.get(bucket)?;
+        let key = plan.rerank.as_deref()?;
+        self.core.rerankers.get(key)
     }
 
     /// The bucket's FTS tokenizer (`icu` default; `ngram` = 2,2 bigram) —

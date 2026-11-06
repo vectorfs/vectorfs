@@ -208,6 +208,14 @@ struct SearchArgs {
     #[arg(long, default_value_t = SearchModeArg::Semantic)]
     mode: SearchModeArg,
 
+    /// Cross-encoder rerank (M3-T11): re-score the topK hits with the
+    /// bucket's gte reranker and return them in rerank order (the raw
+    /// logit as the score; distance is omitted). Needs the bucket's
+    /// `rerank = true` in vectorfs.toml and a text query; not applicable
+    /// to --mode keyword.
+    #[arg(long)]
+    rerank: bool,
+
     /// Structured output (schema_version'd JSON)
     #[arg(long)]
     json: bool,
@@ -866,6 +874,7 @@ async fn search_cmd(args: SearchArgs) {
         "topK": args.top_k,
         "returnText": !args.no_text,
         "searchMode": args.mode.wire(),
+        "rerank": args.rerank,
     });
     if let Some(f) = filter {
         body["filter"] = f;

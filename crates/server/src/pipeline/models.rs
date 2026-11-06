@@ -37,7 +37,12 @@
 //! research/2026-11-multimodal-embedding.md §B1); PP-OCRv5 mobile
 //! Apache-2.0 LANDED as the M3-T10 pdf-ocr kind's det+rec pair (below —
 //! official PaddlePaddle ONNX repos, HF tags verified 2026-11-07 in
-//! research/2026-11-ocr-reranker-selection.md).
+//! research/2026-11-ocr-reranker-selection.md); gte-multilingual-
+//! reranker-base Apache-2.0 LANDED as the M3-T11 reranker kind's model
+//! (below — the BASE repo's HF tag carries the license; the
+//! onnx-community conversion repo itself carries no tag, the same
+//! conversion-carries-base-weights-license reasoning as the gte embedder
+//! row).
 //!
 //! # gte-multilingual-base facts (verified 2026-11-05, step-0 research)
 //!
@@ -220,6 +225,50 @@ pub static BUILTIN_MODELS: &[BuiltinModel] = &[
                 local: "dict.yml",
                 sha256: "5dfeb2777f6d0db8177d8128a8acfcf6e6276dc4ac73ea3bf0dc06d6a5e85d8e",
                 repo: Some("PaddlePaddle/PP-OCRv5_mobile_rec_onnx"),
+            },
+        ],
+        dim: 0,
+        license: "Apache-2.0",
+        image_size: None,
+    },
+    // gte-multilingual-reranker-base, the cross-encoder reranker kind's
+    // model (M3-T11, the §0 2026-11-07 adjudication). Facts verified
+    // 2026-11-07 against the actual artifacts (downloaded + sha-verified
+    // + graph-inspected + scored): the onnx-community conversion of
+    // Apache-2.0 Alibaba-NLP/gte-multilingual-reranker-base (the HF tags;
+    // the conversion carries the base weights' license — the gte embedder
+    // row's reasoning). Graph: fp32 `onnx/model.onnx` 1,257,814,850 B,
+    // IR 10 / opset 14, inputs input_ids + attention_mask +
+    // token_type_ids (int64 [batch, seq]), ONE output `logits`
+    // float32 [batch, 1] — one raw relevance logit per (query, doc)
+    // pair, no sigmoid (the model card's own usage). fp32 is the PINNED
+    // canonical artifact (measured: int8 perturbs scores by up to ~1.0
+    // logit and flips tail ordering — a reranker's whole job is
+    // fine-grained order; the same canonical-fp32 ruling as the gte
+    // embedder and the siglip2 towers). The repo's fp16/int8/q4 variants
+    // stay self-managed `path` options. dim is unused (no embedding
+    // vector — the kind probes the [batch, 1] output shape instead).
+    BuiltinModel {
+        name: "gte-multilingual-reranker-base",
+        hf_repo: "onnx-community/gte-multilingual-reranker-base",
+        files: &[
+            ModelFile {
+                remote: "onnx/model.onnx",
+                local: "model.onnx",
+                sha256: "4712afa6eed2ba8c3f00bf5b90f37fa2c58e60f4f22cf37763d4a48f523ffcc9",
+                repo: None,
+            },
+            ModelFile {
+                remote: "tokenizer.json",
+                local: "tokenizer.json",
+                sha256: "3ffb37461c391f096759f4a9bbbc329da0f36952f88bab061fcf84940c022e98",
+                repo: None,
+            },
+            ModelFile {
+                remote: "config.json",
+                local: "config.json",
+                sha256: "dfa5713436ecb4616eaa576795c8d3efd1f03122031a1ad4973d0b6b7e7edfd3",
+                repo: None,
             },
         ],
         dim: 0,
@@ -814,6 +863,26 @@ pub(crate) mod tests {
             ]
         );
         for f in o.files {
+            assert_eq!(f.sha256.len(), 64);
+            assert!(f.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+        // the gte reranker row (M3-T11): fp32 canonical + tokenizer +
+        // config, one repo, Apache-2.0, no dim (the kind probes [batch, 1])
+        let r = builtin("gte-multilingual-reranker-base").expect("reranker model present");
+        assert_eq!(r.license, "Apache-2.0");
+        assert_eq!(r.image_size, None);
+        assert_eq!(r.dim, 0);
+        let rows: Vec<(&str, &str)> = r.files.iter().map(|f| (f.local, f.remote)).collect();
+        assert_eq!(
+            rows,
+            [
+                ("model.onnx", "onnx/model.onnx"),
+                ("tokenizer.json", "tokenizer.json"),
+                ("config.json", "config.json"),
+            ]
+        );
+        for f in r.files {
+            assert_eq!(f.repo, None, "single-repo model");
             assert_eq!(f.sha256.len(), 64);
             assert!(f.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
         }

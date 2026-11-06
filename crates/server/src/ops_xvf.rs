@@ -42,7 +42,8 @@ use serde_json::json;
 
 use crate::ops::{ApiError, AppState};
 use crate::pipeline::{
-    Embedder as _, HitList, Merge, Modality, Query, merge_hitlists, merge_hitlists_weighted,
+    Embedder as _, HitList, Merge, Modality, Query, Reranker as _, merge_hitlists,
+    merge_hitlists_weighted,
 };
 use crate::store::{QueryRoute, SourceMarker, SourceStatus};
 
@@ -136,6 +137,13 @@ struct SearchInput {
     /// the lexical kernel), `hybrid` (semantic fan-out + BM25 fused by the
     /// bucket's merge strategy). Unknown values are ValidationExceptions.
     search_mode: Option<String>,
+    /// Cross-encoder rerank (M3-T11): re-score the merged candidate set
+    /// (already truncated to topK) with the bucket's configured reranker
+    /// and return hits in rerank order. Requires the bucket's
+    /// `[ingest.<bucket>] rerank = true` (availability: the model loads at
+    /// serve startup), a TEXT query (the cross-encoder reads the pair) and
+    /// a non-keyword mode. Default absent/false = the pre-T11 behavior.
+    rerank: Option<bool>,
 }
 
 /// The parsed `searchMode` (see [`SearchInput::search_mode`]).
@@ -788,6 +796,15 @@ fn decode_image_query(img: &SearchImageInput) -> Result<(Vec<u8>, String), ApiEr
 ///   all lists fused by the same bucket strategy (rrf, or `weighted` where
 ///   BOTH arms of a route share the embedder instance's weight).
 ///
+/// `rerank: true` (M3-T11, per-request; default absent = the pre-T11
+/// behavior): after the merge, re-score the topK candidates with the
+/// bucket's cross-encoder (`[ingest.<bucket>] rerank = true` gates the
+/// model's load at serve startup; the §5.10.3 data flow's merge → rerank →
+/// 回源). Needs a TEXT query and a non-keyword mode (keyword's BM25
+/// ranking IS its semantics); hits come back in rerank order with the
+/// score field carrying the RAW cross-encoder logit, and `distance` is
+/// omitted (the order no longer derives from it).
+///
 /// Hit shape, field by field (appendix E.2):
 /// * `content{text?, type: "TEXT"|"IMAGE"}` — `type` follows the CHUNK's
 ///   modality (`x-vf-modality`; image chunks answer IMAGE whatever the
@@ -905,6 +922,45 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
             ),
         ));
     }
+
+    // rerank (M3-T11) applicability — three loud refusals, each a one-line
+    // fix, none a silent half-feature (the searchMode discipline):
+    // * the bucket must carry a loaded reranker (availability knob, §7);
+    // * the query must be TEXT (a text cross-encoder has no image arm);
+    // * the mode must not be keyword (BM25's ranking semantics IS that
+    //   mode's contract — silently re-sorting exact-term hits by neural
+    //   relevance would defeat the point of asking for keyword).
+    let reranking = input.rerank.unwrap_or(false);
+    let reranker = if reranking {
+        let Some(r) = shared.reranker_of(&input.bucket) else {
+            return Err(ApiError::validation_field(
+                "rerank",
+                format!(
+                    "bucket {:?} has no reranker configured — add `rerank = true` under \
+                     [ingest.{}] in vectorfs.toml (loads the gte cross-encoder at startup) and \
+                     restart the daemon",
+                    input.bucket, input.bucket
+                ),
+            ));
+        };
+        if !matches!(query, Query::Text(_)) {
+            return Err(ApiError::validation_field(
+                "rerank",
+                "rerank needs query.text — the cross-encoder scores (query text, chunk text) \
+                 pairs; use rerank with a text query",
+            ));
+        }
+        if mode == SearchMode::Keyword {
+            return Err(ApiError::validation_field(
+                "rerank",
+                "rerank does not apply to searchMode \"keyword\" — pure BM25's ranking is that \
+                 mode's semantics; use semantic or hybrid for cross-encoder precision ordering",
+            ));
+        }
+        Some(r)
+    } else {
+        None
+    };
 
     let top_k = match input.top_k {
         None => 10,
@@ -1113,6 +1169,43 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
     };
     merged.truncate(top_k); // fusions can exceed topK across route unions
 
+    // ---- rerank (M3-T11): merge → rerank → 回源 (§5.10.3 data flow). The
+    // candidates are the truncated topK (the request's own candidate-set
+    // semantics — rerank re-scores what would be returned); each carries
+    // its stored x-vf-chunk-text (empty for image chunks / text-less
+    // buckets — scored, never dropped). The reranker's output replaces the
+    // merged order AND the scores (raw cross-encoder logits, monotone in
+    // relevance); `distance` stops being emitted below because the order
+    // no longer derives from it.
+    if let Some(reranker) = reranker {
+        let query_text = match &query {
+            Query::Text(t) => t.as_str(),
+            Query::Image(_, _) => unreachable!("validated above: rerank needs a text query"),
+        };
+        let candidates: Vec<crate::pipeline::RerankCandidate> = merged
+            .iter()
+            .map(|h| crate::pipeline::RerankCandidate {
+                key: h.key.clone(),
+                text: attribution
+                    .get(&h.key)
+                    .and_then(|(_, _, m)| m.as_ref())
+                    .and_then(|m| m.get("x-vf-chunk-text"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            })
+            .collect();
+        merged = reranker
+            .rerank(query_text, &candidates)
+            .await
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "reranker of bucket {:?} failed to score the merged candidates: {e}",
+                    input.bucket
+                ))
+            })?;
+    }
+
     let hits: Vec<serde_json::Value> = merged
         .iter()
         .map(|h| {
@@ -1148,7 +1241,10 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
                 "index": index,
                 "key": h.key,
             });
-            if single_list && mode == SearchMode::Semantic {
+            if single_list && mode == SearchMode::Semantic && !reranking {
+                // suppressed under rerank (M3-T11): the hit's order no
+                // longer derives from the vector distance, and a stale
+                // distance would mislead score/threshold reasoning
                 o["distance"] = json!(distance);
             }
             if let Some(m) = &metadata {
@@ -2272,6 +2368,278 @@ mod tests {
             // no `distance` on multi-route hits (appendix E.2)
             assert!(hits.iter().all(|h| h.get("distance").is_none()), "{b}");
         }
+    }
+
+    // ---------------- Search rerank (M3-T11) ----------------
+
+    /// The committed tiny-RERANKER fixture (the cross-encoder kind's own
+    /// suite runs it; these wire tests do too).
+    fn reranker_fixture_dir() -> std::path::PathBuf {
+        for p in [
+            "vf/tests/fixtures/tiny-reranker",
+            "tests/fixtures/tiny-reranker",
+        ] {
+            let d = std::path::PathBuf::from(p);
+            if d.join("model.onnx").is_file() {
+                return d;
+            }
+        }
+        panic!("tiny-reranker fixture not found under tests/fixtures/");
+    }
+
+    /// tiny text pipeline + the tiny cross-encoder reranker (path-based,
+    /// hermetic). `extra` splices further ingest lines (fts for hybrid).
+    fn tiny_rerank_config(extra: &str) -> crate::pipeline::config::PipelineConfig {
+        let text = format!(
+            "[extractor.plain]\nkind = \"txt\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = true\n\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ txt = \"plain\" }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"tiny\"]\nscan_interval_secs = 1\n\
+             rerank = {{ kind = \"cross-encoder\", model = \"tiny-reranker-fixture\", path = \
+             {:?}, offline = true }}\n{extra}",
+            fixture_dir().display().to_string(),
+            reranker_fixture_dir().display().to_string()
+        );
+        load_pipeline_config(&text).unwrap()
+    }
+
+    /// e2e: Search merges, then reranks the topK candidates with the tiny
+    /// cross-encoder (logit = sum of (token_id+1) over the masked pair — an
+    /// EXACT oracle), then shapes hits. Pinned:
+    /// * order = rerank score desc, ties by key asc (the two identical
+    ///   docs tie and fall to the chunk-key order);
+    /// * `score` carries the raw logit (exact values asserted);
+    /// * `distance` is omitted (the order no longer derives from it);
+    /// * hit count is unchanged (rerank re-orders, never filters);
+    /// * rerank ABSENT on a rerank-CONFIGURED bucket is byte-identical to
+    ///   the same bucket without the rerank line at all (the additive red
+    ///   line: availability never changes the off path).
+    #[tokio::test]
+    async fn search_rerank_reorders_with_exact_scores_and_ties_break_by_key() {
+        let f = fixture_with(tiny_rerank_config("")).await;
+        // one 32-char window each: "the fox"(59) < "contract probe
+        // chunk"(51)? — the sums are asserted exactly below; identical
+        // c1/c2 texts force the tie
+        put_source_call(&f, "docs", "docs/a.txt", b"the fox".to_vec()).await;
+        put_source_call(
+            &f,
+            "docs",
+            "docs/b.txt",
+            b"fox embeds the quick fox".to_vec(),
+        )
+        .await;
+        put_source_call(&f, "docs", "docs/c1.txt", b"contract probe chunk".to_vec()).await;
+        put_source_call(&f, "docs", "docs/c2.txt", b"contract probe chunk".to_vec()).await;
+        drive(&f).await;
+        for key in ["docs/a.txt", "docs/b.txt", "docs/c1.txt", "docs/c2.txt"] {
+            assert_eq!(
+                marker_of(&f, key).await.unwrap().status,
+                SourceStatus::Indexed,
+                "{key}"
+            );
+        }
+
+        // ---- rerank ON: the tiny cross-encoder's exact logits ----
+        // pair template [CLS] query [SEP] doc [SEP]; logit = Σ(id+1):
+        //   query "hello vectorfs" prefix = (2+1)+(9+1)+(10+1)+(3+1) = 28
+        //   b "fox embeds the quick fox" = 28 + (15+16+12+13+15) + 4 = 103
+        //   a "the fox"                 = 28 + (12+15) + 4 = 59
+        //   c1/c2 "contract probe chunk"= 28 + (5+6+8) + 4 = 51  (tie)
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"hello vectorfs"},"topK":10,"rerank":true}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 4, "rerank never filters: {b}");
+        let src = |h: &serde_json::Value| h["location"]["key"].as_str().unwrap().to_string();
+        assert_eq!(src(&hits[0]), "docs/b.txt", "{b}");
+        assert_eq!(src(&hits[1]), "docs/a.txt", "{b}");
+        assert_eq!(hits[0]["score"].as_f64().unwrap(), 103.0, "{b}");
+        assert_eq!(hits[1]["score"].as_f64().unwrap(), 59.0, "{b}");
+        // the forced tie: identical scores, key ascending decides
+        assert_eq!(
+            hits[2]["score"].as_f64().unwrap(),
+            hits[3]["score"].as_f64().unwrap(),
+            "identical texts must tie exactly: {b}"
+        );
+        assert_eq!(hits[2]["score"].as_f64().unwrap(), 51.0, "{b}");
+        assert!(
+            hits[2]["key"].as_str().unwrap() < hits[3]["key"].as_str().unwrap(),
+            "tie-break by key ascending: {b}"
+        );
+        // distance omitted under rerank (order no longer derives from it)
+        assert!(hits.iter().all(|h| h.get("distance").is_none()), "{b}");
+        // total order over the wire
+        for w in hits.windows(2) {
+            let ok = w[0]["score"].as_f64().unwrap() > w[1]["score"].as_f64().unwrap()
+                || (w[0]["score"] == w[1]["score"]
+                    && w[0]["key"].as_str().unwrap() < w[1]["key"].as_str().unwrap());
+            assert!(ok, "not rerank-ordered: {b}");
+        }
+
+        // ---- rerank ABSENT on the SAME (rerank-configured) bucket: the
+        // response is byte-identical to a bucket WITHOUT the rerank line —
+        // availability changes nothing about the off path ----
+        let (_, _, off) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"hello vectorfs"},"topK":10}),
+        )
+        .await;
+        let plain = fixture().await;
+        for (key, body) in [
+            ("docs/a.txt", b"the fox".to_vec()),
+            ("docs/b.txt", b"fox embeds the quick fox".to_vec()),
+            ("docs/c1.txt", b"contract probe chunk".to_vec()),
+            ("docs/c2.txt", b"contract probe chunk".to_vec()),
+        ] {
+            put_source_call(&plain, "docs", key, body).await;
+        }
+        drive(&plain).await;
+        let (_, _, plain_b) = call_json(
+            &plain,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"hello vectorfs"},"topK":10}),
+        )
+        .await;
+        assert_eq!(
+            serde_json::to_string(&off).unwrap(),
+            serde_json::to_string(&plain_b).unwrap(),
+            "rerank-configured bucket, rerank off: byte-identical to no-rerank bucket"
+        );
+
+        // ---- explicit rerank: false is the same off path ----
+        let (_, _, off2) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"hello vectorfs"},"topK":10,"rerank":false}),
+        )
+        .await;
+        assert_eq!(off, off2);
+    }
+
+    /// The rerank applicability refusals (each a one-line fix, none a
+    /// silent half-feature): a bucket without a reranker, keyword mode
+    /// (BM25's ranking IS that mode's semantics), and an IMAGE query (the
+    /// cross-encoder reads text pairs). Hybrid + rerank works (fuse, then
+    /// re-score) — 200 with rerank-ordered hits.
+    #[tokio::test]
+    async fn search_rerank_applicability_refusals_and_hybrid() {
+        // (a) no reranker configured: the config gap is a 400 naming the fix
+        let plain = fixture().await;
+        let (st, _, b) = call_json(
+            &plain,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":5,"rerank":true}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        let msg = b["message"].as_str().unwrap();
+        assert!(msg.contains("no reranker configured"), "{b}");
+        assert!(msg.contains("rerank = true"), "{b}");
+        assert!(msg.contains("[ingest.docs]"), "{b}");
+
+        // fts + rerank bucket for the remaining arms
+        let f = fixture_with(tiny_rerank_config("fts = true\n")).await;
+        put_source_call(
+            &f,
+            "docs",
+            "docs/a.txt",
+            b"the quick brown fox jumps over the lazy dog".to_vec(),
+        )
+        .await;
+        put_source_call(
+            &f,
+            "docs",
+            "docs/sea.txt",
+            b"whales and dolphins swim in the deep blue ocean".to_vec(),
+        )
+        .await;
+        drive(&f).await;
+
+        // (b) keyword + rerank: refused — BM25's ranking is that mode's
+        // own semantics
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":5,
+                   "searchMode":"keyword","rerank":true}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert!(
+            b["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not apply to searchMode"),
+            "{b}"
+        );
+        assert!(b["message"].as_str().unwrap().contains("keyword"), "{b}");
+
+        // (c) image query + rerank: refused — needs query.text. Uses the
+        // image pipeline WITH a reranker so the refusal that fires is the
+        // modality one (not the availability one).
+        let img_cfg = {
+            let mut text = format!(
+                "[extractor.imgs]\nkind = \"image\"\n\n\
+                 [embedder.clip]\nkind = \"siglip2\"\nmodel = \"tiny-siglip2\"\npath = {:?}\n\
+                 offline = true\n\n\
+                 [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ img = \"imgs\" }}\n\
+                 chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+                 embedders = [\"clip\"]\nscan_interval_secs = 1\n\
+                 rerank = {{ kind = \"cross-encoder\", model = \"tiny-reranker-fixture\", \
+                 path = {:?}, offline = true }}\n",
+                siglip2_fixture_dir().display().to_string(),
+                reranker_fixture_dir().display().to_string()
+            );
+            text.push_str("fts = true\n"); // not needed, keeps one splice point
+            load_pipeline_config(&text).unwrap()
+        };
+        let img_f = fixture_with(img_cfg).await;
+        let png = crate::pipeline::extract::image::tests::solid_png((8, 8), [1, 2, 3]);
+        let b64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        };
+        let (st, _, b) = call_json(
+            &img_f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"image":{"bytes": b64, "mime": "image/png"}},
+                   "topK":5,"rerank":true}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert!(
+            b["message"]
+                .as_str()
+                .unwrap()
+                .contains("rerank needs query.text"),
+            "{b}"
+        );
+
+        // (d) hybrid + rerank: fuse, then re-score — 200, rerank-ordered,
+        // distance omitted
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":5,
+                   "searchMode":"hybrid","rerank":true}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "{b}");
+        for w in hits.windows(2) {
+            let ok = w[0]["score"].as_f64().unwrap() > w[1]["score"].as_f64().unwrap()
+                || (w[0]["score"] == w[1]["score"]
+                    && w[0]["key"].as_str().unwrap() < w[1]["key"].as_str().unwrap());
+            assert!(ok, "hybrid rerank not totally ordered: {b}");
+        }
+        assert!(hits.iter().all(|h| h.get("distance").is_none()), "{b}");
     }
 
     // ---------------- Search searchMode (M3-T9) ----------------

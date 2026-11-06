@@ -196,6 +196,15 @@ struct IngestRaw {
     /// precedent: pre-T9 fingerprints stay byte-stable).
     #[serde(rename = "fts-tokenizer", default = "default_fts_tokenizer")]
     fts_tokenizer: String,
+    /// Cross-encoder rerank availability (M3-T11, §5.10.2 Reranker row):
+    /// `true` = on with the default model; a TABLE
+    /// (`rerank = { kind = "cross-encoder", model = …, path = …, offline = … }`)
+    /// = on with the model reference carried; absent/`false` = off (the §7
+    /// default). Raw value here (`bool | table`); parsed two-stage below
+    /// like the inline chunker. Query-side ranking policy — EXCLUDED from
+    /// the pipeline fingerprint (see [`pipeline_fingerprint`]).
+    #[serde(default)]
+    rerank: Option<toml::Value>,
 }
 
 fn default_scan_interval_secs() -> usize {
@@ -471,6 +480,65 @@ impl PipelineConfig {
                 }
             }
         }
+        // M3-T11: the reranker rides the same gate. It is configured
+        // INLINE in the ingest section (no instance registry), so the
+        // section line it reports is the ingest section's own.
+        for (bucket, icfg) in &self.ingest {
+            let Some(crate::pipeline::rerank::RerankerKind::CrossEncoder(cfg)) = &icfg.rerank
+            else {
+                continue;
+            };
+            let section = format!("ingest.{bucket}");
+            let line = self.section_line(&section);
+            let files = ["model.onnx", "tokenizer.json"];
+            match &cfg.path {
+                Some(p) => {
+                    let dir = std::path::PathBuf::from(p);
+                    let missing: Vec<&str> = files
+                        .iter()
+                        .filter(|f| !dir.join(f).is_file())
+                        .copied()
+                        .collect();
+                    if !missing.is_empty() {
+                        return Err(PipelineError::config(
+                            format!(
+                                "[{section}]: rerank path {} does not contain {} (a path is \
+                                 never prefetched — point it at a complete model directory: {})",
+                                dir.display(),
+                                missing.join(", "),
+                                files.join(" + ")
+                            ),
+                            line,
+                        ));
+                    }
+                }
+                None => {
+                    let resolved = crate::pipeline::rerank::cross_encoder::resolve_model_name(cfg);
+                    let Some(builtin) = super::models::builtin(&resolved) else {
+                        return Err(PipelineError::config(
+                            format!(
+                                "[{section}]: unknown reranker model '{resolved}' (built-in \
+                                 models: {})",
+                                super::models::builtin_names().join(", ")
+                            ),
+                            line,
+                        ));
+                    };
+                    let dir = models_dir.join(&resolved);
+                    if cfg.offline && !super::models::is_ready(&dir, builtin) {
+                        return Err(PipelineError::config(
+                            format!(
+                                "[{section}]: rerank offline = true but model '{resolved}' is \
+                                 not present under {} — prefetch on a connected machine or set \
+                                 a rerank path; the network will not be used",
+                                dir.display()
+                            ),
+                            line,
+                        ));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -531,6 +599,16 @@ pub struct IngestConfig {
     /// it ENTERS the pipeline fingerprint (elided at the default — the T7
     /// charset three-state precedent; 换分词 = reindex, ADR 0002).
     pub fts_tokenizer: FtsTokenizer,
+    /// Cross-encoder rerank (M3-T11): `None` = off (the default); the
+    /// loaded kind when `rerank = true` / a table form is configured.
+    /// Query-side ranking policy like `merge`/`merge-weights`/`fts` — it
+    /// writes NOTHING to any index and never changes chunk identity, so
+    /// the WHOLE knob (switch AND model reference) stays OUT of the
+    /// pipeline fingerprint: a reranker model is not index-defining the
+    /// way an embedder model is (swap it and no stored artifact changes —
+    /// demanding a reindex would be demanding re-embedding for zero
+    /// difference, the exact outcome the merge-weights ruling refuses).
+    pub rerank: Option<super::rerank::RerankerKind>,
 }
 
 impl PipelineConfig {
@@ -752,6 +830,38 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
             ));
         }
 
+        // rerank (M3-T11): `true` = on with the default model (the §0
+        // adjudication's gte-multilingual-reranker-base — the reranker DOES
+        // have a default tier, unlike siglip2's deliberate no-default era);
+        // absent/`false` = off; a TABLE = on with the model reference. Any
+        // other TOML type dies here with the section line.
+        let rerank = match &rawi.rerank {
+            None | Some(toml::Value::Boolean(false)) => None,
+            Some(toml::Value::Boolean(true)) => Some(super::rerank::RerankerKind::CrossEncoder(
+                super::rerank::cross_encoder::CrossEncoderConfig {
+                    kind: super::rerank::cross_encoder::CrossEncoderTag::CrossEncoder,
+                    model: None,
+                    path: None,
+                    offline: false,
+                },
+            )),
+            Some(v @ toml::Value::Table(_)) => Some(super::rerank::RerankerKind::from_config(
+                &format!("{section}.rerank"),
+                v,
+                line,
+            )?),
+            Some(other) => {
+                return Err(PipelineError::config(
+                    format!(
+                        "[{section}]: rerank must be true, false, or a table {{ kind = \
+                         \"cross-encoder\", … }}, got {}",
+                        other.type_str()
+                    ),
+                    line,
+                ));
+            }
+        };
+
         // merge-weights (M3-T8): dead knobs and bad values die here, at the
         // config line that carries them. Positive finite floats only (a zero
         // or negative weight is not "mute this embedder" — removing it from
@@ -922,6 +1032,7 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
                 charset_fallback: canonical_charset(&rawi.charset_fallback, &section, line)?,
                 fts: rawi.fts,
                 fts_tokenizer,
+                rerank,
             },
         );
     }
@@ -1106,7 +1217,10 @@ fn canonical_charset(
 /// (M3-T7), and the FTS tokenizer (M3-T9) — all name-keyed and
 /// BTreeMap-normalized so key order and
 /// formatting in the source file do not matter. Query-side (`merge`,
-/// `merge-weights`, and since M3-T9 the `fts` switch itself) and
+/// `merge-weights`, since M3-T9 the `fts` switch itself, and since M3-T11
+/// the WHOLE rerank knob — switch AND model reference: a reranker model is
+/// query-side ranking policy, not an index definition the way an embedder
+/// model is, so swapping it must never demand a reindex) and
 /// claim-only fields (`include`, `exclude`, `index-prefix` — v3.1 R5) are
 /// deliberately EXCLUDED: they never change chunk identity, so changing
 /// them must not invalidate completion markers. The same logic puts
@@ -1323,7 +1437,7 @@ index-prefix = "docs"
                 "[ingest.d]: unknown field 'chunkder' (allowed: include, exclude, extract, \
                  chunk, embedders, merge, merge-weights, index-prefix, scan_interval_secs, \
                  max_file_size_mb, retries, extract_timeout_secs, store_chunk_text, \
-                 charset_fallback, fts, fts-tokenizer)"
+                 charset_fallback, fts, fts-tokenizer, rerank)"
             ),
             "{msg}"
         );
@@ -1491,6 +1605,86 @@ chunk = { kind = "token-window", size = 32, overlap = 8 }
             fp(&base),
             fp(&ngram),
             "ngram tokenizes differently — the fingerprint MUST move (reindex)"
+        );
+    }
+
+    // ---- rerank (M3-T11) -----------------------------------------------------
+
+    #[test]
+    fn rerank_parses_bool_table_and_default_off() {
+        // absent = off (§7: M3 superset content ships disabled)
+        let cfg = parse(FP_CFG).unwrap();
+        assert!(cfg.ingest["docs"].rerank.is_none());
+        // explicit false = off; true = the default-tier cross-encoder
+        let cfg = parse(&format!("{FP_CFG}rerank = false\n")).unwrap();
+        assert!(cfg.ingest["docs"].rerank.is_none());
+        let cfg = parse(&format!("{FP_CFG}rerank = true\n")).unwrap();
+        let k = cfg.ingest["docs"].rerank.as_ref().unwrap();
+        assert_eq!(
+            k.describe(),
+            "cross-encoder(model=gte-multilingual-reranker-base)"
+        );
+        // the table form carries the model reference (and its knobs)
+        let cfg = parse(&format!(
+            "{FP_CFG}rerank = {{ kind = \"cross-encoder\", model = \"x\", offline = true }}\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.ingest["docs"].rerank.as_ref().unwrap().describe(),
+            "cross-encoder(model=x, offline)"
+        );
+        let cfg = parse(&format!(
+            "{FP_CFG}rerank = {{ kind = \"cross-encoder\", path = \"/m\" }}\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.ingest["docs"].rerank.as_ref().unwrap().describe(),
+            "cross-encoder(path=/m)"
+        );
+        // closed kind set + unknown fields die at the section line
+        let err = parse(&format!("{FP_CFG}rerank = {{ kind = \"listwise\" }}\n")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown reranker kind 'listwise'"), "{msg}");
+        assert!(msg.contains("at line"), "{msg}");
+        let err = parse(&format!(
+            "{FP_CFG}rerank = {{ kind = \"cross-encoder\", top_n = 5 }}\n"
+        ))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown field 'top_n'"), "{msg}");
+        // a non-bool non-table value is a typed refusal
+        let err = parse(&format!("{FP_CFG}rerank = \"gte\"\n")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rerank must be true, false, or a table"),
+            "{msg}"
+        );
+    }
+
+    /// THE fingerprint pin for the rerank knob (the ruling, executable):
+    /// the whole knob — the availability switch AND the model reference —
+    /// stays OUT of the pipeline fingerprint. off, `true`, and a table
+    /// naming another model all fingerprint IDENTICALLY: the reranker is
+    /// query-side ranking policy (the merge-weights ruling's own words:
+    /// changing it "changes ranking policy, never chunk identity"), and a
+    /// reranker model defines no index the way an embedder model does, so
+    /// flipping it must never demand a `vf reindex`.
+    #[test]
+    fn rerank_never_enters_the_fingerprint_switch_or_model() {
+        let base = parse(FP_CFG).unwrap();
+        let on = parse(&format!("{FP_CFG}rerank = true\n")).unwrap();
+        let off_explicit = parse(&format!("{FP_CFG}rerank = false\n")).unwrap();
+        let other_model = parse(&format!(
+            "{FP_CFG}rerank = {{ kind = \"cross-encoder\", model = \"bge-reranker-v2-m3\" }}\n"
+        ))
+        .unwrap();
+        let fp = |c: &PipelineConfig| c.fingerprint("docs").unwrap();
+        assert_eq!(fp(&base), fp(&on), "the switch elides");
+        assert_eq!(fp(&base), fp(&off_explicit), "explicit off elides too");
+        assert_eq!(
+            fp(&on),
+            fp(&other_model),
+            "the model reference elides — ranking policy, not chunk identity"
         );
     }
 
@@ -1975,6 +2169,59 @@ index-prefix = "docs"
         let err = cfg.validate_model_availability(data.path()).unwrap_err();
         assert!(
             err.to_string().contains("unknown model 'siglip2-so400m'"),
+            "{err}"
+        );
+    }
+
+    /// The rerank arm of the availability gate (M3-T11): a `path` must be
+    /// complete; a table model resolves through the built-in list (unknown
+    /// names die); offline + missing cache refuses with the ingest line.
+    #[test]
+    fn model_availability_gate_rerank_rules() {
+        let data = tempfile::tempdir().unwrap();
+        let base = |rerank: &str| {
+            format!(
+                "[ingest.ddd]\nchunk = {{ kind = \"token-window\", size = 8, overlap = 2 }}\n                 rerank = {rerank}\n"
+            )
+        };
+        // incomplete path: names the missing files
+        let half = tempfile::tempdir().unwrap();
+        std::fs::write(half.path().join("model.onnx"), b"x").unwrap();
+        let cfg = parse(&base(&format!(
+            "{{ kind = \"cross-encoder\", path = {:?} }}",
+            half.path().display()
+        )))
+        .unwrap();
+        let err = cfg.validate_model_availability(data.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("tokenizer.json"), "{msg}");
+        assert!(msg.contains("rerank path"), "{msg}");
+        // offline + empty cache: refuses with the fix
+        let cfg = parse(&base(
+            "{ kind = \"cross-encoder\", model = \"gte-multilingual-reranker-base\", \
+             offline = true }",
+        ))
+        .unwrap();
+        let err = cfg.validate_model_availability(data.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("rerank offline = true"), "{msg}");
+        assert!(msg.contains("gte-multilingual-reranker-base"), "{msg}");
+        assert!(msg.contains("at line 1"), "{msg}");
+        // online + empty cache: OK (serve-load prefetch); off: nothing to
+        // check at all
+        let cfg = parse(&base("true")).unwrap();
+        assert!(cfg.validate_model_availability(data.path()).is_ok());
+        let cfg = parse(&base("false")).unwrap();
+        assert!(cfg.validate_model_availability(data.path()).is_ok());
+        // unknown model without path: the built-in list names it
+        let cfg = parse(&base(
+            "{ kind = \"cross-encoder\", model = \"bge-reranker-v2-m3\" }",
+        ))
+        .unwrap();
+        let err = cfg.validate_model_availability(data.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown reranker model 'bge-reranker-v2-m3'"),
             "{err}"
         );
     }

@@ -1,0 +1,5 @@
+{
+  "model_type": "tiny-fixture",
+  "license": "CC0-1.0 (vectorfs test fixture, generated in-repo)",
+  "task": "text-classification (cross-encoder pair scoring)"
+}

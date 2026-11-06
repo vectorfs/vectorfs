@@ -714,9 +714,13 @@ fn print_pipeline_summary(cfg: &vectorfs_server::pipeline::config::PipelineConfi
         } else {
             format!("[{}]", ingest.embedders.join(", "))
         };
+        let rerank = match &ingest.rerank {
+            None => "off".to_string(),
+            Some(kind) => kind.describe(),
+        };
         println!(
             "ingest {bucket}: chunker={} claim={claim} extract: {routes} \
-             embedders={embedders} merge={} fingerprint={}",
+             embedders={embedders} merge={} rerank={rerank} fingerprint={}",
             ingest.chunk.describe(),
             ingest.merge,
             cfg.fingerprint(bucket).expect("bucket present"),

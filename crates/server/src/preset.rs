@@ -161,6 +161,10 @@ merge = \"rrf\"
 #   # fts-tokenizer = \"icu\"    # default: dictionary zh/en word segmentation
 #   # fts-tokenizer = \"ngram\"  # 2,2 bigram: best CJK recall, but Latin words
 #   #                         # are bigrammed too (substring matches fire)
+# Cross-encoder rerank (`vf search --rerank`: re-scores the topK hits with
+# gte-multilingual-reranker-base) is OFF by default (§7). To enable (loads
+# the ~1.17 GiB model at serve startup):
+#   rerank = true
 ",
                 model = Self::DEFAULT_MODEL
             ),
@@ -237,6 +241,10 @@ merge = \"rrf\"
 #   # fts-tokenizer = \"icu\"    # default: dictionary zh/en word segmentation
 #   # fts-tokenizer = \"ngram\"  # 2,2 bigram: best CJK recall, but Latin words
 #   #                         # are bigrammed too (substring matches fire)
+# Cross-encoder rerank (`vf search --rerank`: re-scores the topK hits with
+# gte-multilingual-reranker-base) is OFF by default (§7). To enable (loads
+# the ~1.17 GiB model at serve startup):
+#   rerank = true
 ",
                 model = Self::DEFAULT_MODEL,
                 image_model = Self::DEFAULT_IMAGE_MODEL
@@ -312,6 +320,10 @@ extract_timeout_secs = 600
 #   # fts-tokenizer = \"icu\"    # default: dictionary zh/en word segmentation
 #   # fts-tokenizer = \"ngram\"  # 2,2 bigram: best CJK recall, but Latin words
 #   #                         are bigrammed too (substring matches fire)
+# Cross-encoder rerank (`vf search --rerank`: re-scores the topK hits with
+# gte-multilingual-reranker-base) is OFF by default (§7). To enable (loads
+# the ~1.17 GiB model at serve startup):
+#   rerank = true
 ",
                 model = Self::DEFAULT_MODEL
             ),

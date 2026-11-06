@@ -1,8 +1,9 @@
 //! File-layer pipeline plugin system (design.md §5.10; skeleton in M2-T2,
 //! extractor/chunker kinds in T4, embedder kinds + model prefetch in T5).
 //!
-//! Three strategy axes live behind traits ([`Extractor`], [`Chunker`],
-//! [`Embedder`]) plus the query-side merge option ([`merge_hitlists`]);
+//! Four strategy axes live behind traits ([`Extractor`], [`Chunker`],
+//! [`Embedder`], [`Reranker`] — the fourth, query-side, M3-T11) plus the
+//! query-side merge option ([`merge_hitlists`]);
 //! the ORCHESTRATION is fixed mechanism in code, the POLICY (which kinds,
 //! which parameters) is TOML (§5.10.0 axiom 1).
 //!
@@ -81,6 +82,7 @@ pub mod gate;
 pub mod models;
 pub mod normalize;
 pub mod probe;
+pub mod rerank;
 
 use std::collections::BTreeMap;
 
@@ -577,6 +579,44 @@ pub trait Embedder: Send + Sync {
     fn doc_modalities(&self) -> &'static [Modality];
     /// Modalities accepted on the QUERY side.
     fn query_modalities(&self) -> &'static [Modality];
+}
+
+/// One rerank input (M3-T11): the candidate's identity (a chunk key) plus
+/// the TEXT the cross-encoder reads — `/x-vf/Search` feeds the stored
+/// `x-vf-chunk-text`. An empty `text` (image chunks store none; buckets
+/// with `store_chunk_text = false`) is LEGAL and scores however the model
+/// scores an empty second member — deterministic and total; the hit is
+/// never dropped (rerank re-orders, it does not filter).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RerankCandidate {
+    pub key: String,
+    pub text: String,
+}
+
+impl RerankCandidate {
+    pub fn new(key: impl Into<String>, text: impl Into<String>) -> Self {
+        RerankCandidate {
+            key: key.into(),
+            text: text.into(),
+        }
+    }
+}
+
+/// The FOURTH axis (§5.10.2 Reranker row, query side, M3-T11):
+/// `query × candidates -> scored`. Implementations return one [`Hit`] per
+/// input candidate — same key set, never fewer (the output of rerank is an
+/// ORDER, not a filter) — sorted score descending with ties broken by key
+/// ascending, such that re-calling with the candidates in any permutation
+/// yields the identical output (the contract suite is
+/// [`contract::reranker_contract`]; the built-in kind achieves it by
+/// key-sorting before batch composition — see `rerank/cross_encoder.rs`).
+#[async_trait::async_trait]
+pub trait Reranker: Send + Sync {
+    async fn rerank(
+        &self,
+        query: &str,
+        candidates: &[RerankCandidate],
+    ) -> Result<Vec<Hit>, PipelineError>;
 }
 
 // ---------------------------------------------------------------------------

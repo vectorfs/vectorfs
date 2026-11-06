@@ -172,6 +172,13 @@ pub struct SearchParams {
     /// `vf search --mode`; the server validates.
     #[serde(default)]
     pub mode: Option<String>,
+    /// Cross-encoder rerank (M3-T11): re-score the topK hits with the
+    /// bucket's gte reranker, returning rerank order with raw-logit
+    /// scores (distance omitted). Needs the bucket's `rerank = true` in
+    /// vectorfs.toml, a text query, and a non-keyword mode; the server
+    /// validates.
+    #[serde(default)]
+    pub rerank: bool,
     /// Results to return, 1..=1000.
     #[serde(default = "default_top_k")]
     pub top_k: i64,
@@ -448,7 +455,7 @@ impl VfMcp {
 
     /// Hybrid file-layer search (M2 T6).
     #[tool(
-        description = "Search an ingest-configured bucket's files: the query text is embedded once per configured embedder, each derived index is queried (topK 1..=1000, optional $-operator filter), and the per-index rankings are merged (rrf). Every hit carries content{text,type}, score, index, key, location{type:'source',key} (the source file to read with get) and metadata. M2: text queries only. Errors are {code,message,hint} (Validation when the bucket lacks an [ingest.<bucket>] section)."
+        description = "Search an ingest-configured bucket's files: the query text is embedded once per configured embedder, each derived index is queried (topK 1..=1000, optional $-operator filter), and the per-index rankings are merged (rrf). Pass rerank: true to re-score the topK hits with the bucket's cross-encoder (needs rerank = true in vectorfs.toml; text queries, non-keyword mode) — hits come back in rerank order with raw-logit scores. Every hit carries content{text,type}, score, index, key, location{type:'source',key} (the source file to read with get) and metadata. M2: text queries only. Errors are {code,message,hint} (Validation when the bucket lacks an [ingest.<bucket>] section)."
     )]
     async fn search(&self, p: Parameters<SearchParams>) -> CallToolResult {
         match self.call_search(p.0).await {
@@ -705,6 +712,7 @@ impl VfMcp {
             // always sent (the CLI does the same): semantic is the default
             // and the server owns the closed-set validation
             "searchMode": p.mode.as_deref().unwrap_or("semantic"),
+            "rerank": p.rerank,
             "topK": p.top_k,
             "returnText": p.return_text,
             "filter": p.filter.clone().filter(|f| !f.is_null()),
@@ -1324,6 +1332,7 @@ mod tests {
         // search: hit shape carries the source location (回源 join)
         let se = vf
             .search(Parameters(SearchParams {
+                rerank: false,
                 bucket: "docs".into(),
                 text: Some("fox".into()),
                 image_path: None,
@@ -1362,6 +1371,7 @@ mod tests {
         // search on a bucket without an ingest section: structured guidance
         let se = vf
             .search(Parameters(SearchParams {
+                rerank: false,
                 bucket: "other".into(),
                 text: Some("x".into()),
                 image_path: None,
@@ -1384,6 +1394,7 @@ mod tests {
         let cases: Vec<(SearchParams, &str)> = vec![
             (
                 SearchParams {
+                    rerank: false,
                     bucket: "docs".into(),
                     text: Some("t".into()),
                     image_path: Some("x.png".into()),
@@ -1396,6 +1407,7 @@ mod tests {
             ),
             (
                 SearchParams {
+                    rerank: false,
                     bucket: "docs".into(),
                     text: None,
                     image_path: None,
@@ -1408,6 +1420,7 @@ mod tests {
             ),
             (
                 SearchParams {
+                    rerank: false,
                     bucket: "docs".into(),
                     text: None,
                     image_path: Some("no-such-file.png".into()),
@@ -1420,6 +1433,7 @@ mod tests {
             ),
             (
                 SearchParams {
+                    rerank: false,
                     bucket: "docs".into(),
                     text: None,
                     image_path: Some("pic.gif".into()),

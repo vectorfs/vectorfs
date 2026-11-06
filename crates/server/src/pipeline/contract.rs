@@ -675,6 +675,101 @@ fn assert_total_order(hits: &[Hit]) {
 }
 
 // ---------------------------------------------------------------------------
+// Reranker (M3-T11, §5.10.2 "Reranker（M3 补）" contract minimums)
+// ---------------------------------------------------------------------------
+
+/// Run the reranker contract against `r` (async: the axis method is an
+/// `async_trait` method). §5.10.2's minimum assertions for the fourth
+/// axis, made executable:
+///
+/// * **分数全序确定** (deterministic total order): scores non-increasing,
+///   equal-score runs ordered by key ascending — the `merge_contract`
+///   tie-break discipline, checked by the same helper;
+/// * **tie-break by key**: duplicates that SCORE identically (an empty
+///   second member, e.g.) still come back in a fixed key order;
+/// * **candidates 顺序不影响重排结果** (order independence — the axis's
+///   headline numeric-determinism clause): the same candidate SET in a
+///   PERMUTED order produces the byte-identical output (same keys, same
+///   scores, same order), twice over (determinism of the determinism);
+/// * **rerank re-orders, never filters**: one hit per input candidate,
+///   the union preserved, no duplicates invented;
+/// * no NaN/Inf scores; empty input → empty output.
+pub async fn reranker_contract<R: super::Reranker + ?Sized>(r: &R) {
+    // a candidate set with a real score spread + a forced near-tie shape
+    // (two empty texts score identically; the tie-break must order them)
+    let cands: Vec<super::RerankCandidate> = [
+        ("k-d", "the quick brown fox embeds"),
+        ("k-a", "alpha contract probe"),
+        ("k-e", ""),
+        ("k-b", "beta second chunk embeds the fox"),
+        ("k-c", ""),
+        ("k-f", "vectorfs"),
+    ]
+    .iter()
+    .map(|(k, t)| super::RerankCandidate::new(*k, *t))
+    .collect();
+
+    let out = r.rerank("contract probe", &cands).await.expect("rerank");
+    // re-orders, never filters: same key set
+    let mut keys: Vec<&str> = out.iter().map(|h| h.key.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["k-a", "k-b", "k-c", "k-d", "k-e", "k-f"]);
+    // deterministic total order (score desc, tie-break by key asc)
+    assert_total_order(&out);
+    for h in &out {
+        assert!(h.score.is_finite(), "non-finite rerank score: {h:?}");
+    }
+
+    // ORDER INDEPENDENCE (the axis's own clause): permuted input ->
+    // byte-identical output. Attention-masked rows are independent, but
+    // float reduction order varies with batch SHAPE — implementations
+    // must pin the batch composition to the candidate SET (the built-in
+    // key-sorts before packing), and this assertion is the pin.
+    let mut perm: Vec<super::RerankCandidate> = cands.clone();
+    perm.reverse();
+    let out_rev = r.rerank("contract probe", &perm).await.expect("rerank rev");
+    assert_eq!(out, out_rev, "reversed candidates changed the result");
+    let rot = vec![
+        cands[3].clone(),
+        cands[0].clone(),
+        cands[5].clone(),
+        cands[2].clone(),
+        cands[4].clone(),
+        cands[1].clone(),
+    ];
+    let out_rot = r.rerank("contract probe", &rot).await.expect("rerank rot");
+    assert_eq!(out, out_rot, "rotated candidates changed the result");
+    // and determinism of the determinism: same call again, same output
+    let again = r
+        .rerank("contract probe", &cands)
+        .await
+        .expect("rerank 2nd");
+    assert_eq!(out, again);
+
+    // a different QUERY is allowed to change the scores (it must not
+    // change the key set)
+    let other_q = r
+        .rerank("a very different query", &cands)
+        .await
+        .expect("rerank q2");
+    let mut keys2: Vec<&str> = other_q.iter().map(|h| h.key.as_str()).collect();
+    keys2.sort_unstable();
+    assert_eq!(keys, keys2, "query changes scores, never the key set");
+    assert_total_order(&other_q);
+
+    // empty input -> empty output, no panic
+    assert!(r.rerank("q", &[]).await.expect("empty rerank").is_empty());
+    // single candidate: passthrough shape
+    let one = r
+        .rerank("q", &[super::RerankCandidate::new("only", "one doc")])
+        .await
+        .expect("single rerank");
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].key, "only");
+    assert!(one[0].score.is_finite());
+}
+
+// ---------------------------------------------------------------------------
 // built-in runs (the LSP defense line: a regression in a built-in kind
 // trips here, not in a user's ingest)
 // ---------------------------------------------------------------------------
@@ -853,6 +948,51 @@ mod tests {
         // Image; query = Image + Text — the text tower ships with the kind)
         assert_eq!(e.doc_modalities(), &[Modality::Image]);
         assert_eq!(e.query_modalities(), &[Modality::Image, Modality::Text]);
+    }
+
+    /// Deterministic pseudo-reranker: score = sha256(key) -> f64 — a THIRD
+    /// grade of test double alongside the real kind: the LSP canary for
+    /// third-party rerankers (the ShaEmbedder precedent), proving the
+    /// contract suite passes an implementation with QUITE different score
+    /// semantics (query-independent, key-only) while demanding exactly the
+    /// axis's order/tie/union discipline.
+    struct ShaReranker;
+
+    #[async_trait::async_trait]
+    impl crate::pipeline::Reranker for ShaReranker {
+        async fn rerank(
+            &self,
+            _query: &str,
+            candidates: &[crate::pipeline::RerankCandidate],
+        ) -> Result<Vec<Hit>, PipelineError> {
+            use sha2::Digest;
+            let mut hits: Vec<Hit> = candidates
+                .iter()
+                .map(|c| {
+                    let b = sha2::Sha256::digest(c.key.as_bytes());
+                    let n = u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+                    Hit {
+                        key: c.key.clone(),
+                        score: (n % 10_000) as f64 / 10_000.0,
+                    }
+                })
+                .collect();
+            hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.key.cmp(&b.key)));
+            Ok(hits)
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_reranker_passes_reranker_contract() {
+        reranker_contract(&ShaReranker).await;
+    }
+
+    #[tokio::test]
+    async fn cross_encoder_kind_passes_reranker_contract() {
+        // the REAL cross-encoder kind against the committed tiny fixture +
+        // the real .so (locator panics with fetch guidance if missing)
+        let r = crate::pipeline::rerank::cross_encoder::tests::reranker_or_panic().await;
+        reranker_contract(&r).await;
     }
 
     /// Deterministic pseudo-embedding: sha256(dim_index + text) -> one f32
