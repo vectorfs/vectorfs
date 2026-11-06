@@ -4,13 +4,13 @@
 //! These are PUBlic assertion suites, not just our own tests: any future
 //! implementation (community kind, wasm plugin in v2) runs the SAME suite to
 //! be admitted — `#[cfg(test)]` below runs it against the built-ins
-//! (`txt`, `pdf-text`, `md`, `pdf-inspector`, `pdf-pages` and `image`
-//! through the image-extractor twin, `token-window`, the real `ort`
-//! kind over the committed tiny ONNX fixture + the real .so, the real
-//! `openai` kind over an in-process fake provider, the real `siglip2` kind
-//! over its committed tiny fixture + the real .so via the image-route
-//! twin) and a local mock embedder kept as the LSP canary for third-party
-//! implementations.
+//! (`txt`, `pdf-text`, `md`, `pdf-inspector`, `pdf-pages`, `docx` and `html`
+//! (M3-T6), `image` through the image-extractor twin, `token-window` and
+//! `markdown` (M3-T6), the real `ort` kind over the committed tiny ONNX
+//! fixture + the real .so, the real `openai` kind over an in-process fake
+//! provider, the real `siglip2` kind over its committed tiny fixture + the
+//! real .so via the image-route twin) and a local mock embedder kept as the
+//! LSP canary for third-party implementations.
 //!
 //! Assertions panic on violation (assertion-suite convention); callers wrap
 //! them in whatever test harness they use.
@@ -574,6 +574,7 @@ fn assert_total_order(hits: &[Hit]) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::chunk::markdown::MarkdownChunker;
     use super::super::chunk::token_window::TokenWindowChunker;
     use super::super::embed::openai;
     use super::super::embed::ort;
@@ -653,10 +654,57 @@ mod tests {
     }
 
     #[test]
+    fn docx_kind_passes_extractor_contract() {
+        // M3-T6: pure-Rust kinds (zip + quick-xml, no .so) through the
+        // standard suite; the sample is CJK-dense so the truncation half
+        // cuts the zip's central directory — detected, Err
+        extractor_contract(
+            &super::super::extract::docx::DocxExtractor,
+            (
+                super::super::extract::docx::tests::minimal_docx(&[
+                    "汉字段落内容一，足够长以覆盖截断。",
+                    "second paragraph with latin text",
+                ])
+                .as_slice(),
+                super::super::extract::docx::tests::DOCX_MIME,
+            ),
+        );
+    }
+
+    #[test]
+    fn html_kind_passes_extractor_contract() {
+        // M3-T6: html5ever recovery makes truncated halves legal HTML with
+        // partial text (the contract's Ok-on-truncation allowance — HTML5
+        // has no framing to detect), and the tag-soup body exercises the
+        // parser's recovery paths inside a contract run
+        extractor_contract(
+            &super::super::extract::html::HtmlExtractor,
+            (
+                "<html><head><title>t</title></head><body><h1>标题</h1><script>if (a<b) {}\
+                 </script><p>汉字正文段落，含<b>加粗</b>与 AT&T。</p></body></html>"
+                    .as_bytes(),
+                "text/html",
+            ),
+        );
+    }
+
+    #[test]
     fn token_window_passes_chunker_contract() {
         let c = TokenWindowChunker::new(8, 3).unwrap();
         chunker_contract(&c, 8, 3);
         let c = TokenWindowChunker::new(4, 2).unwrap();
+        chunker_contract(&c, 4, 2);
+    }
+
+    #[test]
+    fn markdown_chunker_passes_chunker_contract() {
+        // M3-T6: the axis's second kind through the SAME suite — the
+        // concatenation/overlap/budget invariants are kind-independent
+        // (the shared windowing recurrence), so the markdown oracle must
+        // satisfy them on the contract's plain/CJK samples too
+        let c = MarkdownChunker::new(8, 3).unwrap();
+        chunker_contract(&c, 8, 3);
+        let c = MarkdownChunker::new(4, 2).unwrap();
         chunker_contract(&c, 4, 2);
     }
 

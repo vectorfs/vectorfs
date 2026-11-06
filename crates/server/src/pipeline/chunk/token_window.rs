@@ -16,38 +16,11 @@
 //! the T2 chunker contract — exact per-character overlap alignment and the
 //! lossless concatenation invariant. The contract is the hard gate
 //! (§5.10.2: "拼接不变量(块串接 ≡ 原文, overlap 计入)"), so the overlap itself
-//! is implemented HERE, exactly, by slicing the ORIGINAL text:
-//!
-//! ```text
-//! windows are text[s_0..e_0], text[s_1..e_1], … with
-//!   s_0 = 0,  e_last = len (full coverage),
-//!   s_i = e_(i-1) - overlap  (exact char overlap with the previous window),
-//!   e_i = the largest semantic cut in (s_i + overlap, s_i + size]
-//!         or the arithmetic fallback s_i + size (T2 behavior).
-//! ```
-//!
-//! Given those definitions, with all windows being slices of one original
-//! `char` sequence:
-//!
-//! * **overlap alignment**: the last `overlap` chars of window i-1 are
-//!   `text[e_(i-1)-overlap .. e_(i-1)]`, which IS the first `overlap` chars
-//!   of window i — byte-for-byte, by construction;
-//! * **reconstruction**: `window_0 + Σ chars(overlap..) of window_i`
-//!   = `text[0..e_0] + Σ text[e_(i-1)..e_i]` = the original text — chunking
-//!   is lossless w.r.t. the extractor's output, whitespace included
-//!   (text-splitter's trimming never touches us: we only borrow its cut
-//!   positions, then slice the original);
-//! * **CJK safety**: slices are taken on `char` boundaries of the original
-//!   `String` (the contract's String-equality reconstruction doubles as the
-//!   no-mid-glyph proof);
-//! * **size budget**: every window ≤ `size` chars (semantic ends are only
-//!   accepted within the budget; the tail window is emitted when the
-//!   remaining text fits one window);
-//! * **termination/progress**: every non-final end satisfies
-//!   `e > s + overlap` (semantic ends are only accepted above
-//!   `s + overlap`, the arithmetic fallback is `s + size > s + overlap` —
-//!   `overlap < size` is startup-validated), so the next start
-//!   `s' = e - overlap > s` strictly advances.
+//! is implemented LOCALLY, exactly, by slicing the ORIGINAL text — since
+//! M3-T6 (the markdown kind, the axis's second) the recurrence lives in the
+//! axis-shared [`super::windowing`] module with its invariant proofs; this
+//! kind supplies the generic-prose oracle, the markdown kind the
+//! heading-aware one.
 //!
 //! What changed vs the T2 arithmetic windows: windows may now end EARLIER
 //! than `s + size` (at a paragraph/sentence/word boundary) and therefore
@@ -127,36 +100,6 @@ impl TokenWindowChunker {
             .map(|c| c.char_offset + c.chunk.chars().count())
             .collect()
     }
-
-    /// Window the text per the module-doc recurrence. Returns char-index
-    /// ranges; `chunk()` materializes them into `String`s.
-    fn window_ranges(&self, char_len: usize, cuts: &[usize]) -> Vec<(usize, usize)> {
-        let mut out = Vec::new();
-        let mut s = 0usize;
-        loop {
-            if char_len - s <= self.size {
-                // everything left fits one window — the tail window. Its
-                // length is > overlap whenever a window preceded it (the
-                // previous end left >= 1 char uncovered), satisfying the
-                // contract's last-window rule.
-                out.push((s, char_len));
-                return out;
-            }
-            // Non-final end: prefer the largest SEMANTIC cut inside the
-            // budget that still leaves more than `overlap` chars of fresh
-            // content (see module docs for why each bound matters).
-            let hi = s + self.size;
-            let lo = s + self.overlap + 1;
-            let end = cuts
-                .iter()
-                .rev()
-                .find(|&&c| c >= lo && c <= hi)
-                .copied()
-                .unwrap_or(hi);
-            out.push((s, end));
-            s = end - self.overlap;
-        }
-    }
 }
 
 impl Chunker for TokenWindowChunker {
@@ -179,7 +122,8 @@ impl Chunker for TokenWindowChunker {
             // CJK glyphs can never be halved.
             let chars: Vec<char> = part.text.chars().collect();
             let cuts = Self::semantic_cuts(&part.text, self.size);
-            for (s, e) in self.window_ranges(chars.len(), &cuts) {
+            let ranges = super::windowing::ranges(self.size, self.overlap, chars.len(), &cuts);
+            for (s, e) in ranges {
                 out.push(Chunk {
                     index,
                     text: chars[s..e].iter().collect(),

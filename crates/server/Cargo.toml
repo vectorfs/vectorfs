@@ -196,14 +196,66 @@ pdf-inspector = "1.25"
 # stream directly, so both are dead weight. MIT.
 pulldown-cmark = { version = "0.13", default-features = false }
 
-# token-window chunker: semantic text splitting with CHARACTER counting (the
-# §5.7 line: "text-splitter char 计数, 禁 tiktoken 联网特性"). text-splitter
-# 0.33 has NO default features — the tokenizers/tiktoken-rs/code/markdown
-# features are all opt-in and all stay OFF, so nothing model-shaped or
-# network-capable enters the tree. We consume its semantic split points and
+# docx extractor (M3-T6): unzip the OOXML package to reach word/document.xml.
+# zip 9.4, default-features = false drops the default codec grab-bag (aes
+# crypto, bzip2, deflate64, lzma/ppmd, xz, zstd, time crates); the ONE
+# feature kept is `deflate-flate2` = dep:flate2 — the SAME flate2 1.1 this
+# tree already compiles (normalize's gz transform + the lance/reqwest chain),
+# and the tree's `default-features = false, rust_backend` declaration keeps
+# the backend pinned to miniz_oxide (no C zlib can enter through zip: flate2
+# feature unification, verified via cargo tree). Runtime deps zip 9.4 itself
+# brings are all already in the lock (crc32fast, indexmap, memchr, getrandom
+# 0.4, nix) plus one new small pure-Rust crate (typed-path, MIT OR
+# Apache-2.0). This is also the FOUNDATION dependency for T7's epub
+# container kind and the general zip normalize transform — deflate
+# decompression is the codec those need too, so the feature set deliberately
+# does not grow beyond it. MIT.
+zip = { version = "9.4", default-features = false, features = ["deflate-flate2"] }
+
+# docx extractor (M3-T6): pull-event XML text extraction from
+# word/document.xml (w:t runs, w:p paragraph framing). quick-xml 0.41 is
+# ALREADY in the lock as object_store's dependency — declaring it directly
+# adds ZERO new crates (the percent-encoding/sha2 discipline). No features:
+# `escape-html` (HTML5 named entities in unescape) stays OFF because
+# document.xml is strict XML — only the five predefined entities and numeric
+# character references resolve, anything else is a corrupt file and errs
+# loudly. Reader default config keeps end-name checking ON: well-formed
+# OOXML is the contract. MIT.
+quick-xml = { version = "0.41", default-features = false }
+
+# html extractor (M3-T6): the WHATWG-compliant HTML5 parser (servo lineage).
+# Parser CHOICE was settled empirically (the selection note in
+# extract/html.rs has the bench): real-world HTML is tag soup by
+# specification, and a lenient-XML reader (quick-xml check_end_names=false)
+# was measured SILENTLY LOSING the rest of the page on `<script>` bodies
+# containing `<` and hard-erroring on bare `&` (query strings) — two shapes
+# every real page contains. html5ever parses both correctly because that is
+# its specification. default-features = false (the crate's default is
+# already empty; this pins it); no `serde`, no `trace_tokenizer`. New
+# transitive crates: markup5ever, tendril, web_atoms, string_cache, phf
+# 0.14 line, siphasher, new_debug_unreachable, precomputed-hash — all pure
+# Rust, MIT OR Apache-2.0 / Unicode-DFS (deny green). The RcDom sink is
+# hand-rolled in extract/html.rs (~150 lines, the arena is Rc-nodes): the
+# upstream markup5ever_rcdom crate is UNOFFICIAL and pins html5ever 0.33 —
+# taking it would compile a SECOND html5ever copy into the binary. MIT OR
+# Apache-2.0.
+html5ever = { version = "0.40", default-features = false }
+
+# token-window + markdown chunkers (markdown = M3-T6, the chunker axis's
+# second kind): semantic text splitting with CHARACTER counting (the §5.7
+# line: "text-splitter char 计数, 禁 tiktoken 联网特性"). text-splitter 0.33
+# has NO default features — the tokenizers/tiktoken-rs/code features stay
+# OFF, so nothing model-shaped or network-capable enters the tree. The
+# `markdown` feature (opt-in since the M2 landing, enabled by T6) pulls
+# pulldown-cmark 0.13 default-features = false — the EXACT crate, version
+# and feature set the md extractor above already declares, so feature
+# unification adds ZERO new crates (verified by `cargo tree` at landing:
+# no new node in the graph). Both kinds consume semantic split points and
 # enforce the exact char-overlap window invariant locally (token_window.rs
 # has the rationale). MIT.
-text-splitter = { version = "0.33", default-features = false }
+text-splitter = { version = "0.33", default-features = false, features = [
+  "markdown",
+] }
 
 # M3-T1 image modality (design.md §5.10.2 modality axis): the T1 mechanism
 # use is the magic sniff in ImagePayload::validate (image::guess_format —

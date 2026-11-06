@@ -1,6 +1,13 @@
-//! Chunker axis: closed-enum registration + dispatch (M2 T2).
+//! Chunker axis: closed-enum registration + dispatch (M2 T2; the axis's
+//! registration mechanism completed in M3-T6 when `markdown` became the
+//! SECOND kind — the availability string, the label table, `kind_label`
+//! and `from_config` are four views of one registry, parity-pinned, the
+//! same anchor discipline the extractor/embedder axes already had).
 //!
-//! Available kinds (M2): `token-window`. Markdown chunker lands in M3.
+//! Available kinds: `token-window` (M2), `markdown` (M3-T6 —
+//! heading-boundary-first cuts through text-splitter's MarkdownSplitter,
+//! same exact-overlap window recurrence via the shared [`windowing`]
+//! module).
 //!
 //! # Modality dispatch lives HERE, in the axis (§5.10.2, M3-T1)
 //!
@@ -12,16 +19,34 @@
 //! image atoms share ONE counter across all parts) is assigned in one
 //! place.
 
+pub mod markdown;
 pub mod token_window;
+pub mod windowing;
 
 use super::{Chunk, Chunker, Modality, Part, PipelineError};
+use markdown::{MarkdownChunker, MarkdownConfig};
 use token_window::{TokenWindowChunker, TokenWindowConfig};
+
+/// The available-kind list embedded in unknown-kind errors. Derived view of
+/// [`KIND_LABELS`] (the parity test pins the two together — a new kind that
+/// updates the enum but forgets the string fails there, not in a user's
+/// error message).
+pub const CHUNKER_KINDS: &str = "token-window, markdown";
+
+/// Every kind's config label, IN AVAILABILITY-LIST ORDER — the axis twin of
+/// the extractor axis's identity anchor: `kind_label` (the exhaustive match
+/// the compiler walks on a new variant) must agree with this table row for
+/// row (the `kind_registry_views_agree` test walks it). A new kind lands
+/// here, in `kind_label`, and in `from_config` in one diff — everything
+/// else in this module is exhaustive dispatch the compiler already checks.
+pub const KIND_LABELS: &[&str] = &["token-window", "markdown"];
 
 /// Registered chunker kinds (same registration pattern as
 /// [`crate::pipeline::extract::ExtractorKind`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChunkerKind {
     TokenWindow(TokenWindowChunker),
+    Markdown(MarkdownChunker),
 }
 
 impl ChunkerKind {
@@ -49,12 +74,35 @@ impl ChunkerKind {
                     .map(ChunkerKind::TokenWindow)
                     .map_err(|m| PipelineError::config(format!("[{section}]: {m}"), line))
             }
+            "markdown" => {
+                let cfg: MarkdownConfig =
+                    raw.clone().try_into().map_err(|e: toml::de::Error| {
+                        super::config::stage2_error(section, Some(&kind), e.message(), line)
+                    })?;
+                // same window sanity, same startup discipline (the shared
+                // recurrence depends on 0 < overlap < size)
+                MarkdownChunker::new(cfg.size, cfg.overlap)
+                    .map(ChunkerKind::Markdown)
+                    .map_err(|m| PipelineError::config(format!("[{section}]: {m}"), line))
+            }
             other => Err(PipelineError::config(
                 format!(
-                    "[{section}]: unknown chunker kind '{other}' (available kinds: token-window)"
+                    "[{section}]: unknown chunker kind '{other}' (available kinds: \
+                     {CHUNKER_KINDS})"
                 ),
                 line,
             )),
+        }
+    }
+
+    /// The kind's REGISTRY label — the `kind = "…"` config string, one per
+    /// variant, exhaustively matched so a new kind MUST land here (the
+    /// compiler walks it; [`KIND_LABELS`] and the parity test then force the
+    /// table views to agree). Unlike [`Self::describe`] this is knob-free.
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            ChunkerKind::TokenWindow(_) => "token-window",
+            ChunkerKind::Markdown(_) => "markdown",
         }
     }
 
@@ -64,81 +112,89 @@ impl ChunkerKind {
             ChunkerKind::TokenWindow(c) => {
                 format!("token-window(size={}, overlap={})", c.size, c.overlap)
             }
-        }
-    }
-}
-
-/// Dispatch: the enum IS the chunker — and the enum layer is where the
-/// §5.10.2 modality split happens (see module docs).
-impl Chunker for ChunkerKind {
-    fn chunk(&self, parts: &[Part]) -> Result<Vec<Chunk>, PipelineError> {
-        match self {
-            ChunkerKind::TokenWindow(c) => {
-                // Walk the parts in order, chunking each maximal run of
-                // TEXT parts through the kind (a sub-slice, so a text-only
-                // input is ONE call — byte-identical to the pre-image
-                // behavior) and materializing every image part as ONE
-                // atomic chunk at its position. Indices are (re)assigned
-                // GLOBALLY here — the "sequential across all parts"
-                // invariant is the axis's guarantee now, independent of
-                // how any kind numbers its own output.
-                let mut out: Vec<Chunk> = Vec::new();
-                let mut next_index: u32 = 0;
-                let mut run_start = 0usize;
-                let flush_text_run = |run: &[Part],
-                                      out: &mut Vec<Chunk>,
-                                      next_index: &mut u32|
-                 -> Result<(), PipelineError> {
-                    for mut ch in c.chunk(run)? {
-                        ch.index = *next_index;
-                        *next_index += 1;
-                        out.push(ch);
-                    }
-                    Ok(())
-                };
-                for (i, part) in parts.iter().enumerate() {
-                    match part.modality {
-                        Modality::Text => {}
-                        Modality::Image => {
-                            // the payload pairing is a constructor invariant;
-                            // a hand-built part without it is a mechanism bug
-                            // and must fail visibly, not chunk "nothing"
-                            let payload = part.image.clone().ok_or_else(|| {
-                                PipelineError::chunk(format!(
-                                    "part {} declares modality image but carries no image \
-                                     payload — an image part without bytes cannot be chunked",
-                                    i
-                                ))
-                            })?;
-                            // bytes-vs-mime honesty at the seam (garbage or a
-                            // wrong declaration refuses HERE, with the file
-                            // FAILED loudly — never a silent empty-ish chunk)
-                            payload.validate()?;
-                            flush_text_run(&parts[run_start..i], &mut out, &mut next_index)?;
-                            out.push(Chunk {
-                                index: next_index,
-                                text: String::new(),
-                                image: Some(payload),
-                            });
-                            next_index += 1;
-                            run_start = i + 1;
-                        }
-                    }
-                }
-                flush_text_run(&parts[run_start..], &mut out, &mut next_index)?;
-                Ok(out)
+            ChunkerKind::Markdown(c) => {
+                format!("markdown(size={}, overlap={})", c.size, c.overlap)
             }
         }
     }
 }
 
+/// Dispatch: the enum IS the chunker — and the enum layer is where the
+/// §5.10.2 modality split happens (see module docs). The text-run walking
+/// and the image bypass below are AXIS mechanism shared by every kind;
+/// each kind only ever sees a maximal run of Text parts.
+impl Chunker for ChunkerKind {
+    fn chunk(&self, parts: &[Part]) -> Result<Vec<Chunk>, PipelineError> {
+        // Walk the parts in order, chunking each maximal run of TEXT parts
+        // through the kind (a sub-slice, so a text-only input is ONE call —
+        // byte-identical to calling the kind directly) and materializing
+        // every image part as ONE atomic chunk at its position. Indices are
+        // (re)assigned GLOBALLY here — the "sequential across all parts"
+        // invariant is the axis's guarantee now, independent of how any
+        // kind numbers its own output.
+        let chunk_text_run = |run: &[Part]| -> Result<Vec<Chunk>, PipelineError> {
+            match self {
+                ChunkerKind::TokenWindow(c) => c.chunk(run),
+                ChunkerKind::Markdown(c) => c.chunk(run),
+            }
+        };
+        let mut out: Vec<Chunk> = Vec::new();
+        let mut next_index: u32 = 0;
+        let mut run_start = 0usize;
+        let flush_text_run = |run: &[Part],
+                              out: &mut Vec<Chunk>,
+                              next_index: &mut u32|
+         -> Result<(), PipelineError> {
+            for mut ch in chunk_text_run(run)? {
+                ch.index = *next_index;
+                *next_index += 1;
+                out.push(ch);
+            }
+            Ok(())
+        };
+        for (i, part) in parts.iter().enumerate() {
+            match part.modality {
+                Modality::Text => {}
+                Modality::Image => {
+                    // the payload pairing is a constructor invariant;
+                    // a hand-built part without it is a mechanism bug
+                    // and must fail visibly, not chunk "nothing"
+                    let payload = part.image.clone().ok_or_else(|| {
+                        PipelineError::chunk(format!(
+                            "part {} declares modality image but carries no image \
+                             payload — an image part without bytes cannot be chunked",
+                            i
+                        ))
+                    })?;
+                    // bytes-vs-mime honesty at the seam (garbage or a
+                    // wrong declaration refuses HERE, with the file
+                    // FAILED loudly — never a silent empty-ish chunk)
+                    payload.validate()?;
+                    flush_text_run(&parts[run_start..i], &mut out, &mut next_index)?;
+                    out.push(Chunk {
+                        index: next_index,
+                        text: String::new(),
+                        image: Some(payload),
+                    });
+                    next_index += 1;
+                    run_start = i + 1;
+                }
+            }
+        }
+        flush_text_run(&parts[run_start..], &mut out, &mut next_index)?;
+        Ok(out)
+    }
+}
+
 /// Fingerprint-facing serialization: inner config only (the kind tag is a
-/// field of the config struct).
+/// field of the config struct — kind and knobs enter the fingerprint
+/// naturally, no axis-level changes).
 impl serde::Serialize for ChunkerKind {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             // serialize the VALIDATED parameters, not the live chunker
             ChunkerKind::TokenWindow(c) => TokenWindowConfig::from(c).serialize(serializer),
+            ChunkerKind::Markdown(c) => MarkdownConfig::from(c).serialize(serializer),
         }
     }
 }
@@ -176,13 +232,59 @@ mod tests {
 
     #[test]
     fn from_config_unknown_kind() {
-        let raw: toml::Value = toml::from_str("kind = \"markdown\"").unwrap();
+        let raw: toml::Value = toml::from_str("kind = \"sentence\"").unwrap();
         let err = ChunkerKind::from_config("ingest.d.chunk", &raw, None).unwrap_err();
         assert!(
-            err.to_string()
-                .contains("unknown chunker kind 'markdown' (available kinds: token-window)"),
+            err.to_string().contains(
+                "unknown chunker kind 'sentence' (available kinds: token-window, \
+                           markdown)"
+            ),
             "{err}"
         );
+    }
+
+    /// THE parity test (the extractor/embedder axis anchor, landed here with
+    /// the axis's second kind): the availability string, the label table,
+    /// the exhaustive `kind_label` match and `from_config` are four views of
+    /// one registry — a new kind that updates some but not all of them
+    /// fails HERE instead of drifting in production error messages.
+    #[test]
+    fn kind_registry_views_agree() {
+        assert_eq!(CHUNKER_KINDS, KIND_LABELS.join(", "));
+        for label in KIND_LABELS {
+            let raw: toml::Value =
+                toml::from_str(&format!("kind = \"{label}\"\nsize = 32\noverlap = 8")).unwrap();
+            let k = ChunkerKind::from_config("x", &raw, None).unwrap_or_else(|e| {
+                panic!("KIND_LABELS entry {label} must parse: {e}");
+            });
+            assert_eq!(k.kind_label(), *label);
+            // describe carries the label as its head (knobs follow)
+            assert!(k.describe().starts_with(label), "{}", k.describe());
+        }
+        // markdown parses with its own knobs and reports them
+        let raw: toml::Value =
+            toml::from_str("kind = \"markdown\"\nsize = 256\noverlap = 32").unwrap();
+        let k = ChunkerKind::from_config("x", &raw, None).unwrap();
+        assert_eq!(k.describe(), "markdown(size=256, overlap=32)");
+        // unknown fields rejected per kind
+        let raw: toml::Value =
+            toml::from_str("kind = \"markdown\"\nsize = 8\noverlap = 2\nsep = \"\\n\"").unwrap();
+        let err = ChunkerKind::from_config("ingest.d.chunk", &raw, Some(1)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown field 'sep' for kind 'markdown'"),
+            "{err}"
+        );
+        // and its window sanity carries the line
+        let raw: toml::Value =
+            toml::from_str("kind = \"markdown\"\nsize = 8\noverlap = 8").unwrap();
+        let err = ChunkerKind::from_config("ingest.d.chunk", &raw, Some(7)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("markdown chunker requires 0 < overlap < size"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("at line 7"), "{err}");
     }
 
     // ---- M3-T1: the axis-level modality split (image atoms, one index
@@ -283,6 +385,7 @@ mod tests {
         let via_axis = k.chunk(&parts).unwrap();
         let direct = match &k {
             ChunkerKind::TokenWindow(c) => c.chunk(&parts).unwrap(),
+            ChunkerKind::Markdown(_) => unreachable!("kind() builds token-window"),
         };
         assert_eq!(via_axis, direct);
     }

@@ -421,11 +421,15 @@ fn short_key_of(object_key: &str) -> Option<&'static str> {
 /// `pdf-pages` doubly so: it would change the pipeline's modality needs).
 /// The `img` family (M3-T4) stays OUT of `auto` for exactly that second
 /// reason: an auto arm would make every existing `auto` deployment start
-/// claiming image files into pipelines whose embedders are text-only.
+/// claiming image files into pipelines whose embedders are text-only. The
+/// M3-T6 text-face families (`docx`, `html`) stay OUT for the behavior-
+/// expansion half of the same ruling: an auto arm would make existing `auto`
+/// deployments START claiming .docx/.html files overnight — text modality
+/// or not, what a pipeline ingests is the operator's declaration.
 /// Deployments that want the classify-first, no-.so engine, the page-image
-/// route or image files opt in explicitly (`extract = { pdf =
+/// route, image files or the text face opt in explicitly (`extract = { pdf =
 /// "inspector-instance" }`, `pdf = "pages-instance"`, `img =
-/// "image-instance"`).
+/// "image-instance"`, `docx = "…"/`html = "…"`).
 /// M2.1 keeps `auto` a single-member chain: whether it should become a
 /// built-in chain (pdf → pdf-inspector → pdf-text, say) is an M3 ruling,
 /// taken when `pdf-ocr` actually exists to chain onto.
@@ -4805,20 +4809,25 @@ pub(crate) mod tests {
     /// every family the mime table declares must resolve under `auto` — a
     /// table row without a [`builtin_extractor`] arm would silently strand
     /// every `extract = { default = "auto" }` deployment for that family.
-    /// EXEMPTION (M3-T4): `img` is the one deliberate exception — pulling
-    /// image files into every existing `auto` deployment would change their
-    /// modality needs overnight (pdf-pages stayed out of `auto` for the
-    /// same reason); operators opt in with `extract = { img = "…" }`.
+    /// EXEMPTIONS (deliberate, each with its ruling):
+    /// * `img` (M3-T4): pulling image files into every existing `auto`
+    ///   deployment would change their modality needs overnight.
+    /// * `docx`/`html` (M3-T6): both kinds are TEXT-modality, but an auto
+    ///   arm would make every existing `default = "auto"` deployment START
+    ///   claiming .docx/.html files it never touched — the same silent
+    ///   behavior-expansion the image ruling refuses. Operators opt in
+    ///   with `extract = { docx = "…", html = "…" }`.
+    ///
     /// (The cfg(test) `ctn` scaffold key is also exempt: it is scanner-side
     /// claiming only, never an `auto` family.)
     #[test]
     fn auto_mapping_serves_every_mime_family() {
         for (_mime, key) in crate::pipeline::extract::MIME_TO_SHORT_KEY {
-            if *key == "img" {
+            if matches!(*key, "img" | "docx" | "html") {
                 assert!(
                     builtin_extractor(key).is_none(),
-                    "img must stay OUT of auto (the pdf-pages ruling): an auto arm would \
-                     silently re-route every default = \"auto\" deployment into image ingesting"
+                    "{key} must stay OUT of auto (the pdf-pages/image ruling): an auto arm \
+                     would silently expand what every default = \"auto\" deployment claims"
                 );
                 continue;
             }
@@ -5822,6 +5831,219 @@ pub(crate) mod tests {
             "reversed config order must not change the scan's route: {:?}",
             m3.chunks
         );
+    }
+
+    // ---- M3-T6: text face — docx/html sources + markdown chunker, all
+    // through the real worker over committed fixtures ----
+
+    /// Committed text-face fixture directory (a REAL .docx zip package and
+    /// a REAL html page — hermetic, no network, no Office).
+    fn text_face_fixture(name: &str) -> std::path::PathBuf {
+        for p in ["vf/tests/fixtures/text-face", "tests/fixtures/text-face"] {
+            let d = std::path::PathBuf::from(p);
+            if d.join(name).is_file() {
+                return d.join(name);
+            }
+        }
+        panic!("text-face fixture {name} not found under tests/fixtures/text-face/");
+    }
+
+    /// The M3-T6 e2e config: the two text-face extractor instances plus a
+    /// txt passthrough instance (the markdown-chunker e2e routes .md
+    /// through it so the markdown SOURCE reaches the chunker) + the tiny
+    /// fixture embedder; extract entries and the chunker line are
+    /// parameterized.
+    fn text_face_config(extract_entries: &str, chunk: &str) -> PipelineConfig {
+        let text = format!(
+            "[extractor.doc]\nkind = \"docx\"\n\n\
+             [extractor.web]\nkind = \"html\"\n\n\
+             [extractor.plain]\nkind = \"txt\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = \
+             true\n\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ {extract_entries} }}\n\
+             chunk = {chunk}\n\
+             embedders = [\"tiny\"]\nscan_interval_secs = 1",
+            fixture_dir().display().to_string(),
+        );
+        crate::pipeline::config::load_pipeline_config(&text).unwrap()
+    }
+
+    /// THE M3-T6 e2e (the text face closed through the real worker): the
+    /// committed .docx and .html fixtures are claimed, extracted by the
+    /// production kinds (zip+quick-xml / html5ever — no test scaffold in
+    /// the path), chunked, embedded by the tiny fixture embedder — both
+    /// INDEXED with text chunks, and the stored chunk text proves the CJK
+    /// content survived the whole chain (extraction → chunking → metadata).
+    #[tokio::test]
+    async fn docx_and_html_sources_index_through_tiny_embedder() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::copy(text_face_fixture("minimal.docx"), docs.join("note.docx")).unwrap();
+        std::fs::copy(text_face_fixture("page.html"), docs.join("page.html")).unwrap();
+
+        let cfg = text_face_config(
+            "docx = \"doc\", html = \"web\"",
+            "{ kind = \"token-window\", size = 32, overlap = 8 }",
+        );
+        let (rt, _h, state) = runtime_for(dir.path(), &cfg).await;
+        rt.scan_once().await;
+        rt.drain_queue().await;
+
+        for key in ["docs/note.docx", "docs/page.html"] {
+            let m = status_of(&state, "docs", key).await;
+            assert_eq!(m.status, SourceStatus::Indexed, "{key}: {m:?}");
+            assert!(
+                m.chunks
+                    .as_ref()
+                    .unwrap()
+                    .get("text")
+                    .is_some_and(|n| *n >= 1),
+                "{key}: text chunks: {:?}",
+                m.chunks
+            );
+            assert_eq!(m.chunks.as_ref().unwrap().get("image"), None, "{key}");
+        }
+
+        // the derived index: every row text-modality with the source named,
+        // and the CJK content intact in the stored chunk text — per source
+        let spec = rt.shared.core.buckets["docs"].derived["tiny"].clone();
+        let rows = state
+            .storage
+            .scan_vectors("docs", &spec.index_name, None)
+            .await
+            .unwrap();
+        assert!(!rows.is_empty());
+        let texts_of = |name: &str| -> Vec<String> {
+            rows.iter()
+                .filter(|r| {
+                    r.metadata
+                        .as_ref()
+                        .is_some_and(|m| m["x-vf-src-name"] == name)
+                })
+                .map(|r| {
+                    r.metadata.as_ref().unwrap()["x-vf-chunk-text"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+        for row in &rows {
+            let meta = row.metadata.as_ref().unwrap();
+            assert_eq!(meta["x-vf-modality"], "text");
+            assert_eq!(meta["x-vf-model"], "tiny-fixture");
+        }
+        let docx_texts = texts_of("docs/note.docx");
+        assert!(!docx_texts.is_empty());
+        assert!(
+            docx_texts.iter().any(|t| t.contains("向量化管线测试文档")),
+            "docx CJK paragraph survived the chain: {docx_texts:?}"
+        );
+        assert!(
+            docx_texts.iter().any(|t| t.contains("Second paragraph")),
+            "docx latin paragraph survived: {docx_texts:?}"
+        );
+        let html_texts = texts_of("docs/page.html");
+        assert!(
+            html_texts.iter().any(|t| t.contains("测试页面标题")),
+            "html CJK heading survived: {html_texts:?}"
+        );
+        assert!(
+            html_texts.iter().any(|t| t.contains("第一段正文")),
+            "html CJK body survived: {html_texts:?}"
+        );
+        // the html chain's noise contract, end to end: title/script/style
+        // never reached any chunk
+        for t in html_texts.iter().chain(docx_texts.iter()) {
+            assert!(!t.contains("Ignored Title"), "head title leaked: {t:?}");
+            assert!(!t.contains("console.log"), "script body leaked: {t:?}");
+            assert!(!t.contains("color: red"), "style body leaked: {t:?}");
+        }
+    }
+
+    /// The markdown chunker's heading semantics through the real worker: a
+    /// .md file routed through the txt kind (byte passthrough — the
+    /// markdown SOURCE reaches the chunker), sections sized to fit one
+    /// window but never two — every chunk belongs to ONE heading, and no
+    /// chunk spans a heading boundary.
+    #[tokio::test]
+    async fn markdown_chunker_heading_split_through_the_worker() {
+        // 40 body chars per section under size 64: one section fits, two
+        // never do — heading edges are the only sensible cuts
+        let section = |name: &str, i: usize| {
+            format!("# Heading {name}\nbody text {i:02} aaaa bbbb cccc dddd\n\n")
+        };
+        let mut md = String::new();
+        md.push_str(&section("one", 0));
+        md.push_str(&section("two", 1));
+        md.push_str(&section("three", 2));
+
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("doc.md"), &md).unwrap();
+
+        // md = "plain": the txt kind passes the markdown bytes through
+        // (extraction vs chunking are different axes — the user's choice)
+        let cfg = text_face_config(
+            "md = \"plain\"",
+            "{ kind = \"markdown\", size = 64, overlap = 8 }",
+        );
+        let (rt, _h, state) = runtime_for(dir.path(), &cfg).await;
+        rt.scan_once().await;
+        rt.drain_queue().await;
+
+        let m = status_of(&state, "docs", "docs/doc.md").await;
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
+        let n_chunks = m.chunks.as_ref().unwrap()["text"];
+        assert!(n_chunks >= 3, "three sections, none shareable: {m:?}");
+
+        let spec = rt.shared.core.buckets["docs"].derived["tiny"].clone();
+        let rows = state
+            .storage
+            .scan_vectors("docs", &spec.index_name, None)
+            .await
+            .unwrap();
+        assert_eq!(rows.len() as u32, n_chunks, "one vector per chunk");
+        // THE heading-split assertions: same-heading content stays in one
+        // chunk; different headings never share one
+        for row in &rows {
+            let t = row.metadata.as_ref().unwrap()["x-vf-chunk-text"]
+                .as_str()
+                .unwrap();
+            let headings = t.matches("Heading").count();
+            assert!(headings <= 1, "a chunk spans {headings} headings: {t:?}");
+            // a heading and ITS body stay together
+            if t.contains("Heading one") {
+                assert!(
+                    t.contains("body text 00"),
+                    "heading detached from body: {t:?}"
+                );
+                assert!(!t.contains("Heading two"), "{t:?}");
+            }
+            if t.contains("Heading two") {
+                assert!(t.contains("body text 01"), "{t:?}");
+                assert!(!t.contains("Heading three"), "{t:?}");
+            }
+        }
+        // all three sections' content reached the index
+        let all: String = rows
+            .iter()
+            .map(|r| {
+                r.metadata.as_ref().unwrap()["x-vf-chunk-text"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        for want in [
+            "Heading one",
+            "Heading two",
+            "Heading three",
+            "body text 02",
+        ] {
+            assert!(all.contains(want), "missing {want}: {all:?}");
+        }
     }
 
     /// The child three-state vocabulary on the failure side: a child with NO

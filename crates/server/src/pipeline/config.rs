@@ -1276,6 +1276,34 @@ index-prefix = "docs"
     }
 
     #[test]
+    fn fingerprint_chunker_kind_and_knobs_enter_naturally() {
+        // M3-T6 (the chunker axis's second kind): the fingerprint serializes
+        // the INNER config — kind tag and knobs are plain fields of it, so
+        // switching chunker kind (or turning a knob) MUST move the digest
+        // with zero fingerprint-mechanism changes. This test is the
+        // verification, not the mechanism.
+        let chunked = |chunk: &str| {
+            let text = format!(
+                "[extractor.insp]\nkind = \"pdf-inspector\"\n\n\
+                 [ingest.ddd]\nextract = {{ pdf = \"insp\" }}\nchunk = {chunk}"
+            );
+            crate::pipeline::config::load_pipeline_config(&text)
+                .unwrap()
+                .fingerprint("ddd")
+                .unwrap()
+        };
+        let tw = chunked("{ kind = \"token-window\", size = 32, overlap = 8 }");
+        let md = chunked("{ kind = \"markdown\", size = 32, overlap = 8 }");
+        assert_ne!(tw, md, "the chunker KIND moves the fingerprint");
+        // knobs move it too (same kind, different overlap; and a different
+        // size on the other kind — every field of the inner config counts)
+        let md_wide = chunked("{ kind = \"markdown\", size = 32, overlap = 16 }");
+        assert_ne!(md, md_wide);
+        let tw_wide = chunked("{ kind = \"token-window\", size = 64, overlap = 8 }");
+        assert_ne!(tw, tw_wide);
+    }
+
+    #[test]
     fn embedder_sections_parse_for_real_kinds() {
         // the §5.10.4 sample shape, verbatim intent: ort default model +
         // openai remote + air-gapped variant

@@ -9,10 +9,15 @@
 //! coexist behind the one `pdf` short key, selection is explicit),
 //! `pdf-pages` (M3-T3, the third PDF kind and the first IMAGE-output kind:
 //! pdfium renders each page to a PNG Part — same short key again, the
-//! two-kinds-one-key precedent extended to a text/image pair), and `image`
+//! two-kinds-one-key precedent extended to a text/image pair), `image`
 //! (M3-T4, the image FILE kind: one verbatim image Part behind the new
 //! `img` short key — the first family key carried by TWO mime rows,
-//! jpeg + png).
+//! jpeg + png), and `docx` + `html` (M3-T6, the text face: the Word
+//! document kind behind its own `docx` key — a LEAF per the §0 criterion,
+//! see extract/docx.rs — and the HTML document kind behind `html`,
+//! html5ever under the hood per the selection note in extract/html.rs; the
+//! html chain is also T7's epub-chapter route by construction, zero
+//! special-casing either side).
 //! Since M2.1 step 2 every kind also declares its per-[`ContentClass`]
 //! affinity (kind module `affinity`/`refusal_note` free functions, dispatched
 //! exhaustively below) — the ingest router consumes those declarations to
@@ -25,6 +30,8 @@
 //! the one table below so kind names, config keys and mime gates can never
 //! drift apart (single source of truth, pub for the T3 ingest worker).
 
+pub mod docx;
+pub mod html;
 pub mod image;
 pub mod md;
 pub mod pdf_inspector;
@@ -33,6 +40,8 @@ pub mod pdf_text;
 pub mod txt;
 
 use super::{ChildDoc, ContentClass, Extractor, Fit, Modality, Part, PipelineError};
+use docx::{DocxConfig, DocxExtractor};
+use html::{HtmlConfig, HtmlExtractor};
 use image::{ImageConfig, ImageExtractor};
 use md::{MdConfig, MdExtractor};
 use pdf_inspector::{PdfInspectorConfig, PdfInspectorExtractor};
@@ -49,8 +58,13 @@ use txt::{TxtConfig, TxtExtractor};
 /// table is the single mapping both directions consult.
 pub const MIME_TO_SHORT_KEY: &[(&str, &str)] = &[
     ("application/pdf", "pdf"),
+    (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "docx",
+    ),
     ("image/jpeg", "img"),
     ("image/png", "img"),
+    ("text/html", "html"),
     ("text/markdown", "md"),
     ("text/plain", "txt"),
 ];
@@ -59,7 +73,7 @@ pub const MIME_TO_SHORT_KEY: &[(&str, &str)] = &[
 /// [`KIND_LABELS`] (the parity test pins the two together — a new kind that
 /// updates the enum but forgets the string fails there, not in a user's
 /// error message).
-pub const EXTRACTOR_KINDS: &str = "txt, pdf-text, md, pdf-inspector, pdf-pages, image";
+pub const EXTRACTOR_KINDS: &str = "txt, pdf-text, md, pdf-inspector, pdf-pages, image, docx, html";
 
 /// Every production kind's config label, IN AVAILABILITY-LIST ORDER. This is
 /// the registry's identity anchor: `kind_label` (the exhaustive match the
@@ -74,6 +88,8 @@ pub const KIND_LABELS: &[&str] = &[
     "pdf-inspector",
     "pdf-pages",
     "image",
+    "docx",
+    "html",
 ];
 
 /// mime (parameters like `; charset=utf-8` tolerated) -> short key.
@@ -121,6 +137,10 @@ pub const EXTENSION_ALIASES: &[(&str, &str)] = &[
     ("jpg", "img"),
     ("jpeg", "img"),
     ("png", "img"),
+    // the M3-T6 text face: one spelling for docx, both spellings for html
+    ("docx", "docx"),
+    ("html", "html"),
+    ("htm", "html"),
     ("md", "md"),
     ("markdown", "md"),
     ("txt", "txt"),
@@ -158,10 +178,21 @@ pub enum ExtractorKind {
     /// original bytes verbatim (`extract/image.rs`, M3-T4 — the user-facing
     /// supply side of the image chain, behind the `img` short key).
     Image(ImageConfig),
+    /// Word document file: unzip to `word/document.xml`, pull-event XML
+    /// text extraction, ONE text Part of `"\n\n"`-joined paragraphs
+    /// (`extract/docx.rs`, M3-T6). LEAF kind per the §0 criterion — the
+    /// internal XML is not an independently routable user document.
+    Docx(DocxConfig),
+    /// HTML document file: html5ever (WHATWG-compliant) parse, strip
+    /// script/style/head noise, block-level line breaks, ONE text Part
+    /// (`extract/html.rs`, M3-T6). LEAF kind — one html file IS one
+    /// document; the same chain will serve T7's epub chapters by plain
+    /// child re-routing, no special-casing on either side.
+    Html(HtmlConfig),
     /// Scripted CONTAINER kind for the M2.1 step 3 mechanism tests — see
     /// [`TestContainerSpec`]. `cfg(test)` only: the PRODUCTION enum stays at
-    /// leaf kinds only (five since M3-T3's `pdf-pages`; epub/docx/eml and
-    /// the zip dependency are later M3 work), and
+    /// leaf kinds only (seven since M3-T6's `docx`/`html`; the first
+    /// production container kind — epub — is T7 work), and
     /// no test kind is parseable from config (`from_config` has no arm —
     /// tests inject the variant into a loaded plan directly).
     #[cfg(test)]
@@ -309,6 +340,18 @@ impl ExtractorKind {
                 })?;
                 Ok(ExtractorKind::Image(cfg))
             }
+            "docx" => {
+                let cfg: DocxConfig = raw.clone().try_into().map_err(|e: toml::de::Error| {
+                    super::config::stage2_error(section, Some(&kind), e.message(), line)
+                })?;
+                Ok(ExtractorKind::Docx(cfg))
+            }
+            "html" => {
+                let cfg: HtmlConfig = raw.clone().try_into().map_err(|e: toml::de::Error| {
+                    super::config::stage2_error(section, Some(&kind), e.message(), line)
+                })?;
+                Ok(ExtractorKind::Html(cfg))
+            }
             other => Err(PipelineError::config(
                 format!(
                     "[{section}]: unknown extractor kind '{other}' (available kinds: \
@@ -332,7 +375,9 @@ impl ExtractorKind {
             ExtractorKind::Txt(_)
             | ExtractorKind::PdfText(_)
             | ExtractorKind::Md(_)
-            | ExtractorKind::PdfInspector(_) => &[Modality::Text],
+            | ExtractorKind::PdfInspector(_)
+            | ExtractorKind::Docx(_)
+            | ExtractorKind::Html(_) => &[Modality::Text],
             ExtractorKind::PdfPages(_) | ExtractorKind::Image(_) => &[Modality::Image],
             // its children re-enter user routing; the tests' children are
             // text (txt/md chains)
@@ -358,6 +403,8 @@ impl ExtractorKind {
             ExtractorKind::PdfInspector(_) => "pdf-inspector",
             ExtractorKind::PdfPages(_) => "pdf-pages",
             ExtractorKind::Image(_) => "image",
+            ExtractorKind::Docx(_) => "docx",
+            ExtractorKind::Html(_) => "html",
             #[cfg(test)]
             ExtractorKind::TestContainer(_) => "test-container",
             #[cfg(test)]
@@ -372,6 +419,9 @@ impl ExtractorKind {
             ExtractorKind::PdfText(_) => "pdf-text".to_string(),
             ExtractorKind::Md(_) => "md".to_string(),
             ExtractorKind::Image(_) => "image".to_string(),
+            // knob-free kinds (M3-T6): the label is the whole summary
+            ExtractorKind::Docx(_) => "docx".to_string(),
+            ExtractorKind::Html(_) => "html".to_string(),
             // the knob shows only when it departs from the pdf-text-aligned
             // default, keeping summary lines short
             ExtractorKind::PdfInspector(cfg) => {
@@ -421,6 +471,9 @@ impl Extractor for ExtractorKind {
             // configless: the kind IS the extractor (validate-decode, then
             // one verbatim image Part — see extract/image.rs)
             ExtractorKind::Image(_) => ImageExtractor.extract(bytes, mime),
+            // configless (M3-T6): the format intelligence IS the kind
+            ExtractorKind::Docx(_) => DocxExtractor.extract(bytes, mime),
+            ExtractorKind::Html(_) => HtmlExtractor.extract(bytes, mime),
             // role separation made loud: a container NEVER extracts — the
             // worker short-circuits extract for kinds whose unpack yields
             // children, so reaching this arm is a mechanism bug, and it
@@ -457,6 +510,12 @@ impl Extractor for ExtractorKind {
             // or a default chain, where config order is the whole truth
             // (extract/image.rs module docs)
             ExtractorKind::Image(_) => Fit::Capable,
+            // undeclared, same ruling (M3-T6): the ContentClass vocabulary
+            // is PDF-shaped — a docx/html source probes as Unknown and the
+            // router never consults affinity for it (the module docs of
+            // both kinds)
+            ExtractorKind::Docx(_) => Fit::Capable,
+            ExtractorKind::Html(_) => Fit::Capable,
             // undeclared (the trait default, spelled out): a container that
             // declares no fit is Capable everywhere — routing degenerates to
             // config order around it, exactly like any undeclared leaf.
@@ -481,7 +540,9 @@ impl Extractor for ExtractorKind {
             | ExtractorKind::Md(_)
             | ExtractorKind::PdfInspector(_)
             | ExtractorKind::PdfPages(_)
-            | ExtractorKind::Image(_) => Ok(None),
+            | ExtractorKind::Image(_)
+            | ExtractorKind::Docx(_)
+            | ExtractorKind::Html(_) => Ok(None),
             #[cfg(test)]
             ExtractorKind::TestContainer(spec) => spec.unpack(_bytes, _mime),
             // the scripted image kind is a leaf
@@ -507,6 +568,13 @@ impl ExtractorKind {
             // class, so the router never quotes a refusal)
             ExtractorKind::Image(_) => {
                 "an image kind (no affinity declaration — never refuses)".to_string()
+            }
+            // same unreachability (M3-T6: both kinds are Capable everywhere)
+            ExtractorKind::Docx(_) => {
+                "a docx kind (no affinity declaration — never refuses)".to_string()
+            }
+            ExtractorKind::Html(_) => {
+                "an html kind (no affinity declaration — never refuses)".to_string()
             }
             // unreachable in practice (the test container is Capable for
             // every class, so the router never quotes a refusal)
@@ -536,6 +604,8 @@ impl serde::Serialize for ExtractorKind {
             ExtractorKind::PdfInspector(c) => c.serialize(serializer),
             ExtractorKind::PdfPages(c) => c.serialize(serializer),
             ExtractorKind::Image(c) => c.serialize(serializer),
+            ExtractorKind::Docx(c) => c.serialize(serializer),
+            ExtractorKind::Html(c) => c.serialize(serializer),
             // fingerprints serialize CONFIG-loaded kinds only; the test kinds
             // never enter a PipelineConfig (from_config has no arm), so these
             // arms exist purely to keep the closed set exhaustive.
@@ -608,8 +678,12 @@ mod tests {
         for ext in ["jpg", "jpeg", "png"] {
             assert_eq!(short_key_for_extension(ext), Some("img"), "{ext}");
         }
+        // the M3-T6 text face's extension set (both html spellings claim)
+        assert_eq!(short_key_for_extension("docx"), Some("docx"));
+        assert_eq!(short_key_for_extension("html"), Some("html"));
+        assert_eq!(short_key_for_extension("htm"), Some("html"));
         // unknown extensions claim nothing
-        assert_eq!(short_key_for_extension("docx"), None);
+        assert_eq!(short_key_for_extension("epub"), None);
         assert_eq!(short_key_for_extension(""), None);
     }
 
@@ -695,6 +769,20 @@ mod tests {
                 &[Modality::Image],
                 "kind = \"image\"",
             ),
+            (
+                "docx",
+                docx::tests::static_docx(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                &[Modality::Text],
+                "kind = \"docx\"",
+            ),
+            (
+                "html",
+                html::tests::static_html(),
+                "text/html",
+                &[Modality::Text],
+                "kind = \"html\"",
+            ),
         ];
         for (kind_str, bytes, mime, modalities, canonical) in cases {
             let raw: toml::Value = toml::from_str(&format!("kind = \"{kind_str}\"")).unwrap();
@@ -773,7 +861,10 @@ mod tests {
         }
         // image: the UNDECLARED default — Capable for every class (its
         // family has no probe, so no class ever routes it; the dispatch
-        // spells the trait default out, pinned here)
+        // spells the trait default out, pinned here). The M3-T6 text-face
+        // kinds (docx/html) are undeclared for the same reason — the
+        // ContentClass vocabulary is PDF-shaped and their sources probe
+        // Unknown.
         let img = kind("image");
         for class in [
             ContentClass::TextNative,
@@ -782,6 +873,14 @@ mod tests {
             ContentClass::NoText,
         ] {
             assert_eq!(Extractor::affinity(&img, class), Fit::Capable, "{class}");
+        }
+        for s in ["docx", "html"] {
+            let k = kind(s);
+            assert_eq!(
+                Extractor::affinity(&k, ContentClass::TextNative),
+                Fit::Capable,
+                "{s}"
+            );
         }
         // refusal notes exist for every refusing cell (the router quotes them)
         assert!(
@@ -825,6 +924,8 @@ mod tests {
                 "application/pdf",
             ),
             ("image", image::tests::static_png(), "image/png"),
+            ("docx", docx::tests::static_docx(), docx::tests::DOCX_MIME),
+            ("html", html::tests::static_html(), "text/html"),
         ];
         for (kind_str, bytes, mime) in cases {
             let raw: toml::Value = toml::from_str(&format!("kind = \"{kind_str}\"")).unwrap();
@@ -839,15 +940,19 @@ mod tests {
 
     #[test]
     fn from_config_unknown_kind_lists_available() {
-        let raw: toml::Value = toml::from_str("kind = \"docx\"").unwrap();
+        // epub is T7's container kind — unknown TODAY, and the error must
+        // list every kind that DOES exist (docx/html included since M3-T6)
+        let raw: toml::Value = toml::from_str("kind = \"epub\"").unwrap();
         let err = ExtractorKind::from_config("extractor.d", &raw, Some(3)).unwrap_err();
         assert!(
-            err.to_string().contains("unknown extractor kind 'docx'"),
+            err.to_string().contains("unknown extractor kind 'epub'"),
             "{err}"
         );
         assert!(
-            err.to_string()
-                .contains("available kinds: txt, pdf-text, md, pdf-inspector"),
+            err.to_string().contains(
+                "available kinds: txt, pdf-text, md, pdf-inspector, pdf-pages, image, \
+                           docx, html"
+            ),
             "{err}"
         );
         assert!(err.to_string().contains("at line 3"), "{err}");
@@ -896,8 +1001,11 @@ mod tests {
             // field this kind does not have
             ("pdf-pages", "format = \"jpeg\""),
             // the image kind is knob-free (preprocessing belongs to the
-            // embedder)
+            // embedder); the M3-T6 text-face kinds are knob-free too (the
+            // format intelligence IS the kind)
             ("image", "dpi = 72"),
+            ("docx", "dpi = 300"),
+            ("html", "dpi = 72"),
         ] {
             let raw: toml::Value =
                 toml::from_str(&format!("kind = \"{kind_str}\"\n{extra}")).unwrap();
