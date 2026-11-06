@@ -1554,6 +1554,35 @@ index-prefix = "docs"
     }
 
     #[test]
+    fn modality_carry_over_rejects_pdf_pages_without_image_embedder() {
+        // M3-T3: pdf-pages is the first CONFIG-PARSEABLE image-output kind
+        // (the M3-T1 check test needed a runtime placeholder patch for
+        // exactly this shape) — routing to it with only a text embedder
+        // listed now fails at STARTUP with the carry-over error naming the
+        // instance and the modality, before any file is ingested
+        let text = "[extractor.p]\nkind = \"pdf-pages\"\n\n[embedder.t]\nkind = \"ort\"\n\
+                    [ingest.ddd]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
+                    extract = { pdf = \"p\" }\nembedders = [\"t\"]\n";
+        let err = parse(text).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("extractor instance 'p' outputs modality image"),
+            "{msg}"
+        );
+        assert!(msg.contains("no listed embedder accepts it"), "{msg}");
+        // listing a siglip2 embedder beside it carries Image: OK (a named
+        // builtin model parses; artifact presence is the separate
+        // availability gate, not parse)
+        let ok = text.replace(
+            "[embedder.t]\nkind = \"ort\"",
+            "[embedder.t]\nkind = \"ort\"\n\n[embedder.s]\nkind = \"siglip2\"\nmodel = \
+             \"siglip2-base-patch16-224\"",
+        );
+        let fixed = ok.replace("embedders = [\"t\"]", "embedders = [\"t\", \"s\"]");
+        assert!(parse(&fixed).is_ok(), "image carried by siglip2");
+    }
+
+    #[test]
     fn merge_closed_set_with_line() {
         let err = parse(
             "[ingest.d]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
@@ -1618,6 +1647,25 @@ index-prefix = "docs"
         let none = "[extractor.a]\nkind = \"txt\"\n\n[ingest.ddd]\nchunk = { kind = \
                     \"token-window\", size = 8, overlap = 2 }\n";
         assert_ne!(fp_of(&base), fp_of(&none));
+        // M3-T3: the pdf-pages dpi knob enters the fingerprint naturally —
+        // it serializes with the instance config (chunk identity: the same
+        // page at 150 and 300 dpi is different image bytes), so two
+        // otherwise-identical pipelines that differ only in dpi must NOT
+        // share completion markers
+        let mk = |dpi_line: &str| {
+            format!(
+                "[extractor.p]\nkind = \"pdf-pages\"\n{dpi_line}\n[ingest.ddd]\nchunk = {{ kind \
+                 = \"token-window\", size = 8, overlap = 2 }}\nextract = {{ pdf = \"p\" }}\n"
+            )
+        };
+        assert_ne!(
+            fp_of(&mk("")),
+            fp_of(&mk("dpi = 300")),
+            "dpi is config, and config enters the fingerprint"
+        );
+        // ...and the DEFAULT value serializes identically to an explicit
+        // 150 (presence vs value: only the VALUE is canonical)
+        assert_eq!(fp_of(&mk("")), fp_of(&mk("dpi = 150")));
     }
 
     #[test]

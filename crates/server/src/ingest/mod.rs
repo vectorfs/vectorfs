@@ -414,11 +414,14 @@ fn short_key_of(object_key: &str) -> Option<&'static str> {
 
 /// The `auto` mapping's default extractor KIND per short key (kept in lock
 /// step with [`MIME_TO_SHORT_KEY`]). `pdf` deliberately stays `pdf-text`
-/// even though a second PDF kind (`pdf-inspector`) now exists: pdfium is the
-/// battle-tested rendering path and `auto` is an OPINIONATED default — a new
-/// kind landing must not silently re-route every `extract = { default =
-/// "auto" }` deployment. Deployments that want the classify-first, no-.so
-/// engine opt in explicitly (`extract = { pdf = "inspector-instance" }`).
+/// even though two further PDF kinds (`pdf-inspector`, and `pdf-pages` since
+/// M3-T3) exist: pdfium text extraction is the battle-tested path and `auto`
+/// is an OPINIONATED default — a new kind landing must not silently
+/// re-route every `extract = { default = "auto" }` deployment (image-output
+/// `pdf-pages` doubly so: it would change the pipeline's modality needs).
+/// Deployments that want the classify-first, no-.so engine or the page-image
+/// route opt in explicitly (`extract = { pdf = "inspector-instance" }`,
+/// `pdf = "pages-instance"`).
 /// M2.1 keeps `auto` a single-member chain: whether it should become a
 /// built-in chain (pdf → pdf-inspector → pdf-text, say) is an M3 ruling,
 /// taken when `pdf-ocr` actually exists to chain onto.
@@ -5577,6 +5580,229 @@ pub(crate) mod tests {
         // both fixtures are 8; the SEPARATION is the assertion, and each
         // index only ever saw its own embedder's vectors)
         assert_eq!(tiny_rows[0].vector.len(), 8, "text index keeps its own dim");
+    }
+
+    // ---- M3-T3: pdf-pages — real PDF pages through the real worker ----
+
+    /// The pdf-pages e2e config fixture: a `pages` (pdf-pages, default dpi)
+    /// and a `plain` (pdf-text) instance over BOTH fixture embedders (the
+    /// carry-over check needs an image-accepting embedder for `pages` and a
+    /// text-accepting one for `plain`), with the `pdf` route parameterized —
+    /// `"pages"`, `["plain", "pages"]`, … (the routing-chain fixture shape).
+    fn pdf_pages_config(route: &str) -> PipelineConfig {
+        let text = format!(
+            "[extractor.pages]\nkind = \"pdf-pages\"\n\n\
+             [extractor.plain]\nkind = \"pdf-text\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = \
+             true\n\n\
+             [embedder.sig]\nkind = \"siglip2\"\npath = {:?}\noffline = true\n\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ pdf = {route} }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"tiny\", \"sig\"]\nscan_interval_secs = 1",
+            fixture_dir().display().to_string(),
+            siglip2_fixture_dir().display().to_string(),
+        );
+        crate::pipeline::config::load_pipeline_config(&text).unwrap()
+    }
+
+    /// THE M3-T3 e2e (the image chain closed end to end over a REAL PDF): a
+    /// 2-page mixed document renders page-by-page through the real pdfium
+    /// .so (the production kind, no test scaffold anywhere in the path),
+    /// every page becomes one atomic image chunk, siglip2 embeds them —
+    /// INDEXED with image=2, the `-image-N` key namespace numbered BY PAGE
+    /// ORDER (…-image-0, …-image-1), x-vf-modality=image on each row, and
+    /// the two rows' vectors DISTINCT (page 1 draws text, page 2 a raster —
+    /// the tiny fixture maps different pixels to different vectors, pinned
+    /// in its own suite). The text embedder rides along scoped to zero
+    /// chunks and materializes nothing.
+    #[tokio::test]
+    async fn pdf_pages_render_indexes_through_siglip2() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            docs.join("mixed.pdf"),
+            crate::pipeline::extract::pdf_inspector::tests::mixed_text_image_pdf(),
+        )
+        .unwrap();
+
+        let (rt, _h, state) = runtime_for(dir.path(), &pdf_pages_config("\"pages\"")).await;
+        rt.scan_once().await;
+        rt.drain_queue().await;
+
+        let m = status_of(&state, "docs", "docs/mixed.pdf").await;
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
+        assert_eq!(
+            m.chunks.as_ref().unwrap().get("image"),
+            Some(&2u32),
+            "one atomic chunk per page: {:?}",
+            m.chunks
+        );
+        assert_eq!(
+            m.chunks.as_ref().unwrap().get("text"),
+            Some(&0u32),
+            "no text chunks from an image-only extraction: {:?}",
+            m.chunks
+        );
+
+        // the sig index: exactly two image rows, key namespace numbered in
+        // page order, the full metadata contract, distinct page vectors
+        let spec = rt.shared.core.buckets["docs"].derived["sig"].clone();
+        let rows = state
+            .storage
+            .scan_vectors("docs", &spec.index_name, None)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "one vector per rendered page");
+        let mut keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+        keys.sort_unstable();
+        let prefix = keys[0].trim_end_matches("-image-0").to_string();
+        assert_eq!(
+            keys,
+            vec![
+                format!("{prefix}-image-0").as_str(),
+                format!("{prefix}-image-1").as_str()
+            ],
+            "keys number the pages in order from 0: {:?}",
+            keys
+        );
+        for row in &rows {
+            let meta = row.metadata.as_ref().unwrap();
+            assert_eq!(meta["x-vf-modality"], "image");
+            assert_eq!(meta["x-vf-src-name"], "docs/mixed.pdf");
+            assert_eq!(meta["x-vf-model"], "tiny-siglip2");
+            assert_eq!(row.vector.len(), 8, "fixture dim");
+            assert!(row.vector.iter().all(|x| x.is_finite()));
+        }
+        assert_ne!(
+            rows[0].vector, rows[1].vector,
+            "the two pages embed to different vectors (page order carries content)"
+        );
+
+        // the text embedder saw no acceptable chunk: no index of its own
+        let tiny_spec = rt.shared.core.buckets["docs"].derived["tiny"].clone();
+        assert!(
+            state
+                .storage
+                .load_index("docs", &tiny_spec.index_name)
+                .await
+                .unwrap()
+                .is_none(),
+            "a text embedder must not materialize an index for an image-only source"
+        );
+    }
+
+    /// The mixed-chain routing behavior (probe → affinity → route over
+    /// real PDFs, the three-stage mechanism with the image kind in the
+    /// chain): a text-native PDF routes to the TEXT member even when
+    /// pdf-pages sits FIRST in config (Preferred beats config order — the
+    /// mis-order-is-a-quality-accident protection), while an image-only
+    /// (scan-dominant) PDF under the SAME chain routes to pdf-pages
+    /// (Preferred there; pdf-text refuses the class). Both files INDEX,
+    /// each with its own modality's chunks.
+    #[tokio::test]
+    async fn pdf_pages_chain_routes_by_content_class() {
+        // (a) text-native hello.pdf under the MIS-ORDERED chain
+        // [pages, plain]: plain is Preferred for text-native, pages only
+        // Capable — the router must run plain FIRST regardless of config
+        // order, and the file indexes as TEXT
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("hello.pdf"), HELLO_PDF).unwrap();
+        let (rt, _h, state) =
+            runtime_for(dir.path(), &pdf_pages_config("[\"pages\", \"plain\"]")).await;
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let m = status_of(&state, "docs", "docs/hello.pdf").await;
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
+        let chunks = m.chunks.as_ref().unwrap();
+        assert!(
+            chunks.get("text").is_some_and(|n| *n >= 1),
+            "text-native routes to the text member: {chunks:?}"
+        );
+        assert_eq!(chunks.get("image"), None, "no image chunks: {chunks:?}");
+        // ...and only the text index has rows (the pdfium page renderer
+        // never executed)
+        let tiny_spec = rt.shared.core.buckets["docs"].derived["tiny"].clone();
+        let sig_spec = rt.shared.core.buckets["docs"].derived["sig"].clone();
+        assert!(
+            state
+                .storage
+                .load_index("docs", &sig_spec.index_name)
+                .await
+                .unwrap()
+                .is_none(),
+            "pdf-pages must not have run for a text-native PDF"
+        );
+        assert_eq!(
+            state
+                .storage
+                .count_vectors("docs", &tiny_spec.index_name)
+                .await
+                .unwrap() as u32,
+            chunks["text"]
+        );
+
+        // (b) image-only (scan-dominant) PDF under the SAME chain: pdf-pages
+        // is Preferred, pdf-text Refuses — the router runs pages first and
+        // it WINS (pdfium has no text layer to read; rendering is the only
+        // honest product)
+        let dir2 = tempfile::tempdir().unwrap();
+        let docs2 = dir2.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs2).unwrap();
+        std::fs::write(
+            docs2.join("scan.pdf"),
+            crate::pipeline::extract::pdf_inspector::tests::image_only_pdf(),
+        )
+        .unwrap();
+        let (rt2, _h2, state2) =
+            runtime_for(dir2.path(), &pdf_pages_config("[\"pages\", \"plain\"]")).await;
+        rt2.scan_once().await;
+        rt2.drain_queue().await;
+        let m2 = status_of(&state2, "docs", "docs/scan.pdf").await;
+        assert_eq!(m2.status, SourceStatus::Indexed, "{m2:?}");
+        assert_eq!(
+            m2.chunks.as_ref().unwrap().get("image"),
+            Some(&1u32),
+            "the scan rendered: {:?}",
+            m2.chunks
+        );
+        let sig2 = rt2.shared.core.buckets["docs"].derived["sig"].clone();
+        assert_eq!(
+            state2
+                .storage
+                .count_vectors("docs", &sig2.index_name)
+                .await
+                .unwrap(),
+            1,
+            "one vector for the one rendered page"
+        );
+
+        // (c) the REVERSED chain [plain, pages] over the same scan: the
+        // router's verdict must NOT follow config order here either (plain
+        // Refuses scan-dominant) — pages still runs first, same INDEXED
+        // image outcome (config order is only the WITHIN-TIER tie-break)
+        let dir3 = tempfile::tempdir().unwrap();
+        let docs3 = dir3.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs3).unwrap();
+        std::fs::write(
+            docs3.join("scan.pdf"),
+            crate::pipeline::extract::pdf_inspector::tests::image_only_pdf(),
+        )
+        .unwrap();
+        let (rt3, _h3, state3) =
+            runtime_for(dir3.path(), &pdf_pages_config("[\"plain\", \"pages\"]")).await;
+        rt3.scan_once().await;
+        rt3.drain_queue().await;
+        let m3 = status_of(&state3, "docs", "docs/scan.pdf").await;
+        assert_eq!(m3.status, SourceStatus::Indexed, "{m3:?}");
+        assert_eq!(
+            m3.chunks.as_ref().unwrap().get("image"),
+            Some(&1u32),
+            "reversed config order must not change the scan's route: {:?}",
+            m3.chunks
+        );
     }
 
     /// The child three-state vocabulary on the failure side: a child with NO

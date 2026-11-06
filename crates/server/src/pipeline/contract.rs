@@ -4,7 +4,8 @@
 //! These are PUBlic assertion suites, not just our own tests: any future
 //! implementation (community kind, wasm plugin in v2) runs the SAME suite to
 //! be admitted — `#[cfg(test)]` below runs it against the built-ins
-//! (`txt`, `pdf-text`, `md`, `pdf-inspector`, `token-window`, the real `ort`
+//! (`txt`, `pdf-text`, `md`, `pdf-inspector`, `pdf-pages` through the
+//! image-extractor twin, `token-window`, the real `ort`
 //! kind over the committed tiny ONNX fixture + the real .so, the real
 //! `openai` kind over an in-process fake provider, the real `siglip2` kind
 //! over its committed tiny fixture + the real .so via the image-route
@@ -107,6 +108,85 @@ pub fn extractor_contract(x: &dyn Extractor, good: (&[u8], &str)) {
 // ---------------------------------------------------------------------------
 // Chunker
 // ---------------------------------------------------------------------------
+
+/// Run the extractor contract against an IMAGE-output `x` (M3-T3: the twin
+/// [`extractor_contract`] assumes text output — it asserts a non-empty TEXT
+/// part and Text modality, so an image kind cannot run it; the same shape as
+/// `embedder_contract` vs `image_embedder_contract`). `good` = (bytes, mime)
+/// is the known-good sample.
+///
+/// Everything `extractor_contract` asserts, through the image channel:
+///
+/// * **Determinism**: two calls with the same input produce identical output
+///   (byte-identical payloads — the encoder is part of the extractor).
+/// * **Non-empty output with content**: at least one part carries an image
+///   payload (the image twin of the non-empty-text-part assertion — a
+///   `Vec::new()` Ok would silently index nothing).
+/// * **Every part is `Modality::Image` with an EMPTY text channel**, the
+///   payload's declared mime honest against the bytes' sniffed magic
+///   ([`crate::pipeline::ImagePayload::validate`] — the same guard the
+///   chunker bypass runs; a kind that emits garbage or a wrong mime must
+///   fail HERE, not inside an embedder's preprocessing).
+/// * **Wrong mime** (`application/octet-stream`): Err, never a guess.
+/// * **Empty mime** (`""`): tolerated without panic.
+/// * **Empty file**: Err (uniform empty-source handling).
+/// * **Truncated bytes** (first half of `good`): never panic; PDF framing
+///   is self-describing, so an Ok is only acceptable when the truncated
+///   bytes are genuinely valid input for the kind (the truncation halves of
+///   image fixtures Err in practice).
+pub fn image_extractor_contract(x: &dyn Extractor, good: (&[u8], &str)) {
+    let (bytes, mime) = good;
+
+    // determinism (encoder included)
+    let a = x.extract(bytes, mime).expect("good sample must extract");
+    let b = x
+        .extract(bytes, mime)
+        .expect("good sample must extract (2nd)");
+    assert_eq!(
+        a, b,
+        "image extractor is not deterministic on its good sample"
+    );
+
+    // non-empty output carrying image content
+    assert!(
+        !a.is_empty() && a.iter().any(|p| p.image.is_some()),
+        "good sample must produce at least one image part"
+    );
+
+    // modality + channel pairing + bytes-vs-mime honesty per part
+    for part in &a {
+        assert!(matches!(part.modality, Modality::Image));
+        assert!(part.text.is_empty(), "image parts carry no text");
+        part.image
+            .as_ref()
+            .expect("image modality implies a payload")
+            .validate()
+            .expect("declared mime must match the sniffed container magic");
+    }
+
+    // wrong mime -> Err
+    assert!(
+        x.extract(bytes, "application/octet-stream").is_err(),
+        "wrong mime must Err, not guess"
+    );
+
+    // empty mime ("unspecified") -> tolerated, never a panic
+    let _ = x.extract(bytes, "");
+
+    // empty file -> Err (uniform contract)
+    assert!(
+        x.extract(b"", mime).is_err(),
+        "empty input must Err, not return an empty Vec"
+    );
+
+    // truncated input: never panic; Err unless genuinely valid
+    let truncated = &bytes[..bytes.len() / 2];
+    if let Ok(parts) = x.extract(truncated, mime) {
+        for part in &parts {
+            assert!(matches!(part.modality, Modality::Image));
+        }
+    }
+}
 
 /// Run the chunker contract against `c`, given its window parameters
 /// `(size, overlap)` — the overlap-semantics assertions need the DECLARED
@@ -538,6 +618,21 @@ mod tests {
             &PdfInspectorExtractor::new(),
             (
                 super::super::extract::pdf_inspector::tests::HELLO_PDF_MINIMAL,
+                "application/pdf",
+            ),
+        );
+    }
+
+    #[test]
+    fn pdf_pages_passes_image_extractor_contract() {
+        // real .so required (the pdf-text rule: locator panics with fetch
+        // guidance rather than skipping); the IMAGE twin because every Part
+        // this kind emits is Modality::Image with a PNG payload
+        let x = super::super::extract::pdf_pages::tests::extractor_or_panic(150);
+        image_extractor_contract(
+            &x,
+            (
+                super::super::extract::pdf_pages::tests::HELLO_PDF_MINIMAL,
                 "application/pdf",
             ),
         );

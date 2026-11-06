@@ -1,12 +1,15 @@
 //! Extractor axis: closed-enum registration + dispatch (M2 T2 skeleton,
-//! kinds landed through M2 T4).
+//! kinds landed through M2 T4; `pdf-pages` in M3-T3).
 //!
 //! `dyn`-free by design (§5.10.2 v2.1): the enum below is the registry.
 //! Adding a kind = adding a variant + a `from_config` arm; the compiler then
 //! walks every match site in this tree. Available kinds: `txt`,
 //! `pdf-text`, `md`, `pdf-inspector` (the first kind added AFTER the M2
 //! set — the closed-set mechanism's first live exercise; two PDF kinds
-//! coexist behind the one `pdf` short key, selection is explicit).
+//! coexist behind the one `pdf` short key, selection is explicit), and
+//! `pdf-pages` (M3-T3, the third PDF kind and the first IMAGE-output kind:
+//! pdfium renders each page to a PNG Part — same short key again, the
+//! two-kinds-one-key precedent extended to a text/image pair).
 //! Since M2.1 step 2 every kind also declares its per-[`ContentClass`]
 //! affinity (kind module `affinity`/`refusal_note` free functions, dispatched
 //! exhaustively below) — the ingest router consumes those declarations to
@@ -21,12 +24,14 @@
 
 pub mod md;
 pub mod pdf_inspector;
+pub mod pdf_pages;
 pub mod pdf_text;
 pub mod txt;
 
 use super::{ChildDoc, ContentClass, Extractor, Fit, Modality, Part, PipelineError};
 use md::{MdConfig, MdExtractor};
 use pdf_inspector::{PdfInspectorConfig, PdfInspectorExtractor};
+use pdf_pages::{PdfPagesConfig, PdfPagesExtractor};
 use pdf_text::{PdfTextConfig, PdfTextExtractor};
 use txt::{TxtConfig, TxtExtractor};
 
@@ -43,7 +48,7 @@ pub const MIME_TO_SHORT_KEY: &[(&str, &str)] = &[
 /// [`KIND_LABELS`] (the parity test pins the two together — a new kind that
 /// updates the enum but forgets the string fails there, not in a user's
 /// error message).
-pub const EXTRACTOR_KINDS: &str = "txt, pdf-text, md, pdf-inspector";
+pub const EXTRACTOR_KINDS: &str = "txt, pdf-text, md, pdf-inspector, pdf-pages";
 
 /// Every production kind's config label, IN AVAILABILITY-LIST ORDER. This is
 /// the registry's identity anchor: `kind_label` (the exhaustive match the
@@ -51,7 +56,7 @@ pub const EXTRACTOR_KINDS: &str = "txt, pdf-text, md, pdf-inspector";
 /// (the `kind_registry_views_agree` test walks it). A new kind lands here,
 /// in `kind_label`, and in `from_config` in one diff — everything else in
 /// this module is exhaustive dispatch the compiler already checks.
-pub const KIND_LABELS: &[&str] = &["txt", "pdf-text", "md", "pdf-inspector"];
+pub const KIND_LABELS: &[&str] = &["txt", "pdf-text", "md", "pdf-inspector", "pdf-pages"];
 
 /// mime (parameters like `; charset=utf-8` tolerated) -> short key.
 pub fn short_key_for_mime(mime: &str) -> Option<&'static str> {
@@ -117,9 +122,15 @@ pub enum ExtractorKind {
     /// lopdf-based classify-then-extract PDF kind, no native library
     /// (`extract/pdf_inspector.rs`).
     PdfInspector(PdfInspectorConfig),
+    /// pdfium page-to-PNG renderer: one IMAGE Part per page, page order
+    /// preserved (`extract/pdf_pages.rs`, M3-T3 — the image chain's supply
+    /// side; the third kind behind the `pdf` short key, the first whose
+    /// output modality is not Text).
+    PdfPages(PdfPagesConfig),
     /// Scripted CONTAINER kind for the M2.1 step 3 mechanism tests — see
     /// [`TestContainerSpec`]. `cfg(test)` only: the PRODUCTION enum stays at
-    /// four leaf kinds (epub/docx/eml and the zip dependency are M3), and
+    /// leaf kinds only (five since M3-T3's `pdf-pages`; epub/docx/eml and
+    /// the zip dependency are later M3 work), and
     /// no test kind is parseable from config (`from_config` has no arm —
     /// tests inject the variant into a loaded plan directly).
     #[cfg(test)]
@@ -249,6 +260,18 @@ impl ExtractorKind {
                     })?;
                 Ok(ExtractorKind::PdfInspector(cfg))
             }
+            "pdf-pages" => {
+                let cfg: PdfPagesConfig =
+                    raw.clone().try_into().map_err(|e: toml::de::Error| {
+                        super::config::stage2_error(section, Some(&kind), e.message(), line)
+                    })?;
+                // dpi domain is STARTUP validation (the token-window
+                // precedent): 10..=600 dots per inch, fail-fast at the
+                // config line that carries the bad number
+                cfg.validate()
+                    .map_err(|m| PipelineError::config(format!("[{section}]: {m}"), line))?;
+                Ok(ExtractorKind::PdfPages(cfg))
+            }
             other => Err(PipelineError::config(
                 format!(
                     "[{section}]: unknown extractor kind '{other}' (available kinds: \
@@ -265,11 +288,15 @@ impl ExtractorKind {
     /// and its modality declaration land in the same diff.
     pub fn output_modalities(&self) -> &'static [Modality] {
         match self {
-            // Every built-in kind so far emits Text only (§5.10.1).
+            // The text kinds (§5.10.1). pdf-pages is the first Image-output
+            // kind — the config-time modality carry-over check (below in
+            // config.rs) therefore demands an image-accepting embedder on
+            // any ingest that routes to it.
             ExtractorKind::Txt(_)
             | ExtractorKind::PdfText(_)
             | ExtractorKind::Md(_)
             | ExtractorKind::PdfInspector(_) => &[Modality::Text],
+            ExtractorKind::PdfPages(_) => &[Modality::Image],
             // its children re-enter user routing; the tests' children are
             // text (txt/md chains)
             #[cfg(test)]
@@ -292,6 +319,7 @@ impl ExtractorKind {
             ExtractorKind::PdfText(_) => "pdf-text",
             ExtractorKind::Md(_) => "md",
             ExtractorKind::PdfInspector(_) => "pdf-inspector",
+            ExtractorKind::PdfPages(_) => "pdf-pages",
             #[cfg(test)]
             ExtractorKind::TestContainer(_) => "test-container",
             #[cfg(test)]
@@ -312,6 +340,14 @@ impl ExtractorKind {
                     "pdf-inspector(markdown=true)".to_string()
                 } else {
                     "pdf-inspector".to_string()
+                }
+            }
+            // same discipline: bare label at the default dpi
+            ExtractorKind::PdfPages(cfg) => {
+                if cfg.dpi == pdf_pages::DEFAULT_DPI {
+                    "pdf-pages".to_string()
+                } else {
+                    format!("pdf-pages(dpi={})", cfg.dpi)
                 }
             }
             #[cfg(test)]
@@ -339,6 +375,10 @@ impl Extractor for ExtractorKind {
                 };
                 x.extract(bytes, mime)
             }
+            // like the pdf-text arm: snapshot the library resolution per
+            // call (cheap path checks); the pdfium bind itself is
+            // process-global (pdf_text::bind_pdfium)
+            ExtractorKind::PdfPages(cfg) => PdfPagesExtractor::new(cfg).extract(bytes, mime),
             // role separation made loud: a container NEVER extracts — the
             // worker short-circuits extract for kinds whose unpack yields
             // children, so reaching this arm is a mechanism bug, and it
@@ -368,6 +408,7 @@ impl Extractor for ExtractorKind {
             ExtractorKind::PdfText(_) => pdf_text::affinity(class),
             ExtractorKind::Md(_) => md::affinity(class),
             ExtractorKind::PdfInspector(_) => pdf_inspector::affinity(class),
+            ExtractorKind::PdfPages(_) => pdf_pages::affinity(class),
             // undeclared (the trait default, spelled out): a container that
             // declares no fit is Capable everywhere — routing degenerates to
             // config order around it, exactly like any undeclared leaf.
@@ -390,7 +431,8 @@ impl Extractor for ExtractorKind {
             ExtractorKind::Txt(_)
             | ExtractorKind::PdfText(_)
             | ExtractorKind::Md(_)
-            | ExtractorKind::PdfInspector(_) => Ok(None),
+            | ExtractorKind::PdfInspector(_)
+            | ExtractorKind::PdfPages(_) => Ok(None),
             #[cfg(test)]
             ExtractorKind::TestContainer(spec) => spec.unpack(_bytes, _mime),
             // the scripted image kind is a leaf
@@ -411,6 +453,7 @@ impl ExtractorKind {
             ExtractorKind::PdfText(_) => pdf_text::refusal_note(class),
             ExtractorKind::Md(_) => md::refusal_note(class),
             ExtractorKind::PdfInspector(_) => pdf_inspector::refusal_note(class),
+            ExtractorKind::PdfPages(_) => pdf_pages::refusal_note(class),
             // unreachable in practice (the test container is Capable for
             // every class, so the router never quotes a refusal)
             #[cfg(test)]
@@ -437,6 +480,7 @@ impl serde::Serialize for ExtractorKind {
             ExtractorKind::PdfText(c) => c.serialize(serializer),
             ExtractorKind::Md(c) => c.serialize(serializer),
             ExtractorKind::PdfInspector(c) => c.serialize(serializer),
+            ExtractorKind::PdfPages(c) => c.serialize(serializer),
             // fingerprints serialize CONFIG-loaded kinds only; the test kinds
             // never enter a PipelineConfig (from_config has no arm), so these
             // arms exist purely to keep the closed set exhaustive.
@@ -516,39 +560,70 @@ mod tests {
 
     #[test]
     fn from_config_accepts_every_kind() {
-        // (kind string, good sample bytes, good sample mime, expected
-        // canonical TOML of the parsed enum) — pdf-text runs the real .so
-        // (missing library fails the test honestly, pdf_text.rs). The
-        // canonical-form column exists because kinds with knobs
-        // (pdf-inspector) serialize their defaulted fields too — the
-        // fingerprint form is per-kind, not uniformly `kind = "…"`.
-        let cases: &[(&str, &[u8], &str, &str)] = &[
-            ("txt", b"hi", "text/plain", "kind = \"txt\""),
+        // (kind string, good sample bytes, good sample mime, declared output
+        // modality, expected canonical TOML of the parsed enum) — the two
+        // pdfium kinds run the real .so (missing library fails the test
+        // honestly, pdf_text.rs). The canonical-form column exists because
+        // kinds with knobs (pdf-inspector, pdf-pages) serialize their
+        // defaulted fields too — the fingerprint form is per-kind, not
+        // uniformly `kind = "…"`.
+        type Case = (
+            &'static str,
+            &'static [u8],
+            &'static str,
+            &'static [Modality],
+            &'static str,
+        );
+        let cases: &[Case] = &[
+            (
+                "txt",
+                b"hi",
+                "text/plain",
+                &[Modality::Text],
+                "kind = \"txt\"",
+            ),
             (
                 "pdf-text",
                 pdf_text::tests::HELLO_PDF_MINIMAL,
                 "application/pdf",
+                &[Modality::Text],
                 "kind = \"pdf-text\"",
             ),
-            ("md", b"# hi", "text/markdown", "kind = \"md\""),
+            (
+                "md",
+                b"# hi",
+                "text/markdown",
+                &[Modality::Text],
+                "kind = \"md\"",
+            ),
             (
                 "pdf-inspector",
                 pdf_inspector::tests::HELLO_PDF_MINIMAL,
                 "application/pdf",
+                &[Modality::Text],
                 "kind = \"pdf-inspector\"\nmarkdown = false",
             ),
+            (
+                "pdf-pages",
+                pdf_pages::tests::HELLO_PDF_MINIMAL,
+                "application/pdf",
+                &[Modality::Image],
+                "kind = \"pdf-pages\"\ndpi = 150",
+            ),
         ];
-        for (kind_str, bytes, mime, canonical) in cases {
+        for (kind_str, bytes, mime, modalities, canonical) in cases {
             let raw: toml::Value = toml::from_str(&format!("kind = \"{kind_str}\"")).unwrap();
             let k = ExtractorKind::from_config("extractor.x", &raw, Some(1)).unwrap();
             assert_eq!(k.describe(), *kind_str);
-            assert_eq!(k.output_modalities(), &[Modality::Text]);
+            assert_eq!(k.output_modalities(), *modalities);
             // the enum itself dispatches (zero vtable), through the mime the
             // short-key table maps for this kind
             let kind_mime = mime_for_short_key(short_key_for_mime(mime).unwrap()).unwrap();
             let parts = Extractor::extract(&k, bytes, kind_mime)
                 .unwrap_or_else(|e| panic!("{kind_str} must dispatch through the enum: {e}"));
+            // every sample here is the single-page fixture: exactly one Part
             assert_eq!(parts.len(), 1);
+            assert_eq!(parts[0].modality, modalities[0]);
             // fingerprints serialize flat: inner config only
             assert_eq!(toml::to_string(&k).unwrap().trim(), *canonical);
         }
@@ -586,6 +661,22 @@ mod tests {
             Extractor::affinity(&insp, ContentClass::MixedTextScan),
             Fit::Refuses
         );
+        // pdf-pages: the image mirror — scan-dominant is its Preferred,
+        // text-native/mixed stay Capable (the text route outranks page
+        // images there), no-text is refused
+        let pages = kind("pdf-pages");
+        assert_eq!(
+            Extractor::affinity(&pages, ContentClass::ScanDominant),
+            Fit::Preferred
+        );
+        assert_eq!(
+            Extractor::affinity(&pages, ContentClass::TextNative),
+            Fit::Capable
+        );
+        assert_eq!(
+            Extractor::affinity(&pages, ContentClass::NoText),
+            Fit::Refuses
+        );
         // text family: text-native preferred only
         for s in ["txt", "md"] {
             let k = kind(s);
@@ -604,6 +695,10 @@ mod tests {
         assert!(
             insp.refusal_note(ContentClass::ScanDominant)
                 .contains("classification gate")
+        );
+        assert!(
+            pages.refusal_note(ContentClass::NoText).contains("blank"),
+            "the pdf-pages no-text refusal names the blank-page reality"
         );
     }
 
@@ -625,6 +720,11 @@ mod tests {
             (
                 "pdf-inspector",
                 pdf_inspector::tests::HELLO_PDF_MINIMAL,
+                "application/pdf",
+            ),
+            (
+                "pdf-pages",
+                pdf_pages::tests::HELLO_PDF_MINIMAL,
                 "application/pdf",
             ),
         ];
@@ -667,19 +767,44 @@ mod tests {
     }
 
     #[test]
+    fn from_config_rejects_out_of_domain_dpi_with_line() {
+        // the dpi domain is startup validation, attributed to the config
+        // line that carries the bad number (§5.10.3 fail-fast)
+        let raw: toml::Value = toml::from_str("kind = \"pdf-pages\"\ndpi = 5000").unwrap();
+        let err = ExtractorKind::from_config("extractor.p", &raw, Some(4)).unwrap_err();
+        assert!(err.to_string().contains("[extractor.p]"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("outside the accepted range 10..=600"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("dots per inch"), "{err}");
+        assert!(err.to_string().contains("at line 4"), "{err}");
+        // the in-domain knob parses (and departs from the default in
+        // describe — the summary-line discipline)
+        let raw: toml::Value = toml::from_str("kind = \"pdf-pages\"\ndpi = 300").unwrap();
+        let k = ExtractorKind::from_config("extractor.p", &raw, None).unwrap();
+        assert_eq!(k.describe(), "pdf-pages(dpi=300)");
+    }
+
+    #[test]
     fn unknown_fields_rejected_per_kind() {
         for (kind_str, extra) in [
             ("txt", "dpi = 1"),
             ("pdf-text", "dpi = 300"),
             ("md", "gfm = true"),
             ("pdf-inspector", "dpi = 300"),
+            // dpi is LEGAL on pdf-pages — the unknown-field probe needs a
+            // field this kind does not have
+            ("pdf-pages", "format = \"jpeg\""),
         ] {
             let raw: toml::Value =
                 toml::from_str(&format!("kind = \"{kind_str}\"\n{extra}")).unwrap();
             let err = ExtractorKind::from_config("extractor.x", &raw, Some(1)).unwrap_err();
             assert!(
                 err.to_string().contains("unknown field 'dpi'")
-                    || err.to_string().contains("unknown field 'gfm'"),
+                    || err.to_string().contains("unknown field 'gfm'")
+                    || err.to_string().contains("unknown field 'format'"),
                 "{kind_str}: {err}"
             );
         }

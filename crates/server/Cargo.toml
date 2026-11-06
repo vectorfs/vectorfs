@@ -153,10 +153,9 @@ http = "1"
 
 # ---- M2 T4 pipeline kinds (design.md §5.7 "文件层" row, §5.10.2 kind table) ----
 
-# pdf-text extractor: high-level pdfium bindings, DYNAMIC loading only.
-# default-features = false drops the default [pdfium_latest, image_latest,
-# thread_safe] set: image_latest would drag `image` 0.25 in (M3 pdf-pages
-# territory, dead weight today). Kept features:
+# pdf-text / pdf-pages extractors: high-level pdfium bindings, DYNAMIC
+# loading only. default-features = false drops the default [pdfium_latest,
+# thread_safe] set. Kept features:
 #   - thread_safe: pdfium is not thread-safe; this wraps every FFI call in a
 #     mutex so the Extractor (Send + Sync by trait) is sound across the
 #     spawn_blocking ingest pool (§5.10.5). The `static` feature is NOT set —
@@ -164,10 +163,19 @@ http = "1"
 #   - pdfium_7881: newest bindings gate at-or-below our pinned binary
 #     (bblanchon/pdfium-binaries chromium/8066 via scripts/fetch_runtime_libs.sh);
 #     using pdfium_latest (= 8125) could bind symbols the 8066 .so lacks.
+#   - image_latest (= image_025): unlocks PdfBitmap::as_image for pdf-pages
+#     (M3-T3). This was deliberately OFF when pdf-text landed (image 0.25 was
+#     not in the tree — pure dead weight); since M3-T1 the tree declares the
+#     SAME crate and version (image 0.25, jpeg+png) directly, so the feature
+#     rides the already-compiled copy. pdfium-render's own image_025 dep is
+#     default-features = false + ["jpeg"], i.e. feature unification keeps the
+#     enabled set at exactly {jpeg, png} — zero new crates, zero default
+#     feature leakage (verified: cargo tree unchanged apart from the edge).
 # MIT OR Apache-2.0; pdfium itself is BSD-3 / Apache-2.0 (allowed binary dep).
 pdfium-render = { version = "0.9", default-features = false, features = [
   "thread_safe",
   "pdfium_7881",
+  "image_latest",
 ] }
 
 # pdf-inspector extractor: lopdf-based pure-Rust PDF detection/classification

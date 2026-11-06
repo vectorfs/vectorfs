@@ -126,6 +126,33 @@ impl Default for PdfTextExtractor {
     }
 }
 
+/// The process-global pdfium handle shared by every pdfium-backed kind
+/// (`pdf-text` here, `pdf-pages` in its sibling module): bind on first use,
+/// cache the attempt (success or failure) for the process lifetime. The
+/// visibility is scoped to the extract kind modules — the DIP boundary
+/// (pdfium-render types never leave `extract/pdf_*.rs`) holds; a pdfium
+/// swap still touches only these two files.
+pub(in crate::pipeline::extract) fn bind_pdfium(
+    source: &LibrarySource,
+) -> Result<&'static Pdfium, PipelineError> {
+    static PDFIUM: OnceLock<Result<Pdfium, String>> = OnceLock::new();
+    PDFIUM
+        .get_or_init(|| match source {
+            // bind_to_library yields the raw bindings; Pdfium::new wraps
+            // them (and runs the one-shot FPDF_InitLibrary).
+            LibrarySource::File(p) => Pdfium::bind_to_library(p)
+                .map(Pdfium::new)
+                .map_err(|e| format!("bind to {} failed: {e}", p.display())),
+            LibrarySource::System => Pdfium::bind_to_system_library()
+                .map(Pdfium::new)
+                .map_err(|e| format!("no libpdfium found via the system loader: {e}")),
+        })
+        .as_ref()
+        .map_err(|m| {
+            PipelineError::extract(format!("pdfium library unavailable: {m} ({FETCH_HINT})"))
+        })
+}
+
 impl PdfTextExtractor {
     /// Default constructor: apply the documented resolution chain. The path
     /// snapshot is taken HERE (deterministic per process); a resolution
@@ -145,25 +172,9 @@ impl PdfTextExtractor {
         }
     }
 
-    /// The process-global pdfium handle: bind on first use, cache the
-    /// attempt (success or failure) for the process lifetime.
+    /// The process-global pdfium handle (see [`bind_pdfium`]).
     fn pdfium(&self) -> Result<&'static Pdfium, PipelineError> {
-        static PDFIUM: OnceLock<Result<Pdfium, String>> = OnceLock::new();
-        PDFIUM
-            .get_or_init(|| match &self.source {
-                // bind_to_library yields the raw bindings; Pdfium::new wraps
-                // them (and runs the one-shot FPDF_InitLibrary).
-                LibrarySource::File(p) => Pdfium::bind_to_library(p)
-                    .map(Pdfium::new)
-                    .map_err(|e| format!("bind to {} failed: {e}", p.display())),
-                LibrarySource::System => Pdfium::bind_to_system_library()
-                    .map(Pdfium::new)
-                    .map_err(|e| format!("no libpdfium found via the system loader: {e}")),
-            })
-            .as_ref()
-            .map_err(|m| {
-                PipelineError::extract(format!("pdfium library unavailable: {m} ({FETCH_HINT})"))
-            })
+        bind_pdfium(&self.source)
     }
 }
 
