@@ -96,7 +96,7 @@ path = "{fixture}"
 offline = true
 
 [ingest.docs]
-scope = "docs/**"
+include = ["docs/**"]
 extract = {{ txt = "plain" }}
 chunk = {{ kind = "token-window", size = 16, overlap = 4 }}
 embedders = ["tiny"]
@@ -205,7 +205,7 @@ enum Mark {
 }
 
 fn marker_states(data_dir: &Path) -> Vec<(String, Mark, Option<u32>)> {
-    let dir = data_dir.join(".vectorfs/buckets/docs/sources");
+    let dir = data_dir.join("docs-vf/sources");
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(&dir) else {
         return out;
@@ -260,7 +260,9 @@ fn kill9_mid_ingest_restart_converges_exactly_once() {
     let mut d1 = Daemon::spawn(&data_dir, port, "serve-round1.log");
     wait_healthy(port, Instant::now() + Duration::from_secs(30));
 
-    let docs = data_dir.join("docs");
+    // v3: files land INSIDE the source bucket dir (data/docs/), under the
+    // docs/ key prefix the include filter claims
+    let docs = data_dir.join("docs").join("docs");
     std::fs::create_dir_all(&docs).unwrap();
     for i in 0..N {
         std::fs::write(docs.join(format!("doc-{i:03}.txt")), doc_body(i)).unwrap();

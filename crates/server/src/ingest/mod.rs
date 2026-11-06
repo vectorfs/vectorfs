@@ -168,7 +168,7 @@ use crate::pipeline::{
 use crate::store::{SourceMarker, SourceStatus, Storage};
 
 use domain::DerivedSpec;
-use marker::Scope;
+use marker::ClaimFilter;
 
 /// Bounded queue depth (§5.10.5 "~64").
 const QUEUE_DEPTH: usize = 64;
@@ -202,6 +202,21 @@ pub async fn fingerprint_gate(
     data_dir: &Path,
 ) -> Result<(), String> {
     for (vb, _) in cfg.ingest.iter().filter(|(_, i)| !i.embedders.is_empty()) {
+        // A vb whose SYSTEM bucket does not exist yet (fresh s3 deployment:
+        // vectorfs.toml names [ingest.X] before CreateVectorBucket ever ran)
+        // has no source markers to drift — the gate passes trivially. On the
+        // file backend a missing bucket lists as empty, but S3 answers
+        // ListObjects with 404 NoSuchBucket, which would otherwise refuse
+        // startup on every fresh endpoint deployment (G2 s3 full-path
+        // finding, 2026-11-06). The startup lock pass + scan both tolerate
+        // the missing bucket already (§5.1 skip; scan's no-listing guard).
+        if !storage
+            .system_bucket_exists(vb)
+            .await
+            .map_err(|e| format!("reading source markers of bucket {vb}: {e}"))?
+        {
+            continue;
+        }
         let current = cfg.fingerprint(vb).expect("bucket present in config");
         let markers = storage
             .list_sources(vb)
@@ -234,7 +249,10 @@ pub async fn fingerprint_gate(
 /// Everything one ingest bucket needs at runtime, pre-resolved once.
 pub(crate) struct BucketPlan {
     pub fingerprint: String,
-    pub scope: Scope,
+    /// In-bucket claim filter (R5): include/exclude globs; empty = whole
+    /// bucket. The source bucket IS the vb's namespace — there is no
+    /// cross-bucket scope anymore.
+    pub claim: ClaimFilter,
     /// raw extract routing: mime short key (or `default`) -> instance name,
     /// the `auto` sentinel, or an ordered chain of instance names (M2.1;
     /// see [`crate::pipeline::config::ExtractValue`]).
@@ -922,7 +940,7 @@ impl IngestCore {
                 vb.clone(),
                 BucketPlan {
                     fingerprint: cfg.fingerprint(vb).expect("bucket in config"),
-                    scope: Scope::new(icfg.scope.as_deref()),
+                    claim: ClaimFilter::new(&icfg.include, &icfg.exclude),
                     extract: icfg.extract.clone(),
                     extractors: cfg.extractors.clone(),
                     chunker: icfg.chunk.clone(),
@@ -950,6 +968,13 @@ impl IngestCore {
 
     pub fn embedder(&self, name: &str) -> Option<&LoadedEmbedder> {
         self.embedders.get(name)
+    }
+
+    /// Startup lock-skip seam (§5.1): a configured `[ingest.X]` bucket whose
+    /// LOCK could not be taken is dropped from the plan set — its worker and
+    /// scans do not run, everything else serves normally.
+    pub fn remove_bucket(&mut self, vb: &str) {
+        self.buckets.remove(vb);
     }
 
     /// Per-bucket startup summary: (bucket, embedder count, scan seconds).
@@ -1110,20 +1135,38 @@ impl IngestRuntime {
     /// One full list-and-diff pass over every configured bucket, followed by
     /// the GC pass (T7): DELETING reaps first (immediate — a `vf rm` 202 that
     /// woke this scan must converge HERE), then the idle-gated orphan sweep.
-    /// Idempotent; safe to call concurrently with workers (markers are
-    /// single-writer — this process holds the LOCK).
+    /// v3 (R1/R5): every bucket lists ITS OWN source bucket (separate
+    /// namespaces — no shared-root listing, no exclusion list: the system
+    /// objects live in a different bucket by construction). Idempotent; safe
+    /// to call concurrently with workers (markers are single-writer — this
+    /// process holds the bucket LOCKs).
     pub async fn scan_once(&self) {
-        let listing = match list_root(&self.state.storage).await {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("ingest: scan failed (listing the instance root): {e}");
-                // 防误删: without a live listing there is no 真源 to join
-                // against — NO GC of any kind may run this pass.
-                return;
-            }
-        };
         let mut pending_work = false;
+        // per-bucket live listings for the GC pass (keyed by vb)
+        let mut listings: BTreeMap<String, Vec<(String, object_store::ObjectMeta)>> =
+            BTreeMap::new();
         for (vb, plan) in &self.shared.core.buckets {
+            // §5.1 startup skip / lock loss: an unheld bucket gets NO scan
+            // decisions (marker writes are writes); the lock manager's
+            // retry pass brings it back without a restart
+            if !self.state.locks.is_held(vb) {
+                self.shared.warn_unlocked(vb);
+                continue;
+            }
+            self.shared.clear_unlocked_warn(vb);
+            let listing = match list_source_bucket(&self.state.storage, vb).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!(
+                        "ingest: scan of bucket {vb} failed (listing its source bucket): {e}"
+                    );
+                    // 防误删 (R5 护栏②): without THIS bucket's live listing
+                    // there is no 真源 to join against — no scan decisions and
+                    // NO GC of any kind may run for it this pass.
+                    continue;
+                }
+            };
+            listings.insert(vb.clone(), listing.clone());
             match self.scan_bucket(vb, plan, &listing).await {
                 Ok(()) => {
                     // lastScanAt for GetIngestStatus (appendix E.2): stamp on
@@ -1148,27 +1191,51 @@ impl IngestRuntime {
                 }
             }
         }
-        self.gc_pass(&listing, pending_work).await;
+        self.gc_pass(&listings, pending_work).await;
     }
 
-    /// The T7 GC half of one scan pass.
+    /// The T7 GC half of one scan pass (v3 rework, design-v3.md R5).
     ///
-    /// * `live` is the pass's instance-root listing (the 真源): a source is
-    ///   "gone" iff its key hash is absent from it.
+    /// * SCOPE = the buckets this daemon holds locks for ([ingest.X] pinned
+    ///   ∪ lazily acquired protocol buckets still held) — orphan sweep and
+    ///   any cross-bucket write NEVER touch an unlocked bucket (multi-daemon
+    ///   deployments: each daemon minds its own).
+    /// * `listings` carries THIS pass's per-bucket source listings (the 真源);
+    ///   a configured bucket whose listing failed is not in the map and gets
+    ///   no GC (the R5 no-live-listing guard).
+    /// * 护栏② (zero-live): a bucket whose listing came back EMPTY while it
+    ///   still has markers is treated as an anomalous listing — reap and
+    ///   sweep both refuse for it, loudly (an outage must not mass-delete
+    ///   chunks + trigger a re-embed storm). 护栏① (N-strike) lives in
+    ///   marker::plan_absent.
     /// * DELETING reaps are NOT idle-gated (the user behind a `vf rm` 202 is
-    ///   waiting), but they re-verify gone-ness against `live` — a
-    ///   re-appeared object (scan_bucket already flipped the marker back to
-    ///   PENDING in that case) is never reaped on stale state.
+    ///   waiting), but they re-verify gone-ness against the bucket's live
+    ///   set — a re-appeared object (scan_bucket already flipped the marker
+    ///   back to PENDING) is never reaped on stale state.
     /// * the orphan sweep runs only when `pending_work` is false AND no job
-    ///   is queued/in flight (the optimize discipline: janitor work never
-    ///   competes with owed ingest). Orphan window = one scan period
-    ///   (`scan_interval_secs`, default 30s).
-    async fn gc_pass(&self, live: &[(String, object_store::ObjectMeta)], pending_work: bool) {
-        let live_uris: BTreeSet<String> = live
-            .iter()
-            .map(|(k, _)| marker::object_key_hash(k))
-            .collect();
+    ///   is queued/in flight (the optimize discipline). Orphan window = one
+    ///   scan period (`scan_interval_secs`, default 30s). The sweep's live
+    ///   set per bucket is the FULL bucket listing — include/exclude
+    ///   narrowing must not starve orphans into reaping (R5).
+    async fn gc_pass(
+        &self,
+        listings: &BTreeMap<String, Vec<(String, object_store::ObjectMeta)>>,
+        pending_work: bool,
+    ) {
+        // GC scope: held buckets. Configured buckets whose lock we could not
+        // take at startup (or lost) are skipped here too.
+        let held: BTreeSet<String> = self.state.locks.held_buckets().into_iter().collect();
+        // buckets the zero-live guard refused this pass (护栏② gates the
+        // orphan sweep exactly as hard as the reap — an anomalous empty
+        // listing must not mass-delete chunks through either door)
+        let mut guarded: BTreeSet<String> = BTreeSet::new();
         for vb in self.shared.core.buckets.keys() {
+            if !held.contains(vb) {
+                continue; // not ours to write (R5 scope)
+            }
+            let Some(live) = listings.get(vb) else {
+                continue; // listing failed this pass — no 真源, no GC
+            };
             let markers = match self.state.storage.list_sources(vb).await {
                 Ok(m) => m,
                 Err(e) => {
@@ -1176,6 +1243,21 @@ impl IngestRuntime {
                     continue;
                 }
             };
+            // 护栏②: empty listing + markers => anomalous; refuse + warn loud
+            if live.is_empty() && !markers.is_empty() {
+                eprintln!(
+                    "ingest: gc {vb}: listing returned ZERO objects while {} marker(s) exist — \
+                     treating it as an anomalous listing and REFUSING to reap or sweep (delete \
+                     the markers by hand if the bucket really is empty)",
+                    markers.len()
+                );
+                guarded.insert(vb.clone());
+                continue;
+            }
+            let live_uris: BTreeSet<String> = live
+                .iter()
+                .map(|(k, _)| marker::object_key_hash(k))
+                .collect();
             for m in markers {
                 if m.status != SourceStatus::Deleting {
                     continue;
@@ -1203,10 +1285,40 @@ impl IngestRuntime {
         if pending_work || !inflight_empty {
             return; // owed work first; orphans keep (they are only waste)
         }
-        match gc::orphan_sweep(&self.state, &live_uris).await {
-            Ok(0) => {}
-            Ok(n) => eprintln!("ingest: gc: orphan sweep deleted {n} chunk(s)"),
-            Err(e) => eprintln!("ingest: gc: orphan sweep failed (next scan retries): {e}"),
+        for vb in &held {
+            if guarded.contains(vb) {
+                continue; // zero-live guard (护栏②)
+            }
+            let Some(live) = listings.get(vb) else {
+                continue;
+            };
+            // held-but-unconfigured buckets can hit the guard too: an empty
+            // listing with markers is suspicious whatever wrote the markers
+            if live.is_empty() {
+                match self.state.storage.list_sources(vb).await {
+                    Ok(ms) if !ms.is_empty() => {
+                        eprintln!(
+                            "ingest: gc {vb}: listing returned ZERO objects while {} marker(s) \
+                             exist — orphan sweep refused this pass",
+                            ms.len()
+                        );
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(_) => continue,
+                }
+            }
+            let live_uris: BTreeSet<String> = live
+                .iter()
+                .map(|(k, _)| marker::object_key_hash(k))
+                .collect();
+            match gc::orphan_sweep(&self.state, vb, &live_uris).await {
+                Ok(0) => {}
+                Ok(n) => eprintln!("ingest: gc {vb}: orphan sweep deleted {n} chunk(s)"),
+                Err(e) => {
+                    eprintln!("ingest: gc {vb}: orphan sweep failed (next scan retries): {e}")
+                }
+            }
         }
     }
 
@@ -1218,9 +1330,11 @@ impl IngestRuntime {
     ) -> Result<(), String> {
         let storage = &self.state.storage;
         let mut present = HashSet::new();
-        let (mut n_new, mut n_changed, mut n_requeue) = (0u32, 0u32, 0u32);
+        let (mut n_new, mut n_changed, mut n_requeue, mut n_refresh) = (0u32, 0u32, 0u32, 0u32);
         for (key, meta) in listing {
-            if !plan.scope.matches(key) || plan.extractor_chain_for(key).is_none() {
+            // claim filter + extractor routing (R5): unclaimed keys are not
+            // sources of this pipeline
+            if !plan.claim.matches(key) || plan.extractor_chain_for(key).is_none() {
                 continue;
             }
             present.insert(key.clone());
@@ -1267,33 +1381,53 @@ impl IngestRuntime {
                     })
                     .await;
                 }
+                marker::ScanPlan::Refresh(m) => {
+                    // object back after a strike: persist the counter reset
+                    storage
+                        .save_source(vb, &key_hash, &m)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    n_refresh += 1;
+                }
                 marker::ScanPlan::Settled | marker::ScanPlan::Parked => {}
             }
         }
-        // vanished objects -> DELETING (T7's GC reaps chunks + markers; this
-        // task only sets the state). Only markers inside the CURRENT scope:
-        // a scope change must not mass-delete what it merely stopped covering.
-        let mut n_gone = 0u32;
+        // vanished objects -> DELETING via the N-strike gate (R5 护栏①: an
+        // object must be absent VANISH_STRIKES consecutive scans before the
+        // flip; T7's GC reaps chunks + markers afterwards). Only markers the
+        // CURRENT claim filter covers: an include/exclude change must not
+        // mass-delete what it merely stopped claiming.
+        let (mut n_gone, mut n_strike) = (0u32, 0u32);
         for m in storage.list_sources(vb).await.map_err(|e| e.to_string())? {
-            if plan.scope.matches(&m.object_key) && !present.contains(&m.object_key) {
-                if let Some(d) = marker::plan_vanished(m, &marker::now_rfc3339()) {
-                    let key_hash = marker::object_key_hash(&d.object_key);
-                    storage
-                        .save_source(vb, &key_hash, &d)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    n_gone += 1;
+            if plan.claim.matches(&m.object_key) && !present.contains(&m.object_key) {
+                match marker::plan_absent(m, &marker::now_rfc3339()) {
+                    marker::AbsentPlan::FlipDeleting(d) => {
+                        let key_hash = marker::object_key_hash(&d.object_key);
+                        storage
+                            .save_source(vb, &key_hash, &d)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        n_gone += 1;
+                    }
+                    marker::AbsentPlan::WaitForStrike(w) => {
+                        let key_hash = marker::object_key_hash(&w.object_key);
+                        storage
+                            .save_source(vb, &key_hash, &w)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        n_strike += 1;
+                    }
                 }
             }
         }
-        if n_new + n_changed + n_requeue + n_gone > 0 {
+        if n_new + n_changed + n_requeue + n_refresh + n_gone + n_strike > 0 {
             eprintln!(
                 "ingest: scan {vb}: {n_new} new, {n_changed} changed, {n_requeue} requeued, \
-                 {n_gone} deleting"
+                 {n_refresh} refreshed, {n_gone} deleting, {n_strike} strike-counted"
             );
         }
         // KB statistics (appendix E.2): sources examined by this COMPLETED
-        // pass — in-scope, extractor-routed, present objects.
+        // pass — claimed, extractor-routed, present objects.
         self.shared.record_scanned(vb, present.len() as u64);
         Ok(())
     }
@@ -1347,6 +1481,16 @@ impl IngestRuntime {
         let Some(plan) = self.shared.core.buckets.get(&job.vb) else {
             return;
         };
+        // §5.1 (在飞提交前复核锁归属): a bucket whose lock this daemon lost
+        // (or never acquired — startup skip) gets no writes from us. The
+        // commit paths re-check again through ops::put_vectors's write lock.
+        if !self.state.locks.still_ours(&job.vb) {
+            eprintln!(
+                "ingest: {} skipped: bucket {} is not lock-held by this daemon",
+                job.object_key, job.vb
+            );
+            return;
+        }
         let storage = &self.state.storage;
 
         // ---- load marker, flip IN_PROGRESS ----
@@ -1382,12 +1526,13 @@ impl IngestRuntime {
         // ---- read the object (size-gated) ----
         // candidate keys: canonical first, raw second — externally placed
         // files keep their raw name on the file backend (T6 finding, see
-        // domain::user_object_key_candidates)
-        let backend = storage.backend().clone();
+        // domain::user_object_key_candidates). The read addresses THIS
+        // bucket's SOURCE store (v3: one store per bucket).
+        let source = storage.source_store(&job.vb);
         let mut get = None;
         let mut hard_err = None;
-        for okey in domain::user_object_key_candidates(&backend, &job.object_key) {
-            match storage.catalog().get(&okey).await {
+        for okey in domain::user_object_key_candidates(&job.object_key) {
+            match source.get(&okey).await {
                 Ok(g) => {
                     get = Some(g);
                     break;
@@ -2064,21 +2209,15 @@ fn split_batches(rows: Vec<BatchRow>, dim: usize) -> Vec<Vec<BatchRow>> {
 // instance-root listing
 // ---------------------------------------------------------------------------
 
-/// List the WHOLE instance root (user namespace), returning
-/// root-relative keys with their metadata. Excludes the reserved system
-/// prefix (`.vectorfs/`, plus the memory backend's `vf/.vectorfs/` lance
-/// mirror) — model caches live under it too, so the exclusion is what keeps
-/// scans off them (§5.10.4 "`.vectorfs/` 恒排除").
-async fn list_root(storage: &Storage) -> Result<Vec<(String, object_store::ObjectMeta)>, String> {
-    list_root_at(storage.catalog(), storage.backend()).await
-}
-
-/// The backend-parameterized half of [`list_root`] — the `/x-vf` face
-/// (ListSources' marker x live join, T6) reuses it against the same catalog.
+/// List ONE bucket's SOURCE store (design-v3.md R1/R5: the source bucket IS
+/// the vb's namespace — system objects live in the separate `X-vf` bucket,
+/// so the exclusion list of the v2.2 shared-root scan is gone by
+/// construction), returning bucket-relative keys with their metadata. The
+/// `/x-vf` face (ListSources' marker x live join) reuses it.
 ///
-/// Key canonicalization (a T6-found latent bug of the T3 scanner):
+/// Key canonicalization (a T6-found latent bug of the T3 scanner, kept):
 /// `object_store::path::Path` percent-encodes non-ASCII and AWS-discouraged
-/// characters (`%{}\^]"'>~<#|*?` + controls) at construction, and the LOCAL
+/// characters (`%{}`\\^]"'>~<#|*?` + controls) at construction, and the LOCAL
 /// backend materializes that canonical form on disk — so a listed location's
 /// string is CANONICAL, while every human-facing key (marker `object_key`,
 /// PutSource's decoded `x-vf-file-name`, GetSource lookups through
@@ -2088,40 +2227,20 @@ async fn list_root(storage: &Storage) -> Result<Vec<(String, object_store::Objec
 /// vanish-flip (raw twin) on every scan. Decode is the exact inverse of
 /// `Path`'s encoding (which escapes `%` itself), so the round trip is
 /// bijective.
-pub(crate) async fn list_root_at(
-    catalog: &Arc<dyn object_store::ObjectStore>,
-    backend: &crate::backends::Backend,
+pub(crate) async fn list_source_bucket(
+    storage: &Storage,
+    vb: &str,
 ) -> Result<Vec<(String, object_store::ObjectMeta)>, String> {
     use futures_util::StreamExt;
-    let mut stream = catalog.list(None);
+    let store = storage.source_store(vb);
+    let mut stream = store.list(None);
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
-        let meta = item.map_err(|e| format!("list: {e}"))?;
-        let raw = meta.location.as_ref().to_string();
-        // S3: the catalog store is rooted at the BUCKET, so keys carry the
-        // configured prefix; strip it and skip anything outside it (other
-        // tenants of the same bucket are not this instance root).
-        let key = match backend {
-            crate::backends::Backend::S3(cfg) => {
-                let Some(k) = raw.strip_prefix(&format!("{}/", cfg.prefix.trim_matches('/')))
-                else {
-                    continue;
-                };
-                k.to_string()
-            }
-            _ => raw,
-        };
-        let key = percent_encoding::percent_decode_str(&key)
+        let meta = item.map_err(|e| format!("list bucket {vb}: {e}"))?;
+        let key = percent_encoding::percent_decode_str(meta.location.as_ref())
             .decode_utf8_lossy()
             .into_owned();
-        if key.starts_with(crate::backends::SYSTEM_PREFIX)
-            || key.starts_with(&format!(
-                "{}/{}",
-                crate::backends::MEMORY_HOST,
-                crate::backends::SYSTEM_PREFIX
-            ))
-            || key.is_empty()
-        {
+        if key.is_empty() {
             continue;
         }
         out.push((key, meta));
@@ -2205,6 +2324,10 @@ pub struct IngestShared {
     /// loop would then burn attempts on. Extraction/embedding still run in
     /// parallel — only the final commit is one-at-a-time.
     write_lock: tokio::sync::Mutex<()>,
+    /// Buckets already WARNED as lock-skipped this uptime (throttle: a 1s
+    /// scan interval must not print the same skip every pass; cleared when
+    /// the lock recovers).
+    unlocked_warned: std::sync::Mutex<BTreeSet<String>>,
 }
 
 impl IngestShared {
@@ -2222,6 +2345,7 @@ impl IngestShared {
             inflight: std::sync::Mutex::new(HashSet::new()),
             reindex_barrier: std::sync::Mutex::new(BTreeSet::new()),
             write_lock: tokio::sync::Mutex::new(()),
+            unlocked_warned: std::sync::Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -2311,13 +2435,30 @@ impl IngestShared {
         self.core.embedder(name)
     }
 
-    /// Is `object_key` a SOURCE of this bucket's pipeline (scope match AND a
-    /// routed extractor chain)? PutSource refuses keys outside it — a marker
-    /// for an unscoped key would never be touched by the scanner again.
+    /// Is `object_key` a SOURCE this bucket's pipeline claims (claim-filter
+    /// match AND a routed extractor chain, R5)? PutSource refuses keys
+    /// outside it — a marker for an unclaimed key would never be touched by
+    /// the scanner again.
     pub fn claims_key(&self, bucket: &str, object_key: &str) -> bool {
         self.core.buckets.get(bucket).is_some_and(|p| {
-            p.scope.matches(object_key) && p.extractor_chain_for(object_key).is_some()
+            p.claim.matches(object_key) && p.extractor_chain_for(object_key).is_some()
         })
+    }
+
+    /// Warn (once) that a bucket is lock-skipped (§5.1).
+    pub(crate) fn warn_unlocked(&self, bucket: &str) {
+        let mut warned = self.unlocked_warned.lock().unwrap();
+        if warned.insert(bucket.to_string()) {
+            eprintln!(
+                "ingest: bucket {bucket} scan SKIPPED — its writer lock is held elsewhere; \
+                 resuming when the lock is recovered"
+            );
+        }
+    }
+
+    /// Clear the lock-skip warning state (the lock came back).
+    pub(crate) fn clear_unlocked_warn(&self, bucket: &str) {
+        self.unlocked_warned.lock().unwrap().remove(bucket);
     }
 
     /// Stamp a completed scan (scheduler -> GetIngestStatus).
@@ -2581,6 +2722,7 @@ async fn reindex_bucket_quiesced(
             status_reason: None,
             retries: 0,
             retries_exhausted: false,
+            misses: 0,
             updated_at: now.clone(),
             chunks: None,
             engines: None,
@@ -2748,7 +2890,7 @@ pub(crate) mod tests {
         let text = format!(
             "[extractor.plain]\nkind = \"txt\"\n\n\
              [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = true\n\n\
-             [ingest.docs]\nscope = \"docs/**\"\nextract = {{ txt = \"plain\" }}\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ txt = \"plain\" }}\n\
              chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
              embedders = [\"tiny\"]\nscan_interval_secs = 1\n{}",
             fixture_dir().display().to_string(),
@@ -2759,14 +2901,24 @@ pub(crate) mod tests {
     }
 
     fn test_state(dir: &Path) -> Arc<AppState> {
-        Arc::new(AppState {
-            storage: Arc::new(Storage::file(dir)),
-            creds: None,
-            region: "us-east-1".into(),
-            account: "000000000000".into(),
-            trace: false,
-            ingest: None,
-        })
+        Arc::new(AppState::new(
+            Arc::new(Storage::file(dir)),
+            None,
+            "us-east-1".into(),
+            "000000000000".into(),
+            false,
+            None,
+        ))
+    }
+
+    /// Pin + acquire the writer locks for every configured bucket — the test
+    /// counterpart of serve's startup pass (§5.1; jobs refuse unlocked
+    /// buckets by design, and GC only covers held buckets).
+    async fn hold_locks(state: &AppState, buckets: impl Iterator<Item = String>) {
+        for vb in buckets {
+            state.locks.pin(&vb);
+            state.locks.ensure_held(&vb).await.unwrap();
+        }
     }
 
     /// Runtime in test mode: no spawned tasks; the test drives
@@ -2781,6 +2933,7 @@ pub(crate) mod tests {
             .await
             .expect("fixture embedder loads");
         let state = test_state(dir);
+        hold_locks(&state, core.buckets.keys().cloned()).await;
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handle = Arc::new(IngestHandle::new(IngestShared::new(core)));
         let rt = IngestRuntime::new(
@@ -2810,7 +2963,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (rt, _h, state) = test_runtime(dir.path(), "").await;
         // user objects land in the instance root, inside the scope
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(
             docs.join("a.txt"),
@@ -2934,9 +3087,11 @@ pub(crate) mod tests {
             }
         }
         walk(dir.path(), &mut outside);
+        // v3: user data lives ONLY in the source bucket; the system bucket
+        // (docs-vf) and the daemon home (.vectorfs) are the other two trees
         let user_files: Vec<String> = outside
             .iter()
-            .filter(|p| !p.contains("/.vectorfs"))
+            .filter(|p| !p.contains("/.vectorfs") && !p.contains("/docs-vf/"))
             .cloned()
             .collect();
         assert_eq!(
@@ -2955,6 +3110,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let state = test_state(dir.path());
+        hold_locks(&state, core.buckets.keys().cloned()).await;
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handle = Arc::new(IngestHandle::new(IngestShared::new(core)));
         let rt = IngestRuntime::new(
@@ -2965,7 +3121,7 @@ pub(crate) mod tests {
         );
         rt.spawn(&handle);
 
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("s.txt"), "scheduled scan should pick this up").unwrap();
 
@@ -3005,7 +3161,7 @@ pub(crate) mod tests {
     async fn non_utf8_file_fails_with_reason_and_no_retry() {
         let dir = tempfile::tempdir().unwrap();
         let (rt, _h, state) = test_runtime(dir.path(), "retries = 0\n").await;
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("bad.txt"), b"\xff\xfe\xfa not utf8 \xff").unwrap();
 
@@ -3045,6 +3201,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let state = test_state(dir.path());
+        hold_locks(&state, core.buckets.keys().cloned()).await;
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let rt = IngestRuntime::new(
             IngestShared::new(core),
@@ -3053,7 +3210,7 @@ pub(crate) mod tests {
             rx,
         );
 
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("a.txt"), "fan out to two embedders, one dead").unwrap();
 
@@ -3087,7 +3244,7 @@ pub(crate) mod tests {
     async fn content_hash_skip_beats_metadata_only_rewrite() {
         let dir = tempfile::tempdir().unwrap();
         let (rt, _h, state) = test_runtime(dir.path(), "").await;
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         let file = docs.join("a.txt");
         std::fs::write(&file, "identical bytes will survive a rewrite").unwrap();
@@ -3130,7 +3287,7 @@ pub(crate) mod tests {
     async fn changed_content_reingests_and_deletion_flips_deleting() {
         let dir = tempfile::tempdir().unwrap();
         let (rt, _h, state) = test_runtime(dir.path(), "").await;
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         let file = docs.join("a.txt");
         std::fs::write(&file, "first version of the content").unwrap();
@@ -3158,10 +3315,25 @@ pub(crate) mod tests {
             "converged"
         );
 
-        // deletion => the SAME scan pass reaps it (T7: DELETING flip + GC are
-        // one convergence unit — the `vf rm` 202 poll contract)
+        // deletion => the vanish N-strike gate (v3 R5: TWO consecutive
+        // absent scans) then the reap — the flip+GC convergence the `vf rm`
+        // 202 poll contract observes, one strike later. A non-source file
+        // keeps the listing non-empty (the zero-live guard 护栏② would
+        // otherwise refuse the reap of a bucket that emptied completely).
+        std::fs::write(file.with_file_name("keep.png"), b"not a source").unwrap();
         std::fs::remove_file(&file).unwrap();
-        rt.scan_once().await;
+        rt.scan_once().await; // strike 1: counted, no flip
+        let struck = state
+            .storage
+            .load_source("docs", &marker::object_key_hash("docs/a.txt"))
+            .await
+            .unwrap();
+        assert_eq!(
+            struck.as_ref().unwrap().misses,
+            1,
+            "first absence counts a strike"
+        );
+        rt.scan_once().await; // strike 2: flip + reap in the same pass
         let gone = state
             .storage
             .load_source("docs", &marker::object_key_hash("docs/a.txt"))
@@ -3184,7 +3356,7 @@ pub(crate) mod tests {
         // encoded-twin marker and vanish-flips its real one each scan.
         let dir = tempfile::tempdir().unwrap();
         let (rt, _h, state) = test_runtime(dir.path(), "").await;
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("汉字 文档#1.txt"), "unicode content here").unwrap();
         rt.scan_once().await;
@@ -3206,7 +3378,7 @@ pub(crate) mod tests {
     async fn oversize_file_parks_without_reading() {
         let dir = tempfile::tempdir().unwrap();
         let (rt, _h, state) = test_runtime(dir.path(), "max_file_size_mb = 1\n").await;
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         // a sparse file reports > 1 MiB without materializing it
         let file = docs.join("big.txt");
@@ -3243,6 +3415,7 @@ pub(crate) mod tests {
             status_reason: None,
             retries: 0,
             retries_exhausted: false,
+            misses: 0,
             updated_at: "t".into(),
             chunks: Some(BTreeMap::from([("text".to_string(), 1)])),
             engines: None,
@@ -3287,7 +3460,7 @@ pub(crate) mod tests {
         // is re-enqueued by the next scan and converges
         let dir = tempfile::tempdir().unwrap();
         let (rt, _h, state) = test_runtime(dir.path(), "").await;
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(
             docs.join("a.txt"),
@@ -3345,7 +3518,7 @@ pub(crate) mod tests {
     async fn store_chunk_text_false_omits_the_key() {
         let dir = tempfile::tempdir().unwrap();
         let (rt, _h, state) = test_runtime(dir.path(), "store_chunk_text = false\n").await;
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("a.txt"), "no chunk text should be stored for me").unwrap();
         rt.scan_once().await;
@@ -3379,7 +3552,7 @@ pub(crate) mod tests {
         let text = format!(
             "[extractor.plain]\nkind = \"txt\"\n\n\
              [embedder.tiny]\nkind = \"ort\"\nmodel = \"{model}\"\npath = {:?}\noffline = true\n\n\
-             [ingest.docs]\nscope = \"docs/**\"\nextract = {{ txt = \"plain\" }}\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ txt = \"plain\" }}\n\
              chunk = {{ kind = \"token-window\", size = {chunk_size}, overlap = 8 }}\n\
              embedders = [\"tiny\"]\nscan_interval_secs = 1\n",
             fixture_dir().display().to_string(),
@@ -3397,6 +3570,7 @@ pub(crate) mod tests {
             .await
             .expect("fixture embedder loads");
         let state = test_state(dir);
+        hold_locks(&state, core.buckets.keys().cloned()).await;
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let handle = Arc::new(IngestHandle::new(IngestShared::new(core)));
         let rt = IngestRuntime::new(
@@ -3444,7 +3618,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn reindex_full_flow_shrink_zero_residue_and_gate_recovery() {
         let dir = tempfile::tempdir().unwrap();
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("a.txt"), LONG_BODY).unwrap();
 
@@ -3480,7 +3654,9 @@ pub(crate) mod tests {
             .unwrap_err();
         assert!(err.contains("--reindex"), "{err}");
 
-        // (3) serve --reindex selection + mechanism (pre-spawn shape)
+        // (3) serve --reindex selection + mechanism (pre-spawn shape); the
+        // old "daemon" releases its bucket locks first (same-process restart)
+        state.locks.release_all().await;
         let (rt2, handle2, state2) = runtime_for(dir.path(), &new_cfg).await;
         let outcome = reindex_bucket_if_stale(&state2, handle2.shared(), "docs")
             .await
@@ -3590,7 +3766,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn reindex_barrier_refuses_new_enqueues() {
         let dir = tempfile::tempdir().unwrap();
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("a.txt"), LONG_BODY).unwrap();
 
@@ -3634,7 +3810,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn reindex_barrier_waits_for_inflight_then_flips_it_too() {
         let dir = tempfile::tempdir().unwrap();
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("a.txt"), LONG_BODY).unwrap();
 
@@ -3683,7 +3859,7 @@ pub(crate) mod tests {
     async fn orphan_sweep_reaps_markerless_chunks_when_idle_only() {
         let dir = tempfile::tempdir().unwrap();
         let (rt, _h, state) = test_runtime(dir.path(), "").await;
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("a.txt"), LONG_BODY).unwrap();
         std::fs::write(docs.join("b.txt"), "a second, shorter body").unwrap();
@@ -3752,7 +3928,7 @@ pub(crate) mod tests {
     async fn gc_spares_foreign_keys_and_unstamped_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let (rt, _h, state) = test_runtime(dir.path(), "").await;
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("a.txt"), LONG_BODY).unwrap();
         rt.scan_once().await;
@@ -3814,10 +3990,14 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        // the object vanishes: its OWN chunks are reaped, the two foreign
-        // rows survive
+        // the object vanishes: its OWN chunks are reaped (after the v3
+        // N-strike gate — two consecutive absent scans), the two foreign
+        // rows survive. keep.png keeps the listing non-empty (护栏② would
+        // refuse a fully-emptied bucket's reap).
+        std::fs::write(docs.join("keep.png"), b"not a source").unwrap();
         std::fs::remove_file(docs.join("a.txt")).unwrap();
-        rt.scan_once().await;
+        rt.scan_once().await; // strike 1
+        rt.scan_once().await; // strike 2: flip + reap
 
         let derived_rows = state
             .storage
@@ -3986,7 +4166,7 @@ pub(crate) mod tests {
              [extractor.plain]\nkind = \"pdf-text\"\n\n\
              [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = \
              true\n\n\
-             [ingest.docs]\nscope = \"docs/**\"\nextract = {{ pdf = {route} }}\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ pdf = {route} }}\n\
              chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
              embedders = [\"tiny\"]\nscan_interval_secs = 1\nretries = 0\n",
             fixture_dir().display().to_string(),
@@ -4011,7 +4191,7 @@ pub(crate) mod tests {
         // (1) chain ["insp", "plain"]: mixed class routes to plain (Capable;
         // insp refuses) — INDEXED via the pdfium half of the divergence
         let dir = tempfile::tempdir().unwrap();
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("mixed.pdf"), &bytes).unwrap();
         let (rt, _h, state) =
@@ -4039,7 +4219,7 @@ pub(crate) mod tests {
         // (pinned precisely at the router in the route unit tests); the
         // file indexes either way.
         let dir_tb = tempfile::tempdir().unwrap();
-        let docs_tb = dir_tb.path().join("docs");
+        let docs_tb = dir_tb.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs_tb).unwrap();
         std::fs::write(docs_tb.join("hello.pdf"), HELLO_PDF).unwrap();
         let (rt_tb, _h_tb, state_tb) =
@@ -4056,9 +4236,10 @@ pub(crate) mod tests {
         // and NO routing vocabulary: a single member never probes
         // (members.len() > 1 gate), so no class annotation, no wrapper
         let dir2 = tempfile::tempdir().unwrap();
-        let docs2 = dir2.path().join("docs");
+        let docs2 = dir2.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs2).unwrap();
         std::fs::write(docs2.join("mixed.pdf"), &bytes).unwrap();
+        state.locks.release_all().await; // same-process restart
         let (rt2, _h2, state2) = runtime_for(dir2.path(), &pdf_route_config("\"insp\"")).await;
         rt2.scan_once().await;
         rt2.drain_queue().await;
@@ -4087,7 +4268,7 @@ pub(crate) mod tests {
         let mut corrupt = b"%PDF-1.7\n".to_vec();
         corrupt.extend_from_slice(&[0x00, 0xff, 0x13, 0x37, 0xde, 0xad, 0xbe, 0xef]);
         let dir = tempfile::tempdir().unwrap();
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("corrupt.pdf"), &corrupt).unwrap();
         let (rt, _h, state) =
@@ -4127,7 +4308,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn routing_all_refuse_parks_without_executing_any_member() {
         let dir = tempfile::tempdir().unwrap();
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(
             docs.join("scan.pdf"),
@@ -4488,6 +4669,7 @@ pub(crate) mod tests {
             .expect("fixture embedder loads");
         patch(core.buckets.get_mut("docs").expect("docs bucket"));
         let state = test_state(dir);
+        hold_locks(&state, core.buckets.keys().cloned()).await;
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let handle = Arc::new(IngestHandle::new(IngestShared::new(core)));
         let rt = IngestRuntime::new(
@@ -4510,7 +4692,7 @@ pub(crate) mod tests {
              [extractor.ctn]\nkind = \"txt\"\n\n\
              [extractor.inner]\nkind = \"txt\"\n\n\
              [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = true\n\n\
-             [ingest.docs]\nscope = \"docs/**\"\nextract = {{ {extract_entries} }}\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ {extract_entries} }}\n\
              chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
              embedders = [\"tiny\"]\nscan_interval_secs = 1\n{extra}",
             fixture_dir().display().to_string(),
@@ -4530,7 +4712,7 @@ pub(crate) mod tests {
     async fn gz_document_full_chain_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let (rt, _h, state) = runtime_for(dir.path(), &tiny_config("").1).await;
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         let body = "the quick brown fox jumps over the lazy dog again and again";
         std::fs::write(docs.join("a.txt.gz"), gz(body.as_bytes())).unwrap();
@@ -4574,7 +4756,7 @@ pub(crate) mod tests {
     async fn corrupt_gz_document_parks_with_hint_name_reason() {
         let dir = tempfile::tempdir().unwrap();
         let (rt, _h, state) = runtime_for(dir.path(), &tiny_config("retries = 3\n").1).await;
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         let mut bad = vec![0x1f, 0x8b, 0x08, 0x00];
         bad.extend_from_slice(b"definitely not a deflate stream");
@@ -4617,7 +4799,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (rt, _h, state) =
             runtime_for(dir.path(), &tiny_config("max_file_size_mb = 1\n").1).await;
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         // ~1.5 MiB of highly compressible text: raw gz stays far under the
         // 1 MiB raw gate, the expansion blows past it
@@ -4650,7 +4832,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn container_children_reenter_user_configured_chains_e2e() {
         let dir = tempfile::tempdir().unwrap();
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         let payload = b"CONTAINER-PAYLOAD";
         std::fs::write(docs.join("book.ctn"), payload).unwrap();
@@ -4731,7 +4913,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn container_child_normalize_runs_before_child_routing() {
         let dir = tempfile::tempdir().unwrap();
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         let payload = b"GZ-CHILD-CONTAINER";
         std::fs::write(docs.join("book.ctn"), payload).unwrap();
@@ -4778,7 +4960,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn container_children_all_failing_aggregate_reasons() {
         let dir = tempfile::tempdir().unwrap();
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         let payload = b"EMPTY-CONTAINER";
         std::fs::write(docs.join("book.ctn"), payload).unwrap();
@@ -4836,7 +5018,7 @@ pub(crate) mod tests {
     async fn container_nested_two_levels_ok_third_refused() {
         // ---- two levels: doc.ctn -> ctn -> default(inner) -> leaf.txt ----
         let dir = tempfile::tempdir().unwrap();
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("book.ctn"), b"OUTER".as_slice()).unwrap();
         let cfg = ctn_config("ctn = \"ctn\", txt = \"plain\", default = \"inner\"", "");
@@ -4880,7 +5062,7 @@ pub(crate) mod tests {
 
         // ---- three layers: the third container Errs before its children --
         let dir3 = tempfile::tempdir().unwrap();
-        let docs3 = dir3.path().join("docs");
+        let docs3 = dir3.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs3).unwrap();
         std::fs::write(docs3.join("book.ctn"), b"OUTER".as_slice()).unwrap();
         let cfg3 = ctn_config(
@@ -4944,7 +5126,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn container_children_limit_errs() {
         let dir = tempfile::tempdir().unwrap();
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("many.ctn"), b"MANY".as_slice()).unwrap();
         let children: Vec<ChildDoc> = (0..=256)
@@ -5007,7 +5189,7 @@ pub(crate) mod tests {
 
         // (a) raw-oversize + ok sibling -> INDEXED, only the sibling's text
         let dir = tempfile::tempdir().unwrap();
-        let docs = dir.path().join("docs");
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("book.ctn"), b"PAY-A".as_slice()).unwrap();
         let (payload, cfg, _) = mk(
@@ -5050,7 +5232,7 @@ pub(crate) mod tests {
         // size, sibling still indexes (decompression may not smuggle past
         // the file-size guard)
         let dir_b = tempfile::tempdir().unwrap();
-        let docs_b = dir_b.path().join("docs");
+        let docs_b = dir_b.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs_b).unwrap();
         std::fs::write(docs_b.join("book.ctn"), b"PAY-B".as_slice()).unwrap();
         let (payload_b, cfg_b, _) = mk(b"PAY-B", vec![]);
@@ -5082,7 +5264,7 @@ pub(crate) mod tests {
         // (c) ONLY the oversize child: the container yields, the reason
         // names the skip
         let dir_c = tempfile::tempdir().unwrap();
-        let docs_c = dir_c.path().join("docs");
+        let docs_c = dir_c.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs_c).unwrap();
         std::fs::write(docs_c.join("book.ctn"), b"PAY-C".as_slice()).unwrap();
         let (payload_c, cfg_c, _) = mk(b"PAY-C", vec![]);

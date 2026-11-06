@@ -13,7 +13,6 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::backends::Backend;
 use crate::store::{BucketMeta, DerivedIndexInfo, IndexMeta, Storage};
 
 use crate::pipeline::embed::EmbedderKind;
@@ -139,6 +138,8 @@ pub async fn ensure_domain(
                 vector_bucket_arn: format!("arn:aws:s3vectors:{region}:{account}:bucket/{vb}"),
                 creation_time_rfc3339: rfc3339,
                 creation_time_epoch: epoch,
+                deployment: storage.deployment_identity(region, account),
+                placement: storage.placement(vb),
                 default_index_mode: None,
             };
             // put_json_create under the single-writer LOCK: Conflict here
@@ -245,15 +246,11 @@ fn now_pair() -> (f64, String) {
     (secs, crate::ops::epoch_to_rfc3339(secs))
 }
 
-/// Instance-root-relative key of a USER object (Source bytes live in the
-/// user namespace; the `.vectorfs/` funnel in `Backend::object_key` is for
-/// system objects only). S3 keys additionally carry the configured bucket
-/// prefix.
-pub fn user_object_key(backend: &Backend, key: &str) -> object_store::path::Path {
-    match backend {
-        Backend::S3(cfg) => cfg.catalog_key(key),
-        Backend::File { .. } | Backend::Memory => object_store::path::Path::from(key),
-    }
+/// Bucket-relative key of a USER object (design-v3.md R1/R5: source bytes
+/// live in the vb's own SOURCE bucket; keys address that store directly —
+/// no backend-specific mapping remains).
+pub fn user_object_key(key: &str) -> object_store::path::Path {
+    object_store::path::Path::from(key)
 }
 
 /// READ/DELETE key candidates of a user object, canonical form first.
@@ -261,16 +258,16 @@ pub fn user_object_key(backend: &Backend, key: &str) -> object_store::path::Path
 /// Why two (T6 finding, file backend): `object_store::path::Path::from`
 /// CANONICALIZES (percent-encodes non-ASCII and `%{}\^]"'>~<#|*?`), and the
 /// local backend materializes that form — so objects WE write live under
-/// canonical names. But an EXTERNALLY placed file (cp/mv into the instance
-/// root — the §5.10.4 data-source model) keeps its RAW name, and
+/// canonical names. But an EXTERNALLY placed file (cp/mv into the bucket —
+/// the §5.10.4 data-source model) keeps its RAW name, and
 /// `LocalFileSystem::list` reports raw names. Reads/deletes therefore try
 /// the canonical key first, then the raw form (built via `from_url_path`,
 /// which validates without re-encoding). A key containing a literal `%`
 /// stays canonical-only: the percent-decoding construction would be
 /// ambiguous there (documented limitation; such keys also cannot round-trip
 /// a listing decode).
-pub fn user_object_key_candidates(backend: &Backend, key: &str) -> Vec<object_store::path::Path> {
-    let primary = user_object_key(backend, key);
+pub fn user_object_key_candidates(key: &str) -> Vec<object_store::path::Path> {
+    let primary = user_object_key(key);
     if key.contains('%') {
         return vec![primary];
     }
@@ -446,27 +443,13 @@ mod tests {
     }
 
     #[test]
-    fn user_object_key_maps_per_backend() {
-        use crate::backends::S3BackendConfig;
+    fn user_object_key_is_bucket_relative() {
+        // v3: one rule for every backend — the store handle IS the bucket
+        assert_eq!(user_object_key("docs/a.txt").as_ref(), "docs/a.txt");
         assert_eq!(
-            user_object_key(&Backend::File { root: "/d".into() }, "docs/a.txt").as_ref(),
-            "docs/a.txt"
-        );
-        assert_eq!(
-            user_object_key(&Backend::Memory, "docs/a.txt").as_ref(),
-            "docs/a.txt"
-        );
-        let cfg = S3BackendConfig {
-            endpoint: "http://x".into(),
-            bucket: "b".into(),
-            prefix: "pre".into(),
-            region: "us-east-1".into(),
-            access_key: None,
-            secret_key: None,
-        };
-        assert_eq!(
-            user_object_key(&Backend::S3(Box::new(cfg)), "docs/a.txt").as_ref(),
-            "pre/docs/a.txt"
+            user_object_key("docs/a.txt").as_ref(),
+            "docs/a.txt",
+            "backend arg is accepted (and ignored) for symmetry"
         );
     }
 
@@ -475,15 +458,15 @@ mod tests {
     /// form; a literal '%' key stays canonical-only (decode ambiguity).
     #[test]
     fn user_object_key_candidates_canonical_then_raw() {
-        let plain = user_object_key_candidates(&Backend::Memory, "docs/a.txt");
+        let plain = user_object_key_candidates("docs/a.txt");
         assert_eq!(plain.len(), 1, "ASCII-plain keys have one form");
 
-        let uni = user_object_key_candidates(&Backend::Memory, "docs/汉字 文档#1.txt");
+        let uni = user_object_key_candidates("docs/汉字 文档#1.txt");
         assert_eq!(uni.len(), 2, "canonical + raw");
         assert!(uni[0].as_ref().contains("%E6%B1%89"), "{}", uni[0].as_ref());
         assert_eq!(uni[1].as_ref(), "docs/汉字 文档#1.txt", "raw form second");
 
-        let pct = user_object_key_candidates(&Backend::Memory, "docs/100%done.txt");
+        let pct = user_object_key_candidates("docs/100%done.txt");
         assert_eq!(pct.len(), 1, "literal '%' never falls back to decoding");
     }
 }

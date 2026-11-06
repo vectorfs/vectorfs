@@ -61,6 +61,10 @@ struct RawFile {
     // deployments materialize this pointing at the /vectorfs/models volume
     // (§5.10.7).
     models_dir: Option<String>,
+    // `bucket_suffix` (design-v3.md §3-R6): tolerated here so the pipeline
+    // parser sees the same file; strictly typed + validated below because
+    // the vb-name gates need it.
+    bucket_suffix: Option<String>,
     // M2 T2 plugin sections: instance name -> spanned section table.
     extractor: Option<BTreeMap<String, toml::Spanned<toml::Value>>>,
     embedder: Option<BTreeMap<String, toml::Spanned<toml::Value>>>,
@@ -69,10 +73,19 @@ struct RawFile {
 
 /// Per-bucket raw ingest shape (`deny_unknown_fields`; `chunk` stays a raw
 /// value because it is parsed by the chunker axis's own two-stage parser).
+/// v3.1 (R5): `scope` is DELETED — the source bucket IS the namespace; the
+/// optional `include`/`exclude` globs are in-bucket claim filters only
+/// (省缺 = 整桶). The strict parse of a v2.2 `scope` key hard-fails with its
+/// TOML line (fail-fast, expected during the axis switch).
 #[derive(serde::Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct IngestRaw {
-    scope: Option<String>,
+    /// Optional in-bucket claim filter (glob; empty/absent = whole bucket).
+    #[serde(default)]
+    include: Vec<String>,
+    /// Optional in-bucket claim exclusion (glob; wins over include).
+    #[serde(default)]
+    exclude: Vec<String>,
     #[serde(default)]
     extract: BTreeMap<String, ExtractValue>,
     chunk: Option<toml::Value>,
@@ -221,6 +234,10 @@ pub struct PipelineConfig {
     /// `<data-dir>/.vectorfs/models` default, resolved at USE time — the
     /// parser has no data dir).
     pub models_dir: Option<std::path::PathBuf>,
+    /// `bucket_suffix` (design-v3.md R6): validated, defaults `-vf`. The
+    /// ingest-bucket name gates use it (names must fit 3..=63−len(suffix)
+    /// and not end with the suffix).
+    pub bucket_suffix: String,
     /// Non-fatal advisories (warnings) collected during validation — e.g. an
     /// ort embedder pointing `path` at a model outside the built-in table
     /// (license then being the operator's audit, §5.10.5). `pipelines check`
@@ -322,12 +339,16 @@ impl PipelineConfig {
     }
 }
 
-/// One `[ingest.<bucket>]` section (design.md §5.10.4).
+/// One `[ingest.<bucket>]` section (design.md §5.10.4; v3.1 R5: the source
+/// bucket IS the namespace — `include`/`exclude` are in-bucket claim
+/// filters, not namespace selectors).
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
-    /// Ingest scope prefix/glob inside the instance root; `None` = whole
-    /// root (`.vectorfs/` is always excluded — mechanism, not config).
-    pub scope: Option<String>,
+    /// Optional in-bucket claim filter (globs; empty = whole bucket). Affects
+    /// claiming and vanish-flips ONLY — never the GC orphan live-set (R5).
+    pub include: Vec<String>,
+    /// Optional claim exclusion (globs; wins over `include`).
+    pub exclude: Vec<String>,
     /// mime short key (plus the reserved `default` key) -> extractor
     /// instance name, the sentinel `"auto"` (built-in mime->kind map), or an
     /// ORDERED array of instance names (M2.1 fallback chain; see
@@ -455,6 +476,15 @@ fn unknown_field_parts(message: &str) -> Option<(&str, String)> {
 pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError> {
     let raw: RawFile = toml::from_str(text)
         .map_err(|e| PipelineError::config(e.message().to_string(), toml_line(text, &e)))?;
+
+    // ---- bucket_suffix (R6): validated first — the ingest name gates need
+    // it, and a bad namespace constant fails before anything else parses.
+    let bucket_suffix = raw
+        .bucket_suffix
+        .clone()
+        .unwrap_or_else(|| crate::backends::DEFAULT_BUCKET_SUFFIX.to_string());
+    crate::backends::validate_bucket_suffix(&bucket_suffix)
+        .map_err(|e| PipelineError::config(format!("bucket_suffix: {e}"), None))?;
 
     // section-header lines for the runtime availability gate (§5.10.3
     // fail-fast with line attribution)
@@ -626,7 +656,8 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
         ingest.insert(
             bucket,
             IngestConfig {
-                scope: rawi.scope,
+                include: rawi.include,
+                exclude: rawi.exclude,
                 extract: rawi.extract,
                 chunk,
                 embedders: rawi.embedders,
@@ -644,20 +675,19 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
     // ---- name-shape gates for everything the file layer AUTO-CREATES ----
     // The ingest section key becomes a real vector bucket and every listed
     // embedder (or the index-prefix) becomes half of a derived INDEX name
-    // (`{prefix|embedder}-{key8}`, §5.10.5). Both must satisfy the S3
-    // Vectors name rule at PARSE time — a CreateVectorBucket/CreateIndex
-    // ValidationException at 3am ingest time would be a much later, much
-    // more confusing failure. Derived names additionally lose 9 chars to
-    // the "-xxxxxxxx" suffix.
+    // (`{prefix|embedder}-{key8}`, §5.10.5). The bucket rule is the v3 one
+    // (design-v3.md R1/D5: 3..=63−len(suffix), no suffix tail) so a
+    // CreateVectorBucket ValidationException cannot fire at 3am ingest time.
+    // Derived index names additionally lose 9 chars to the "-xxxxxxxx"
+    // suffix.
     for (bucket, icfg) in &ingest {
         let section = format!("ingest.{bucket}");
         let line = section_lines.get(&section).copied();
-        if !is_aws_name(bucket) {
+        if let Err(e) = crate::backends::validate_vector_bucket_name(bucket, &bucket_suffix) {
             return Err(PipelineError::config(
                 format!(
-                    "[{section}]: bucket name '{bucket}' is invalid: must be 3-63 characters, \
-                     lowercase letters, digits and hyphens, starting and ending with an \
-                     alphanumeric character (the file layer auto-creates this vector bucket)"
+                    "[{section}]: bucket name '{bucket}' is invalid: {e} (the file layer \
+                     auto-creates this vector bucket)"
                 ),
                 line,
             ));
@@ -714,6 +744,7 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
         embedders,
         ingest,
         models_dir: raw.models_dir.map(std::path::PathBuf::from),
+        bucket_suffix,
         warnings,
         section_lines,
     })
@@ -756,25 +787,10 @@ fn names_or_none(names: &[&str]) -> String {
     }
 }
 
-/// The S3 Vectors bucket/index name rule (mirrors ops::validate_name — the
-/// pipeline layer cannot depend on the HTTP layer, and the rule is 3 lines).
-fn is_aws_name(name: &str) -> bool {
-    (3..=63).contains(&name.len())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric())
-        && name
-            .chars()
-            .last()
-            .is_some_and(|c| c.is_ascii_alphanumeric())
-}
-
-/// Base part of a derived index name: the same charset, but 1..=54 — the
-/// `-{8 hex}` derived-key suffix must still fit inside the 63-char cap.
+/// Base part of a derived index name: the same charset as S3 Vectors index
+/// names (3-63 rule lives in ops::validate_name; vector-bucket names use the
+/// stricter v3 rule backends::validate_vector_bucket_name), but 1..=54 —
+/// the `-{8 hex}` derived-key suffix must still fit inside the 63-char cap.
 fn is_derived_name_base(name: &str) -> bool {
     (1..=54).contains(&name.len())
         && name
@@ -806,9 +822,10 @@ fn toml_line(text: &str, err: &toml::de::Error) -> Option<usize> {
 /// the extract ROUTING (M2.1: chain composition AND order; see below), the
 /// chunker, and the listed embedder instances, all name-keyed and
 /// BTreeMap-normalized so key order and formatting in the source file do
-/// not matter. Query-side (`merge`) and routing-only fields (`scope`,
-/// `index-prefix`) are deliberately EXCLUDED: they never change chunk
-/// identity, so changing them must not invalidate completion markers.
+/// not matter. Query-side (`merge`) and claim-only fields (`include`,
+/// `exclude`, `index-prefix` — v3.1 R5) are deliberately EXCLUDED: they
+/// never change chunk identity, so changing them must not invalidate
+/// completion markers.
 pub fn pipeline_fingerprint(
     ingest: &IngestConfig,
     extractors: &BTreeMap<String, ExtractorKind>,
@@ -886,7 +903,8 @@ region = "us-east-1"
 kind = "txt"
 
 [ingest.docs]
-scope = "docs/**"
+include = ["docs/**"]
+exclude = ["**.tmp"]
 extract = { txt = "plain", default = "auto" }
 chunk = { kind = "token-window", size = 512, overlap = 64 }
 merge = "rrf"
@@ -904,7 +922,9 @@ index-prefix = "docs"
         assert!(cfg.embedders.is_empty());
         assert_eq!(cfg.ingest.len(), 1);
         let d = &cfg.ingest["docs"];
-        assert_eq!(d.scope.as_deref(), Some("docs/**"));
+        assert_eq!(d.include, ["docs/**".to_string()]);
+        assert_eq!(d.exclude, ["**.tmp".to_string()]);
+        assert_eq!(cfg.bucket_suffix, crate::backends::DEFAULT_BUCKET_SUFFIX);
         assert_eq!(d.extract["txt"], ExtractValue::Single("plain".into()));
         assert_eq!(d.extract["default"], ExtractValue::Single("auto".into()));
         assert_eq!(d.merge, Merge::Rrf);
@@ -982,9 +1002,9 @@ index-prefix = "docs"
         let msg = err.to_string();
         assert!(
             msg.contains(
-                "[ingest.d]: unknown field 'chunkder' (allowed: scope, extract, chunk, \
-                 embedders, merge, index-prefix, scan_interval_secs, max_file_size_mb, retries, \
-                 extract_timeout_secs, store_chunk_text)"
+                "[ingest.d]: unknown field 'chunkder' (allowed: include, exclude, extract, \
+                 chunk, embedders, merge, index-prefix, scan_interval_secs, max_file_size_mb, \
+                 retries, extract_timeout_secs, store_chunk_text)"
             ),
             "{msg}"
         );
@@ -1341,7 +1361,7 @@ kind = "pdf-text"
 kind = "txt"
 
 [ingest.docs]
-scope = "docs/**"
+include = ["docs/**"]
 extract = { pdf = "pdf", default = "auto" }
 chunk = { kind = "token-window", size = 512, overlap = 64 }
 embedders = ["text", "remote"]
@@ -1479,10 +1499,11 @@ index-prefix = "docs"
     #[test]
     fn fingerprint_stable_across_key_order_and_irrelevant_fields() {
         let a = base_ingest();
-        // same semantics: map key order swapped, merge/scope/index-prefix added
+        // same semantics: map key order swapped, merge + claim-only fields
+        // (include/exclude/index-prefix) added — none enter the fingerprint
         let b = "[extractor.a]\nkind = \"txt\"\n\n[ingest.ddd]\nchunk = { kind = \"token-window\", \
                  size = 8, overlap = 2 }\nextract = { txt = \"a\" }\nmerge = \"rrf\"\n\
-                 scope = \"x/**\"\nindex-prefix = \"x\"\n";
+                 include = [\"x/**\"]\nexclude = [\"**.tmp\"]\nindex-prefix = \"x\"\n";
         assert_eq!(fp_of(&a), fp_of(&b));
         // repeated parse -> same value (no nondeterminism)
         assert_eq!(fp_of(&a), fp_of(&a));

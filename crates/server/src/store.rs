@@ -1,31 +1,34 @@
-//! Storage facade over the unified backend (M1 T2; design.md §5.2/§5.3).
+//! Storage facade over the unified bucket-pair backend (design-v3.md §3/§4;
+//! M1 T2 base, v3.1 全轴换).
 //!
 //! Two responsibilities:
-//! - catalog: `buckets/<name>/bucket.json`,
-//!   `buckets/<vb>/indexes/<ix>/index.json` — ALL via object_store
-//!   (`get` → NotFound → 404; create = `put_opts(PutMode::Create)`, race-free
-//!   on file/memory/S3). The `.vectorfs/` system prefix is applied centrally
-//!   by `Backend::object_key` (backends.rs), so the keys below are
-//!   system-relative. The file backend no longer touches std::fs for
-//!   catalog objects (only backend setup in backends.rs creates/canonicalizes
-//!   the data dir itself). M1 T3 adds the management-plane half of the
-//!   catalog: enumeration (list), removal (bucket/index delete incl. the
-//!   Lance dataset objects), policy.json (raw bytes, store & echo only,
-//!   design.md §4.4), tags.json (bucket and index ARN scopes) and the
-//!   echo-only indexMode/defaultIndexMode knobs.
+//! - catalog: `X-vf/bucket.json`, `X-vf/indexes/<ix>/index.json`,
+//!   `X-vf/sources/<keyHash>.json`, `X-vf/{policy,tags}.json` — ALL via
+//!   per-bucket object_store handles (`get` → NotFound → 404; create =
+//!   `put_opts(PutMode::Create)`, race-free on file/memory/S3). System keys
+//!   are BUCKET-ROOT-relative (D2 — no `.vectorfs/` inner prefix); the
+//!   source bucket `X` holds ONLY user objects (§5.3-3).
 //! - engine: lancedb (the ONLY module that touches lancedb API, design.md
-//!   §5.7). One Lance table per index at `<index>/data` (file:
-//!   `file://<root>/.vectorfs/buckets/<vb>/indexes/<ix>/data`, memory:
-//!   `memory://vf/.vectorfs/…`, S3:
-//!   `s3://<bucket>[/<prefix>]/.vectorfs/…`), opened through the
-//!   backend's shared `Session` (per-registry object stores). A fresh
-//!   `Connection` per operation remains a spike simplification — no connection
-//!   cache; M0 REPORT 遗留 3, TODO for a later M1 task. M1 T4 adds the
-//!   vector-surface engine paths: key point-lookup (GetVectors), key-ordered
-//!   cursor scan (ListVectors) and key-bound delete (DeleteVectors) — all via
-//!   DataFusion expression predicates (see `keys_in`), never SQL strings.
-//!   M1 T5 adds the filter engine integration: dynamic typed mirror columns
-//!   and dual query routes (see below).
+//!   §5.7). One Lance table per index at `indexes/<ix>/data` inside the
+//!   system bucket (file: `file://<root>/X-vf/indexes/…`, memory:
+//!   `memory://X-vf/indexes/…`, s3: `s3://X-vf/indexes/…`), opened through
+//!   the backend's shared `Session`. See the M1 T4/T5 notes below for the
+//!   vector-surface and filter-engine paths (unchanged by v3).
+//!
+//! v3 lifecycle (§3-R3): `create_bucket` implements the CreateVectorBucket
+//! semantics — raw CreateBucket for `X-vf`, conflict-typed hints, the
+//! EMPTY-BUCKET ADOPTION rule (D7: empty + no marker + no LOCK = crash
+//! residue, adopt), never creating or requiring the source bucket `X`.
+//! `delete_bucket` implements the prescribed deletion order (清空 → 删
+//! marker → 删 LOCK → DeleteBucket) with the BucketNotEmpty converging loop;
+//! the source bucket is NEVER deleted (D4). `list_buckets` is the R9
+//! suffix-scan enumeration (no central registry): s3 = ListBuckets + marker
+//! 校验, file = read_dir, memory = shared key-space prefixes.
+//!
+//! Ownership (§3-R2): `bucket.json` carries the DEPLOYMENT identity
+//! (region+account+endpoint) + placement. "我方" = identity matches; the
+//! daemon instance UUID lives only in LOCK writer ids and is decoupled from
+//! ownership.
 //!
 //! Lance schema: `key: utf8 not null`, `vector: fixed_size_list<f32, dim>`
 //! (not null), `metadata_json: utf8 nullable` — the COMPLETE original metadata
@@ -48,8 +51,8 @@
 //! children}))` evolution → reopen → `merge_insert` with the full target
 //! schema. A key's scalar type must stay stable across the whole index:
 //! number→string (or scalar↔list) drift is a ValidationException — the schema
-//! itself is the per-key type registry (single writer, design.md §5.1, makes
-//! the read-classify-evolve sequence race-free).
+//! itself is the per-key type registry (single writer per bucket, design-v3
+//! §5.1, makes the read-classify-evolve sequence race-free).
 //!
 //! # 性能对照（M1 T5 交付数据，predicate pushdown vs 纯内存路径）
 //!
@@ -74,6 +77,7 @@
 //! ratios were 1.9–2.6x on the same dataset.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use lancedb::arrow::arrow_array::{
@@ -97,6 +101,23 @@ use crate::filter::{Filter, MetaCol};
 
 pub(crate) const TABLE_NAME: &str = "vectors";
 
+// ---------------------------------------------------------------------------
+// deployment identity + ownership marker (design-v3.md §3-R2/D8)
+// ---------------------------------------------------------------------------
+
+/// WHO owns a system bucket: the DEPLOYMENT (region+account+endpoint), not
+/// any daemon instance. A stateless redeploy (container rebuild, new
+/// machine, lost local volume) presents the same identity and re-claims
+/// every existing system bucket.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeploymentIdentity {
+    pub region: String,
+    pub account: String,
+    pub endpoint: String,
+}
+
+/// The ownership marker / bucket catalog entry `X-vf/bucket.json`. R2: the
+/// deployment identity + placement ARE the marker payload.
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct BucketMeta {
     pub vector_bucket_name: String,
@@ -105,6 +126,11 @@ pub struct BucketMeta {
     pub creation_time_rfc3339: String,
     /// Unix epoch seconds (fractional) — wire format for rest-json timestamps.
     pub creation_time_epoch: f64,
+    /// Ownership: the deployment this bucket belongs to (R2/D8).
+    pub deployment: DeploymentIdentity,
+    /// `x-vf-placement` echo (R4): `s3://X-vf@endpoint` | `file://<dir>/X-vf`
+    /// | `memory://X-vf`.
+    pub placement: String,
     /// `defaultIndexMode` (M1 T3): stored & echoed by PutVectorBucketDefault-
     /// IndexMode; consumed at CreateIndex time. Echo-only — runtime query
     /// behavior is always pre-filter/ENHANCED (design.md §4.4).
@@ -180,7 +206,7 @@ pub enum SourceStatus {
     /// Attempts exhausted (poison); never auto-retried.
     #[serde(rename = "FAILED")]
     Failed,
-    /// The object vanished from the instance root; GC (T7) owns the rest.
+    /// The object vanished from the source bucket; GC (T7) owns the rest.
     #[serde(rename = "DELETING")]
     Deleting,
 }
@@ -205,16 +231,18 @@ impl std::fmt::Display for SourceStatus {
 }
 
 /// One Source marker: the no-queue ingest bookkeeping (§5.10.5 — "待摄取 =
-/// 无标记，或签名与标记不符"). Persisted at
-/// `.vectorfs/buckets/<vb>/sources/<keyHash>.json` via the catalog store.
+/// 无标记，或签名与标记不符"). Persisted at `X-vf/sources/<keyHash>.json`
+/// via the bucket's system store.
 ///
 /// `etag_sig` is the CHEAP change signal (real etag when the backend lists
 /// one, else a size+mtime pseudo-signature — see `ingest::marker::signature_of`);
 /// `content_hash` is the DEFINITIVE sha256 of the bytes, computed inside the
-/// job and used for the metadata-only-rewrite skip.
+/// job and used for the metadata-only-rewrite skip. `misses` (v3.1 R5) is
+/// the N-strike counter: consecutive scans the object was absent before the
+/// DELETING flip (a transient empty/partial listing must not reap chunks).
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
 pub struct SourceMarker {
-    /// Full object key relative to the instance root (S3-semantic key).
+    /// Full object key relative to the SOURCE bucket root (S3-semantic key).
     pub object_key: String,
     /// Cheap listing signature at the last observed state.
     pub etag_sig: String,
@@ -230,6 +258,10 @@ pub struct SourceMarker {
     pub retries: u32,
     #[serde(default)]
     pub retries_exhausted: bool,
+    /// Consecutive scans the object was ABSENT (N-strike, R5); reset to 0 by
+    /// any present sighting.
+    #[serde(default)]
+    pub misses: u32,
     /// RFC3339 (UTC) of the last marker write.
     pub updated_at: String,
     /// Per-modality chunk counts of the last (partial or full) completion —
@@ -253,7 +285,8 @@ pub enum StoreError {
     /// bucket/index already exists -> ConflictException
     Conflict(String),
     /// request-shape problem detected below the wire layer (metadata type
-    /// drift, stale/unknown QueryVectors page version) -> ValidationException
+    /// drift, stale/unknown QueryVectors page version, invalid
+    /// bucket_suffix shapes) -> ValidationException
     Validation(String),
     /// anything else -> InternalServerException
     Internal(String),
@@ -277,12 +310,24 @@ fn internal(e: impl std::fmt::Display) -> StoreError {
 // storage
 // ---------------------------------------------------------------------------
 
-/// Backend-agnostic storage: catalog objects + Lance datasets both flow from
-/// one [`Backend`].
+/// Backend-agnostic storage over the bucket-pair backend: one system-store
+/// handle + one source-store handle per vector bucket, both flowing from one
+/// [`Backend`].
 pub struct Storage {
     backend: Backend,
-    catalog: Arc<dyn object_store::ObjectStore>,
+    bucket_suffix: String,
     session: Arc<lancedb::Session>,
+    /// The memory backend's ONE shared key space (bucket handles are
+    /// PrefixStore views over it; R9 enumeration reads it directly).
+    memory: Option<Arc<object_store::memory::InMemory>>,
+    /// Raw bucket admin (s3 backend only; file/memory admin is local).
+    admin: Option<crate::s3admin::S3Admin>,
+    /// Per-bucket store-handle caches (source `X` / system `X-vf`
+    /// separately — R3: touching the SYSTEM half must never materialize the
+    /// SOURCE bucket, which is created lazily by the first PutSource).
+    /// Constructing a file handle materializes that one bucket directory.
+    source_stores: std::sync::Mutex<HashMap<String, Arc<dyn object_store::ObjectStore>>>,
+    system_stores: std::sync::Mutex<HashMap<String, Arc<dyn object_store::ObjectStore>>>,
 }
 
 impl std::fmt::Debug for Storage {
@@ -291,33 +336,59 @@ impl std::fmt::Debug for Storage {
     }
 }
 
+/// State of a MARKER-LESS system bucket for the Delete-tail replay
+/// (design-v3.md §5.2 row 4 / §5.3-4 exemption).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailState {
+    /// No system bucket at all.
+    Missing,
+    /// Bucket holds only deletion residue (policy.json / tags.json /
+    /// sources/*) or nothing; `fresh_lock` = a live foreign LOCK object is
+    /// present (its holder is mid-operation on the dying bucket — the
+    /// lockless tail cleanup must wait for that lock to go stale).
+    Residue { fresh_lock: bool },
+    /// Objects beyond residue (indexes or foreign data): not a vb of ours,
+    /// and not cleanup-able.
+    Occupied,
+}
+
 impl Storage {
-    /// Build from a parsed backend (file/memory/s3). The file root is
-    /// normalized (created + canonicalized) here if it was not already.
-    pub fn new(backend: Backend) -> Result<Self, String> {
+    /// Build from a parsed backend (file/memory/s3) + the configured
+    /// `bucket_suffix` (validated here — a bad suffix refuses every
+    /// backend, fail-fast).
+    pub fn new(backend: Backend, bucket_suffix: &str) -> Result<Self, String> {
+        backends::validate_bucket_suffix(bucket_suffix)?;
         let backend = backend.normalized()?;
         let handles = backend.build()?;
+        let admin = match &backend {
+            Backend::S3(cfg) => Some(crate::s3admin::S3Admin::new(cfg)),
+            _ => None,
+        };
         Ok(Storage {
             backend,
-            catalog: handles.catalog,
+            bucket_suffix: bucket_suffix.to_string(),
             session: handles.session,
+            memory: handles.memory,
+            admin,
+            source_stores: std::sync::Mutex::new(HashMap::new()),
+            system_stores: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
-    /// File backend rooted at `dir` (creates + canonicalizes it).
+    /// File backend rooted at `dir` (creates + canonicalizes it), default
+    /// `bucket_suffix`.
     pub fn file(root: impl Into<std::path::PathBuf>) -> Self {
-        Storage::new(Backend::File { root: root.into() })
-            .expect("file backend setup cannot fail (dir is created)")
+        Storage::new(
+            Backend::File { root: root.into() },
+            backends::DEFAULT_BUCKET_SUFFIX,
+        )
+        .expect("file backend setup cannot fail (dir is created)")
     }
 
-    /// Volatile in-process backend (CI / emulator mode).
+    /// Volatile in-process backend (CI / emulator mode), default suffix.
     pub fn memory() -> Self {
-        Storage::new(Backend::Memory).expect("memory backend setup cannot fail")
-    }
-
-    /// S3 backend (M0-verified injection route).
-    pub fn s3(cfg: backends::S3BackendConfig) -> Result<Self, String> {
-        Storage::new(Backend::S3(Box::new(cfg)))
+        Storage::new(Backend::Memory, backends::DEFAULT_BUCKET_SUFFIX)
+            .expect("memory backend setup cannot fail")
     }
 
     /// The backend (for LOCK placement + logging).
@@ -325,56 +396,460 @@ impl Storage {
         &self.backend
     }
 
-    /// Catalog + LOCK object store (shared with lock.rs).
-    pub fn catalog(&self) -> &Arc<dyn object_store::ObjectStore> {
-        &self.catalog
+    /// The lancedb session shared by every index connection.
+    pub fn session(&self) -> &Arc<lancedb::Session> {
+        &self.session
+    }
+
+    /// The memory backend's shared key space (None on file/s3) — the doctor
+    /// and other direct probes open scratch buckets through it.
+    pub fn memory_handle(&self) -> Option<&Arc<object_store::memory::InMemory>> {
+        self.memory.as_ref()
+    }
+
+    /// Raw-delete a PHYSICAL bucket by name (doctor probe cleanup; file:
+    /// remove_dir_all, memory: no-op, s3: DeleteBucket best effort).
+    pub async fn delete_bucket_raw(&self, bucket: &str) {
+        match &self.backend {
+            Backend::File { root } => {
+                let _ = std::fs::remove_dir_all(root.join(bucket));
+            }
+            Backend::Memory => {}
+            Backend::S3(_) => {
+                if let Some(admin) = &self.admin {
+                    let _ = admin.delete_bucket(bucket).await;
+                }
+            }
+        }
+    }
+
+    /// Configured `bucket_suffix` (R6: an install-time constant).
+    pub fn bucket_suffix(&self) -> &str {
+        &self.bucket_suffix
+    }
+
+    /// Physical system bucket name of vb `X`: `X + bucket_suffix` (R1).
+    pub fn sys_bucket(&self, vb: &str) -> String {
+        backends::system_bucket_name(vb, &self.bucket_suffix)
+    }
+
+    /// `x-vf-placement` echo (R4) of one vb's system bucket.
+    pub fn placement(&self, vb: &str) -> String {
+        let sys = self.sys_bucket(vb);
+        match &self.backend {
+            Backend::File { root } => format!("file://{}/{sys}", root.display()),
+            Backend::Memory => format!("memory://{sys}"),
+            Backend::S3(cfg) => format!("s3://{sys}@{}", cfg.endpoint),
+        }
+    }
+
+    /// This daemon's deployment identity (R2/D8) — what ownership markers
+    /// compare against.
+    pub fn deployment_identity(&self, region: &str, account: &str) -> DeploymentIdentity {
+        DeploymentIdentity {
+            region: region.to_string(),
+            account: account.to_string(),
+            endpoint: self.backend.endpoint_id(),
+        }
+    }
+
+    /// The source-bucket object store of vb `X` (pure user namespace).
+    /// Constructing the handle lazily CREATES the bucket on the file backend
+    /// (R3: the source bucket may be created at any time — adoption rules
+    /// make that safe); s3 requires [`Storage::ensure_source_bucket`] first.
+    pub fn source_store(&self, vb: &str) -> Arc<dyn object_store::ObjectStore> {
+        let mut cache = self.source_stores.lock().unwrap();
+        if let Some(s) = cache.get(vb) {
+            return s.clone();
+        }
+        // user_object_key (R1): bucket-relative — the store IS the bucket
+        let store = backends::open_bucket_store(&self.backend, vb, self.memory.as_ref())
+            .expect("bucket store construction cannot fail (dirs are created)");
+        cache.insert(vb.to_string(), store.clone());
+        store
+    }
+
+    /// The system-bucket object store of vb `X` (bucket-root-relative
+    /// system keys: `LOCK`, `bucket.json`, `sources/…`, `indexes/…`).
+    /// Same lazy-creation note as [`Storage::source_store`] (it materializes
+    /// `X-vf`, never `X`); read paths that must not materialize anything
+    /// check [`Storage::system_bucket_exists`] first.
+    pub fn system_store(&self, vb: &str) -> Arc<dyn object_store::ObjectStore> {
+        let mut cache = self.system_stores.lock().unwrap();
+        if let Some(s) = cache.get(vb) {
+            return s.clone();
+        }
+        let sys = self.sys_bucket(vb);
+        let store = backends::open_bucket_store(&self.backend, &sys, self.memory.as_ref())
+            .expect("bucket store construction cannot fail (dirs are created)");
+        cache.insert(vb.to_string(), store.clone());
+        store
+    }
+
+    /// Drop the cached handles after the system bucket was RAW-DELETED
+    /// (delete_bucket): a stale LocalFileSystem prefix would resurrect an
+    /// empty directory on the next use.
+    fn evict_stores(&self, vb: &str) {
+        self.system_stores.lock().unwrap().remove(vb);
+        self.source_stores.lock().unwrap().remove(vb);
+    }
+
+    // ---- raw bucket admin (R3/R9; s3 = s3admin, file/memory = local) ----
+
+    /// Does the SYSTEM bucket physically exist? (file: directory present;
+    /// memory: any key under the prefix; s3: HeadBucket.)
+    pub async fn system_bucket_exists(&self, vb: &str) -> Result<bool, StoreError> {
+        self.raw_bucket_exists(&self.sys_bucket(vb)).await
+    }
+
+    async fn raw_bucket_exists(&self, bucket: &str) -> Result<bool, StoreError> {
+        match &self.backend {
+            Backend::File { root } => Ok(root.join(bucket).is_dir()),
+            Backend::Memory => {
+                let Some(mem) = &self.memory else {
+                    return Ok(false);
+                };
+                let prefix = object_store::path::Path::from(bucket.to_string());
+                Ok(!backends::list_prefix(mem.as_ref(), &prefix)
+                    .await
+                    .map_err(internal)?
+                    .is_empty())
+            }
+            Backend::S3(_) => {
+                let admin = self.admin.as_ref().expect("s3 backend carries an admin");
+                admin
+                    .head_bucket(bucket)
+                    .await
+                    .map_err(|e| internal(e.to_string()))
+            }
+        }
+    }
+
+    /// Ensure the SOURCE bucket `X` exists (R3 lazy creation, D4): no-op
+    /// when present; created when missing (s3: raw CreateBucket — losing a
+    /// create race to someone else's identical bucket is benign adoption).
+    pub async fn ensure_source_bucket(&self, vb: &str) -> Result<(), StoreError> {
+        match &self.backend {
+            Backend::File { .. } | Backend::Memory => {
+                let _ = self.source_store(vb); // materializes file dirs
+                Ok(())
+            }
+            Backend::S3(_) => {
+                let admin = self.admin.as_ref().expect("s3 backend carries an admin");
+                if !admin
+                    .head_bucket(vb)
+                    .await
+                    .map_err(|e| internal(e.to_string()))?
+                {
+                    // Both Created and AlreadyExists are fine: existing =
+                    // adoption (良性竞态, §5.2).
+                    admin
+                        .create_bucket(vb)
+                        .await
+                        .map_err(|e| map_admin_create_err(e, vb))?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Every candidate vb name from the R9 suffix scan, WITHOUT the marker
+    /// check (callers filter by ownership; enumeration never invents a
+    /// second source of truth).
+    pub async fn suffix_scan_candidates(&self) -> Result<Vec<String>, StoreError> {
+        let suffix = self.bucket_suffix.as_str();
+        let mut candidates: Vec<String> = match &self.backend {
+            Backend::File { root } => std::fs::read_dir(root)
+                .map_err(|e| internal(format!("read {}: {e}", root.display())))?
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(suffix))
+                .map(|n| n.trim_end_matches(suffix).to_string())
+                .collect(),
+            Backend::Memory => {
+                let Some(mem) = &self.memory else {
+                    return Ok(Vec::new());
+                };
+                let mut firsts = std::collections::BTreeSet::new();
+                for key in backends::list_all(mem.as_ref()).await.map_err(internal)? {
+                    if let Some(seg) = key.as_ref().split('/').next() {
+                        firsts.insert(seg.to_string());
+                    }
+                }
+                firsts
+                    .into_iter()
+                    .filter(|n| n.ends_with(suffix))
+                    .map(|n| n.trim_end_matches(suffix).to_string())
+                    .collect()
+            }
+            Backend::S3(_) => {
+                let admin = self.admin.as_ref().expect("s3 backend carries an admin");
+                admin
+                    .list_bucket_names()
+                    .await
+                    .map_err(|e| internal(e.to_string()))?
+                    .into_iter()
+                    .filter(|n| n.ends_with(suffix))
+                    .map(|n| n.trim_end_matches(suffix).to_string())
+                    .collect()
+            }
+        };
+        candidates.sort();
+        candidates.dedup();
+        Ok(candidates)
     }
 
     // ---- catalog (object_store everywhere; §5.0 “目录: catalog JSON 对象(条件写)”) ----
 
+    /// Read `X-vf/bucket.json`; Ok(None) = no marker (no such vb, or crash
+    /// residue). Read-only: does NOT materialize a missing file-backend
+    /// bucket directory.
     pub async fn load_bucket(&self, name: &str) -> Result<Option<BucketMeta>, StoreError> {
-        backends::read_json(
-            &*self.catalog,
-            &self.key(&format!("buckets/{name}/bucket.json")),
-        )
-        .await
-        .map_err(internal)
+        if let Backend::File { root } = &self.backend
+            && !root.join(self.sys_bucket(name)).is_dir()
+        {
+            return Ok(None); // read path must not materialize bucket dirs
+        }
+        backends::read_json(&*self.system_store(name), &Self::MARKER_KEY.into())
+            .await
+            .map_err(internal)
     }
 
-    pub async fn load_index(&self, vb: &str, ix: &str) -> Result<Option<IndexMeta>, StoreError> {
-        backends::read_json(
-            &*self.catalog,
-            &self.key(&format!("buckets/{vb}/indexes/{ix}/index.json")),
-        )
-        .await
-        .map_err(internal)
+    /// `bucket.json` — the marker object key (bucket-root-relative).
+    const MARKER_KEY: &'static str = "bucket.json";
+
+    /// The LOCK object key (bucket-root-relative; lock.rs).
+    const LOCK_KEY: &'static str = "LOCK";
+
+    /// G2 crash-injection seam (design-v3.md §5.2 rows 3-4, §10-G2): when
+    /// `VF_TEST_CRASH` names a lifecycle cut point, the process aborts RIGHT
+    /// THERE — a real hard crash (no graceful-shutdown handlers, no LOCK
+    /// release) that leaves exactly the §5.2 on-storage state for the replay
+    /// matrix (tests/lifecycle_crash_replay.rs). The two named points:
+    /// `create_after_raw_create` (raw CreateBucket done, marker not written)
+    /// and `delete_after_marker` (marker + LOCK deleted, raw DeleteBucket not
+    /// sent). Test-only: unset in production this is one env lookup per
+    /// lifecycle op (create/delete are rare admin verbs, not per-request).
+    fn crash_point(name: &str) {
+        if std::env::var("VF_TEST_CRASH").ok().as_deref() == Some(name) {
+            eprintln!("vectorfs: VF_TEST_CRASH={name} — aborting at the cut point");
+            std::process::abort();
+        }
     }
 
+    /// CreateVectorBucket lifecycle (R3): raw-create `X-vf`, adopt crash
+    /// residue, write the ownership marker. NEVER touches the source bucket
+    /// `X` (lazy, D4).
+    ///
+    /// * marker present ⇒ Conflict (replay = ConflictException, A-F3; hint:
+    ///   存量桶可直接使用或先 Delete);
+    /// * non-marker objects present (a foreign `-vf` bucket in use) ⇒
+    ///   Conflict with the bucket_suffix hint (§5.2 row 1);
+    /// * empty + no marker + no LOCK ⇒ ADOPT (D7 — Create-crash / Delete-
+    ///   tail-crash residue), which is exactly the plain create path;
+    /// * raw CreateBucket losing a race (s3) ⇒ same adoption logic on the
+    ///   next marker write (conditional create decides).
     pub async fn create_bucket(&self, meta: &BucketMeta) -> Result<(), StoreError> {
-        let key = self.key(&format!("buckets/{}/bucket.json", meta.vector_bucket_name));
+        let vb = meta.vector_bucket_name.as_str();
+        let sys = self.sys_bucket(vb);
+
+        // ---- raw create FIRST on s3 (R8: converge on "create then probe",
+        // never on the error-code split — and real endpoints ERROR on
+        // listing/getting from a bucket that does not exist yet, so the
+        // probes below must not run first; file/memory: the store
+        // construction below materializes the bucket) ----
+        if let Backend::S3(_) = &self.backend {
+            let admin = self.admin.as_ref().expect("s3 backend carries an admin");
+            admin
+                .create_bucket(&sys)
+                .await
+                .map_err(|e| map_admin_create_err(e, vb))?;
+        }
+
+        let store = self.system_store(vb); // materializes the bucket (file)
+
+        // §5.2 row 3 cut point: raw CreateBucket succeeded, marker not yet
+        // written (G2 replay matrix; see crash_point doc).
+        Self::crash_point("create_after_raw_create");
+
+        // ---- state probe: marker / foreign objects ----
+        if backends::read_json::<BucketMeta>(&*store, &Self::MARKER_KEY.into())
+            .await
+            .map_err(internal)?
+            .is_some()
+        {
+            return Err(StoreError::Conflict(format!(
+                "vector bucket {vb} already exists (its system bucket {sys} carries an \
+                 ownership marker) — use it directly, or DeleteVectorBucket first if you mean \
+                 to replace it"
+            )));
+        }
+        // "Empty" for ADOPTION purposes (D7) = no FOREIGN DATA: our own
+        // mechanism keys may legitimately precede the marker — the lazy
+        // per-bucket LOCK (§5.1 startup pin) and scan-time source markers
+        // both materialize `X-vf` before the first ensure-domain creates
+        // the vb. Anything beyond the mechanism set (indexes/, unknown
+        // objects) is a bucket in actual use -> Conflict (§5.2 row 1).
+        let foreign = backends::list_all(&*store)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .any(|k| {
+                let k = k.as_ref();
+                let mechanism = k == Self::LOCK_KEY
+                    || k == "policy.json"
+                    || k == "tags.json"
+                    || k.starts_with("sources/");
+                !mechanism && k != Self::MARKER_KEY
+            });
+        if foreign {
+            return Err(StoreError::Conflict(format!(
+                "a foreign bucket named {sys} already exists and is not empty — pick another \
+                 vector bucket name, or change bucket_suffix (currently {:?}) so vectorfs \
+                 system buckets stop colliding with it",
+                self.bucket_suffix
+            )));
+        }
+
+        // ---- marker (conditional: a racing creator that wrote its own
+        // marker first makes ours lose — that is the conflict case again) ----
         let json = serde_json::to_vec_pretty(meta).map_err(internal)?;
-        if !backends::put_json_create(&*self.catalog, &key, &json)
+        if !backends::put_json_create(&*store, &Self::MARKER_KEY.into(), &json)
             .await
             .map_err(internal)?
         {
             return Err(StoreError::Conflict(format!(
-                "vector bucket {} already exists",
-                meta.vector_bucket_name
+                "vector bucket {vb} already exists (marker written concurrently)"
             )));
         }
         Ok(())
     }
 
-    /// Create index.json (conditional) + the empty Lance table. On Lance
-    /// failure the index.json is deleted again (best effort) so the catalog
-    /// never advertises an index without a dataset.
+    /// DeleteVectorBucket lifecycle (R3), prescribed order: 清空 marker/LOCK
+    /// 之外全部对象 → 删 marker → 删 LOCK → raw DeleteBucket. BucketNotEmpty
+    /// from a racing writer re-enters the loop (bounded). The SOURCE bucket
+    /// is never touched (D4). Caller has verified no indexes + holds the
+    /// bucket lock.
+    pub async fn delete_bucket(&self, name: &str) -> Result<(), StoreError> {
+        let sys = self.sys_bucket(name);
+        for round in 0..3 {
+            let store = self.system_store(name);
+            let keys = backends::list_all(&*store).await.map_err(internal)?;
+            for key in keys {
+                // deletion order inside one round: residue first, then the
+                // marker, then the LOCK (LOCK last-but-one keeps the
+                // takeover guard alive as long as possible)
+                if key.as_ref() == Self::MARKER_KEY || key.as_ref() == Self::LOCK_KEY {
+                    continue;
+                }
+                backends::delete_object(&*store, &key)
+                    .await
+                    .map_err(internal)?;
+            }
+            backends::delete_object(&*store, &Self::MARKER_KEY.into())
+                .await
+                .map_err(internal)?;
+            backends::delete_object(&*store, &Self::LOCK_KEY.into())
+                .await
+                .map_err(internal)?;
+
+            // §5.2 row 4 cut point: marker + LOCK deleted, raw DeleteBucket
+            // not yet sent (G2 replay matrix; see crash_point doc).
+            Self::crash_point("delete_after_marker");
+
+            // ---- raw DeleteBucket ----
+            match &self.backend {
+                Backend::File { root } => {
+                    let dir = root.join(&sys);
+                    if dir.is_dir() {
+                        // best-effort: a racing writer may hold a file open;
+                        // the next Delete replay re-enters the loop
+                        if let Err(e) = std::fs::remove_dir_all(&dir) {
+                            if round == 2 {
+                                return Err(internal(format!("remove {sys}: {e}")));
+                            }
+                            continue;
+                        }
+                    }
+                    self.evict_stores(name);
+                    return Ok(());
+                }
+                Backend::Memory => {
+                    self.evict_stores(name);
+                    return Ok(()); // keys deleted above; no bucket object to remove
+                }
+                Backend::S3(_) => {
+                    let admin = self.admin.as_ref().expect("s3 backend carries an admin");
+                    match admin.delete_bucket(&sys).await {
+                        Ok(()) => {
+                            self.evict_stores(name);
+                            return Ok(());
+                        }
+                        // BucketNotEmpty: a racing writer put an object back —
+                        // re-read, re-evaluate (§5.2 row 5), bounded rounds
+                        Err(e) if e.status == Some(409) && round < 2 => continue,
+                        Err(e) => return Err(internal(e.to_string())),
+                    }
+                }
+            }
+        }
+        Err(StoreError::Internal(format!(
+            "delete of system bucket {sys} did not converge"
+        )))
+    }
+
+    /// Classify a marker-less system bucket (Delete-tail replay probe).
+    pub async fn system_bucket_tail(&self, vb: &str) -> Result<TailState, StoreError> {
+        if !self.system_bucket_exists(vb).await? {
+            return Ok(TailState::Missing);
+        }
+        let store = self.system_store(vb);
+        let keys = backends::list_all(&*store).await.map_err(internal)?;
+        let is_residue =
+            |k: &str| k == "policy.json" || k == "tags.json" || k.starts_with("sources/");
+        if keys
+            .iter()
+            .any(|k| !is_residue(k.as_ref()) && k.as_ref() != "LOCK")
+        {
+            return Ok(TailState::Occupied);
+        }
+        let fresh_lock = match backends::read_json::<crate::lock::LockInfo>(&*store, &"LOCK".into())
+            .await
+            .map_err(internal)?
+        {
+            Some(info) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                info.heartbeat_age(now) < crate::lock::LOCK_TTL
+            }
+            None => false,
+        };
+        Ok(TailState::Residue { fresh_lock })
+    }
+
+    /// Lockless Delete-tail cleanup (§5.3-4 exemption): remove the residue
+    /// objects + stale LOCK, then raw-delete the bucket. Caller verified
+    /// [`TailState::Residue`] with no fresh lock.
+    pub async fn delete_bucket_tail(&self, vb: &str) -> Result<(), StoreError> {
+        self.delete_bucket(vb).await
+    }
+
+    pub async fn load_index(&self, vb: &str, ix: &str) -> Result<Option<IndexMeta>, StoreError> {
+        backends::read_json(
+            &*self.system_store(vb),
+            &format!("indexes/{ix}/index.json").into(),
+        )
+        .await
+        .map_err(internal)
+    }
+
     pub async fn create_index(&self, meta: &IndexMeta) -> Result<(), StoreError> {
-        let key = self.key(&format!(
-            "buckets/{}/indexes/{}/index.json",
-            meta.vector_bucket_name, meta.index_name
-        ));
+        let key = object_store::path::Path::from(format!("indexes/{}/index.json", meta.index_name));
         let json = serde_json::to_vec_pretty(meta).map_err(internal)?;
-        if !backends::put_json_create(&*self.catalog, &key, &json)
+        if !backends::put_json_create(&*self.system_store(&meta.vector_bucket_name), &key, &json)
             .await
             .map_err(internal)?
         {
@@ -389,7 +864,9 @@ impl Storage {
         {
             Ok(c) => c,
             Err(e) => {
-                let _ = backends::delete_object(&*self.catalog, &key).await;
+                let _ =
+                    backends::delete_object(&*self.system_store(&meta.vector_bucket_name), &key)
+                        .await;
                 return Err(e);
             }
         };
@@ -398,20 +875,17 @@ impl Storage {
             .execute()
             .await
         {
-            let _ = backends::delete_object(&*self.catalog, &key).await; // best-effort rollback
+            let _ =
+                backends::delete_object(&*self.system_store(&meta.vector_bucket_name), &key).await; // best-effort rollback
             return Err(internal(e));
         }
         Ok(())
     }
 
-    fn key(&self, rel: &str) -> object_store::path::Path {
-        self.backend.object_key(rel)
-    }
-
     // ---- Source markers (M2 T3; catalog objects like the metas above) ----
 
-    fn source_key(&self, vb: &str, key_hash: &str) -> object_store::path::Path {
-        self.key(&format!("buckets/{vb}/sources/{key_hash}.json"))
+    fn source_key(&self, key_hash: &str) -> object_store::path::Path {
+        object_store::path::Path::from(format!("sources/{key_hash}.json"))
     }
 
     /// Load one Source marker; Ok(None) = no marker (the no-queue "pending"
@@ -421,7 +895,7 @@ impl Storage {
         vb: &str,
         key_hash: &str,
     ) -> Result<Option<SourceMarker>, StoreError> {
-        backends::read_json(&*self.catalog, &self.source_key(vb, key_hash))
+        backends::read_json(&*self.system_store(vb), &self.source_key(key_hash))
             .await
             .map_err(internal)
     }
@@ -435,26 +909,25 @@ impl Storage {
         marker: &SourceMarker,
     ) -> Result<(), StoreError> {
         let json = serde_json::to_vec_pretty(marker).map_err(internal)?;
-        backends::put_json_overwrite(&*self.catalog, &self.source_key(vb, key_hash), &json)
+        backends::put_json_overwrite(&*self.system_store(vb), &self.source_key(key_hash), &json)
             .await
             .map_err(internal)
     }
 
-    /// Every Source marker of one bucket. Suffix-parsed like list_buckets
-    /// (S3 keys carry the configured prefix; fixed positions would drift).
+    /// Every Source marker of one bucket. Suffix-parsed like list_buckets.
     pub async fn list_sources(&self, vb: &str) -> Result<Vec<SourceMarker>, StoreError> {
         let mut out = Vec::new();
-        let prefix = self.key(&format!("buckets/{vb}/sources"));
-        for key in backends::list_prefix(&*self.catalog, &prefix)
+        let prefix = object_store::path::Path::from("sources");
+        for key in backends::list_prefix(&*self.system_store(vb), &prefix)
             .await
             .map_err(internal)?
         {
-            // …/buckets/<vb>/sources/<keyHash>.json
+            // …/sources/<keyHash>.json
             let segs = key.as_ref().split('/').collect::<Vec<_>>();
-            if segs.len() >= 3
+            if segs.len() >= 2
                 && segs[segs.len() - 2] == "sources"
                 && segs.last().is_some_and(|s| s.ends_with(".json"))
-                && let Some(m) = backends::read_json::<SourceMarker>(&*self.catalog, &key)
+                && let Some(m) = backends::read_json::<SourceMarker>(&*self.system_store(vb), &key)
                     .await
                     .map_err(internal)?
             {
@@ -467,35 +940,26 @@ impl Storage {
 
     /// Remove one marker (idempotent; the delete path rolls T7's GC).
     pub async fn delete_source(&self, vb: &str, key_hash: &str) -> Result<(), StoreError> {
-        backends::delete_object(&*self.catalog, &self.source_key(vb, key_hash))
+        backends::delete_object(&*self.system_store(vb), &self.source_key(key_hash))
             .await
             .map_err(internal)
     }
 
-    // ---- catalog: management-plane enumeration & removal (M1 T3, design.md §5.3) ----
+    // ---- catalog: management-plane enumeration & removal (M1 T3, R9) ----
 
-    /// All bucket metas, sorted by name (ListVectorBuckets ordering).
-    /// Key parsing is suffix-based: on the s3 backend every key additionally
-    /// carries the configured bucket prefix, so fixed positions would drift.
-    pub async fn list_buckets(&self) -> Result<Vec<BucketMeta>, StoreError> {
+    /// All bucket metas of THIS deployment, sorted by name (ListVectorBuckets
+    /// ordering). R9 suffix scan + ownership marker check: a `-vf` bucket
+    /// without our marker is somebody else's (or debris) and is skipped.
+    pub async fn list_buckets(
+        &self,
+        identity: &DeploymentIdentity,
+    ) -> Result<Vec<BucketMeta>, StoreError> {
         let mut out = Vec::new();
-        for key in backends::list_prefix(&*self.catalog, &self.key("buckets"))
-            .await
-            .map_err(internal)?
-        {
-            // …/buckets/<vb>/bucket.json — ignore everything else (indexes/, tags…)
-            let segs = key.as_ref().split('/').collect::<Vec<_>>();
-            if segs.len() >= 2 && segs.last() == Some(&"bucket.json") {
-                let name = segs[segs.len() - 2];
-                if let Some(meta) = backends::read_json::<BucketMeta>(
-                    &*self.catalog,
-                    &self.key(&format!("buckets/{name}/bucket.json")),
-                )
-                .await
-                .map_err(internal)?
-                {
-                    out.push(meta);
-                }
+        for vb in self.suffix_scan_candidates().await? {
+            if let Some(meta) = self.load_bucket(&vb).await?
+                && &meta.deployment == identity
+            {
+                out.push(meta);
             }
         }
         out.sort_by(|a, b| a.vector_bucket_name.cmp(&b.vector_bucket_name));
@@ -505,80 +969,52 @@ impl Storage {
     /// All index metas of one bucket, sorted by name (ListIndexes ordering).
     pub async fn list_indexes(&self, vb: &str) -> Result<Vec<IndexMeta>, StoreError> {
         let mut out = Vec::new();
-        for key in
-            backends::list_prefix(&*self.catalog, &self.key(&format!("buckets/{vb}/indexes")))
-                .await
-                .map_err(internal)?
+        let prefix = object_store::path::Path::from("indexes");
+        for key in backends::list_prefix(&*self.system_store(vb), &prefix)
+            .await
+            .map_err(internal)?
         {
-            // …/indexes/<ix>/index.json (see list_buckets for the suffix parse)
+            // …/indexes/<ix>/index.json
             let segs = key.as_ref().split('/').collect::<Vec<_>>();
-            if segs.len() >= 3
+            if segs.len() == 3
                 && segs.last() == Some(&"index.json")
-                && segs[segs.len() - 3] == "indexes"
+                && let Some(meta) = backends::read_json::<IndexMeta>(&*self.system_store(vb), &key)
+                    .await
+                    .map_err(internal)?
             {
-                let ix = segs[segs.len() - 2];
-                let rel = format!("buckets/{vb}/indexes/{ix}/index.json");
-                if let Some(meta) =
-                    backends::read_json::<IndexMeta>(&*self.catalog, &self.key(&rel))
-                        .await
-                        .map_err(internal)?
-                {
-                    out.push(meta);
-                }
+                out.push(meta);
             }
         }
         out.sort_by(|a, b| a.index_name.cmp(&b.index_name));
         Ok(out)
     }
 
-    /// True if ANY object lives under `buckets/<vb>/indexes/` — the
-    /// DeleteVectorBucket non-empty guard. (Single-writer lock makes the
-    /// list-then-delete sequence race-free, design.md §5.1.)
+    /// True if ANY object lives under `indexes/` — the DeleteVectorBucket
+    /// non-empty guard. (The bucket lock serializes list-then-delete,
+    /// design-v3.md §5.1.)
     pub async fn bucket_has_indexes(&self, vb: &str) -> Result<bool, StoreError> {
-        Ok(
-            !backends::list_prefix(&*self.catalog, &self.key(&format!("buckets/{vb}/indexes")))
-                .await
-                .map_err(internal)?
-                .is_empty(),
+        Ok(!backends::list_prefix(
+            &*self.system_store(vb),
+            &object_store::path::Path::from("indexes"),
         )
+        .await
+        .map_err(internal)?
+        .is_empty())
     }
 
-    /// Remove a bucket's catalog objects (bucket.json + optional policy.json /
-    /// tags.json). Caller must have verified the bucket has no indexes.
-    pub async fn delete_bucket(&self, name: &str) -> Result<(), StoreError> {
-        for rel in [
-            format!("buckets/{name}/bucket.json"),
-            format!("buckets/{name}/policy.json"),
-            format!("buckets/{name}/tags.json"),
-        ] {
-            backends::delete_object(&*self.catalog, &self.key(&rel))
+    /// Remove an index: every object under `indexes/<ix>/` — index.json,
+    /// tags.json AND the Lance dataset under `data/` — one sweep on the
+    /// system bucket's store. (The v2.2 memory `vf/` mirror sweep is gone:
+    /// v3 memory dataset keys ARE bucket-relative, §5.3-5.)
+    pub async fn delete_index(&self, vb: &str, ix: &str) -> Result<(), StoreError> {
+        let base = object_store::path::Path::from(format!("indexes/{ix}"));
+        for key in backends::list_prefix(&*self.system_store(vb), &base)
+            .await
+            .map_err(internal)?
+        {
+            backends::delete_object(&*self.system_store(vb), &key)
                 .await
                 .map_err(internal)?;
-        }
-        Ok(())
-    }
-
-    /// Remove an index: every object under the index's system-prefix dir
-    /// (`.vectorfs/buckets/<vb>/indexes/<ix>/` — index.json, tags.json AND
-    /// the Lance dataset under `data/`, which shares the catalog object store
-    /// on file/s3 backends). The memory backend's engine datasets live under
-    /// the `vf/` URL-host prefix on the same shared map (backends.rs
-    /// SharedMemoryProvider), i.e. at `vf/.vectorfs/…` — a key shape the
-    /// object_key funnel cannot express, so that mirror prefix is swept
-    /// explicitly; a no-op on file/s3 where it never exists.
-    pub async fn delete_index(&self, vb: &str, ix: &str) -> Result<(), StoreError> {
-        let catalog_base = self.key(&format!("buckets/{vb}/indexes/{ix}"));
-        let memory_base =
-            object_store::path::Path::from(format!("{}/{catalog_base}", backends::MEMORY_HOST));
-        for base in [catalog_base, memory_base] {
-            for key in backends::list_prefix(&*self.catalog, &base)
-                .await
-                .map_err(internal)?
-            {
-                backends::delete_object(&*self.catalog, &key)
-                    .await
-                    .map_err(internal)?;
-            }
         }
         Ok(())
     }
@@ -586,12 +1022,9 @@ impl Storage {
     // ---- policy (§4.4: store & echo, never enforce) ----
 
     pub async fn load_policy(&self, vb: &str) -> Result<Option<String>, StoreError> {
-        match backends::get_with_etag(
-            &*self.catalog,
-            &self.key(&format!("buckets/{vb}/policy.json")),
-        )
-        .await
-        .map_err(internal)?
+        match backends::get_with_etag(&*self.system_store(vb), &"policy.json".into())
+            .await
+            .map_err(internal)?
         {
             None => Ok(None),
             Some((bytes, _etag)) => Ok(Some(
@@ -603,8 +1036,8 @@ impl Storage {
     /// Idempotent overwrite; raw bytes as received (byte-faithful echo).
     pub async fn put_policy(&self, vb: &str, raw: &str) -> Result<(), StoreError> {
         backends::put_json_overwrite(
-            &*self.catalog,
-            &self.key(&format!("buckets/{vb}/policy.json")),
+            &*self.system_store(vb),
+            &"policy.json".into(),
             raw.as_bytes(),
         )
         .await
@@ -612,20 +1045,17 @@ impl Storage {
     }
 
     pub async fn delete_policy(&self, vb: &str) -> Result<(), StoreError> {
-        backends::delete_object(
-            &*self.catalog,
-            &self.key(&format!("buckets/{vb}/policy.json")),
-        )
-        .await
-        .map_err(internal)
+        backends::delete_object(&*self.system_store(vb), &"policy.json".into())
+            .await
+            .map_err(internal)
     }
 
     // ---- tags (bucket ARN and index ARN both address tags.json, §5.3) ----
 
-    fn tags_key(&self, vb: &str, ix: Option<&str>) -> object_store::path::Path {
-        self.key(&match ix {
-            None => format!("buckets/{vb}/tags.json"),
-            Some(ix) => format!("buckets/{vb}/indexes/{ix}/tags.json"),
+    fn tags_key(&self, ix: Option<&str>) -> object_store::path::Path {
+        object_store::path::Path::from(match ix {
+            None => "tags.json".to_string(),
+            Some(ix) => format!("indexes/{ix}/tags.json"),
         })
     }
 
@@ -634,10 +1064,12 @@ impl Storage {
         vb: &str,
         ix: Option<&str>,
     ) -> Result<serde_json::Map<String, serde_json::Value>, StoreError> {
-        Ok(backends::read_json(&*self.catalog, &self.tags_key(vb, ix))
-            .await
-            .map_err(internal)?
-            .unwrap_or_else(serde_json::Map::new))
+        Ok(
+            backends::read_json(&*self.system_store(vb), &self.tags_key(ix))
+                .await
+                .map_err(internal)?
+                .unwrap_or_else(serde_json::Map::new),
+        )
     }
 
     pub async fn put_tags(
@@ -648,7 +1080,7 @@ impl Storage {
     ) -> Result<(), StoreError> {
         let json =
             serde_json::to_vec(&serde_json::Value::Object(tags.clone())).map_err(internal)?;
-        backends::put_json_overwrite(&*self.catalog, &self.tags_key(vb, ix), &json)
+        backends::put_json_overwrite(&*self.system_store(vb), &self.tags_key(ix), &json)
             .await
             .map_err(internal)
     }
@@ -662,13 +1094,9 @@ impl Storage {
             .ok_or_else(|| StoreError::Internal(format!("bucket {name} vanished mid-write")))?;
         meta.default_index_mode = Some(mode.to_string());
         let json = serde_json::to_vec_pretty(&meta).map_err(internal)?;
-        backends::put_json_overwrite(
-            &*self.catalog,
-            &self.key(&format!("buckets/{name}/bucket.json")),
-            &json,
-        )
-        .await
-        .map_err(internal)
+        backends::put_json_overwrite(&*self.system_store(name), &Self::MARKER_KEY.into(), &json)
+            .await
+            .map_err(internal)
     }
 
     pub async fn set_index_mode(&self, vb: &str, ix: &str, mode: &str) -> Result<(), StoreError> {
@@ -679,8 +1107,8 @@ impl Storage {
         meta.index_mode = Some(mode.to_string());
         let json = serde_json::to_vec_pretty(&meta).map_err(internal)?;
         backends::put_json_overwrite(
-            &*self.catalog,
-            &self.key(&format!("buckets/{vb}/indexes/{ix}/index.json")),
+            &*self.system_store(vb),
+            &object_store::path::Path::from(format!("indexes/{ix}/index.json")),
             &json,
         )
         .await
@@ -692,8 +1120,8 @@ impl Storage {
     /// Open a lancedb connection to an index's data dir through the shared
     /// session (registry-routed store for file/memory/s3 alike).
     async fn connect_index(&self, vb: &str, ix: &str) -> Result<Connection, StoreError> {
-        let mut builder =
-            lancedb::connect(&self.backend.lance_uri(vb, ix)).session(self.session.clone());
+        let uri = self.backend.lance_uri(&self.sys_bucket(vb), ix);
+        let mut builder = lancedb::connect(&uri).session(self.session.clone());
         if let Some(opts) = self.backend.storage_options() {
             builder = builder.storage_options(opts);
         }
@@ -898,6 +1326,21 @@ impl Storage {
     pub async fn count_vectors(&self, vb: &str, ix: &str) -> Result<usize, StoreError> {
         let table = self.open_table(vb, ix).await?;
         table.count_rows(None).await.map_err(internal)
+    }
+}
+
+/// s3admin create errors → StoreError (§5.2): InvalidBucketName/400 becomes
+/// a ValidationException pointing at `bucket_suffix`; everything else is
+/// internal.
+fn map_admin_create_err(e: crate::s3admin::AdminError, vb: &str) -> StoreError {
+    match e.status {
+        Some(400) => StoreError::Validation(format!(
+            "creating the system bucket for {vb} was rejected by the endpoint ({}): the name \
+             derived from bucket_suffix may be illegal there — adjust bucket_suffix or the \
+             bucket name",
+            e.message
+        )),
+        _ => internal(e.to_string()),
     }
 }
 
@@ -1489,6 +1932,22 @@ fn rust_distance(a: &[f32], b: &[f32], metric: &str) -> f32 {
 // tests (M1 T5): dual-route consistency + pushdown-vs-memory performance
 // ---------------------------------------------------------------------------
 
+/// Test fixture meta with the v3 marker fields (default suffix `-vf`,
+/// deployment identity of a stock daemon) — shared by every crate test
+/// module that seeds a bucket.
+#[cfg(test)]
+pub(crate) fn test_bucket_meta(storage: &Storage, vb: &str) -> BucketMeta {
+    BucketMeta {
+        vector_bucket_name: vb.to_string(),
+        vector_bucket_arn: format!("arn:aws:s3vectors:us-east-1:0:bucket/{vb}"),
+        creation_time_rfc3339: "2026-11-04T00:00:00.000Z".into(),
+        creation_time_epoch: 0.0,
+        deployment: storage.deployment_identity("us-east-1", "000000000000"),
+        placement: storage.placement(vb),
+        default_index_mode: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1568,13 +2027,7 @@ mod tests {
         // are short-lived; the OS reclaims on exit)
         std::mem::forget(dir);
         storage
-            .create_bucket(&BucketMeta {
-                vector_bucket_name: "vb".into(),
-                vector_bucket_arn: "arn:aws:s3vectors:us-east-1:0:bucket/vb".to_string(),
-                creation_time_rfc3339: "2026-11-04T00:00:00.000Z".into(),
-                creation_time_epoch: 0.0,
-                default_index_mode: None,
-            })
+            .create_bucket(&test_bucket_meta(&storage, "vb"))
             .await
             .unwrap();
         storage
@@ -1871,7 +2324,7 @@ mod tests {
                 vec![row("c".into(), 3, dim, json!({"s": ["x"]}))],
             )
             .await;
-        assert!(matches!(e, Err(StoreError::Validation(_))), "{e:?}");
+        assert!(matches!(&e, Err(StoreError::Validation(_))), "{e:?}");
         // list stays list: fine
         storage
             .upsert_vectors(
@@ -2020,6 +2473,7 @@ mod tests {
             status_reason: None,
             retries: 0,
             retries_exhausted: false,
+            misses: 0,
             updated_at: "2026-11-05T00:00:00.000Z".into(),
             chunks: Some(BTreeMap::from([("text".to_string(), 3)])),
             engines: None,
@@ -2042,8 +2496,9 @@ mod tests {
         let m: SourceMarker = serde_json::from_value(pre).expect("pre-observability marker");
         assert_eq!(m.status, SourceStatus::Indexed);
         assert!(m.engines.is_none(), "old markers read as None, never warn");
+        assert_eq!(m.misses, 0, "pre-v3.1 markers read as zero strikes");
 
-        let mut with = serde_json::json!({
+        let with = serde_json::json!({
             "object_key": "docs/b.txt",
             "etag_sig": "size=1;mtime_ns=3",
             "pipeline_fingerprint": "fp",
@@ -2072,6 +2527,8 @@ mod tests {
     async fn source_marker_round_trip_and_list() {
         let dir = tempfile::tempdir().unwrap();
         let s = Storage::file(dir.path());
+        let meta = test_bucket_meta(&s, "vb");
+        s.create_bucket(&meta).await.unwrap();
         // absent -> None
         assert!(s.load_source("vb", "deadbeef").await.unwrap().is_none());
         // save two, load both back byte-equal on the fields that matter
@@ -2103,12 +2560,13 @@ mod tests {
         s.delete_source("vb", "hash0000000000002").await.unwrap();
         s.delete_source("vb", "hash0000000000002").await.unwrap();
         assert_eq!(s.list_sources("vb").await.unwrap().len(), 1);
-        // markers live under the system prefix, never in the user namespace
-        let entries = std::fs::read_dir(dir.path()).unwrap().flatten();
-        assert_eq!(
-            entries.filter(|e| e.file_name() != ".vectorfs").count(),
-            0,
-            "marker writes must stay inside .vectorfs/"
+        // markers live in the SYSTEM bucket, never in the source namespace
+        // (§5.3-1/§5.3-3): <data>/vb-vf/sources exists, and the source
+        // bucket was never even materialized (lazy, D4)
+        assert!(dir.path().join("vb-vf/sources").is_dir());
+        assert!(
+            !dir.path().join("vb").exists(),
+            "source bucket must hold zero system objects (it is never created by marker ops)"
         );
     }
 
@@ -2163,5 +2621,99 @@ mod tests {
             );
             assert_eq!(s.to_string(), want);
         }
+    }
+
+    // ---- v3 lifecycle + enumeration (design-v3.md §3-R3/R9) ----
+
+    /// Create replay = Conflict with the 存量 hint; a foreign non-empty
+    /// system bucket = Conflict with the bucket_suffix hint; empty residue
+    /// is adopted (D7).
+    #[tokio::test]
+    async fn bucket_lifecycle_conflict_adoption_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::file(dir.path());
+        let meta = test_bucket_meta(&s, "docs");
+        s.create_bucket(&meta).await.unwrap();
+        assert!(dir.path().join("docs-vf/bucket.json").is_file());
+
+        // replay -> Conflict, hint names the existing bucket
+        match s.create_bucket(&meta).await {
+            Err(StoreError::Conflict(m)) => assert!(m.contains("already exists"), "{m}"),
+            other => panic!("expected conflict, got {other:?}"),
+        }
+
+        // foreign non-empty system bucket (no marker) -> Conflict with the
+        // bucket_suffix hint
+        let foreign = test_bucket_meta(&s, "wiki");
+        let sys_store = s.system_store("wiki"); // materializes wiki-vf
+        backends::put_json_overwrite(&*sys_store, &"someone-elses-object".into(), b"data")
+            .await
+            .unwrap();
+        match s.create_bucket(&foreign).await {
+            Err(StoreError::Conflict(m)) => assert!(m.contains("bucket_suffix"), "{m}"),
+            other => panic!("expected conflict, got {other:?}"),
+        }
+
+        // empty residue (no marker, no objects) -> adopted (D7)
+        let residue = test_bucket_meta(&s, "logs");
+        let _ = s.system_store("logs"); // materialize the empty dir
+        s.create_bucket(&residue).await.unwrap();
+        assert!(s.load_bucket("logs").await.unwrap().is_some());
+
+        // delete order converges and removes the physical bucket; source
+        // bucket dir is never created by create/delete (lazy, D4)
+        s.delete_bucket("docs").await.unwrap();
+        assert!(s.load_bucket("docs").await.unwrap().is_none());
+        assert!(!dir.path().join("docs-vf").exists());
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !entries.iter().any(|n| n == "docs"),
+            "source bucket never created (entries: {entries:?})"
+        );
+    }
+
+    /// R9 enumeration is a suffix scan + ownership marker check: foreign
+    /// markers and marker-less `-vf` buckets are skipped.
+    #[tokio::test]
+    async fn list_buckets_is_suffix_scan_with_marker_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::file(dir.path());
+        let identity = s.deployment_identity("us-east-1", "000000000000");
+        assert!(s.list_buckets(&identity).await.unwrap().is_empty());
+
+        s.create_bucket(&test_bucket_meta(&s, "docs"))
+            .await
+            .unwrap();
+        s.create_bucket(&test_bucket_meta(&s, "kb")).await.unwrap();
+
+        // a foreign-owned marker (different deployment identity) is skipped
+        let mut foreign = test_bucket_meta(&s, "other");
+        foreign.deployment = DeploymentIdentity {
+            region: "eu-west-1".into(),
+            account: "999999999999".into(),
+            endpoint: s.backend().endpoint_id(),
+        };
+        s.create_bucket(&foreign).await.unwrap();
+
+        // a marker-less `-vf` directory (somebody's real bucket) is skipped
+        let _ = s.system_store("plain"); // materializes plain-vf/ only
+
+        let listed = s.list_buckets(&identity).await.unwrap();
+        let names: Vec<&str> = listed
+            .iter()
+            .map(|m| m.vector_bucket_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["docs", "kb"], "{names:?}");
+
+        // the placement echo is materialized per backend
+        assert_eq!(
+            listed[0].placement,
+            s.placement("docs"),
+            "placement is recorded on the marker"
+        );
     }
 }

@@ -21,7 +21,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use vectorfs_server::config::{self, ServeFlags};
 use vectorfs_server::ops::AppState;
 use vectorfs_server::report::Failure;
-use vectorfs_server::{backends, lock, mcp, status, store};
+use vectorfs_server::{backends, lock, mcp, status};
 
 /// `--version` needs a `&'static str` for clap; compute once (report.rs
 /// explains the VF_GIT_HASH compile-time option).
@@ -157,10 +157,11 @@ struct ServeArgs {
     #[arg(long)]
     data_dir: Option<String>,
 
-    /// Backend: `file` (uses --data-dir), `memory` (volatile — CI/emulator
-    /// mode, DATA IS NOT PERSISTED), or
-    /// `s3+http(s)://host:port/bucket[/prefix]` (S3-compatible remote;
-    /// credentials from --s3-access-key/--s3-secret-key/--s3-region or
+    /// Backend: `file` (uses --data-dir as the bucket root), `memory`
+    /// (volatile — CI/emulator mode, DATA IS NOT PERSISTED), or
+    /// `s3+http(s)://host:port` (S3-compatible ENDPOINT; buckets are
+    /// addressed per vector bucket — source bucket X + system bucket X-vf.
+    /// Credentials from --s3-access-key/--s3-secret-key/--s3-region or
     /// VF_S3_ACCESS_KEY/VF_S3_SECRET_KEY/VF_S3_REGION, falling back to
     /// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_REGION)
     /// [env: VF_BACKEND] [default: file]
@@ -240,7 +241,7 @@ struct DoctorArgs {
     #[arg(long)]
     data_dir: Option<String>,
 
-    /// Backend: file | memory | s3+http(s)://host:port/bucket[/prefix]
+    /// Backend: file | memory | s3+http(s)://host:port
     /// [env: VF_BACKEND] [default: file]
     #[arg(long)]
     backend: Option<String>,
@@ -509,7 +510,11 @@ fn print_pipeline_summary(cfg: &vectorfs_server::pipeline::config::PipelineConfi
         println!("models_dir: {}", dir.display());
     }
     for (bucket, ingest) in &cfg.ingest {
-        let scope = ingest.scope.as_deref().unwrap_or("<whole root>");
+        let claim = if ingest.include.is_empty() && ingest.exclude.is_empty() {
+            "<whole bucket>".to_string()
+        } else {
+            format!("include={:?} exclude={:?}", ingest.include, ingest.exclude)
+        };
         // extract routes, BTreeMap order; the array form shows the chain
         // (order = try order), the string form shows verbatim
         let routes = if ingest.extract.is_empty() {
@@ -528,7 +533,7 @@ fn print_pipeline_summary(cfg: &vectorfs_server::pipeline::config::PipelineConfi
             format!("[{}]", ingest.embedders.join(", "))
         };
         println!(
-            "ingest {bucket}: chunker={} scope={scope} extract: {routes} \
+            "ingest {bucket}: chunker={} claim={claim} extract: {routes} \
              embedders={embedders} merge={} fingerprint={}",
             ingest.chunk.describe(),
             ingest.merge,
@@ -690,7 +695,7 @@ async fn serve(args: ServeArgs) {
              vectors are LOST when the process exits (CI / emulator mode). ***"
         );
     }
-    let storage = match store::Storage::new(backend) {
+    let storage = match cfg.storage() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("vectorfs: backend init failed: {e}");
@@ -698,6 +703,25 @@ async fn serve(args: ServeArgs) {
         }
     };
     let backend = storage.backend().clone();
+
+    let storage_arc = Arc::new(storage);
+
+    // ---- local flock (design-v3.md §5.1, unchanged mechanism) ----
+    // Taken BEFORE any bucket LOCK: a second daemon on this machine must be
+    // refused while it still holds NOTHING (per-bucket LOCKs taken before a
+    // failing flock would linger fresh for a full TTL on exit paths that
+    // never reach the heartbeat loop's cleanup).
+    let _flock = match lock::take_flock(&backend) {
+        Ok(g) => Some(g),
+        Err(lock::LockError::Held(who)) => {
+            eprintln!(
+                "vectorfs: refusing to start: another writer owns this data root ({who}).\n\
+                 \x20 If that daemon is really gone, stop it or remove the stale flock file."
+            );
+            std::process::exit(3);
+        }
+        Err(lock::LockError::Backend(_)) => None, // memory/s3: no local home
+    };
 
     // ---- ingest runtime, pre-lock half (M2 T3, design.md §5.10.5) ----
     // With ingest sections configured: (1) the FINGERPRINT gate reads every
@@ -709,6 +733,9 @@ async fn serve(args: ServeArgs) {
     // us for the lock). No ingest config = the pure-protocol face, zero
     // extra tasks, behavior unchanged.
     let mut ingest_core = None;
+    // Per-bucket lock registry (v3 §5.1): built AFTER storage, BEFORE the
+    // ingest buckets pin their locks.
+    let locks = lock::LockManager::new(storage_arc.clone());
     if let Some(pcfg) = pipeline_cfg.as_ref().filter(|c| !c.ingest.is_empty()) {
         if args.reindex {
             eprintln!(
@@ -716,7 +743,7 @@ async fn serve(args: ServeArgs) {
                  at startup"
             );
         } else if let Err(e) =
-            vectorfs_server::ingest::fingerprint_gate(&storage, pcfg, &cfg.data_dir).await
+            vectorfs_server::ingest::fingerprint_gate(&storage_arc, pcfg, &cfg.data_dir).await
         {
             eprintln!("vectorfs: refusing to start: {e}");
             std::process::exit(2);
@@ -726,6 +753,26 @@ async fn serve(args: ServeArgs) {
         });
         match vectorfs_server::ingest::IngestCore::load(pcfg, &models_dir).await {
             Ok(core) => {
+                // startup lock pass (§5.1): a bucket whose LOCK cannot be
+                // taken is PINNED but skipped (its scans and jobs refuse
+                // unlocked buckets) — one contested bucket must not take
+                // the whole daemon down. The heartbeat loop re-tries the
+                // lock each TTL/3, so a stale lock self-heals.
+                for vb in core.describe_buckets().into_iter().map(|(vb, _, _)| vb) {
+                    locks.pin(&vb);
+                    if let Err(e) = locks.ensure_held(&vb).await {
+                        eprintln!(
+                            "vectorfs: ingest {vb}: SKIPPED for now — cannot take its writer \
+                             lock ({}); scans resume when the other writer releases or its \
+                             heartbeat expires ({}s)",
+                            match e {
+                                lock::LockError::Held(who) => who,
+                                lock::LockError::Backend(e) => e,
+                            },
+                            lock::LOCK_TTL.as_secs()
+                        );
+                    }
+                }
                 for (vb, embedders, scan) in core.describe_buckets() {
                     eprintln!(
                         "vectorfs: ingest {vb}: {embedders} embedder(s), scan every {scan}s \
@@ -746,24 +793,6 @@ async fn serve(args: ServeArgs) {
         }
     }
 
-    // ---- single-writer lock (§5.1): acquired BEFORE the listener binds ----
-    let lock_guard = match lock::acquire(&backend, storage.catalog().clone()).await {
-        Ok(g) => g,
-        Err(lock::LockError::Held(who)) => {
-            eprintln!(
-                "vectorfs: refusing to start: another writer owns this data root ({who}).\n\
-                 \x20 If that daemon is really gone, wait for its lock heartbeat to expire \
-                 ({}s) and restart, or remove the stale LOCK object.",
-                lock::LOCK_TTL.as_secs()
-            );
-            std::process::exit(3);
-        }
-        Err(lock::LockError::Backend(e)) => {
-            eprintln!("vectorfs: lock acquisition failed: {e}");
-            std::process::exit(3);
-        }
-    };
-
     // ---- HTTP ----
     let auth_desc = if cfg.no_auth {
         "none (--no-auth)".to_string()
@@ -780,23 +809,23 @@ async fn serve(args: ServeArgs) {
     // Ingest wiring (M2 T3): the HANDLE exists iff the runtime core was
     // built — it goes INTO the AppState (T6's immediate-trigger + /x-vf
     // surface over the SAME shared core); the scheduler + workers then
-    // spawn off that same state (single-writer LOCK held, so first-write
+    // spawn off that same state (per-bucket LOCKs held, so first-write
     // domain creation is race-free by ownership).
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let storage = Arc::new(storage);
     let handle = ingest_core.map(|core| {
         Arc::new(vectorfs_server::ingest::IngestHandle::new(
             vectorfs_server::ingest::IngestShared::new(core),
         ))
     });
-    let state = AppState {
-        storage: storage.clone(),
-        creds: if cfg.no_auth { None } else { cfg.creds.clone() },
-        region: cfg.region.clone(),
-        account: cfg.account.clone(),
-        trace: cfg.trace,
-        ingest: handle.clone(),
-    };
+    let state = AppState::with_locks(
+        storage_arc.clone(),
+        locks.clone(),
+        if cfg.no_auth { None } else { cfg.creds.clone() },
+        cfg.region.clone(),
+        cfg.account.clone(),
+        cfg.trace,
+        handle.clone(),
+    );
     let ingest_drain = handle.clone();
     // ---- `serve --reindex` flip (T7): BEFORE any worker exists ----
     // The startup-flag resolution of the gate/reindex deadlock (主会话
@@ -823,7 +852,7 @@ async fn serve(args: ServeArgs) {
                 Ok(None) => {}
                 Err(e) => {
                     eprintln!("vectorfs: --reindex of {vb} failed: {e}");
-                    lock_guard.release().await;
+                    locks.release_all().await;
                     std::process::exit(2);
                 }
             }
@@ -846,12 +875,13 @@ async fn serve(args: ServeArgs) {
     }
     eprintln!(
         "vectorfs: starting on {}:{} backend={backend} auth={auth_desc} \
-         region={} account={} owner={} trace={}",
+         region={} account={} bucket_suffix={} writer={} trace={}",
         cfg.bind_host,
         cfg.port,
         cfg.region,
         cfg.account,
-        lock_guard.info().owner_uuid,
+        storage_arc.bucket_suffix(),
+        locks.writer_id(),
         cfg.trace
     );
 
@@ -860,45 +890,19 @@ async fn serve(args: ServeArgs) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("vectorfs: bind {}:{} failed: {e}", cfg.bind_host, cfg.port);
-            lock_guard.release().await;
+            locks.release_all().await;
             std::process::exit(2);
         }
     };
 
-    // Heartbeat: TTL/3 rewrite; loss of ownership (taken over after our TTL
-    // expired) must stop the daemon — wired into graceful shutdown.
-    let heartbeat_lock = Arc::new(tokio::sync::Mutex::new(lock_guard));
-    tokio::spawn({
-        let mut shutdown_rx = shutdown_rx.clone();
-        let shutdown_tx = shutdown_tx.clone();
-        let lock = heartbeat_lock.clone();
-        async move {
-            let mut ticker = tokio::time::interval(lock::HEARTBEAT_INTERVAL);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {}
-                    _ = shutdown_rx.changed() => break,
-                }
-                let mut guard = lock.lock().await;
-                match guard.heartbeat().await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        eprintln!(
-                            "vectorfs: LOCK lost (taken over by another writer after heartbeat \
-                             expiry) — shutting down."
-                        );
-                        let _ = shutdown_tx.send(true);
-                        break;
-                    }
-                    Err(e) => eprintln!("vectorfs: LOCK heartbeat error: {e} (will retry)"),
-                }
-            }
-        }
-    });
+    // Heartbeat + idle release (§5.1): every held bucket lock heartbeats in
+    // parallel each TTL/3; losing one bucket's lock parks ONLY that bucket
+    // (the manager logs it — the daemon keeps serving the rest).
+
+    locks.start(shutdown_rx.clone());
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server exited");
 
@@ -906,33 +910,30 @@ async fn serve(args: ServeArgs) {
     // scheduler/workers stop taking NEW files and finish the current one),
     // drain them inside the 8s budget (Docker SIGKILLs at 10s), then release
     // the LOCK (only if still ours) and drop the flock.
-    eprintln!("vectorfs: shutting down, releasing lock…");
+    eprintln!("vectorfs: shutting down, releasing bucket locks…");
     let _ = shutdown_tx.send(true);
     if let Some(ingest) = ingest_drain.as_ref() {
         ingest
             .shutdown(vectorfs_server::ingest::SHUTDOWN_BUDGET)
             .await;
     }
-    heartbeat_lock.lock().await.release().await;
+    locks.release_all().await;
 }
 
-/// ctrl-c / SIGTERM, or the heartbeat task signalling lock loss.
+/// ctrl-c / SIGTERM (per-bucket lock loss no longer stops the daemon —
+/// §5.1 parks only the affected bucket).
 #[cfg(unix)]
-async fn shutdown_signal(mut lost_lock: tokio::sync::watch::Receiver<bool>) {
+async fn shutdown_signal() {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("install SIGTERM handler");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
         _ = sigterm.recv() => {},
-        _ = lost_lock.changed() => {},
     }
 }
 
 /// ctrl-c only (non-unix fallback).
 #[cfg(not(unix))]
-async fn shutdown_signal(mut lost_lock: tokio::sync::watch::Receiver<bool>) {
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {},
-        _ = lost_lock.changed() => {},
-    }
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c().await
 }

@@ -13,9 +13,12 @@
 #   smoke-ubuntu-20-04 — unpacks the x86_64 tarball inside `docker run
 #                        ubuntu:20.04`, `vectorfs init && vectorfs serve`,
 #                        apt-installs python3+boto3 and drives a 5-step
-#                        roundtrip (create/put/query/get/delete+cleanup).
-#                        This is the glibc-compatibility gate for the release
-#                        binary.
+#                        roundtrip (create/put/query/get/delete+cleanup)
+#                        PLUS the v3 dual-bucket assertions (design-v3.md
+#                        §3-R1/D4: create materializes only `X-vf/` with
+#                        its marker, the source bucket is lazy; delete
+#                        removes `X-vf/` entirely). This is the
+#                        glibc-compatibility gate for the release binary.
 #   publish            — needs BOTH green: merges artifacts, writes
 #                        sha256sums.txt, attaches everything via
 #                        softprops/action-gh-release.
@@ -39,6 +42,12 @@
 #      supports 3.8 and carries the s3vectors client (added ~1.39, mid-2025).
 #      If the resolver lands below that, pin boto3 to the newest 3.8-capable
 #      release with s3vectors in the pip3 line below.
+#   6. v3 dual-bucket assertions first-run confirmation: the smoke_check.py
+#      assertions around the SDK steps (create materializes ONLY `X-vf/`
+#      with its marker, source bucket lazy; delete removes `X-vf/` entirely)
+#      were added with the v3 bucket model (PR2) and have never run on
+#      hosted runners — the first tag push after v3 must confirm they pass
+#      here (design-v3.md §3-R1/D4).
 # ---------------------------------------------------------------------------
 name: Release
 
@@ -193,24 +202,40 @@ jobs:
           mkdir -p dist && tar -xzf vectorfs-*-x86_64-unknown-linux-gnu.tar.gz -C dist
           cat > dist/smoke_check.py <<'PYEOF'
           import argparse, sys, urllib.request
+          from pathlib import Path
           import boto3
 
           p = argparse.ArgumentParser()
           p.add_argument("--endpoint", required=True)
           p.add_argument("--access-key", required=True)
           p.add_argument("--secret-key", required=True)
+          p.add_argument("--data-dir", required=True,
+                         help="the daemon's data dir (host-visible mount) for the v3 dual-bucket assertions")
           a = p.parse_args()
           c = boto3.client("s3vectors", endpoint_url=a.endpoint,
                            aws_access_key_id=a.access_key,
                            aws_secret_access_key=a.secret_key,
                            region_name="us-east-1")
           b, i = "smoke-bucket", "smoke-index"
+          d = Path(a.data_dir)
           c.create_vector_bucket(vectorBucketName=b)                        # 1 create
+          # v3 dual-bucket assertion (design-v3.md §3-R1, D4): the create
+          # materialized ONLY the system bucket dir `X-vf/` (ownership
+          # marker inside); the source bucket `X/` does NOT exist yet — the
+          # source bucket is created lazily by the first PutSource/vf put.
+          assert (d / "smoke-bucket-vf" / "bucket.json").is_file(), \
+              "system bucket marker smoke-bucket-vf/bucket.json missing"
+          assert not (d / "smoke-bucket").exists(), \
+              "source bucket must not exist at create time (lazy, D4)"
           c.create_index(vectorBucketName=b, indexName=i, dataType="float32",
                         dimension=3, distanceMetric="cosine")
           c.put_vectors(vectorBucketName=b, indexName=i, vectors=[           # 2 put
               {"key": "k1", "data": {"float32": [1.0, 0.0, 0.0]}},
               {"key": "k2", "data": {"float32": [0.0, 1.0, 0.0]}}])
+          # the index landed inside the system bucket tree (all persistent
+          # vb state lives in X-vf — §5.3-1)
+          assert any((d / "smoke-bucket-vf" / "indexes").rglob("index.json")), \
+              "index metadata must live under smoke-bucket-vf/indexes/"
           q = c.query_vectors(vectorBucketName=b, indexName=i,               # 3 query
                               queryVector={"float32": [1.0, 0.0, 0.0]},
                               topK=2, returnDistance=True)["vectors"]
@@ -220,11 +245,18 @@ jobs:
           assert sorted(v["key"] for v in g) == ["k1", "k2"], g
           c.delete_index(vectorBucketName=b, indexName=i)                    # 5 delete
           c.delete_vector_bucket(vectorBucketName=b)
-          print("smoke: 5 steps PASS")
+          # 删净 (R3): DeleteVectorBucket removed the system bucket entirely;
+          # the source bucket never existed in this run (no PutSource)
+          assert not (d / "smoke-bucket-vf").exists(), \
+              "DeleteVectorBucket must remove the system bucket tree"
+          assert not (d / "smoke-bucket").exists(), "source bucket must still be absent"
+          print("smoke: 5 steps + v3 dual-bucket assertions PASS")
           PYEOF
           # container half: healthz poll via stdlib (curl not assumed), then
           # serve for the host half. Credentials land in the mounted dist/
-          # dir for the host to read.
+          # dir for the host to read; the DATA DIR is also under the mount
+          # (./vfdata below /work/dist) so the host-side python can assert
+          # the physical dual-bucket topology around the SDK steps.
           # VF_LISTEN=0.0.0.0: serve must bind the container's eth0 for the
           # published port (the -p forward) to reach it — the default
           # 127.0.0.1 bind resets host connections.
@@ -233,15 +265,15 @@ jobs:
             -v "$PWD:/work" -w /work/dist ubuntu:20.04 bash -euo pipefail -c '
             set -euo pipefail
             apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 >/dev/null
-            ./vectorfs init --data-dir /tmp/vfdata
-            ./vectorfs serve --data-dir /tmp/vfdata >/tmp/vf.log 2>&1 &
+            ./vectorfs init --data-dir ./vfdata
+            ./vectorfs serve --data-dir ./vfdata >/tmp/vf.log 2>&1 &
             VF_PID=$!
             for i in $(seq 1 30); do
               python3 -c "import urllib.request;urllib.request.urlopen(\"http://127.0.0.1:8787/healthz\",timeout=1)" \
                 && break || sleep 1
             done
             ./vf status --endpoint http://127.0.0.1:8787
-            cp /tmp/vfdata/.vectorfs/vectorfs.toml ./smoke-creds.toml
+            cp ./vfdata/.vectorfs/vectorfs.toml ./smoke-creds.toml
             tail -5 /tmp/vf.log
             wait $VF_PID
           '
@@ -269,7 +301,7 @@ jobs:
           SK=$(awk -F"\"" "/^secret_access_key/{print \$2}" dist/smoke-creds.toml)
           pip install --quiet --user boto3
           python3 dist/smoke_check.py --endpoint http://127.0.0.1:18787 \
-            --access-key "$AK" --secret-key "$SK"
+            --access-key "$AK" --secret-key "$SK" --data-dir dist/vfdata
           docker kill vf-smoke
 
   publish:

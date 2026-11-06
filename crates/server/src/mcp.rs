@@ -1,5 +1,5 @@
 //! `vectorfs mcp` (M1 T6, design.md §5.8): a stdio MCP server for the "agent
-//! single-user" mode — NO daemon, the MCP process IS the only writer.
+//! single-user" mode — NO daemon, the MCP process IS a writer.
 //!
 //! Relationship to `vectorfs serve`: same storage layer, same wire semantics.
 //! Every tool is a thin, MCP-shaped call into the exact operation handlers
@@ -7,14 +7,13 @@
 //! ≤ 500, GetVectors keys ≤ 100), validation, filter semantics and
 //! deterministic ordering are the SDK path verbatim, with zero duplication.
 //! What differs is the transport (stdio JSON-RPC instead of HTTP+SigV4) and
-//! the exclusivity model: `vectorfs mcp` **takes the single-writer LOCK with the
-//! same protocol as `vectorfs serve`** (lock.rs) and holds it for its whole
-//! lifetime — while it runs, neither another `vectorfs mcp` nor a `vectorfs serve` may
-//! write the same data root (a holder is reported as a structured
-//! `{code, message, hint}` error, never a hang). Read-only (`--tools ro`)
-//! still takes the LOCK: one simple rule — one writer process per data root
-//! (design.md §5.1) — and the SDK-over-HTTP path stays the way to read
-//! concurrently with a daemon.
+//! the exclusivity model: `vectorfs mcp` follows the v3 per-bucket LOCK rules
+//! (design-v3.md §5.1) — the local flock guards the daemon home against a
+//! same-machine double start, bucket LOCKs are acquired LAZILY on the first
+//! write touch and idle-release after a TTL (a holder is reported as a
+//! structured `{code, message, hint}` error, never a hang). Read-only
+//! (`--tools ro`) takes no bucket lock at all; the SDK-over-HTTP path stays
+//! the way to read concurrently with a daemon.
 //!
 //! Agent contract (§5.8): tool results are JSON strings carrying
 //! `schema_version`; failures come back as tool ERROR results (not server
@@ -349,9 +348,9 @@ impl VfMcp {
 
 #[tool_router(router = tool_router)]
 impl VfMcp {
-    /// List every vector bucket in this data root, sorted by name.
+    /// List every vector bucket of this deployment, sorted by name.
     #[tool(
-        description = "List all vector buckets in the data root, sorted by name. Returns {schema_version, buckets:[{name, arn, creationTime}]}."
+        description = "List all vector buckets of this deployment, sorted by name. Returns {schema_version, buckets:[{name, arn, creationTime}]}."
     )]
     async fn list_vector_buckets(&self) -> CallToolResult {
         match self.call_list_vector_buckets().await {
@@ -743,7 +742,7 @@ fn tool_error(text: String) -> CallToolResult {
 #[tool_handler(
     router = self.tool_router,
     name = "vectorfs",
-    instructions = "vectorfs single-agent mode: this MCP process is the ONLY writer of its data root (it holds the same single-writer LOCK as `vectorfs serve`). Locate indexes with list_vector_buckets + list_indexes (they carry dimension/metric), then query_vectors / get_vectors; for ingest-configured buckets also search (hybrid file search with merged, source-attributed hits) and list_sources; with --tools rw also put_source / put_vectors / delete_vectors. Results are deterministic (queries: distance asc then key asc; get_vectors: key asc). Every result is a JSON string with schema_version; failures are tool errors shaped {code, message, hint}."
+    instructions = "vectorfs single-agent mode: this MCP process writes through per-bucket locks (same rules as `vectorfs serve`; --tools ro takes none). Locate indexes with list_vector_buckets + list_indexes (they carry dimension/metric), then query_vectors / get_vectors; for ingest-configured buckets also search (hybrid file search with merged, source-attributed hits) and list_sources; with --tools rw also put_source / put_vectors / delete_vectors. Results are deterministic (queries: distance asc then key asc; get_vectors: key asc). Every result is a JSON string with schema_version; failures are tool errors shaped {code, message, hint}."
 )]
 impl ServerHandler for VfMcp {}
 
@@ -771,7 +770,7 @@ pub async fn run(cfg: &crate::config::StorageConfig, mode: ToolsMode) -> McpExit
         Ok(b) => b,
         Err(e) => return McpExit::Failed(format!("invalid backend: {e}")),
     };
-    let storage = match crate::store::Storage::new(backend.clone()) {
+    let storage = match cfg.storage() {
         Ok(s) => s,
         Err(e) => return McpExit::Failed(format!("backend init failed: {e}")),
     };
@@ -781,25 +780,22 @@ pub async fn run(cfg: &crate::config::StorageConfig, mode: ToolsMode) -> McpExit
              process exits (CI / emulator mode). ***"
         );
     }
+    let storage = Arc::new(storage);
 
-    // single-writer LOCK — same protocol as `vectorfs serve` (lock.rs): this MCP
-    // process is the exclusive writer for its whole lifetime.
-    let lock_guard = match crate::lock::acquire(&backend, storage.catalog().clone()).await {
-        Ok(g) => g,
+    // same-machine double-start guard (§5.1: the flock guards the daemon
+    // home). Bucket LOCKs follow the serve rules — lazy per-bucket acquire,
+    // idle release, `--tools ro` never takes one (its tools only read).
+    let _flock = match crate::lock::take_flock(&backend) {
+        Ok(g) => Some(g),
         Err(crate::lock::LockError::Held(who)) => {
             return McpExit::Held(
                 who,
-                format!(
-                    "another writer owns this data root; if it is really gone, its lock \
-                     heartbeat expires after {}s and a restart takes over",
-                    crate::lock::LOCK_TTL.as_secs()
-                ),
+                "another vectorfs daemon on this machine holds the local lock".to_string(),
             );
         }
-        Err(crate::lock::LockError::Backend(e)) => {
-            return McpExit::Failed(format!("lock acquisition failed: {e}"));
-        }
+        Err(crate::lock::LockError::Backend(_)) => None, // memory/s3: no local home
     };
+    let locks = crate::lock::LockManager::new(storage.clone());
 
     // region/account only mint ARNs / parse ARN locators; the tool surface
     // uses names, but resolve them the same way serve would when
@@ -852,91 +848,61 @@ pub async fn run(cfg: &crate::config::StorageConfig, mode: ToolsMode) -> McpExit
         }
     }
 
-    let state = Arc::new(AppState {
-        storage: Arc::new(storage),
-        creds: None, // no wire auth on stdio — the transport is the boundary
-        region: file_cfg
+    let state = Arc::new(AppState::with_locks(
+        storage,
+        locks.clone(),
+        None, // no wire auth on stdio — the transport is the boundary
+        file_cfg
             .as_ref()
             .map(|c| c.region.clone())
             .unwrap_or_else(|| crate::config::DEFAULT_REGION.to_string()),
-        account: file_cfg
+        file_cfg
             .as_ref()
             .map(|c| c.account_id.clone())
             .unwrap_or_else(|| crate::config::DEFAULT_ACCOUNT.to_string()),
-        trace: false,
+        false,
         // query-side embedders (search/put_source) — never the scheduler.
         ingest,
-    });
+    ));
 
-    // heartbeat (TTL/3): losing ownership (taken over after our TTL expired)
-    // must stop the process — wired to service cancellation below, exactly
-    // like serve's graceful shutdown.
-    let (loss_tx, mut loss_rx) = tokio::sync::watch::channel(false);
-    let heartbeat_lock = Arc::new(tokio::sync::Mutex::new(lock_guard));
-    tokio::spawn({
-        let lock = heartbeat_lock.clone();
-        let loss_tx = loss_tx.clone();
-        async move {
-            let mut ticker = tokio::time::interval(crate::lock::HEARTBEAT_INTERVAL);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                ticker.tick().await;
-                let mut guard = lock.lock().await;
-                match guard.heartbeat().await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        eprintln!(
-                            "vectorfs mcp: LOCK lost (taken over by another writer after heartbeat \
-                             expiry) — shutting down."
-                        );
-                        let _ = loss_tx.send(true);
-                        break;
-                    }
-                    Err(e) => eprintln!("vectorfs mcp: LOCK heartbeat error: {e} (will retry)"),
-                }
-            }
-        }
-    });
+    // heartbeat + idle release (§5.1): the manager's loop parks only the
+    // affected bucket on loss; with lazy locks this process never pins
+    // buckets it is not touching (`--tools ro` acquires nothing at all).
+    locks.start(shutdown_watch());
 
     let mode_name = if mode == ToolsMode::Rw { "rw" } else { "ro" };
     eprintln!(
-        "vectorfs mcp: serving stdio MCP (tools={mode_name}, backend {}, owner {}) — this process \
-         is the single writer of the data root",
+        "vectorfs mcp: serving stdio MCP (tools={mode_name}, backend {}, writer {}) — bucket \
+         locks are lazy (ro acquires none)",
         state.storage.backend(),
-        heartbeat_lock.lock().await.info().owner_uuid
+        state.locks.writer_id()
     );
 
     let server = VfMcp::new(state, mode);
     let service = match server.serve(rmcp::transport::stdio()).await {
         Ok(s) => s,
         Err(e) => {
-            heartbeat_lock.lock().await.release().await;
             return McpExit::Failed(format!("stdio serve failed: {e}"));
         }
     };
-    // graceful end = client closed stdin (waiting(), consumes the service);
-    // lock loss = cancel via the service's token, then let it flush briefly.
-    let token = service.cancellation_token();
-    tokio::select! {
-        r = service.waiting() => {
-            match r {
-                Ok(reason) => {
-                    eprintln!("vectorfs mcp: session ended ({reason:?})");
-                }
-                Err(e) => eprintln!("vectorfs mcp: session error: {e}"),
-            }
+    // graceful end = client closed stdin (waiting(), consumes the service).
+    // (v3 §5.1: losing one bucket's lock parks that bucket's tools — a 409
+    // tool error — instead of killing the session.)
+    match service.waiting().await {
+        Ok(reason) => {
+            eprintln!("vectorfs mcp: session ended ({reason:?})");
         }
-        _ = loss_rx.changed() => {
-            if *loss_rx.borrow() {
-                eprintln!("vectorfs mcp: cancelling the MCP session…");
-                token.cancel();
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-        }
+        Err(e) => eprintln!("vectorfs mcp: session error: {e}"),
     }
-    eprintln!("vectorfs mcp: shutting down, releasing lock…");
-    heartbeat_lock.lock().await.release().await;
+    eprintln!("vectorfs mcp: shutting down, releasing bucket locks…");
+    locks.release_all().await;
     McpExit::Ok
+}
+
+/// Always-open shutdown watch for the lock heartbeat loop (the MCP session
+/// end is observed by the caller, not the loop).
+fn shutdown_watch() -> tokio::sync::watch::Receiver<bool> {
+    tokio::sync::watch::channel(false).1
 }
 
 // ---------------------------------------------------------------------------
@@ -949,14 +915,14 @@ mod tests {
     use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage, ServerResult};
 
     fn state(dir: &std::path::Path) -> Arc<AppState> {
-        Arc::new(AppState {
-            storage: Arc::new(crate::store::Storage::file(dir)),
-            creds: None,
-            region: "us-east-1".into(),
-            account: "000000000000".into(),
-            trace: false,
-            ingest: None,
-        })
+        Arc::new(AppState::new(
+            Arc::new(crate::store::Storage::file(dir)),
+            None,
+            "us-east-1".into(),
+            "000000000000".into(),
+            false,
+            None,
+        ))
     }
 
     /// Seed one bucket + one index (dim 2, cosine) through the real ops
@@ -1215,7 +1181,7 @@ mod tests {
         let text = format!(
             "[extractor.plain]\nkind = \"txt\"\n\n\
              [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = true\n\n\
-             [ingest.docs]\nscope = \"docs/**\"\nextract = {{ txt = \"plain\" }}\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ txt = \"plain\" }}\n\
              chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
              embedders = [\"tiny\"]\nscan_interval_secs = 1\n",
             fixture_dir().display().to_string()
@@ -1228,14 +1194,14 @@ mod tests {
         let handle = Arc::new(crate::ingest::IngestHandle::new(
             crate::ingest::IngestShared::new(core),
         ));
-        let state = Arc::new(AppState {
-            storage: Arc::new(crate::store::Storage::file(dir)),
-            creds: None,
-            region: "us-east-1".into(),
-            account: "000000000000".into(),
-            trace: false,
-            ingest: Some(handle.clone()),
-        });
+        let state = Arc::new(AppState::new(
+            Arc::new(crate::store::Storage::file(dir)),
+            None,
+            "us-east-1".into(),
+            "000000000000".into(),
+            false,
+            Some(handle.clone()),
+        ));
         // one indexed source through the REAL scan (deterministic, no spawn)
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let rt = crate::ingest::IngestRuntime::new(
@@ -1244,9 +1210,13 @@ mod tests {
             Arc::new(tokio::sync::Notify::new()),
             rx,
         );
-        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        // v3: the file lives INSIDE the source bucket dir, under the docs/
+        // key prefix; the writer locks are held like serve's startup pass
+        state.locks.pin("docs");
+        state.locks.ensure_held("docs").await.unwrap();
+        std::fs::create_dir_all(dir.join("docs").join("docs")).unwrap();
         std::fs::write(
-            dir.join("docs").join("a.txt"),
+            dir.join("docs").join("docs").join("a.txt"),
             "the quick brown fox jumps over the lazy dog",
         )
         .unwrap();
@@ -1311,8 +1281,8 @@ mod tests {
         assert_eq!(v["key"], "docs/uploaded.txt");
         assert_eq!(v["status"], "PENDING");
         assert!(
-            dir.path().join("docs/uploaded.txt").is_file(),
-            "object landed in the instance root"
+            dir.path().join("docs/docs/uploaded.txt").is_file(),
+            "object landed inside the source bucket, under the docs/ key prefix"
         );
 
         // search on a bucket without an ingest section: structured guidance

@@ -20,6 +20,7 @@ pub mod ops;
 pub mod ops_xvf;
 pub mod pipeline;
 pub mod preset;
+pub mod s3admin;
 pub mod status;
 pub mod store;
 
@@ -344,14 +345,14 @@ mod tests {
     use tower::ServiceExt; // oneshot
 
     fn test_state(dir: &std::path::Path, creds: Option<sigv4::Credentials>) -> ops::AppState {
-        ops::AppState {
-            storage: std::sync::Arc::new(store::Storage::file(dir)),
+        ops::AppState::new(
+            std::sync::Arc::new(store::Storage::file(dir)),
             creds,
-            region: "us-east-1".into(),
-            account: "000000000000".into(),
-            trace: false,
-            ingest: None,
-        }
+            "us-east-1".into(),
+            "000000000000".into(),
+            false,
+            None,
+        )
     }
 
     async fn send(

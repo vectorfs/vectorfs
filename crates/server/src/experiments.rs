@@ -4,7 +4,9 @@
 //! (2) merge_insert x dynamic schema evolution (M0 Q10 / 附录B-Q10).
 //!
 //! The S3 rows are `#[ignore]`d (need a live S3-compatible server) and run
-//! manually: `VF_S3CP_URI='s3+http://127.0.0.1:9000/vf-spike' cargo test -- --ignored`
+//! manually (v3: the URI is ENDPOINT-shaped, the probe bucket is
+//! `VF_S3CP_BUCKET` defaulting to `vf-spike`):
+//! `VF_S3CP_URI='s3+http://127.0.0.1:9000' cargo test -- --ignored`
 
 use std::sync::Arc;
 
@@ -66,22 +68,18 @@ async fn conditional_put_local() {
 }
 
 /// S3-compatible server row of the conditional-write matrix.
-/// Env: VF_S3CP_URI='s3+http://127.0.0.1:9000/vf-spike' (+ optional
-/// VF_S3_ACCESS_KEY/VF_S3_SECRET_KEY). Exercises the same code path Lance's
-/// ConditionalPutCommitHandler uses for manifest commits (PutMode::Create).
+/// Env: VF_S3CP_URI='s3+http://127.0.0.1:9000' (+ optional
+/// VF_S3_ACCESS_KEY/VF_S3_SECRET_KEY, and VF_S3CP_BUCKET defaulting to
+/// `vf-spike` — v3 buckets are addressed per name, not by the URI path).
+/// Exercises the same code path Lance's ConditionalPutCommitHandler uses
+/// for manifest commits (PutMode::Create).
 #[tokio::test]
 #[ignore = "needs live S3 server; set VF_S3CP_URI"]
 async fn conditional_put_s3() {
-    let uri =
-        std::env::var("VF_S3CP_URI").expect("VF_S3CP_URI=s3+http://host:port/bucket[/prefix]");
-    let cfg = crate::backends::S3BackendConfig::parse(&uri).expect("parse s3+ uri");
-    let cfg = crate::backends::S3BackendConfig {
-        access_key: std::env::var("VF_S3_ACCESS_KEY").ok().or(cfg.access_key),
-        secret_key: std::env::var("VF_S3_SECRET_KEY").ok().or(cfg.secret_key),
-        ..cfg
-    };
-    let store = cfg.build_catalog_store().expect("build store");
-    let path = cfg.catalog_key("cond-test/taskd-probe.json");
+    let cfg = s3cp_config();
+    let bucket = std::env::var("VF_S3CP_BUCKET").unwrap_or_else(|_| "vf-spike".to_string());
+    let store = cfg.build_bucket_store(&bucket).expect("build store");
+    let path = object_store::path::Path::from("cond-test/taskd-probe.json");
 
     let _ = store.delete(&path).await; // idempotent rerun
     store
@@ -304,21 +302,26 @@ async fn merge_insert_with_schema_evolution() {
     assert_eq!(by_key["c"].0, Some(0));
 }
 
+/// The shared VF_S3CP_* construction (endpoint-shaped URI + creds).
+fn s3cp_config() -> crate::backends::S3BackendConfig {
+    let uri = std::env::var("VF_S3CP_URI").expect("VF_S3CP_URI=s3+http://host:port");
+    let cfg = crate::backends::S3BackendConfig::parse(&uri).expect("parse s3+ endpoint uri");
+    crate::backends::S3BackendConfig {
+        access_key: std::env::var("VF_S3_ACCESS_KEY").ok().or(cfg.access_key),
+        secret_key: std::env::var("VF_S3_SECRET_KEY").ok().or(cfg.secret_key),
+        ..cfg
+    }
+}
+
 /// S3 backend GET/LIST probe (diagnostics for cloud endpoints: which verb
 /// fails, with what exact server response). Env: same as conditional_put_s3.
 #[tokio::test]
 #[ignore = "needs live S3 server; set VF_S3CP_URI"]
 async fn s3_get_list_probe() {
-    let uri =
-        std::env::var("VF_S3CP_URI").expect("VF_S3CP_URI=s3+http://host:port/bucket[/prefix]");
-    let cfg = crate::backends::S3BackendConfig::parse(&uri).expect("parse s3+ uri");
-    let cfg = crate::backends::S3BackendConfig {
-        access_key: std::env::var("VF_S3_ACCESS_KEY").ok().or(cfg.access_key),
-        secret_key: std::env::var("VF_S3_SECRET_KEY").ok().or(cfg.secret_key),
-        ..cfg
-    };
-    let store = cfg.build_catalog_store().expect("build store");
-    let path = cfg.catalog_key("cond-test/get-probe.json");
+    let cfg = s3cp_config();
+    let bucket = std::env::var("VF_S3CP_BUCKET").unwrap_or_else(|_| "vf-spike".to_string());
+    let store = cfg.build_bucket_store(&bucket).expect("build store");
+    let path = object_store::path::Path::from("cond-test/get-probe.json");
     let _ = store.delete(&path).await;
     store
         .put(&path, b"probe".to_vec().into())
@@ -335,7 +338,7 @@ async fn s3_get_list_probe() {
     use futures_util::TryStreamExt as _;
     use object_store::ObjectStore as _;
     match store
-        .list(Some(&cfg.catalog_key("cond-test/")))
+        .list(Some(&object_store::path::Path::from("cond-test/")))
         .map_ok(|m| m.location.to_string())
         .try_collect::<Vec<_>>()
         .await

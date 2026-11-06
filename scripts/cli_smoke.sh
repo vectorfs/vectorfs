@@ -55,7 +55,8 @@ AK="$(grep -E '^access_key_id' "$TOML" | head -1 | cut -d'"' -f2)"
 SK="$(grep -E '^secret_access_key' "$TOML" | head -1 | cut -d'"' -f2)"
 [[ -n "$AK" && -n "$SK" ]] || fail "cannot parse credentials from $TOML"
 
-# append the file-layer pipeline (tiny fixture, txt -> docs/** scope)
+# append the file-layer pipeline (tiny fixture; v3: whole-bucket claim, the
+# source bucket IS the docs/ directory)
 cat >> "$TOML" <<EOF
 
 [extractor.plain]
@@ -68,7 +69,6 @@ path = "$FIXTURE"
 offline = true
 
 [ingest.docs]
-scope = "docs/**"
 extract = { txt = "plain" }
 chunk = { kind = "token-window", size = 32, overlap = 8 }
 embedders = ["tiny"]
@@ -81,13 +81,17 @@ VF_ORT_PATH="$ORT_LIB" "$VECTORFS" serve --data-dir "$DATA" --port "$PORT" \
 SERVE_PID=$!
 
 # wait for the no-auth /health probe (up to 60s; the ingest worker + models
-# load before the listener binds)
+# load before the listener binds). The probe runs inside a subshell: a bare
+# `exec 2>/dev/null` at this scope would PERMANENTLY silence the script's
+# stderr — swallowing every later fail() message (found the hard way when
+# the v3 dual-bucket assertions failed mute).
 healthy=""
 for _ in $(seq 1 300); do
-    if exec 2>/dev/null 3<>"/dev/tcp/127.0.0.1/$PORT"; then
-        printf 'GET /health HTTP/1.1\r\nhost: smoke\r\nconnection: close\r\n\r\n' >&3
-        resp="$(head -c 200 <&3 || true)"
-        exec 3<&- 2>/dev/null || true
+    if resp="$(
+            exec 3<>"/dev/tcp/127.0.0.1/$PORT" 2>/dev/null || exit 1
+            printf 'GET /health HTTP/1.1\r\nhost: smoke\r\nconnection: close\r\n\r\n' >&3
+            head -c 200 <&3
+        )"; then
         [[ "$resp" == *'"ok":true'* ]] && { healthy=1; break; }
     fi
     sleep 0.2
@@ -103,6 +107,18 @@ put_out="$("$VF" put "$WORK/fox.txt" --bucket docs --key docs/fox.txt --timeout 
     || { echo "$WORK/serve.log tail:" >&2; tail -30 "$WORK/serve.log" >&2; fail "vf put"; }
 echo "put -> $put_out"
 [[ "$put_out" == "INDEXED"$'\t'"docs/fox.txt" ]] || fail "put did not reach INDEXED: $put_out"
+
+# v3 dual-bucket assertion (design-v3.md §3-R1): the vb `docs` materialized
+# the source bucket dir <data>/docs/ holding the USER object (key docs/fox.txt
+# → <data>/docs/docs/fox.txt), and the system bucket dir <data>/docs-vf/
+# with the marker + indexes — and nothing else at the data root besides the
+# daemon home .vectorfs/ and those two bucket trees.
+[[ -f "$DATA/docs/docs/fox.txt" ]] || fail "source bucket object $DATA/docs/docs/fox.txt missing"
+[[ -f "$DATA/docs-vf/bucket.json" ]] || fail "system bucket marker $DATA/docs-vf/bucket.json missing"
+[[ -d "$DATA/docs-vf/indexes" ]] || fail "system bucket indexes/ missing"
+[[ ! -e "$DATA/docs/bucket.json" ]] || fail "system object leaked into the source bucket"
+root_entries="$(ls -A "$DATA" | LC_ALL=C sort | tr '\n' ' ')"
+[[ "$root_entries" == ".vectorfs docs docs-vf " ]] || fail "unexpected data root entries: $root_entries"
 
 echo "== get (byte round trip) =="
 "$VF" get docs/fox.txt --bucket docs --out "$WORK/roundtrip.txt"

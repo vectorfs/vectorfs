@@ -1,49 +1,36 @@
-//! Unified storage backend abstraction (design.md §5.2): one `Backend` enum
-//! for `file` / `memory` / `s3`, each producing
-//! (a) an `Arc<dyn object_store::ObjectStore>` used for ALL catalog JSON
-//!     (bucket.json / index.json / policy.json / tags.json) and the LOCK
-//!     object — reads are `get` (NotFound -> 404), creations are
-//!     `put_opts(PutMode::Create)` (race-free create-if-not-exists on every
-//!     target backend: O_EXCL on LocalFileSystem, If-None-Match:* on S3,
-//!     map-insert on InMemory), overwrites are `PutMode::Overwrite` (or
-//!     `PutMode::Update(etag)` where a CAS is needed — see lock.rs);
-//! (b) a lancedb `Session` whose `ObjectStoreRegistry` routes Lance dataset
-//!     URIs through the same object_store abstraction.
+//! Unified storage backend abstraction (design-v3.md §1/§3-R1): one
+//! `Backend` enum for `file` / `memory` / `s3`, addressing a BUCKET PAIR per
+//! vector bucket — source bucket `X` (pure user namespace) + system bucket
+//! `X-vf` (vectorfs-owned, root IS the system area, D2). The backend spec
+//! is ENDPOINT-shaped (no bucket/prefix): buckets are addressed per vector
+//! bucket through [`Storage`] (store.rs), which resolves
+//! `system_bucket_name(vb, bucket_suffix)` and opens one object-store handle
+//! per bucket.
 //!
-//! Injection route (M0-verified, zero AWS SDK; previously s3.rs, absorbed
-//! here so all three backends live in one module):
-//! 1. `object_store` crate's own S3 client (`object_store::aws::AmazonS3`,
-//!    reqwest + aws-lc-rs only — no aws-config chain).
-//! 2. Providers wrapped into lance_io `ObjectStoreProvider`s registered on an
-//!    `ObjectStoreRegistry`; the registry goes into a custom `lance::Session`,
-//!    handed to `lancedb::ConnectBuilder::session()`. Storage options flow via
-//!    `ConnectBuilder::storage_options()` into `ObjectStoreParams`.
-//! 3. Lance manifest commits on the "s3" scheme use
-//!    `ConditionalPutCommitHandler` = `PutMode::Create` (If-None-Match:*).
+//! Per-bucket stores:
+//! - file: `<data-dir>/X/` + `<data-dir>/X-vf/` — prefix-rooted
+//!   `LocalFileSystem` each (the data dir also holds the daemon's local
+//!   home `<data-dir>/.vectorfs/`, see [`SYSTEM_PREFIX`]);
+//! - memory: ONE shared `InMemory` key space for the whole daemon; bucket
+//!   handles are `PrefixStore` views rooted at `X` / `X-vf`, so bucket
+//!   relative key sets are byte-identical across backends (§5.3-5);
+//! - s3: one `AmazonS3` client per physical bucket (endpoint + creds come
+//!   from the endpoint-shaped backend config).
 //!
-//! Backend-specific notes:
-//! - file: the registry is lance-io's OWN default `FileStoreProvider`
-//!   (lance's optimized local code paths — direct IO probing, local dir
-//!   operations). We deliberately do NOT replace it with a plain
-//!   LocalFileSystem provider: that would give up lance's local fast paths
-//!   for zero gain. The catalog side still goes through object_store's
-//!   `LocalFileSystem` (prefix-rooted), which is a different, tiny overhead
-//!   path. Net difference vs the old spike: engine opens `file://` URIs via
-//!   the session instead of bare paths — same provider underneath.
-//! - memory: lance-io's default memory provider hands every `new_store` call a
-//!   FRESH `InMemory` map; our registry cache holds only WEAK references, so
-//!   per-operation Connections (current store.rs design) could let the map be
-//!   dropped between operations, silently losing datasets. We therefore
-//!   register `SharedMemoryProvider`, which returns ONE `Arc<InMemory>`
-//!   owned by this `Backend` for the whole daemon lifetime. The same instance
-//!   also serves the catalog, so `vectorfs status`-style tooling sees one coherent
-//!   store. The `memory` backend is volatile by definition (CI/emulator mode).
+//! Lance datasets live under `indexes/<ix>/data` INSIDE the system bucket;
+//! the memory URI's host segment IS the bucket name
+//! (`memory://docs-vf/indexes/…` ⇒ map key exactly `docs-vf/indexes/…` —
+//! the `vf/` mirror prefix of v2.2 is deleted, §4 memory rework).
 //!
-//! Layout (design.md §5.3 v2.2): every backend keeps ALL vectorfs-owned data
-//! under the reserved `.vectorfs/` prefix (see [`SYSTEM_PREFIX`]) — catalog
-//! JSON and the LOCK at `.vectorfs/…`, Lance datasets at
-//! `.vectorfs/buckets/…` — so the instance root (S3 bucket[/prefix] or local
-//! dir) holds nothing but user data.
+//! Injection route (M0-verified, zero AWS SDK; unchanged from v2.2):
+//! object_store's own S3 client wrapped into lance-io providers on an
+//! `ObjectStoreRegistry` inside a custom `lance::Session`, handed to
+//! `lancedb::ConnectBuilder::session()`. Lance manifest commits on the
+//! "s3" scheme use `ConditionalPutCommitHandler` = `PutMode::Create`.
+//!
+//! Raw bucket ADMIN (create/head/delete/list-buckets) has no object_store
+//! API — that is `s3admin.rs` (design-v3.md §3-R8); the file/memory halves
+//! of the same four verbs are local operations implemented in store.rs.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -57,13 +44,82 @@ use url::Url;
 /// Cloud block size lance's own s3 provider uses (64KB; const is private there).
 const CLOUD_BLOCK_SIZE: usize = 64 * 1024;
 
-/// Reserved system prefix (design.md §5.3 v2.2 git-mental-model layout): ALL
-/// vectorfs-owned data — catalog JSON, LOCK, flock, vectorfs.toml, Lance
-/// datasets — lives under `<root>/.vectorfs/`, so the instance root stays a
-/// clean user file namespace (any S3 tool can read/write the rest directly).
-/// object_key()/lance_uri()/flock_path() below apply it centrally; callers
-/// keep passing system-RELATIVE keys ("LOCK", "buckets/<vb>/bucket.json").
+/// Reserved name of the daemon's LOCAL home directory
+/// `<data-dir>/.vectorfs/` (design-v3.md §4): vectorfs.toml, models cache,
+/// flock. v3 RETIRES it from object-key paths — system objects are
+/// bucket-root-relative inside `X-vf`; only these three local-home uses
+/// remain (config.rs, pipeline/models.rs, [`Backend::flock_path`]).
 pub const SYSTEM_PREFIX: &str = ".vectorfs";
+
+/// Default `bucket_suffix` (design-v3.md §0-D3): vb `X` ⇔ source bucket `X`
+/// + system bucket `X-vf`.
+pub const DEFAULT_BUCKET_SUFFIX: &str = "-vf";
+
+/// Physical system bucket name of vector bucket `vb` (R1):
+/// `X` + `bucket_suffix`.
+pub fn system_bucket_name(vb: &str, suffix: &str) -> String {
+    format!("{vb}{suffix}")
+}
+
+/// Validate a configured `bucket_suffix` (R6): lowercase/digits/hyphens only,
+/// length 2..=16, MUST end alphanumeric, and a LEADING HYPHEN IS ALLOWED.
+/// Note: the spec's literal regex `^[a-z0-9][a-z0-9-]*[a-z0-9]$` rejects its
+/// own default `-vf` (first char `-`) — the default being normative, the
+/// leading class is widened to `[a-z0-9-]` (registered deviation, final
+/// report). Ending alphanumeric keeps every concatenated system-bucket name
+/// (`X` + suffix) bucket-legal. `_` and `.` stay illegal — not portable
+/// across AWS S3/R2/MinIO and default Ceph (§2 fact table).
+pub fn validate_bucket_suffix(suffix: &str) -> Result<(), String> {
+    let ok = (2..=16).contains(&suffix.len())
+        && suffix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && suffix
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "bucket_suffix {suffix:?} is invalid: must be 2-16 characters, lowercase letters, \
+             digits and hyphens (a leading hyphen is fine — the \"-vf\" default has one), \
+             ending with an alphanumeric character (_ and . are not portable across S3 \
+             implementations and are rejected)"
+        ))
+    }
+}
+
+/// Validate a vector bucket NAME for a given suffix (R1/D5): class-S3
+/// charset without dots, length 3..=63−len(suffix), and NOT ending with the
+/// suffix itself (prevents `X-vf-vf` recursion ambiguity; AWS allows such
+/// names — registered deviation, design-v3.md §7).
+pub fn validate_vector_bucket_name(name: &str, suffix: &str) -> Result<(), String> {
+    let max = 63usize.saturating_sub(suffix.len());
+    let charset = (3..=max).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    let ok = charset
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && !name.ends_with(suffix);
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "vectorBucketName {name:?} is invalid: must be 3-{max} characters, lowercase \
+             letters, digits and hyphens, starting and ending with an alphanumeric character, \
+             and must not end with the configured bucket_suffix {suffix:?}"
+        ))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // S3 provider (from the M0 spike, unchanged in substance)
@@ -137,39 +193,34 @@ fn lance_err(e: object_store::Error) -> lance::Error {
     lance::Error::invalid_input_source(Box::new(e))
 }
 
-/// Parsed `--backend s3+http://host:port/bucket[/prefix]` configuration.
+/// Parsed `--backend s3+http(s)://host:port` configuration (design-v3.md
+/// §3-R6: ENDPOINT-shaped — no bucket, no prefix; buckets are addressed per
+/// vector bucket). Bucket management (create/head/delete/list) is
+/// [`crate::s3admin::S3Admin`], built from the same config.
 #[derive(Debug, Clone)]
 pub struct S3BackendConfig {
     pub endpoint: String,
-    pub bucket: String,
-    /// Optional key prefix inside the bucket ("" = bucket root).
-    pub prefix: String,
     pub region: String,
     pub access_key: Option<String>,
     pub secret_key: Option<String>,
 }
 
 impl S3BackendConfig {
-    /// Parse `s3+<endpoint-url>/<bucket>[/prefix]`.
+    /// Parse `s3+<endpoint-url>` — scheme http/https, authority host:port,
+    /// and NO path (a bucket path segment is the retired v2.2 form: None
+    /// here, which `Backend::parse` turns into the v3-shape error).
     pub fn parse(spec: &str) -> Option<Self> {
         let rest = spec.strip_prefix("s3+")?;
         let url = Url::parse(rest).ok()?;
         if !matches!(url.scheme(), "http" | "https") {
             return None;
         }
-        let endpoint = format!("{}://{}", url.scheme(), url.authority());
-        let path = url.path().trim_start_matches('/');
-        let (bucket, prefix) = match path.split_once('/') {
-            Some((b, p)) => (b.to_string(), p.trim_matches('/').to_string()),
-            None => (path.to_string(), String::new()),
-        };
-        if bucket.is_empty() {
-            return None;
+        if !url.path().is_empty() && url.path() != "/" {
+            return None; // bucket-path form (v2.2) — rejected, endpoint only
         }
+        let endpoint = format!("{}://{}", url.scheme(), url.authority());
         Some(Self {
             endpoint,
-            bucket,
-            prefix,
             region: "us-east-1".to_string(), // MinIO/seaweedfs convention; overridden by caller
             access_key: None,
             secret_key: None,
@@ -198,36 +249,16 @@ impl S3BackendConfig {
         m
     }
 
-    /// Lance dataset URI for an index's data dir (under the system prefix;
-    /// see [`SYSTEM_PREFIX`]).
-    pub fn lance_uri(&self, vb: &str, ix: &str) -> String {
-        match self.prefix.is_empty() {
-            true => format!(
-                "s3://{}/{SYSTEM_PREFIX}/buckets/{vb}/indexes/{ix}/data",
-                self.bucket
-            ),
-            false => format!(
-                "s3://{}/{}/{SYSTEM_PREFIX}/buckets/{vb}/indexes/{ix}/data",
-                self.bucket, self.prefix
-            ),
-        }
-    }
-
-    /// Object key (relative to bucket) for a catalog JSON object.
-    pub fn catalog_key(&self, rel: &str) -> object_store::path::Path {
-        let full = if self.prefix.is_empty() {
-            rel.to_string()
-        } else {
-            format!("{}/{}", self.prefix.trim_matches('/'), rel)
-        };
-        object_store::path::Path::from(full)
-    }
-
-    /// Direct object_store client for catalog JSON (separate from lance).
-    pub fn build_catalog_store(&self) -> object_store::Result<Arc<dyn object_store::ObjectStore>> {
+    /// Direct object_store client for ONE physical bucket (catalog JSON,
+    /// source objects — everything except Lance datasets, which route
+    /// through the session registry).
+    pub fn build_bucket_store(
+        &self,
+        bucket: &str,
+    ) -> object_store::Result<Arc<dyn object_store::ObjectStore>> {
         use object_store::aws::AmazonS3Builder;
         let mut builder = AmazonS3Builder::new()
-            .with_url(format!("s3://{}", self.bucket))
+            .with_url(format!("s3://{bucket}"))
             .with_config(
                 object_store::aws::AmazonS3ConfigKey::Endpoint,
                 &self.endpoint,
@@ -251,8 +282,10 @@ impl S3BackendConfig {
 // ---------------------------------------------------------------------------
 
 /// Memory provider that hands out ONE shared `InMemory` map for the lifetime
-/// of the owning `Backend` (see module doc for why lance's default — a fresh
-/// map per `new_store` — is wrong for our per-operation connections).
+/// of the owning `Backend` (see module doc). The URI's host segment is the
+/// BUCKET NAME (v3): `memory://docs-vf/indexes/…` resolves to the map key
+/// `docs-vf/indexes/…` — the same key the bucket's PrefixStore handle
+/// produces, so catalog and engine share one coherent key space per bucket.
 #[derive(Debug)]
 pub struct SharedMemoryProvider {
     inner: Arc<object_store::memory::InMemory>,
@@ -279,8 +312,8 @@ impl ObjectStoreProvider for SharedMemoryProvider {
         ))
     }
 
-    /// Mirrors lance-io's own memory provider: the URL domain (we always use
-    /// the constant "vf") plus the path form the object key.
+    /// Mirrors lance-io's own memory provider: the URL domain (here: the
+    /// bucket name) plus the path form the object key.
     fn extract_path(&self, url: &Url) -> lance::Result<object_store::path::Path> {
         let mut output = String::new();
         if let Some(domain) = url.domain() {
@@ -302,12 +335,6 @@ impl ObjectStoreProvider for SharedMemoryProvider {
     }
 }
 
-/// Domain component of memory:// dataset URIs. Constant so every URI spells
-/// the same namespace (`memory://vf/<SYSTEM_PREFIX>/buckets/<vb>/…`). Store
-/// keys derived from it (`vf/.vectorfs/…`) are swept by delete_index —
-/// visible to that module, hence pub(crate).
-pub(crate) const MEMORY_HOST: &str = "vf";
-
 // ---------------------------------------------------------------------------
 // Backend enum
 // ---------------------------------------------------------------------------
@@ -316,12 +343,15 @@ pub(crate) const MEMORY_HOST: &str = "vf";
 /// LOCK) is backend-agnostic.
 #[derive(Debug, Clone)]
 pub enum Backend {
-    /// Local directory root (default). `root` is canonicalized to an absolute
-    /// path so `file://` engine URIs parse.
+    /// Local directory root (default) — the data dir doubles as the bucket
+    /// root: `X/`, `X-vf/` and the daemon home `.vectorfs/` are siblings.
+    /// `root` is canonicalized to an absolute path so `file://` engine URIs
+    /// parse.
     File { root: PathBuf },
     /// Volatile process-local store (CI / emulator mode).
     Memory,
-    /// S3-compatible remote via `s3+http(s)://host:port/bucket[/prefix]`.
+    /// S3-compatible remote via `s3+http(s)://host:port` (endpoint-shaped,
+    /// design-v3.md R6).
     S3(Box<S3BackendConfig>),
 }
 
@@ -330,17 +360,19 @@ impl std::fmt::Display for Backend {
         match self {
             Backend::File { root } => write!(f, "file:{}", root.display()),
             Backend::Memory => write!(f, "memory"),
-            Backend::S3(cfg) => write!(f, "s3:{}/{}{}", cfg.bucket, cfg.prefix, cfg.endpoint),
+            Backend::S3(cfg) => write!(f, "s3:{}", cfg.endpoint),
         }
     }
 }
 
 impl Backend {
-    /// Parse a `--backend` spec. Three forms (design.md §5.2 / M1 T2):
+    /// Parse a `--backend` spec (design-v3.md §3-R6). Three forms:
     /// - `file` → the `--data-dir` directory (spike-era `file:<dir>` also
     ///   accepted for compatibility),
     /// - `memory` → volatile store,
-    /// - `s3+http(s)://host:port/bucket[/prefix]` → S3-compatible remote.
+    /// - `s3+http(s)://host:port` → S3-compatible endpoint. A BUCKET PATH
+    ///   segment (`s3+http://h/bucket`) is the retired v2.2 form and fails
+    ///   fast naming the v3 shape.
     ///
     /// The file root is created + canonicalized HERE (not in `build`) so every
     /// derived artifact — `file://` engine URIs, the prefix-rooted catalog
@@ -354,56 +386,47 @@ impl Backend {
             _ if spec.starts_with("file:") => Ok(Backend::File {
                 root: file_root(std::path::Path::new(spec.strip_prefix("file:").unwrap()))?,
             }),
-            _ if spec.starts_with("s3+") => S3BackendConfig::parse(spec)
-                .map(|cfg| Backend::S3(Box::new(cfg)))
-                .ok_or_else(|| {
-                    format!(
-                        "invalid s3 backend {spec:?} \
-                         (expected s3+http://host:port/bucket[/prefix])"
-                    )
-                }),
+            _ if spec.starts_with("s3+") => {
+                if S3BackendConfig::parse(spec).is_none() {
+                    return Err(format!(
+                        "invalid s3 backend {spec:?} — v3 backend specs are ENDPOINT-shaped: \
+                         s3+http://host:port (buckets are addressed per vector bucket; \
+                         s3+http://host:port/bucket was the v2.2 form and is no longer accepted)"
+                    ));
+                }
+                S3BackendConfig::parse(spec)
+                    .map(|cfg| Backend::S3(Box::new(cfg)))
+                    .ok_or_else(|| format!("invalid s3 backend {spec:?}"))
+            }
             other => Err(format!(
                 "cannot parse --backend {other:?} \
-                 (expected file | memory | s3+http://host:port/bucket[/prefix])"
+                 (expected file | memory | s3+http://host:port)"
             )),
         }
     }
 
-    /// Lance dataset URI for one index's data dir (§5.3 layout: everything
-    /// under the reserved system prefix).
-    pub fn lance_uri(&self, vb: &str, ix: &str) -> String {
+    /// Lance dataset URI for one index's data dir inside the SYSTEM bucket
+    /// `sys_bucket` (e.g. `docs-vf`). Memory's host segment IS the bucket
+    /// name so the dataset lands on the shared map at exactly the
+    /// bucket-relative key (§4 memory rework, §5.3-5 isomorphism).
+    pub fn lance_uri(&self, sys_bucket: &str, ix: &str) -> String {
         match self {
-            Backend::File { root } => format!(
-                "file://{}/{SYSTEM_PREFIX}/buckets/{vb}/indexes/{ix}/data",
-                root.display()
-            ),
-            Backend::Memory => {
-                format!("memory://{MEMORY_HOST}/{SYSTEM_PREFIX}/buckets/{vb}/indexes/{ix}/data")
+            Backend::File { root } => {
+                format!("file://{}/{sys_bucket}/indexes/{ix}/data", root.display())
             }
-            Backend::S3(cfg) => cfg.lance_uri(vb, ix),
+            Backend::Memory => format!("memory://{sys_bucket}/indexes/{ix}/data"),
+            Backend::S3(_) => format!("s3://{sys_bucket}/indexes/{ix}/data"),
         }
     }
 
-    /// Object-store key for a catalog/LOCK object relative to the backend root.
-    /// The system prefix is applied HERE (the single funnel): callers pass
-    /// system-relative keys ("LOCK", "buckets/<vb>/bucket.json") and never
-    /// spell `.vectorfs/` themselves. S3 additionally prepends the configured
-    /// bucket prefix via `catalog_key` — exactly once each.
-    pub fn object_key(&self, rel: &str) -> object_store::path::Path {
-        // rel == "" scopes to the whole system prefix (status volume
-        // accounting on S3); trailing separators would collapse anyway, but
-        // being explicit keeps the empty case from producing a dangling '/'.
-        let system_rel = match rel.trim_matches('/') {
-            "" => SYSTEM_PREFIX.to_string(),
-            rel => format!("{SYSTEM_PREFIX}/{rel}"),
-        };
+    /// Deployment identity endpoint component (design-v3.md §0-D8): the
+    /// placement a daemon serves. Ownership markers compare this plus
+    /// region+account — NOT the daemon instance UUID.
+    pub fn endpoint_id(&self) -> String {
         match self {
-            // The file catalog store is prefix-rooted at `root`; memory keys
-            // are plain relative paths on the shared map. A leading dot
-            // segment is a legal object_store Path (only bare "." / ".."
-            // segments are special — pinned by the tests below).
-            Backend::File { .. } | Backend::Memory => object_store::path::Path::from(system_rel),
-            Backend::S3(cfg) => cfg.catalog_key(&system_rel),
+            Backend::File { root } => format!("file://{}", root.display()),
+            Backend::Memory => "memory".to_string(),
+            Backend::S3(cfg) => cfg.endpoint.clone(),
         }
     }
 
@@ -429,9 +452,11 @@ impl Backend {
     }
 
     /// Local flock file path (file backend only — same-machine double-start
-    /// guard; see lock.rs): `<root>/.vectorfs/flock`. A separate file, NOT the
-    /// LOCK object: the LOCK object is rewritten by put/delete, which would
-    /// swap the inode out from under the flock.
+    /// guard, locks the daemon's LOCAL home; see lock.rs): always
+    /// `<data-dir>/.vectorfs/flock` (`root` == the data dir on this
+    /// backend). A separate file, NOT the LOCK object: the LOCK object is
+    /// rewritten by put/delete, which would swap the inode out from under
+    /// the flock.
     pub fn flock_path(&self) -> Option<std::path::PathBuf> {
         match self {
             Backend::File { root } => Some(root.join(SYSTEM_PREFIX).join("flock")),
@@ -439,31 +464,37 @@ impl Backend {
         }
     }
 
-    /// Build (a) the object store serving catalog + LOCK objects and (b) the
-    /// lancedb session whose registry serves engine datasets — the two halves
-    /// of the unified backend.
+    /// Physical directory of `bucket` under a file root (helper for
+    /// existence probes; the store constructors below materialize it).
+    pub fn file_bucket_root(&self, bucket: &str) -> Option<PathBuf> {
+        match self {
+            Backend::File { root } => Some(root.join(bucket)),
+            _ => None,
+        }
+    }
+
+    /// Build the lancedb `Session` whose registry serves engine datasets for
+    /// every bucket, plus (memory backend) the ONE shared `InMemory` map
+    /// that all per-bucket PrefixStore handles view (§3-R1).
     pub fn build(&self) -> Result<BackendHandles, String> {
         // The registry starts from lance-io's defaults: their "file" provider
         // (optimized local code paths — see module doc) plus their default
         // "memory" provider, which we immediately replace below.
         let registry = ObjectStoreRegistry::default();
-        let catalog: Arc<dyn object_store::ObjectStore> = match self {
-            Backend::File { root } => Arc::new(
-                object_store::local::LocalFileSystem::new_with_prefix(root)
-                    .map_err(|e| e.to_string())?,
-            ),
+        let memory = match self {
             Backend::Memory => {
                 let mem = Arc::new(object_store::memory::InMemory::new());
                 registry.insert(
                     "memory",
                     Arc::new(SharedMemoryProvider { inner: mem.clone() }),
                 );
-                mem
+                Some(mem)
             }
-            Backend::S3(cfg) => {
+            Backend::S3(_) => {
                 registry.insert("s3", Arc::new(StaticS3Provider));
-                cfg.build_catalog_store().map_err(|e| e.to_string())?
+                None
             }
+            Backend::File { .. } => None,
         };
         // Cache sizes mirror lance::Session::default() (6GiB index / 1GiB
         // metadata budget as *cache budget*, not RSS cap).
@@ -472,7 +503,46 @@ impl Backend {
             1024 * 1024 * 1024,
             Arc::new(registry),
         ));
-        Ok(BackendHandles { catalog, session })
+        Ok(BackendHandles { session, memory })
+    }
+}
+
+/// Open the object-store handle for ONE physical bucket (design-v3.md §3-R1).
+///
+/// - file: `<root>/<bucket>/` is created (materializing the directory IS
+///   creating the bucket on this backend) and prefix-rooted LocalFileSystem
+///   is returned;
+/// - memory: a `PrefixStore` view over the shared map — keys are
+///   bucket-relative, the shared key space carries `<bucket>/…`;
+/// - s3: a per-bucket `AmazonS3` client. The bucket is NOT created here —
+///   creation is the R3 lifecycle (store.rs / s3admin.rs).
+pub fn open_bucket_store(
+    backend: &Backend,
+    bucket: &str,
+    memory: Option<&Arc<object_store::memory::InMemory>>,
+) -> Result<Arc<dyn object_store::ObjectStore>, String> {
+    match backend {
+        Backend::File { root } => {
+            let dir = root.join(bucket);
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("create bucket dir {}: {e}", dir.display()))?;
+            Ok(Arc::new(
+                object_store::local::LocalFileSystem::new_with_prefix(&dir)
+                    .map_err(|e| e.to_string())?,
+            ))
+        }
+        Backend::Memory => {
+            let mem = memory.ok_or_else(|| {
+                "memory bucket store requested before the shared map was built".to_string()
+            })?;
+            Ok(Arc::new(object_store::prefix::PrefixStore::new(
+                mem.clone(),
+                object_store::path::Path::from(bucket),
+            )))
+        }
+        Backend::S3(cfg) => cfg
+            .build_bucket_store(bucket)
+            .map_err(|e| format!("open s3 bucket {bucket}: {e}")),
     }
 }
 
@@ -483,12 +553,13 @@ fn file_root(p: &std::path::Path) -> Result<PathBuf, String> {
     std::fs::canonicalize(p).map_err(|e| format!("cannot canonicalize {}: {e}", p.display()))
 }
 
-/// The two handles every backend yields (see [`Backend::build`]).
+/// What [`Backend::build`] yields: the engine session shared by every
+/// bucket, plus the memory backend's single shared map.
 pub struct BackendHandles {
-    /// Object store for catalog JSON + LOCK objects.
-    pub catalog: Arc<dyn object_store::ObjectStore>,
     /// lancedb session whose registry routes dataset URIs.
     pub session: Arc<Session>,
+    /// The memory backend's ONE shared `InMemory` (None on file/s3).
+    pub memory: Option<Arc<object_store::memory::InMemory>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -514,8 +585,8 @@ pub async fn read_json<T: serde::de::DeserializeOwned>(
 }
 
 /// Conditional create (`PutMode::Create`); Ok(false) = already exists.
-/// This is THE race-free create primitive shared by catalog objects, the LOCK
-/// object and (on s3) Lance manifest commits (design.md §5.2).
+/// This is THE race-free create primitive shared by catalog objects and the
+/// LOCK object (design-v3.md §5.1 — same mechanism, granularity = bucket).
 pub async fn put_json_create(
     store: &dyn object_store::ObjectStore,
     key: &object_store::path::Path,
@@ -621,10 +692,9 @@ pub async fn delete_object(
     }
 }
 
-/// List all object keys under a prefix (M1 T3: ListVectorBuckets /
-/// ListIndexes enumeration + DeleteIndex/DeleteVectorBucket removal).
-/// Works on every backend (LocalFileSystem / InMemory / S3 all implement
-/// `list`; on S3 this is a ListObjectsV2 prefix scan).
+/// List all object keys under a prefix (bucket-relative, on one bucket's
+/// store). Works on every backend (LocalFileSystem / InMemory / S3 all
+/// implement `list`; on S3 this is a ListObjectsV2 prefix scan).
 pub async fn list_prefix(
     store: &dyn object_store::ObjectStore,
     prefix: &object_store::path::Path,
@@ -640,11 +710,25 @@ pub async fn list_prefix(
     Ok(out)
 }
 
-/// (object count, total byte size) under a prefix — `vectorfs status` data-root
-/// volume accounting (M1 T6). Sizes come from list metadata only; no object
-/// body is ever fetched. `None` = the whole store root (on the file backend
-/// that is everything in the data dir; on S3 it is the entire bucket, so S3
-/// callers should pass their configured prefix instead).
+/// List EVERY key of a store (no prefix) — the memory backend's R9
+/// enumeration reads the whole shared key space this way.
+pub async fn list_all(
+    store: &dyn object_store::ObjectStore,
+) -> Result<Vec<object_store::path::Path>, String> {
+    use futures_util::StreamExt;
+    let mut stream = store.list(None);
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        let meta = item.map_err(|e| format!("list: {e}"))?;
+        out.push(meta.location);
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// (object count, total byte size) under a prefix — `vectorfs status`
+/// volume accounting (M1 T6), now per bucket (design-v3.md §6 status row).
+/// Sizes come from list metadata only; no object body is ever fetched.
 pub async fn prefix_stats(
     store: &dyn object_store::ObjectStore,
     prefix: Option<&object_store::path::Path>,
@@ -690,124 +774,155 @@ mod tests {
             Backend::parse("memory", dd).unwrap(),
             Backend::Memory
         ));
-        let Backend::S3(cfg) = Backend::parse("s3+http://h:9000/b/p", dd).unwrap() else {
+        let Backend::S3(cfg) = Backend::parse("s3+http://h:9000", dd).unwrap() else {
             panic!("s3");
         };
         assert_eq!(cfg.endpoint, "http://h:9000");
-        assert_eq!(cfg.bucket, "b");
-        assert_eq!(cfg.prefix, "p");
+        // v2.2 bucket-path form fails fast naming the v3 shape
+        let err = Backend::parse("s3+http://h:9000/b/p", dd).unwrap_err();
+        assert!(err.contains("ENDPOINT-shaped"), "{err}");
         assert!(Backend::parse("ftp://x", dd).is_err());
-        assert!(Backend::parse("s3+http://h:9000", dd).is_err()); // no bucket
     }
 
     #[test]
-    fn backend_uris_and_keys() {
+    fn backend_uris_and_names() {
         let dd = tempfile::tempdir().unwrap();
         let f = Backend::parse("file", dd.path()).unwrap();
         let abs = format!("{}", dd.path().canonicalize().unwrap().display());
+        // system bucket names are spelled by the caller (store.rs maps
+        // vb -> X-vf via bucket_suffix); the URI host/path below must make
+        // dataset keys land bucket-relative
         assert_eq!(
-            f.lance_uri("vb", "ix"),
-            format!("file://{abs}/.vectorfs/buckets/vb/indexes/ix/data")
+            f.lance_uri("docs-vf", "ix"),
+            format!("file://{abs}/docs-vf/indexes/ix/data")
         );
-        assert_eq!(f.object_key("Lock").as_ref(), ".vectorfs/Lock");
-        assert_eq!(f.object_key("").as_ref(), ".vectorfs");
         assert_eq!(
             f.flock_path().unwrap(),
             dd.path().canonicalize().unwrap().join(".vectorfs/flock")
         );
+        assert_eq!(f.endpoint_id(), format!("file://{abs}"));
         let m = Backend::parse("memory", dd.path()).unwrap();
         assert_eq!(
-            m.lance_uri("vb", "ix"),
-            "memory://vf/.vectorfs/buckets/vb/indexes/ix/data"
+            m.lance_uri("docs-vf", "ix"),
+            "memory://docs-vf/indexes/ix/data"
         );
-        assert_eq!(
-            m.object_key("buckets/x/bucket.json").as_ref(),
-            ".vectorfs/buckets/x/bucket.json"
-        );
-        let s = Backend::parse("s3+http://h:9000/b/pre", dd.path()).unwrap();
-        assert_eq!(
-            s.lance_uri("vb", "ix"),
-            "s3://b/pre/.vectorfs/buckets/vb/indexes/ix/data"
-        );
-        // system prefix + configured bucket prefix, each applied exactly once
-        assert_eq!(s.object_key("Lock").as_ref(), "pre/.vectorfs/Lock");
-        let s_no_prefix = Backend::parse("s3+http://h:9000/b", dd.path()).unwrap();
-        assert_eq!(s_no_prefix.object_key("Lock").as_ref(), ".vectorfs/Lock");
+        assert_eq!(m.endpoint_id(), "memory");
+        let s = Backend::parse("s3+http://h:9000", dd.path()).unwrap();
+        assert_eq!(s.lance_uri("docs-vf", "ix"), "s3://docs-vf/indexes/ix/data");
+        assert_eq!(s.endpoint_id(), "http://h:9000");
     }
 
-    /// The system prefix is a LEADING DOT segment — legal for object_store
-    /// (only bare "." / ".." segments are special) — and file-backend objects
-    /// physically land under `<root>/.vectorfs/`, leaving the rest of the
-    /// root free for user data (design.md §5.3).
+    /// bucket_suffix / vb-name gates (R1/R6/D5).
+    #[test]
+    fn suffix_and_vb_name_gates() {
+        assert_eq!(DEFAULT_BUCKET_SUFFIX, "-vf");
+        assert!(validate_bucket_suffix("-vf").is_ok());
+        assert!(validate_bucket_suffix("x2").is_ok());
+        assert!(validate_bucket_suffix("-system-x9").is_ok());
+        assert!(
+            validate_bucket_suffix("vf").is_ok(),
+            "no leading hyphen needed"
+        );
+        for bad in ["", "v", "-vf-", "_x", "a.b", "-VF", "vf-", &"x".repeat(17)] {
+            assert!(validate_bucket_suffix(bad).is_err(), "{bad:?}");
+        }
+        // vb names: charset, 3..=63-len(suffix), not suffix-tailed
+        assert!(validate_vector_bucket_name("docs", "-vf").is_ok());
+        assert!(validate_vector_bucket_name(&"d".repeat(60), "-vf").is_ok());
+        assert!(validate_vector_bucket_name(&"d".repeat(61), "-vf").is_err());
+        assert!(validate_vector_bucket_name("ab", "-vf").is_err());
+        assert!(validate_vector_bucket_name("has.dot", "-vf").is_err());
+        assert!(validate_vector_bucket_name("docs-vf", "-vf").is_err());
+        assert!(validate_vector_bucket_name("-docs", "-vf").is_err());
+        // shorter suffix widens the name budget: 61 legal at "-v" (63-2)
+        assert!(validate_vector_bucket_name(&"d".repeat(61), "-v").is_ok());
+        assert_eq!(system_bucket_name("docs", "-vf"), "docs-vf");
+    }
+
+    /// Per-bucket stores round-trip bucket-relative keys, and the memory
+    /// shared key space carries the `<bucket>/` prefix exactly once
+    /// (§5.3-5 isomorphism prerequisite).
     #[tokio::test]
-    async fn dot_segment_objects_roundtrip_under_system_prefix() {
+    async fn per_bucket_stores_key_spaces() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let handles = Backend::File { root: root.clone() }.build().unwrap();
-        let key = object_store::path::Path::from(".vectorfs/LOCK");
-
+        let froot = Backend::File { root: root.clone() };
+        let _ = froot.build().unwrap();
+        let docs = open_bucket_store(&froot, "docs", None).unwrap();
+        let sys = open_bucket_store(&froot, "docs-vf", None).unwrap();
+        let key = object_store::path::Path::from("indexes/ix/index.json");
+        assert!(put_json_create(&*sys, &key, b"{}").await.unwrap());
         assert!(
-            put_json_create(&*handles.catalog, &key, b"{\"owner\":1}")
+            read_json::<serde_json::Value>(&*docs, &key)
                 .await
-                .unwrap(),
-            "leading-dot key must be creatable"
+                .unwrap()
+                .is_none(),
+            "buckets are physically separate directories"
         );
-        let v: serde_json::Value = read_json(&*handles.catalog, &key).await.unwrap().unwrap();
-        assert_eq!(v["owner"], 1);
-        // physical location: INSIDE .vectorfs/ — LocalFileSystem's put
-        // creates parent dirs itself, no manual mkdir needed
-        assert!(
-            root.join(".vectorfs/LOCK").is_file(),
-            "LOCK must live at {}/.vectorfs/LOCK",
-            root.display()
-        );
-        // and nothing leaked into the root itself
+        assert!(root.join("docs-vf/indexes/ix/index.json").is_file());
+        assert!(!root.join("docs/indexes").exists());
+
+        let m = Backend::Memory.build().unwrap();
+        let mem = m.memory.as_ref().unwrap();
+        let mdocs = open_bucket_store(&Backend::Memory, "docs", Some(mem)).unwrap();
+        let msys = open_bucket_store(&Backend::Memory, "docs-vf", Some(mem)).unwrap();
+        assert!(put_json_create(&*msys, &key, b"{\"a\":1}").await.unwrap());
+        // the raw shared map key carries the bucket prefix exactly once and
+        // is invisible to the SOURCE bucket's view
+        let raw = object_store::path::Path::from("docs-vf/indexes/ix/index.json");
         assert_eq!(
-            std::fs::read_dir(&root).unwrap().count(),
-            1,
-            "instance root must contain only .vectorfs/"
+            read_json::<serde_json::Value>(mem.as_ref(), &raw)
+                .await
+                .unwrap()
+                .unwrap()["a"],
+            1
+        );
+        assert!(
+            read_json::<serde_json::Value>(&*mdocs, &key)
+                .await
+                .unwrap()
+                .is_none(),
+            "bucket views are disjoint key spaces"
+        );
+        // and a second system bucket is disjoint from the first
+        let other = open_bucket_store(&Backend::Memory, "kb-vf", Some(mem)).unwrap();
+        assert!(
+            read_json::<serde_json::Value>(&*other, &key)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
     #[tokio::test]
     async fn catalog_primitives_roundtrip_and_conflict() {
         let dir = tempfile::tempdir().unwrap();
-        let handles = Backend::File {
+        let backend = Backend::File {
             root: dir.path().to_path_buf(),
-        }
-        .build()
-        .unwrap();
+        };
+        let _ = backend.build().unwrap();
+        let store = open_bucket_store(&backend, "vb-vf", None).unwrap();
         let key = object_store::path::Path::from("x/y.json");
 
         assert_eq!(
-            read_json::<serde_json::Value>(&*handles.catalog, &key)
-                .await
-                .unwrap(),
+            read_json::<serde_json::Value>(&*store, &key).await.unwrap(),
             None
         );
+        assert!(put_json_create(&*store, &key, br#"{"a":1}"#).await.unwrap());
         assert!(
-            put_json_create(&*handles.catalog, &key, br#"{"a":1}"#)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !put_json_create(&*handles.catalog, &key, br#"{"a":2}"#)
-                .await
-                .unwrap(),
+            !put_json_create(&*store, &key, br#"{"a":2}"#).await.unwrap(),
             "second conditional create must lose"
         );
-        let v: serde_json::Value = read_json(&*handles.catalog, &key).await.unwrap().unwrap();
+        let v: serde_json::Value = read_json(&*store, &key).await.unwrap().unwrap();
         assert_eq!(v["a"], 1);
-        put_json_overwrite(&*handles.catalog, &key, br#"{"a":3}"#)
+        put_json_overwrite(&*store, &key, br#"{"a":3}"#)
             .await
             .unwrap();
-        let v: serde_json::Value = read_json(&*handles.catalog, &key).await.unwrap().unwrap();
+        let v: serde_json::Value = read_json(&*store, &key).await.unwrap().unwrap();
         assert_eq!(v["a"], 3);
-        delete_object(&*handles.catalog, &key).await.unwrap();
+        delete_object(&*store, &key).await.unwrap();
         assert_eq!(
-            read_json::<serde_json::Value>(&*handles.catalog, &key)
-                .await
-                .unwrap(),
+            read_json::<serde_json::Value>(&*store, &key).await.unwrap(),
             None
         );
     }
@@ -816,31 +931,22 @@ mod tests {
     /// If-Match primitive and needs a live server — see experiments.rs).
     #[tokio::test]
     async fn cas_overwrite_memory() {
-        let handles = Backend::Memory.build().unwrap();
+        let m = Backend::Memory.build().unwrap();
+        let store = open_bucket_store(&Backend::Memory, "vb-vf", m.memory.as_ref()).unwrap();
         let key = object_store::path::Path::from("cas.json");
-        put_json_create(&*handles.catalog, &key, b"v1")
-            .await
-            .unwrap();
-        let (_, etag) = get_with_etag(&*handles.catalog, &key)
-            .await
-            .unwrap()
-            .unwrap();
+        put_json_create(&*store, &key, b"v1").await.unwrap();
+        let (_, etag) = get_with_etag(&*store, &key).await.unwrap().unwrap();
         assert!(
-            put_json_cas(&*handles.catalog, &key, b"v2", &etag)
-                .await
-                .unwrap(),
+            put_json_cas(&*store, &key, b"v2", &etag).await.unwrap(),
             "matching etag must win"
         );
         assert!(
-            !put_json_cas(&*handles.catalog, &key, b"v3", "\"stale\"")
+            !put_json_cas(&*store, &key, b"v3", "\"stale\"")
                 .await
                 .unwrap(),
             "stale etag must lose"
         );
-        let (bytes, _) = get_with_etag(&*handles.catalog, &key)
-            .await
-            .unwrap()
-            .unwrap();
+        let (bytes, _) = get_with_etag(&*store, &key).await.unwrap().unwrap();
         assert_eq!(&bytes[..], b"v2");
     }
 }

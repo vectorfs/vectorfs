@@ -1,6 +1,6 @@
-# vectorfs 设计文档 v2.2
+# vectorfs 设计文档 v3
 
-- 日期：2026-11-04（v1.0 = 2026-11-03；v2.1 五路审查修订、v2.2 存储布局统一均当日完成）
+- 日期：2026-11-06（v1.0 = 2026-11-03；v2.1 五路审查修订、v2.2 存储布局统一 = 2026-11-04；v3 桶模型重构 = 2026-11-06，见 §0 末行与 [design-v3.md](design-v3.md)）
 - 状态：重定位后设计基线。协议面（§4）与引擎（§5.1–5.6）继承 v1.0；文件层与插件系统见 §5.10。变更以 §0 裁决记录为唯一入口；正文术语冲突时**以 §0 最新裁决为准**。
 - 文档纪律（G6）：本文件是唯一长期设计文档；spike 结束后按实测结论修订并裁剪，文档总量恒 ≤ 代码量。
 
@@ -39,6 +39,7 @@
 | **/x-vf/Reindex 作业级串行——静默屏障（2026-11-05，用户裁决；清偿 §10.8 留账）** | reindex_bucket 增第 0 步**静默屏障**（per-bucket quiesce barrier）：置屏障 → `enqueue` 对该桶拒收新作业（被拒源由 flip 转 PENDING + reindex 尾随 wake 自动收敛，零遗漏）→ **不持 write_lock** 有界等待（90s/100ms 轮询）该桶 in-flight 清空 → 枚举+锁内 clear+flip（原机制不动）。屏障等待不持锁（worker 提交需 write_lock，持锁等待成死锁环）；超时**响亮降级**为旧「跳过在飞」语义（严格不劣于 §10.8 原状并记 stderr）；`serve --reindex` 在 workers 孵化前运行天然无争用。语义从「跳过当下在飞的源」升级为「严格在作业之间运行」——清旧块不再可能围绕一个迟到的 worker 提交进行 | 实证（drain_queue 确定性复现竞态形状）：`reindex_barrier_waits_for_inflight_then_flips_it_too`（在飞 job 阻塞 reindex、drain 后**同一源也被翻转**——旧行为会跳过它 flipped=0）；`reindex_barrier_refuses_new_enqueues`（屏障期拒收、撤屏障后同 enqueue 通过）；既有 reindex 全链/gate 恢复/ops_xvf 集成测试不回退 |
 | **引擎版本可观测（2026-11-05，用户裁决；接受新增持久字段）** | 「引擎升级=操作员显式重嵌」既定立场补上**可见的一半**：`pipeline::engines` 表（pdfium=runtime_lib_pins 的 PDFIUM_RELEASE、onnxruntime=ORT_RELEASE+ort crate 版本+API 版本、pdf-inspector=Cargo.lock 版本；**parity 测试**对脚本与 lockfile 锁死，改版本不更新表=CI 红）暴露于 /healthz 与 /health（additive 成员，与 version 同属身份信息；uptime 仍限 healthz）与 `vf status`/`vectorfs status --endpoint`；`SourceMarker` 增 `engines` 字段（serde default，旧 marker=None=前观测时代**永不告警**），INDEXED/PARTIAL 完成时写入、flip/失败时清空；`doctor` 的 ingest 检查按桶计数引擎漂移源并给「引擎升级不改指纹，重嵌是操作员显式决定」的补救语（Warn 级，混合代次可接受则不动作）。**不进指纹**（指纹漂移拒启动，引擎漂移只警告——两级严重度刻意分离）。PR 三问记录：新增持久字段有用户裁决 | 实证：schema 互读测试（旧 JSON→None、新字段往返、None 不序列化）；healthz/health additive 断言；reindex 全链断言 INDEXED 载表/flip 清空；真 daemon 冒烟（healthz+health+vf status 三面输出）；单包构建暴露并修复 client tokio feature 缺声明（fs/time——整仓特征合曾掩蔽，恰证「依赖清单即客户端保证」） |
 | **vf 命令面借鉴 S3 CLI 惯用形态（2026-11-05，用户裁决「轻量包 A+B+C」）** | 对照 aws s3 / mc / s5cmd / rclone 后采纳三条，**明确不采纳** cp/mv 统一（稀释 put 的摄取等待独有语义）与 sync/rm 递归/alias set（M3+ 出需求再裁，sync 与 scope 扫摄取语义重叠）：(A) **`bucket/key` 路径位置参数**贯穿 get/cat/rm（put 用尾随 `/` 的目标位，aws-cp 式 `docs/pre/`⇒key `pre/<文件名>`；search/reindex 用裸桶名位参）——**flag 优先的向后兼容**：`--bucket` 在场时位置参数一律是完整 key（含 `/` 的 key 以 flag 形态寻址，首个 `/` 前为桶的歧义由显式 flag 消解；开发期实测互斥方案会破坏既有 `get docs/fox.txt --bucket docs` 合法形态而否决）；put 的目标位与 --bucket 互斥为 USAGE 错误；(B) **`vf ls`**：无参=列摄取桶（`aws s3 ls` 形，复用 GetIngestStatus）、带桶=列已摄取文件（与 sources list 同渲染，`--status` 过滤，prefix 客户端过滤——wire 无 prefix 参数）；(C) **`vf cat`**=get 的 stdout 直出（无 --out，能写文件的 cat 只是可发现性更差的 get）。差异动词保持一等公民不动：put 等待 INDEXED、search 回源、reindex | 实证：`cli_s3_style_forms_smoke` 真 daemon 全形态（ls 三形/put 目标位/cat/get 路径/search/reindex 位参/USAGE 错误形状/flag 形态含 `/` key 向后兼容）；既有 `cli_full_command_smoke` 全形态不回退；docker 实机走查（无 scope 配置）路径形态全通；附录E.4 表已按新形态改写 |
+| **桶模型重构（2026-11-06，v3；全文见 [design-v3.md](design-v3.md)）** | **双桶映射定稿**：vector bucket `X` ⇔ 源桶 `X`（用户域，纯用户命名空间）+ 系统桶 `X-vf`（vectorfs 域，根即系统区）；**废弃**"单实例根装全部逻辑桶"布局、scope/claims_key 与"物理桶/逻辑桶"双义词汇（病根 = 部署单元/数据面桶/文件命名空间三角色压进一个概念）。**D1-D8**：D1 双桶对（命名约定即放置，零配置）；D2 系统桶根即系统区；D3 桶后缀可配（`bucket_suffix`，默认 `-vf`，仅文件配置、装时刻常量）；D4 源桶惰性创建、DeleteVectorBucket 删净 `X-vf`、源桶永不删；D5 vb 名 ≤63−len(suffix)（默认 60）、类 S3 命名**无点**、不得以后缀结尾；D6 锁粒度 daemon→桶；D7 崩溃重放=空桶收养（无 tombstone）；D8 所有权=部署身份（region+account+endpoint），非实例 UUID。R1-R10、布局、竞态矩阵、验收门与实施裁决（PR1-3 已完成）见 design-v3.md | 本文件 §5.1（锁粒度）/§5.3（布局）按其替换，§4.4/§5.10.3/§5.10.4/§5.10.7 对应行已修订；wire 面 21 op 零变化，超集仅加 `x-vf-placement` 回显；`VF_BACKEND` 收敛 endpoint 形态（`file`/`memory`/`s3+http(s)://host:port`，带桶路径段 fail-fast） |
 
 ## 1. 定位
 
@@ -124,7 +125,7 @@
 
 | AWS 概念 | v1 实现 | 说明 |
 |---|---|---|
-| vector bucket | `<root>/.vectorfs/buckets/<name>/bucket.json` | 名 3–63；ARN 自造 `arn:aws:s3vectors:{region}:{account}:bucket/…`（region/account 可配，默认 us-east-1/000000000000） |
+| vector bucket | **源桶 `X` + 系统桶 `X-vf`**（v3 双桶，design-v3.md §7：命名约定即放置，零配置；所有权 marker=`X-vf/bucket.json`，记部署身份 D8） | 名 3..=63−len(bucket_suffix)（默认 60）、类 S3 命名**无点**、不得以当前后缀结尾；ARN 自造 `arn:aws:s3vectors:{region}:{account}:bucket/…`（region/account 可配，默认 us-east-1/000000000000）原样；落点经 `x-vf-placement` 超集回显（自托管透明性，非对齐项） |
 | index | `<root>/buckets/<vb>/indexes/<ix>/` Lance dataset | 创建时定 dataType=float32 / dimension 1–4096 / metric ∈ {cosine, euclidean}，**不可改**（无 UpdateIndex，符合 AWS） |
 | vector = {key, data.float32, metadata} | Lance 行：`key: utf8`(主键), `vector: fixed_size_list<f32, dim>`, `metadata: struct<…>`（动态字段，见 §5.3） | key 1–1024 字符、大小写敏感、任意 UTF-8、每索引唯一；**PutVectors = upsert**（整行替换，metadata 整体替换——*spike* 对拍 AWS 确认"省略 metadata 是否保留旧值"，附录B-Q5） |
 | indexMode CLASSIC/ENHANCED | **恒 ENHANCED 行为**（预过滤：先过滤后 KNN） | UpdateIndexMode = 200 空响应；defaultIndexMode 存储并回显；这是本地实现的天然优势（无后置过滤的召回损失），文档明示 |
@@ -138,6 +139,8 @@
 
 **照抄并校验**（超限报 ValidationException / 对应错误）：PutVectors ≤500 向量且 body ≤20MiB；GetVectors ≤100 keys；DeleteVectors ≤500 keys；dimension 1–4096；metadata 每向量 ≤40KB / ≤50 键 / filterable ≤2KB / non-filterable 键 ≤10；topK ≤10,000（每页 100 + nextToken）；filter 每查询 ≤100 条约束（ENHANCED；我们恒 ENHANCED 故恒适用）；ListVectors maxResults 1–1000（默认 500，累计 >1MB 截断）；ListVectorBuckets/ListIndexes maxResults 1–500 + prefix；segmentCount 1–16 / segmentIndex 0–15（成对出现）。
 **不执行**（本地无意义）：QPS/吞吐配额、20 亿向量、10,000 bucket/index 上限。文档以一张"limits 对照表"写明哪些相同、哪些放宽。
+
+**v3 桶模型偏离行（三条，design-v3.md §7）**：①vb 名上限 63−len(bucket_suffix)（默认 `-vf` ⇒ 60，AWS=63）；②vb 名不得以 bucket_suffix 结尾（AWS 允许；防 `X-vf-vf` 递归歧义）；③多 daemon 同 endpoint 拓扑下协议面 op 可返回 ConflictException（AWS 单写者场景不出现）。
 
 **向量校验**：cosine 拒零向量；两 metric 均拒 NaN/Infinity；JSON 数值入站折叠 float32（对齐 AWS 折转语义）。
 
@@ -184,10 +187,10 @@ vf CLI ──HTTP/SigV4──►┐    AWS SDK / MCP 客户端
 
 ### 5.1 进程与锁模型
 
-- 双薄 bin：服务端 `vectorfs` + 客户端 `vf`（同 crate 共享 lib，§5.8）。**每个实例根一个写者 daemon**。
-- 锁：本地 flock（同机双启）+ `<root>/.vectorfs/LOCK` 对象（条件写创建 + 心跳续期 TTL，心跳携带 writer id；防跨机双写）。接管 = 条件写 put-if-match（旧 token 为匹配值）——过期本身即死亡判据，**不依赖跨机不可实现的"确认旧进程死"**（v2.1 修订，与 §5.10.5 一致）。
+- 双薄 bin：服务端 `vectorfs` + 客户端 `vf`（同 crate 共享 lib，§5.8）。**写者粒度 = 桶**（v3/D6，替换 v2"每实例根一个写者"）：每活动 vector bucket 一把 `X-vf/LOCK`，daemon 级 LOCK 退役。
+- 锁：本地 flock（锁 daemon 本地家 `<data-dir>/.vectorfs/`，同机双启）+ **per-bucket LOCK 对象** `X-vf/LOCK`（条件写创建 + 心跳续期 TTL，心跳携带 writer id=daemon 实例 UUID；防跨机双写）。接管 = 条件写 put-if-match（旧 token 为匹配值）——过期本身即死亡判据，**不依赖跨机不可实现的"确认旧进程死"**（v2.1 修订，与 §5.10.5 一致）。收尾语义全文见 **design-v3.md §5.1**：启动为 `[ingest.X]` 取锁（失败仅跳过该桶+告警，不拖死 daemon）、协议面惰性取锁+空闲释放、失去某桶锁仅该桶泊车、心跳并行化。
 - **崩溃恢复 = 客户端重试**：所有写操作 key 寻址、幂等（upsert/delete 天然幂等；bucket/index 创建冲突报 ConflictException 亦幂等）。**无 intent journal**——继承设计的"CAS parquet → SQLite intent → Lance∥tantivy → done 四步写序"整体废弃，理由：那套设计为多存储组件一致性而生，本架构里 **Lance manifest 提交就是唯一事务边界**（原子、版本化、可重放）。
-- 多实例：v1 不支持多写者；读者恒读最新 manifest（Lance 快照读），跨 daemon 只读访问允许但不在支持矩阵内。
+- 多实例：v1 不支持多写者（**桶级单写者**）；不相交桶集可多 daemon 并存，纯协议面多 daemon 需外部按桶分流（design-v3.md §5.1）；读者恒读最新 manifest（Lance 快照读），跨 daemon 只读访问允许但不在支持矩阵内。
 
 ### 5.2 存储后端抽象
 
@@ -195,24 +198,25 @@ vf CLI ──HTTP/SigV4──►┐    AWS SDK / MCP 客户端
 - v0.1 矩阵：`file://`（默认，零配置）、`memory://`（CI/测试）、`s3://`——**已实测：SeaweedFS 4.52（M0，9/9+延迟+条件写）与 Cloudflare R2（2026-11-04，双 SDK 32+32 conformance+条件写+doctor 探针，region=auto）**；AWS S3 / MinIO 存量——If-None-Match:\* 文档核实，未实测。R2 首测暴露真 bug：serve 绕过 `StorageConfig::backend()` 致 S3 凭证未注入、请求未签名（SeaweedFS 匿名 Admin 掩蔽此问题，R2 以 400 InvalidArgument 揭露）——已修复并加回归测试；教训：**匿名宽容后端会掩蔽签名路径缺陷，后端 conformance 必须含一个强制鉴权的真实云**。R2 的 `use_constant_size_upload_parts` 已按 endpoint 自动启用。后续验证扩展（M3，§7）：Ceph RGW、Garage/Silo。
 - **条件写矩阵（M0 结论）**：LocalFS / SeaweedFS 实测，AWS / R2 / MinIO 文档核实——全部支持 If-None-Match:\*；Lance manifest 提交即走此路径 ⇒ **提交原子性在全部目标后端成立**；LOCK 对象降级保留为防御性设计，非必需。
 
-### 5.3 数据布局与 Lance schema（v2.2：git 心智模型）
+### 5.3 数据布局与 Lance schema（v3：双桶布局，替换 v2.2 实例根布局；全文见 design-v3.md §4）
 
-实例根（= S3 bucket[/prefix] 或本地目录；旧称"数据根"，全文同义）内，**用户文件 = 普通对象，任何 S3 工具直达读写删，无包装无副本**；vectorfs 全部自有数据收进单一保留前缀 `.vectorfs/`：
+**v3 双桶**：vector bucket `X` ⇔ 源桶 `X` + 系统桶 `X + bucket_suffix`（默认 `X-vf`，D3）。**用户文件 = 源桶内普通对象**，任何 S3 工具直达读写删，无包装无副本（源桶零系统对象，扫描=整桶）；vectorfs 全部持久自有状态收进系统桶**根即系统区**（D2，无内层前缀）。三后端桶相对键集逐字节同构：s3 = 真 S3 桶对；file = `<data-dir>/X/` + `<data-dir>/X-vf/`；memory = 共享键空间内 `X/…` 与 `X-vf/…`。
 
 ```
-<root>/                          # 用户文件命名空间；摄取范围由 scope 声明（§5.10.4）
-├── docs/manual.pdf              #   标准 S3 API 直传/直删 → 下周期被摄取/GC
-├── inbox/report.docx
-└── .vectorfs/                   # 保留前缀（系统目录，用户勿写；一实例根一个）
-    ├── LOCK                     # 写者锁（条件写+心跳，writer id）
-    ├── vectorfs.toml            # 配置+凭证（继承 bucket ACL，文档注明）
-    └── buckets/<vectorBucketName>/
-        ├── bucket.json  policy.json  tags.json
-        ├── sources/<keyHash>.json   # 逐文件标记：对象键、etag、内容哈希、管线指纹、状态机
-        └── indexes/<indexName>/
-            ├── index.json  tags.json
-            └── data/               # Lance dataset（目录名固定，不用 "lance" 默认名避免歧义）
+S3 endpoint（或 <data-dir>/ 作桶根，或 memory）      <data-dir>/.vectorfs/（daemon 本地家）
+├── docs/                     ← 源桶：纯用户命名空间   ├── vectorfs.toml（配置+凭证）
+│   ├── manual.pdf              零系统对象；扫描=整桶  ├── models/
+│   └── inbox/report.docx       （S3 API 直传→下周期  └── flock（本地同机双启锁）
+│                                被摄取/GC）
+└── docs-vf/                  ← 系统桶：根即系统区（D2）
+    ├── LOCK                  ← per-bucket 写者锁（条件写+心跳，writer id）
+    ├── bucket.json           ← 所有权 marker（部署身份 region+account+endpoint，D8）
+    ├── policy.json  tags.json
+    ├── sources/<keyHash>.json    # 逐文件标记：对象键、etag、内容哈希、管线指纹、状态机
+    └── indexes/<ix>/{index.json, tags.json, data/}   # Lance dataset 原样
 ```
+
+保留字收敛：系统桶根级 `LOCK`/`bucket.json`/`policy.json`/`tags.json`/`sources`/`indexes` 为机制固定位（用户输入到不了桶根）；file 后端 data-dir 根级 `.vectorfs/`（daemon 家）；vb 名不得以后缀结尾。源桶无任何保留字。
 - Lance schema：`key: utf8 not null`、`vector: fixed_size_list<float32, dim>`、`metadata: struct<动态字段>` + `metadata_json: utf8`（nonFilterable 键的原文）。
 - **动态 schema 演化（M0 闭环，附录B-Q10）**：批内出现新 metadata 键 → `add_columns().transform(AllNulls(仅新子字段))` 演化 → merge_insert，三步在同一请求内完成。实证：跳过演化直接提交会被干净拒绝（fail-closed，无静默损坏）；演化后旧行 NULL、新行带值。值类型冲突（同键先 number 后 string）→ ValidationException。
 - 一代一表原则保留的简化版：index 创建参数即"代"；嵌入模型版本由 index 派生键隔离（换模型 ⇒ 派生新 index，§5.10.1）。
@@ -288,7 +292,7 @@ vf CLI ──HTTP/SigV4──►┐    AWS SDK / MCP 客户端
 
 | 概念 | 定义 | 存储 |
 |---|---|---|
-| **Source** | 实例根里的**普通对象**（标准 S3 API 直达；`vf put` / PutSource 只是便捷包装：落普通键 + 即时触发摄取）。摄取范围由 `[ingest.<vb>]` 的 `scope`（前缀/glob）声明；`.vectorfs/` 之外皆文件命名空间 | 对象本体在实例根；标记在 `.vectorfs/buckets/<vb>/sources/`（对象键、etag、内容哈希、指纹、状态机） |
+| **Source** | **源桶里的普通对象**（标准 S3 API 直达；`vf put` / PutSource 只是便捷包装：落源桶普通键 + 即时触发摄取）。v3 起源桶整体即该 vb 的命名空间（桶间零共享是物理事实）；桶内认领可选 `include`/`exclude` glob 过滤，省缺 = 整桶 | 对象本体在源桶 `X`；标记在 `X-vf/sources/`（对象键、etag、内容哈希、指纹、状态机） |
 | **Embedder** | 内容→向量引擎；实例声明 {dim, doc/query 模态}；**一个实例 1:1 一个 index**，index 派生键 = hash(model, dim, 配置)——同名实例改 model 也派生新 index，杜绝静默混写 | index 元数据 + vectorfs.toml |
 | Chunk | **vector 的文件层视图**（非新实体）：key = f(**对象键**, 模态, 序号)（保持短）——**含对象键防同内容文件互踩**（两个相同内容的文件是两个 Source 各自成 chunk；内容哈希用于 etag 变更后"内容未变跳过重嵌"）。metadata 带 `x-vf-src-*` 回源键——**完整键集**：`x-vf-src-uri`（对象键短哈希 ≤100B，filterable，**GC join 键**）/ `x-vf-src-name`（对象键全文，non-filterable）/ `x-vf-src-page`（页/帧/段号，M3）/ `x-vf-modality` / `x-vf-model` / `x-vf-chunk-text`（non-filterable，**默认存、可关**——Search 直接返回文本，对齐官方 embed-cli 的 SRC-CONTENT 先例） | Lance index 行 |
 | `[ingest.<bucket>]` | 每 bucket 的摄取配置节（缺省 ⇒ 纯协议面，文件层不介入） | vectorfs.toml |
@@ -334,13 +338,16 @@ query: 输入 → query 模态匹配的各 embedder → embed_query → 各查�
 ```
 
 - **批量切分**（公理 2 的落地）：批 = min(500 向量, 20MiB − metadata 估重)，顺序提交；崩溃重跑以幂等 key 收敛。
-- **摄取触发（统一模型，v2.2）**：周期增量 list-and-diff（扫描各 scope，排除 `.vectorfs/`；默认 30s 可配）+ `vf put`/PutSource 即时触发。**真源 = 实例根对象列表**——S3 API 直接上传/覆盖/删除的对象在下周期被摄取/更新/GC（KB ingestion job 同款扫描模型；S3 事件通知留作加速项）。daemon 不在上传路径上。
+- **摄取触发（统一模型；v3 换轴，源桶即数据源）**：周期增量 list-and-diff（扫描各**源桶**整桶，可选 include/exclude 认领过滤；默认 30s 可配）+ `vf put`/PutSource 即时触发。**真源 = 源桶对象列表**——S3 API 直接上传/覆盖/删除的对象在下周期被摄取/更新/GC（KB ingestion job 同款扫描模型；S3 事件通知留作加速项）。daemon 不在上传路径上。GC/orphan sweep 作用域 = 本 daemon 持锁的桶集合，绝不触碰未持锁的桶（design-v3.md R5）。
 - **首次 put 幂等建域**：自动创建配置声明的 bucket 与派生 index（存在则校验 dim/metric/派生键，匹配复用、不符报错）。
 - **加载期 fail-fast**（数个 if，不是引擎）：extractor 输出模态无 embedder 承接 ⇒ 拒启；index 派生键与配置不符 ⇒ 提示 `vf reindex`；overlap ≥ size ⇒ 拒启；报错带 TOML 行号。
 
 #### 5.10.4 配置形态（vectorfs.toml，一屏为限）
 
 ```toml
+bucket_suffix = "-vf"                  # 桶后缀（v3 新增；省缺即此值。仅文件配置、装时刻常量，
+                                      # 校验/漂移语义见 design-v3.md R6）
+
 [embedder.text]                       # 全局具名实例；一实例 = 一 index
 kind = "ort"
 model = "gte-multilingual-base"       # M2 默认：305M、中文良好、下载轻；换 bge-m3 是一行
@@ -357,26 +364,27 @@ offline = true
 [extractor.pdf]
 kind = "pdf-text"
 
-[ingest.docs]                         # 绑定 vector bucket "docs"
-scope = "docs/**"                     # 摄取范围（实例根内前缀/glob）；省略 = 整根（.vectorfs/ 恒排除）
+[ingest.docs]                         # vb "docs" ⇔ 桶 docs（源）+ docs-vf（系统）
 extract = { pdf = ["insp", "pdf"], default = "auto" }
                                      # mime 短键 → extractor 实例名或有序回退链
                                      # （数组：Err/空产出 ⇒ 退让下一成员，首个非空 Ok 胜；
-                                     # "auto" 只可独占整值；多值语义详见 §5.10.3/§0 回退链裁决）
+                                     #  "auto" 只可独占整值；多值语义详见 §5.10.3/§0 回退链裁决）
 chunk = { kind = "token-window", size = 512, overlap = 64 }
 embedders = ["text"]                  # 实例集合；同模态多实例 = fan-out
 merge = "rrf"
 index-prefix = "docs"                 # 派生 index 名前缀（可选）
+# include = ["**.pdf"]                # 可选桶内认领过滤（v3 替换 scope）；省缺 = 整桶
+# exclude = ["**.tmp"]
 ```
 
 preset = 内建 TOML 模板；`vectorfs init --preset X` **预取模型**（进度条、sha256 校验、tmp+rename 原子落盘、`HF_ENDPOINT` 镜像可配）并物化配置。M2 交付三档：`dev`（无模型纯协议面）/ `text-rag` / `air-gapped`；`multimodal` / `image-search` / `scanned-docs` 随 M3 图像模态与 OCR 交付。
 
 #### 5.10.5 健壮性（v2.1 修订）
 
-- **无队列设计**：不建独立任务队列——待摄取 = "无标记，或 etag/内容哈希与标记不符 ⇒ 置 PENDING"（FAILED 且 retriesExhausted 者除外），worker 周期扫描 + `vf put` 唤醒；队列损坏/积压/重复入队问题类别整体消失（幂等 key 化解重复）。执行模型：每实例根一个 tokio 任务持有有界 mpsc（~64）；CPU 段（extract/chunk/embed）经 spawn_blocking 进信号量限并发（=CPU 核数）的阻塞池；模型惰性加载用 OnceLock；SIGTERM 复用 watch channel——停取新任务、完成当前文件后退出（停机超时 < Docker 默认 10s）。
+- **无队列设计**：不建独立任务队列——待摄取 = "无标记，或 etag/内容哈希与标记不符 ⇒ 置 PENDING"（FAILED 且 retriesExhausted 者除外），worker 周期扫描 + `vf put` 唤醒；队列损坏/积压/重复入队问题类别整体消失（幂等 key 化解重复）。执行模型：每摄取桶一个 tokio 任务持有有界 mpsc（~64）；CPU 段（extract/chunk/embed）经 spawn_blocking 进信号量限并发（=CPU 核数）的阻塞池；模型惰性加载用 OnceLock；SIGTERM 复用 watch channel——停取新任务、完成当前文件后退出（停机超时 < Docker 默认 10s）。
 - **指纹与 reindex**：完成标记记录**管线指纹**（= hash(extractor+chunker+embedder 实例配置)）；配置变更 ⇒ 启动 fail-fast，`vf reindex` 显式执行（按旧指纹 filter 清旧块 → 重写 → 更新标记）；无后台隐式迁移。index 元数据记录 **index 派生键**（= hash(model, dim, embedder 配置)），每批写入前校验，不符即泊车报错。两个哈希各司其职：管线指纹管"块集身份"，派生键管"index 身份"。
 - **毒丸防护**：文件大小上限（配置，默认 200MB）、extractor 单文件超时、重试 N 次（默认 3）+ 指数退避 → `FAILED` + `retriesExhausted`（不再自动重试，`statusReason` 与 `vf sources status` 可见——状态命名对齐 KB，附录E.2）；OOM 防护 = 大小上限 + RSS 自监控（§5.9）。
-- **GC 判据（防误删，v2.1）**：只对 ingest 管理的 index（元数据有标记）执行，且匹配 **chunk key 派生格式**与 `x-vf-src-uri`——禁止裸前缀过滤（防误删恰好使用 x-vf-* 键的纯协议用户向量）；对账走 ListVectors+segments（非 Query）；GC 限速 + 空闲窗口（复用 optimize 纪律）；孤儿窗口 = 对账周期（默认值文档明示）。**真源 = 实例根对象列表**（排除 `.vectorfs/`）：对象经任何途径被删 ⇒ 下周期 GC 其 chunk + 标记；`vf rm` = 删对象（经 object_store）+ 立即触发 GC（异步完成，202 DELETING 状态可见——与 S3 直接删除最终等价）。
+- **GC 判据（防误删，v2.1）**：只对 ingest 管理的 index（元数据有标记）执行，且匹配 **chunk key 派生格式**与 `x-vf-src-uri`——禁止裸前缀过滤（防误删恰好使用 x-vf-* 键的纯协议用户向量）；对账走 ListVectors+segments（非 Query）；GC 限速 + 空闲窗口（复用 optimize 纪律）；孤儿窗口 = 对账周期（默认值文档明示）。**真源 = 源桶对象列表**（源桶零系统对象，无需排除前缀）：对象经任何途径被删 ⇒ 下周期 GC 其 chunk + 标记；`vf rm` = 删对象（经 object_store）+ 立即触发 GC（异步完成，202 DELETING 状态可见——与 S3 直接删除最终等价）。
 - **openai provider**：429/超时指数退避；批内任一失败整批重试（幂等 key 保安全）；持续失败 ⇒ 泊车（协议面不受影响）。
 - **LOCK 接管竞态（v2.1）**：心跳携带 writer id；接管用条件写 put-if-match（旧 token 为匹配值），不依赖跨机不可实现的"确认旧进程死"。
 - **metadata 预算**：`x-vf-src-uri` 恒为 ≤100B **对象键**短哈希（原对象键全文放 non-filterable 的 `x-vf-src-name`）；摄取前预检（超长拒收 fail-loud）；回源键全声明 filterable；预算表进 README。
@@ -390,18 +398,18 @@ preset = 内建 TOML 模板；`vectorfs init --preset X` **预取模型**（进�
 
 #### 5.10.7 Docker 部署
 
-ghcr multi-arch（amd64/arm64 对齐发布矩阵）debian-slim non-root，内含双命令；卷 `/vectorfs/data` + `/vectorfs/models`（模型不进镜像层；air-gapped 自焙衍生镜像，文档给 Dockerfile.example）；`VF_PRESET` env + 入口脚本首启物化 TOML 进数据卷；**env 覆盖收敛为标量项**（端点/凭证/preset/后端），复杂结构改 TOML——边界写明；healthcheck = `GET /health`；SIGTERM 优雅停机（5.10.5）；每实例根恰一容器（LOCK 条件写接管，§5.1；S3 后端可无状态重启）；`--backend memory --no-auth` 容器 = testcontainers 秒级 s3vectors 模拟器；`deploy/docker-compose.yml` 进仓库；K8s 文档化不发 chart。发布物基线：tarball 在 ubuntu:20.04 容器构建（glibc 2.31 对齐既有冒烟）；.so（ort/pdfium）pin 版本 + SHA 随 sha256sums；CI 用仓内 ~1MB 小 ONNX fixture 保 hermetic，真模型测试每周档。
+ghcr multi-arch（amd64/arm64 对齐发布矩阵）debian-slim non-root，内含双命令；卷 `/vectorfs/data` + `/vectorfs/models`（模型不进镜像层；air-gapped 自焙衍生镜像，文档给 Dockerfile.example）；`VF_PRESET` env + 入口脚本首启物化 TOML 进数据卷；**env 覆盖收敛为标量项**（端点/凭证/preset/后端），复杂结构改 TOML——边界写明；healthcheck = `GET /health`；SIGTERM 优雅停机（5.10.5）；**每 endpoint 按桶划分（v3）**：单 daemon 管全部桶仍是默认部署形态（单容器）；不相交桶集可多 daemon（per-bucket LOCK，§5.1；S3 后端可无状态重启）；纯协议面多 daemon 需外部按桶分流（惰性锁是执行面不是声明面）；`--backend memory --no-auth` 容器 = testcontainers 秒级 s3vectors 模拟器；`deploy/docker-compose.yml` 进仓库；K8s 文档化不发 chart。发布物基线：tarball 在 ubuntu:20.04 容器构建（glibc 2.31 对齐既有冒烟）；.so（ort/pdfium）pin 版本 + SHA 随 sha256sums；CI 用仓内 ~1MB 小 ONNX fixture 保 hermetic，真模型测试每周档。
 
 #### 5.10.8 明确不做
 
-分支声明 / 条件表达式 / 拓扑引擎（多路 fan-out 只是 embedders 列表里多一个名字；**extractor 有序回退链同理**——2026-11-05 裁决：线性列表非 DAG，内容路由智能住在 kind 内部，机制层零路由引擎）；任意 DAG；独立任务队列；后台隐式重嵌引擎（重嵌 = 显式 `vf reindex`）；模态槽位配置（路由由 embedder 模态声明推导）；**自建 S3 对象面**（PutObject/GetObject 等对象 API 不实现——标准工具直接操作实例根，vectorfs 只读扫描）；**内容寻址源仓库/文件副本**（v2.2：文件即普通对象，不做第二份存储）；插件商店；v1 不做 wasm runtime 与进程外插件。
+分支声明 / 条件表达式 / 拓扑引擎（多路 fan-out 只是 embedders 列表里多一个名字；**extractor 有序回退链同理**——2026-11-05 裁决：线性列表非 DAG，内容路由智能住在 kind 内部，机制层零路由引擎）；任意 DAG；独立任务队列；后台隐式重嵌引擎（重嵌 = 显式 `vf reindex`）；模态槽位配置（路由由 embedder 模态声明推导）；**自建 S3 对象面**（PutObject/GetObject 等对象 API 不实现——标准工具直接操作源桶，vectorfs 只读扫描）；**内容寻址源仓库/文件副本**（v2.2：文件即普通对象，不做第二份存储）；插件商店；v1 不做 wasm runtime 与进程外插件。
 
 ## 6. 一致性模型（卖点之一）
 
 - **写后立读强一致**：Lance manifest 原子切换 + S3 系对象存储读写一致 ⇒ 上一毫秒 PutVectors、下一毫秒 QueryVectors 必见。对齐 AWS 官方表述 "Writes … are strongly consistent"，且**无任何最终一致窗口**（对比：阿里 Standard 模式写后约 2–3 秒可查——我们的本地实现天然免疫）。
 - 单写者 ⇒ 写全序串行化。
 - 分页 = manifest 快照隔离（token 携带版本）。
-- **数据可退出性承诺**：实例根 = 开放格式（Lance + JSON），daemon 消失数据仍可被任何 Lance 工具读取——写进 README，是对用户的承诺也是项目的优雅退出路径。
+- **数据可退出性承诺**：系统桶 `X-vf` = 开放格式（Lance + JSON），daemon 消失数据仍可被任何 Lance 工具读取——写进 README，是对用户的承诺也是项目的优雅退出路径。
 
 ## 7. 里程碑与验证门（K0：分步执行，每步过门才进下一步）
 
@@ -472,7 +480,7 @@ ghcr multi-arch（amd64/arm64 对齐发布矩阵）debian-slim non-root，内含
 | 12 | 上层范围蔓延（解析/嵌入/对账各自皆无底洞） | 高 | 高 | 四轴封闭 + 机制固定 + §10 三问 + 每步验收门；**M2 已收窄为 text 单模态 MVP（v2.1）** | 新模态/新 kind 无用户证据 → PR 模板拒绝 |
 | 13 | 模型许可红线（jina-clip-v2 CC-BY-NC、jina-v4 Qwen Research、MM-Embed NC、Chinese-CLIP 无标注） | 中 | 高 | 内置默认仅 permissive（gte Apache-2.0/bge-m3 MIT/SigLIP2 Apache）；cargo-deny 拦截；许可清单文档化（§5.10.5） | 新内置模型引入前 license 审查步骤 |
 | 14 | CPU 嵌入延迟拖垮体验 | 中 | 中 | SigLIP2 <1s/图、bge-m3 批异步；MLLM 类只作远端/GPU provider；队列泊车不伤协议面 | bench 超标 → preset 降级或默认远端 |
-| 15 | Docker 单写者被误解（一实例根起多容器） | 中 | 中 | LOCK 对象 TTL 心跳（§5.1）+ 启动锁冲突报错清晰 + compose 注释与 FAQ | 用户报告锁问题 → 文档补 |
+| 15 | Docker 单写者被误解（同桶集起多容器；v3 起锁粒度=桶，不相交桶集多 daemon 合法） | 中 | 中 | per-bucket LOCK 对象 TTL 心跳（§5.1）+ 启动锁冲突报错清晰 + compose 注释与 FAQ | 用户报告锁问题 → 文档补 |
 | 16 | AWS 官方补 chunking/hybrid 挤压上层 | 中 | 中 | 官方天然绑 Bedrock；我们=本地/任意 S3/离线/可插拔 | embed-cli 与 S3 Vectors changelog 月度哨 |
 
 ## 9. Kill criteria 与先行指标
@@ -588,9 +596,9 @@ ghcr multi-arch（amd64/arm64 对齐发布矩阵）debian-slim non-root，内含
 
 | 操作 | Method+URI | 关键参数 → 响应 | 说明 |
 |---|---|---|---|
-| PutSource | POST /x-vf/PutSource | bucket, key(头)；body = 原始字节 → **202** `{key, status:"PENDING"}` | **便捷包装**（v2.2）：对象落实例根普通键 + 即时触发摄取；S3 API 直传的对象由周期扫描摄取（§5.10.3），不经此 op；对齐 KB `IngestKnowledgeBaseDocuments` 契约 |
+| PutSource | POST /x-vf/PutSource | bucket, key(头)；body = 原始字节 → **202** `{key, status:"PENDING"}` | **便捷包装**（v2.2）：对象落源桶普通键 + 即时触发摄取（源桶不存在则惰性建桶，v3/D4）；S3 API 直传的对象由周期扫描摄取（§5.10.3），不经此 op；对齐 KB `IngestKnowledgeBaseDocuments` 契约 |
 | GetSource | POST /x-vf/GetSource | bucket, key → `{status, statusReason?, retriesExhausted?, mime, etag, pipelineFingerprint, chunks[{index, count}]}` | 状态机对齐 KB 文档状态命名：`PENDING / IN_PROGRESS / PARTIALLY_INDEXED / INDEXED / FAILED / DELETING`；失败原因逐文件可见（`statusReason`，KB 同名字段） |
-| GetSourceData | POST /x-vf/GetSourceData | bucket, key → 原始字节流（透传读实例根对象） | `vf get` 底层（回源下载；s3 后端也可直接 GetObject） |
+| GetSourceData | POST /x-vf/GetSourceData | bucket, key → 原始字节流（透传读源桶对象） | `vf get` 底层（回源下载；s3 后端也可直接 GetObject） |
 | ListSources | POST /x-vf/ListSources | bucket, status?, maxResults(1–1000, 默认 500), nextToken → sources[] | 标记 × 实时列表 join；`vf sources list` 底层 |
 | DeleteSource | POST /x-vf/DeleteSource | bucket, key → **202** `{status:"DELETING"}` | = 删对象（经 object_store）+ 异步 GC chunk——与 S3 直接删除等价的便捷包装；对齐 KB `DeleteKnowledgeBaseDocuments` 的 202+轮询 |
 | **Search** | POST /x-vf/Search | bucket, query{text\|image\|audio(M4)}, topK(1–1000), filter?（**$ 短名语法**，§4.6 同款）, returnText? → hits[] | **旗舰超集 op**：fan-out + merge + 回源；hits 形状对齐 KB Retrieve 的 KnowledgeBaseRetrievalResult（下） |
@@ -604,7 +612,7 @@ hits[] = { content{text, type: TEXT|IMAGE|AUDIO|VIDEO},   // KB content.type 同
            score,                                            // 合并分（rrf/weighted）
            distance?,                                        // 单路查询时有意义
            index, key,                                       // vectorfs 特有：派生 index 名 + chunk key
-           location{type:"source", key, page?},              // KB location 同位（回源 = 实例根对象键）
+           location{type:"source", key, page?},              // KB location 同位（回源 = 源桶对象键）
            metadata }
 ```
 
@@ -616,7 +624,7 @@ AWS 面 21 op 不受影响——文件层经它们写入（公理 2 §5.10.0）�
 
 ### E.4 CLI 命令表
 
-**服务端 `vectorfs`**（实例根本地执行；公共 flag：`--data-dir`）：
+**服务端 `vectorfs`**（daemon 本地执行，`--data-dir` 即 daemon 本地家；公共 flag：`--data-dir`）：
 
 | 命令 | 作用 |
 |---|---|
@@ -633,7 +641,7 @@ AWS 面 21 op 不受影响——文件层经它们写入（公理 2 §5.10.0）�
 
 | 命令 | 作用 |
 |---|---|
-| `put <file…> <bucket>/[<prefix>/]` 或 `--bucket <b> [--key <k>]` `[--async]` | 落实例根普通对象 + 即时触发摄取；默认前台 + stderr 进度；尾随 `/` 的末位参数是 aws-cp 式目标位（`docs/pre/` ⇒ key `pre/<文件名>`） |
+| `put <file…> <bucket>/[<prefix>/]` 或 `--bucket <b> [--key <k>]` `[--async]` | 落源桶普通对象 + 即时触发摄取；默认前台 + stderr 进度；尾随 `/` 的末位参数是 aws-cp 式目标位（`docs/pre/` ⇒ key `pre/<文件名>`） |
 | `search "<text>" [<b>] 或 --bucket <b> [--top-k N] [--filter JSON] [--json]`（M3+ 增 `--image <f>`，M4 增 `--audio <f>`） | 唯一检索动词：fan-out + merge + 回源 |
 | `ls [<bucket>[/prefix>]] [--status S]` | S3-CLI 列表形态：无参=列摄取桶（`aws s3 ls` 形）、带桶=列已摄取文件（prefix 客户端过滤）；与 `sources list` 同渲染 |
 | `sources list --bucket <b> [--status S]` | 列已摄取文件（标记 × 列表 join，分页）——动词形态，`ls` 为其简写 |
@@ -653,7 +661,7 @@ AWS 面 21 op 不受影响——文件层经它们写入（公理 2 §5.10.0）�
 | Bedrock KB | vectorfs | 取舍 |
 |---|---|---|
 | KnowledgeBase 实体 | bucket + `[ingest.<bucket>]` | 不引入独立 KB 实体——bucket 即边界 |
-| DataSource（S3 周期扫描拉取） | scope 摄取模型（v2.2 统一）：实例根即数据源，文件=普通对象，扫描+标记 | **采纳且更彻底**：KB 的 DataSource 配置消失——bucket 本身就是数据源（.git 心智） |
+| DataSource（S3 周期扫描拉取） | 整源桶摄取模型（v3 换轴）：源桶即数据源，文件=普通对象，扫描+标记 | **采纳且更彻底**：KB 的 DataSource 配置消失——**源桶本身**就是数据源（.git 心智） |
 | IngestKnowledgeBaseDocuments（202 + documentDetails 状态） | PutSource（202 + 状态轮询） | **采纳**：入队即返回、逐文档状态 |
 | IngestionJob 统计（8 个 numberOf\* 计数器） | GetIngestStatus 统计块 | **采纳适用子集（5 个 numberOf\*）** |
 | merge 选项 | rrf / weighted / first | 超集（M2 rrf，M3 weighted） |

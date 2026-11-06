@@ -119,10 +119,10 @@ pub async fn run(cfg: &StorageConfig) -> Result<DoctorReport, Failure> {
         Failure::new(
             "BACKEND_INVALID",
             e,
-            "backend must be file | memory | s3+http(s)://host:port/bucket[/prefix]",
+            "backend must be file | memory | s3+http(s)://host:port",
         )
     })?;
-    let storage = Storage::new(backend.clone()).map_err(|e| {
+    let storage = cfg.storage().map_err(|e| {
         Failure::new(
             "BACKEND_INIT",
             format!("cannot open backend {backend}: {e}"),
@@ -133,8 +133,8 @@ pub async fn run(cfg: &StorageConfig) -> Result<DoctorReport, Failure> {
     let mut checks = Vec::new();
     checks.push(check_backend_write(&backend, &storage).await);
     checks.push(check_config(cfg).await);
-    checks.push(check_lock(&backend, &storage).await);
-    checks.push(check_indexes(&storage).await);
+    checks.push(check_lock(cfg, &storage).await);
+    checks.push(check_indexes(cfg, &storage).await);
     checks.push(check_disk_free(&backend, cfg));
     checks.push(check_multipart(&backend, &storage).await);
     checks.push(check_models(cfg).await);
@@ -164,19 +164,41 @@ fn probe_suffix() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// A scratch bucket for the doctor's write probes (v3: object keys are
+/// bucket-relative, so a probe needs a bucket): `vf-doctor-probe-{8hex}`.
+/// The probes create it, exercise the primitive, then raw-delete it —
+/// leaving nothing behind.
+fn probe_bucket() -> String {
+    format!("vf-doctor-probe-{}", probe_suffix())
+}
+
 async fn check_backend_write(backend: &crate::backends::Backend, storage: &Storage) -> Check {
-    let key = backend.object_key(&format!(".vf-doctor-probe-{}", probe_suffix()));
-    let create = crate::backends::put_json_create(storage.catalog(), &key, b"probe");
+    let bucket = probe_bucket();
+    let key = object_store::path::Path::from("probe.json");
+    let store = match crate::backends::open_bucket_store(backend, &bucket, storage.memory_handle())
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return Check::not_pass(
+                "backend-write",
+                CheckStatus::Fail,
+                format!("creating probe bucket {bucket} failed: {e}"),
+                "check the data-dir permissions (file) or the endpoint reachability (s3)",
+            );
+        }
+    };
+    let create = crate::backends::put_json_create(&*store, &key, b"probe");
     match create.await {
         Ok(true) => {
-            if let Err(e) = crate::backends::delete_object(storage.catalog(), &key).await {
+            if let Err(e) = crate::backends::delete_object(&*store, &key).await {
                 return Check::not_pass(
                     "backend-write",
                     CheckStatus::Warn,
                     format!("probe object created but not deletable: {e}"),
-                    "remove the .vectorfs/.vf-doctor-probe-* object at the data root manually",
+                    "remove the vf-doctor-probe-* bucket at the bucket root manually",
                 );
             }
+            storage.delete_bucket_raw(&bucket).await; // leave nothing behind
             let what = match backend {
                 crate::backends::Backend::File { .. } => {
                     "file backend: conditional create (O_EXCL) + delete of the probe object"
@@ -277,44 +299,120 @@ async fn check_config(cfg: &StorageConfig) -> Check {
     }
 }
 
-async fn check_lock(backend: &crate::backends::Backend, storage: &Storage) -> Check {
-    match probe_lock(backend, storage).await {
-        Err(e) => Check::not_pass(
-            "lock",
-            CheckStatus::Fail,
-            format!("cannot read the LOCK object: {e}"),
-            "remove the LOCK object at the data root while no writer runs",
-        ),
-        Ok(probe) => match (&probe.state, &probe.daemon) {
-            (LockState::Free, _) => Check::pass("lock", "no writer holds this data root"),
-            (LockState::Held, Some(d)) => Check::pass(
+/// Per-vb probes (design-v3.md §6 status/doctor row): for every listed vb —
+/// system bucket reachable, marker owned by THIS deployment, LOCK state.
+/// Also WARNs on suffix-matching buckets we do NOT own (foreign markers or
+/// marker-less `-vf` debris the R9 enumeration skips).
+async fn check_lock(cfg: &StorageConfig, storage: &Storage) -> Check {
+    let (region, account) = crate::config::read_config(&cfg.data_dir)
+        .ok()
+        .flatten()
+        .map(|c| (c.region, c.account_id))
+        .unwrap_or_else(|| {
+            (
+                crate::config::DEFAULT_REGION.to_string(),
+                crate::config::DEFAULT_ACCOUNT.to_string(),
+            )
+        });
+    let identity = storage.deployment_identity(&region, &account);
+    let candidates = match storage.suffix_scan_candidates().await {
+        Ok(c) => c,
+        Err(e) => {
+            return Check::not_pass(
                 "lock",
-                format!(
-                    "held by a live daemon (pid {}, host {}, heartbeat {}s ago < TTL {}s)",
-                    d.pid, d.host, d.heartbeat_age_s, probe.ttl_s
-                ),
-            ),
-            (LockState::Stale, Some(d)) => Check::not_pass(
-                "lock",
-                CheckStatus::Warn,
-                format!(
-                    "stale LOCK: heartbeat {}s old (owner pid {}, host {}) — its writer is gone",
-                    d.heartbeat_age_s, d.pid, d.host
-                ),
-                "restart takes over after TTL automatically: vectorfs serve / vectorfs mcp (or remove the LOCK object while nothing runs)",
-            ),
-            (_, None) => Check::not_pass(
-                "lock",
-                CheckStatus::Warn,
-                "LOCK object present but unparseable (crashed-write debris)",
-                "the next writer takes over automatically; to clean up now, remove the LOCK object while nothing runs",
-            ),
-        },
+                CheckStatus::Fail,
+                format!("cannot enumerate system buckets (suffix scan): {e}"),
+                "check backend reachability (vectorfs doctor's backend-write row)",
+            );
+        }
+    };
+    let mut details = Vec::new();
+    let mut warns = Vec::new();
+    for vb in &candidates {
+        let meta = match storage.load_bucket(vb).await {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                // marker-less `-vf` bucket: skipped by enumeration — report
+                // as WARN debris unless it is empty (adoption residue)
+                warns.push(format!(
+                    "{vb}-…: no ownership marker (a foreign bucket or crash residue; the \
+                     enumeration skips it)"
+                ));
+                continue;
+            }
+            Err(e) => {
+                return Check::not_pass(
+                    "lock",
+                    CheckStatus::Fail,
+                    format!("cannot read the marker of {vb}: {e}"),
+                    "check backend reachability",
+                );
+            }
+        };
+        if meta.deployment != identity {
+            warns.push(format!(
+                "{vb}: marker names a DIFFERENT deployment (region={}, account={}…); it is \
+                 not served by this configuration",
+                meta.deployment.region,
+                &meta.deployment.account[..4.min(meta.deployment.account.len())]
+            ));
+            continue;
+        }
+        // our bucket: system-bucket reachability is implied by the marker
+        // read above; the LOCK row is the per-vb single-writer state
+        match probe_lock(storage, vb).await {
+            Ok(probe) => match (&probe.state, &probe.daemon) {
+                (LockState::Free, _) => details.push(format!("{vb}: free")),
+                (LockState::Held, Some(d)) => details.push(format!(
+                    "{vb}: held by pid {} (host {}, heartbeat {}s ago)",
+                    d.pid, d.host, d.heartbeat_age_s
+                )),
+                (LockState::Stale, Some(d)) => warns.push(format!(
+                    "{vb}: STALE lock (heartbeat {}s old, owner pid {}) — its writer is gone",
+                    d.heartbeat_age_s, d.pid
+                )),
+                (_, None) => warns.push(format!(
+                    "{vb}: LOCK present but unparseable (crashed-write debris)"
+                )),
+            },
+            Err(e) => {
+                return Check::not_pass(
+                    "lock",
+                    CheckStatus::Fail,
+                    format!("cannot read the LOCK of {vb}: {e}"),
+                    "remove that LOCK object while no writer runs",
+                );
+            }
+        }
     }
+    if candidates.is_empty() {
+        return Check::pass("lock", "no system buckets yet (no vector buckets)");
+    }
+    if !warns.is_empty() {
+        return Check::not_pass(
+            "lock",
+            CheckStatus::Warn,
+            format!("{} — warns: {}", details.join("; "), warns.join("; ")),
+            "stale/debris locks self-heal on the next writer start; foreign-marker buckets \
+             belong to another deployment (or another bucket_suffix)",
+        );
+    }
+    Check::pass("lock", details.join("; "))
 }
 
-async fn check_indexes(storage: &Storage) -> Check {
-    let buckets = match storage.list_buckets().await {
+async fn check_indexes(cfg: &StorageConfig, storage: &Storage) -> Check {
+    let (region, account) = crate::config::read_config(&cfg.data_dir)
+        .ok()
+        .flatten()
+        .map(|c| (c.region, c.account_id))
+        .unwrap_or_else(|| {
+            (
+                crate::config::DEFAULT_REGION.to_string(),
+                crate::config::DEFAULT_ACCOUNT.to_string(),
+            )
+        });
+    let identity = storage.deployment_identity(&region, &account);
+    let buckets = match storage.list_buckets(&identity).await {
         Ok(b) => b,
         Err(e) => {
             return Check::not_pass(
@@ -387,9 +485,22 @@ async fn check_indexes(storage: &Storage) -> Check {
 /// the LIVE backend honestly does on file/memory too (no assumed verdicts).
 async fn check_multipart(backend: &crate::backends::Backend, storage: &Storage) -> Check {
     use object_store::ObjectStoreExt as _;
-    let key = backend.object_key(&format!(".vf-doctor-multipart-{}", probe_suffix()));
+    let bucket = probe_bucket();
+    let key = object_store::path::Path::from("multipart-probe.bin");
     let payload = b"vectorfs doctor multipart probe payload: multiple tiny parts on purpose";
-    let upload = match storage.catalog().put_multipart(&key).await {
+    let store = match crate::backends::open_bucket_store(backend, &bucket, storage.memory_handle())
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return Check::not_pass(
+                "multipart",
+                CheckStatus::Fail,
+                format!("creating probe bucket {bucket} failed: {e}"),
+                "large PutSource uploads (>100MB) would fail; check backend health and permissions",
+            );
+        }
+    };
+    let upload = match store.put_multipart(&key).await {
         Ok(u) => u,
         Err(e) => {
             return Check::not_pass(
@@ -406,14 +517,15 @@ async fn check_multipart(backend: &crate::backends::Backend, storage: &Storage) 
     writer.write(payload);
     match writer.finish().await {
         Ok(_put_result) => {
-            if let Err(e) = crate::backends::delete_object(storage.catalog(), &key).await {
+            if let Err(e) = crate::backends::delete_object(&*store, &key).await {
                 return Check::not_pass(
                     "multipart",
                     CheckStatus::Warn,
                     format!("multipart probe object committed but not deletable: {e}"),
-                    "remove the .vectorfs/.vf-doctor-multipart-* object at the data root manually",
+                    "remove the vf-doctor-probe-* bucket at the bucket root manually",
                 );
             }
+            storage.delete_bucket_raw(&bucket).await; // leave nothing behind
             let what = match backend {
                 crate::backends::Backend::File { .. } => {
                     "file backend: multipart upload (3-part commit + delete of the probe object)"
@@ -851,7 +963,7 @@ pub fn render_human(r: &DoctorReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{BucketMeta, IndexMeta};
+    use crate::store::IndexMeta;
 
     fn cfg(dir: &std::path::Path) -> StorageConfig {
         StorageConfig {
@@ -860,6 +972,7 @@ mod tests {
             s3_region: "us-east-1".into(),
             s3_access_key: None,
             s3_secret_key: None,
+            bucket_suffix: crate::backends::DEFAULT_BUCKET_SUFFIX.into(),
         }
     }
 
@@ -884,7 +997,7 @@ mod tests {
         let pipeline = format!(
             "\n[extractor.plain]\nkind = \"txt\"\n\n\
              [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = true\n\n\
-             [ingest.docs]\nscope = \"docs/**\"\nextract = {{ txt = \"plain\" }}\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ txt = \"plain\" }}\n\
              chunk = {{ kind = \"token-window\", size = {chunk_size}, overlap = 8 }}\n\
              embedders = [\"tiny\"]\nscan_interval_secs = 1\n",
             fixture_dir().display().to_string()
@@ -907,13 +1020,7 @@ mod tests {
         write_pipeline_config(dir.path(), 32);
         let storage = Storage::file(dir.path());
         storage
-            .create_bucket(&BucketMeta {
-                vector_bucket_name: "vb".into(),
-                vector_bucket_arn: "arn:aws:s3vectors:us-east-1:0:bucket/vb".into(),
-                creation_time_rfc3339: "2026-11-04T00:00:00.000Z".into(),
-                creation_time_epoch: 0.0,
-                default_index_mode: None,
-            })
+            .create_bucket(&crate::store::test_bucket_meta(&storage, "vb"))
             .await
             .unwrap();
         storage
@@ -959,7 +1066,7 @@ mod tests {
         let base = std::fs::read_to_string(crate::config::config_path(dir.path())).unwrap();
         let pipeline = "\n[extractor.plain]\nkind = \"txt\"\n\n\
              [embedder.dead]\nkind = \"ort\"\npath = \"/nonexistent-model\"\noffline = true\n\n\
-             [ingest.docs]\nscope = \"docs/**\"\nextract = { txt = \"plain\" }\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = { txt = \"plain\" }\n\
              chunk = { kind = \"token-window\", size = 32, overlap = 8 }\n\
              embedders = [\"dead\"]\nscan_interval_secs = 1\n";
         std::fs::write(crate::config::config_path(dir.path()), base + pipeline).unwrap();
@@ -989,6 +1096,7 @@ mod tests {
                     status_reason: None,
                     retries: 0,
                     retries_exhausted: false,
+                    misses: 0,
                     updated_at: "t".into(),
                     chunks: None,
                     engines: None,
@@ -1031,8 +1139,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::config::init(dir.path(), false).unwrap();
         let storage = Storage::file(dir.path());
-        let backend = storage.backend().clone();
-        let key = backend.object_key("LOCK");
+        // v3: per-bucket LOCK; the probe bucket carries the seeded marker
+        storage
+            .create_bucket(&crate::store::test_bucket_meta(&storage, "vb"))
+            .await
+            .unwrap();
+        let key = object_store::path::Path::from("LOCK");
+        let lock_store = storage.system_store("vb");
 
         let stale = crate::lock::LockInfo {
             owner_uuid: "cafe".into(),
@@ -1042,7 +1155,7 @@ mod tests {
             heartbeat_at: 500.0, // epoch — ancient
         };
         crate::backends::put_json_overwrite(
-            storage.catalog(),
+            &*lock_store,
             &key,
             &serde_json::to_vec(&stale).unwrap(),
         )
@@ -1054,7 +1167,7 @@ mod tests {
         let lock = report.checks.iter().find(|c| c.name == "lock").unwrap();
         assert_eq!(lock.status, CheckStatus::Warn);
         assert!(
-            lock.hint.as_deref().unwrap().contains("takes over"),
+            lock.hint.as_deref().unwrap().contains("self-heal"),
             "{lock:?}"
         );
 
@@ -1065,7 +1178,7 @@ mod tests {
             .unwrap()
             .as_secs_f64();
         crate::backends::put_json_overwrite(
-            storage.catalog(),
+            &*lock_store,
             &key,
             &serde_json::to_vec(&live).unwrap(),
         )
@@ -1073,7 +1186,7 @@ mod tests {
         .unwrap();
         let report = run(&cfg(dir.path())).await.unwrap();
         let lock = report.checks.iter().find(|c| c.name == "lock").unwrap();
-        assert_eq!(lock.status, CheckStatus::Pass);
+        assert_eq!(lock.status, CheckStatus::Pass, "{lock:?}");
     }
 
     #[tokio::test]
@@ -1082,13 +1195,7 @@ mod tests {
         crate::config::init(dir.path(), false).unwrap();
         let storage = Storage::file(dir.path());
         storage
-            .create_bucket(&BucketMeta {
-                vector_bucket_name: "vb".into(),
-                vector_bucket_arn: "arn:aws:s3vectors:us-east-1:0:bucket/vb".into(),
-                creation_time_rfc3339: "2026-11-04T00:00:00.000Z".into(),
-                creation_time_epoch: 0.0,
-                default_index_mode: None,
-            })
+            .create_bucket(&crate::store::test_bucket_meta(&storage, "vb"))
             .await
             .unwrap();
         storage
@@ -1110,7 +1217,7 @@ mod tests {
         // corrupt the dataset: wipe the lance dataset dir, keep index.json
         // (lance keeps the table under data/<table>/ — remove the whole data
         // path so reopening the index cannot succeed)
-        let data = dir.path().join(".vectorfs/buckets/vb/indexes/ix/data");
+        let data = dir.path().join("vb-vf/indexes/ix/data");
         std::fs::remove_dir_all(&data).unwrap();
         std::fs::write(&data, b"not a dataset").unwrap();
 

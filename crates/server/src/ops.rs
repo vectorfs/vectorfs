@@ -73,6 +73,10 @@ use crate::store::{self, BucketMeta, IndexMeta, MetaMirror, StoreError, VectorRo
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Arc<store::Storage>,
+    /// Per-bucket lock registry (design-v3.md §5.1): write paths acquire
+    /// lazily via [`require_write_lock`]; startup pins the `[ingest.X]`
+    /// buckets.
+    pub locks: Arc<crate::lock::LockManager>,
     pub creds: Option<crate::sigv4::Credentials>,
     pub region: String,
     pub account: String,
@@ -82,6 +86,74 @@ pub struct AppState {
     /// every pre-T3 construction site) keeps `None`; T6's `vf put` /
     /// PutSource use `wake()` for the immediate-trigger path.
     pub ingest: Option<Arc<crate::ingest::IngestHandle>>,
+}
+
+impl AppState {
+    /// Assemble with a fresh per-bucket lock registry over `storage`
+    /// (design-v3.md §5.1). Every construction site — serve, mcp, and the
+    /// test fixtures — goes through here so the locks field can never be
+    /// forgotten.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        storage: Arc<store::Storage>,
+        creds: Option<crate::sigv4::Credentials>,
+        region: String,
+        account: String,
+        trace: bool,
+        ingest: Option<Arc<crate::ingest::IngestHandle>>,
+    ) -> Self {
+        let locks = crate::lock::LockManager::new(storage.clone());
+        Self::with_locks(storage, locks, creds, region, account, trace, ingest)
+    }
+
+    /// [`AppState::new`] with an EXTERNAL lock registry — serve / mcp pin
+    /// their `[ingest.X]` locks on the manager BEFORE the state exists, so
+    /// they must thread their own manager through (a second, empty registry
+    /// would make every write path look unlocked).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_locks(
+        storage: Arc<store::Storage>,
+        locks: Arc<crate::lock::LockManager>,
+        creds: Option<crate::sigv4::Credentials>,
+        region: String,
+        account: String,
+        trace: bool,
+        ingest: Option<Arc<crate::ingest::IngestHandle>>,
+    ) -> Self {
+        AppState {
+            storage,
+            locks,
+            creds,
+            region,
+            account,
+            trace,
+            ingest,
+        }
+    }
+}
+
+/// This daemon's deployment identity (R2/D8) — the ownership marker
+/// comparator.
+pub(crate) fn identity_of(state: &AppState) -> store::DeploymentIdentity {
+    state
+        .storage
+        .deployment_identity(&state.region, &state.account)
+}
+
+/// Acquire (lazily) the bucket's writer lock for a WRITE path
+/// (design-v3.md §5.1). Held-by-another maps to 409 ConflictException with
+/// the occupant; a parked bucket (lock lost by THIS daemon) also 409s.
+async fn require_write_lock(state: &AppState, vb: &str) -> Result<(), ApiError> {
+    state.locks.note_activity(vb);
+    match state.locks.ensure_held(vb).await {
+        Ok(()) => Ok(()),
+        Err(crate::lock::LockError::Held(who)) => Err(ApiError::conflict(format!(
+            "vector bucket {vb} is locked by another writer ({who}); this daemon's protocol \
+             locks are lazy — the other writer must release it or its heartbeat must expire \
+             before this bucket can be written"
+        ))),
+        Err(crate::lock::LockError::Backend(e)) => Err(ApiError::internal(e)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -649,12 +721,10 @@ fn segment_of(key: &str, segment_count: i64) -> i64 {
 }
 
 /// Locate bucket -> index, mapping misses to 404 before any engine work.
+/// The bucket must carry THIS deployment's marker (R2): a foreign-owned
+/// system bucket is not a vb of ours.
 async fn resolve_index(state: &AppState, vb: &str, ix: &str) -> Result<IndexMeta, ApiError> {
-    if state.storage.load_bucket(vb).await?.is_none() {
-        return Err(ApiError::not_found(format!(
-            "vector bucket {vb} does not exist"
-        )));
-    }
+    require_bucket(state, vb).await?;
     match state.storage.load_index(vb, ix).await? {
         None => Err(ApiError::not_found(format!(
             "index {ix} does not exist in vector bucket {vb}"
@@ -794,13 +864,23 @@ fn resolve_index_locator(
     }
 }
 
-/// Load a bucket meta or 404 (post-locator).
+/// Load a bucket meta or 404 (post-locator). Only OUR deployment's markers
+/// count (R2/D8: `X-vf` + matching deployment identity ⇔ vb exists, §5.3-2);
+/// also feeds the lock manager's idle-release bookkeeping.
 async fn require_bucket(state: &AppState, name: &str) -> Result<BucketMeta, ApiError> {
-    state
+    let meta = state
         .storage
         .load_bucket(name)
         .await?
-        .ok_or_else(|| ApiError::not_found(format!("vector bucket {name} does not exist")))
+        .ok_or_else(|| ApiError::not_found(format!("vector bucket {name} does not exist")))?;
+    if meta.deployment != identity_of(state) {
+        // a foreign deployment's system bucket under our suffix — not ours
+        return Err(ApiError::not_found(format!(
+            "vector bucket {name} does not exist"
+        )));
+    }
+    state.locks.note_activity(name);
+    Ok(meta)
 }
 
 // ---------------------------------------------------------------------------
@@ -885,21 +965,35 @@ fn validate_prefix(prefix: Option<&str>) -> Result<Option<&str>, ApiError> {
 // handlers
 // ---------------------------------------------------------------------------
 
+/// CreateVectorBucket (design-v3.md §3-R3): the storage layer runs the
+/// lifecycle (raw CreateBucket of `X-vf`, conflict hint typing, empty-bucket
+/// adoption); the source bucket `X` is NEVER created here (lazy, D4 — first
+/// PutSource / `vf put` materializes it). On success the new bucket's writer
+/// lock is taken lazily so the creating daemon owns it immediately (§5.1).
 pub async fn create_vector_bucket(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let input: CreateVectorBucketInput = parse_body(&body)?;
-    validate_name("vectorBucketName", &input.vector_bucket_name)?;
+    // v3 name rule (R1/D5): suffix-aware length cap + no suffix tail.
+    if let Err(e) = crate::backends::validate_vector_bucket_name(
+        &input.vector_bucket_name,
+        state.storage.bucket_suffix(),
+    ) {
+        return Err(ApiError::validation(e));
+    }
     let (epoch, rfc3339) = now();
     let meta = BucketMeta {
         vector_bucket_arn: arn_bucket(&state, &input.vector_bucket_name),
         vector_bucket_name: input.vector_bucket_name.clone(),
         creation_time_rfc3339: rfc3339,
         creation_time_epoch: epoch,
+        deployment: identity_of(&state),
+        placement: state.storage.placement(&input.vector_bucket_name),
         default_index_mode: None,
     };
     state.storage.create_bucket(&meta).await?;
+    require_write_lock(&state, &input.vector_bucket_name).await?;
 
     // Model (botocore 2025-07-15): required member `vectorBucketArn` only.
     // AWS CLI reference documents `vectorBucket` — double-emit, SDKs ignore extras.
@@ -960,6 +1054,7 @@ pub async fn create_index(
         input.vector_bucket_arn.as_deref(),
     )?;
     let bucket_meta = require_bucket(&state, &vb).await?;
+    require_write_lock(&state, &vb).await?;
 
     let (epoch, rfc3339) = now();
     let meta = IndexMeta {
@@ -1026,6 +1121,7 @@ pub async fn put_vectors(State(state): State<AppState>, body: Bytes) -> Result<R
         input.index_arn.as_deref(),
     )?;
     let meta = resolve_index(&state, &vb, &ix).await?;
+    require_write_lock(&state, &vb).await?;
 
     // Payload cap (AWS: "Request payload size: Up to 20 MiB"). Checked after
     // the body is fully buffered: the gate middleware + DefaultBodyLimit sit
@@ -1358,6 +1454,7 @@ pub async fn delete_vectors(
         input.index_arn.as_deref(),
     )?;
     resolve_index(&state, &vb, &ix).await?;
+    require_write_lock(&state, &vb).await?;
     validate_key_list(&input.keys, "keys", 500)?;
 
     state.storage.delete_vectors(&vb, &ix, &input.keys).await?;
@@ -1497,12 +1594,15 @@ pub async fn get_vector_bucket(
 
 /// Full `VectorBucket` shape (model: name/arn/creationTime required +
 /// defaultIndexMode when set; encryptionConfiguration is never emitted —
-/// CreateVectorBucket does not store one yet, see module TODO).
+/// CreateVectorBucket does not store one yet, see module TODO). The v3
+/// SUPERSET member `x-vf-placement` (R4) echoes the system bucket's
+/// placement — self-hosted transparency, not an AWS alignment item.
 fn bucket_full_json(meta: &BucketMeta) -> serde_json::Value {
     let mut o = json!({
         "vectorBucketName": meta.vector_bucket_name,
         "vectorBucketArn": meta.vector_bucket_arn,
         "creationTime": meta.creation_time_epoch,
+        "x-vf-placement": meta.placement,
     });
     if let Some(mode) = &meta.default_index_mode {
         o["defaultIndexMode"] = json!(mode);
@@ -1510,10 +1610,15 @@ fn bucket_full_json(meta: &BucketMeta) -> serde_json::Value {
     o
 }
 
-/// DeleteVectorBucket -> 200 empty. Non-empty bucket (any index objects)
-/// -> 409 ConflictException (S3 semantic convention for delete-non-empty;
-/// the model admits ConflictException). TODO(AWS 对拍): exact AWS text +
-/// whether AWS cleans up or refuses; unverified against the real service.
+/// DeleteVectorBucket -> 200 empty (design-v3.md §3-R3). Non-empty bucket
+/// (any index) -> 409 ConflictException (AWS 实测语义; v3.0 误写
+/// ValidationException 已纠正). With the bucket lock held, the storage layer
+/// runs the prescribed deletion order (清空 → 删 marker → 删 LOCK →
+/// DeleteBucket); the SOURCE bucket is never touched (D4). The DELETE TAIL
+/// WINDOW is the explicit §5.3-4 exemption: a replay whose marker is already
+/// gone but whose system bucket still holds deletion residue (or is empty)
+/// finishes the cleanup WITHOUT the lock — both crash directions converge,
+/// no tombstone (D7).
 pub async fn delete_vector_bucket(
     State(state): State<AppState>,
     body: Bytes,
@@ -1524,27 +1629,58 @@ pub async fn delete_vector_bucket(
         input.vector_bucket_name.as_deref(),
         input.vector_bucket_arn.as_deref(),
     )?;
-    require_bucket(&state, &name).await?;
-    if state.storage.bucket_has_indexes(&name).await? {
-        return Err(ApiError::conflict(format!(
-            "vector bucket {name} still contains vector indexes; delete them first"
-        )));
+    match state.storage.load_bucket(&name).await? {
+        Some(meta) => {
+            if meta.deployment != identity_of(&state) {
+                return Err(ApiError::not_found(format!(
+                    "vector bucket {name} does not exist"
+                )));
+            }
+            if state.storage.bucket_has_indexes(&name).await? {
+                return Err(ApiError::conflict(format!(
+                    "vector bucket {name} still contains vector indexes; delete them first"
+                )));
+            }
+            require_write_lock(&state, &name).await?;
+            state.storage.delete_bucket(&name).await?;
+            // the storage layer removed the LOCK object inside the deletion
+            // order — retire the registry entry without touching the object
+            state.locks.drop_guard(&name);
+            Ok(empty_ok())
+        }
+        None => {
+            // marker gone: DELETE-tail replay (§5.2 row 4) — finish the
+            // cleanup only when the system bucket is residue/empty
+            match state.storage.system_bucket_tail(&name).await? {
+                store::TailState::Residue { fresh_lock: false } => {
+                    // lockless tail cleanup (§5.3-4 exemption)
+                    state.storage.delete_bucket_tail(&name).await?;
+                    Ok(empty_ok())
+                }
+                store::TailState::Residue { fresh_lock: true } => Err(ApiError::conflict(format!(
+                    "vector bucket {name} deletion residue exists but another writer holds \
+                     its lock — retry after that writer releases"
+                ))),
+                _ => Err(ApiError::not_found(format!(
+                    "vector bucket {name} does not exist"
+                ))),
+            }
+        }
     }
-    // bucket.json + optional policy.json/tags.json (index metadata dirs are
-    // empty by the check above — nothing else may live under
-    // .vectorfs/buckets/<name>/).
-    state.storage.delete_bucket(&name).await?;
-    Ok(empty_ok())
 }
 
 /// ListVectorBuckets -> {vectorBuckets: [VectorBucketSummary], nextToken?}.
+/// Enumeration is the R9 suffix scan (no central registry), filtered to OUR
+/// deployment's markers; the v3 superset member `x-vf-placement` rides each
+/// summary (R4). nextToken stability across concurrent bucket create/delete
+/// by other daemons is best-effort (documented §3-R9).
 pub async fn list_vector_buckets(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let input: ListVectorBucketsInput = parse_body(&body)?;
     let prefix = validate_prefix(input.prefix.as_deref())?;
-    let all = state.storage.list_buckets().await?;
+    let all = state.storage.list_buckets(&identity_of(&state)).await?;
     let filtered: Vec<BucketMeta> = match prefix {
         Some(p) => all
             .into_iter()
@@ -1561,11 +1697,13 @@ pub async fn list_vector_buckets(
     let buckets: Vec<serde_json::Value> = page
         .iter()
         .map(|m| {
-            // VectorBucketSummary: name/arn/creationTime only (model).
+            // VectorBucketSummary: name/arn/creationTime only (model) + the
+            // v3 placement superset member.
             json!({
                 "vectorBucketName": m.vector_bucket_name,
                 "vectorBucketArn": m.vector_bucket_arn,
                 "creationTime": m.creation_time_epoch,
+                "x-vf-placement": m.placement,
             })
         })
         .collect();
@@ -1607,6 +1745,7 @@ pub async fn delete_index(
         input.index_arn.as_deref(),
     )?;
     resolve_index(&state, &vb, &ix).await?;
+    require_write_lock(&state, &vb).await?;
     state.storage.delete_index(&vb, &ix).await?;
     Ok(empty_ok())
 }
@@ -1676,6 +1815,7 @@ pub async fn put_vector_bucket_policy(
         input.vector_bucket_arn.as_deref(),
     )?;
     require_bucket(&state, &name).await?;
+    require_write_lock(&state, &name).await?;
     let raw = match input.policy {
         serde_json::Value::String(s) => {
             // must be a JSON document (AWS validates policy syntax; we check
@@ -1731,6 +1871,7 @@ pub async fn delete_vector_bucket_policy(
         input.vector_bucket_arn.as_deref(),
     )?;
     require_bucket(&state, &name).await?;
+    require_write_lock(&state, &name).await?;
     state.storage.delete_policy(&name).await?;
     Ok(empty_ok())
 }
@@ -1840,6 +1981,7 @@ pub async fn tag_resource(
     let arn = resource_arn_from_uri(&uri)?;
     let input: TagResourceInput = parse_body(&body)?;
     let (vb, ix) = require_tag_target(&state, &arn).await?;
+    require_write_lock(&state, &vb).await?;
     validate_tags(&input.tags)?;
     let mut tags = state.storage.load_tags(&vb, ix.as_deref()).await?;
     for (k, v) in input.tags {
@@ -1867,6 +2009,7 @@ pub async fn untag_resource(State(state): State<AppState>, uri: Uri) -> Result<R
         ));
     }
     let (vb, ix) = require_tag_target(&state, &arn).await?;
+    require_write_lock(&state, &vb).await?;
     let mut tags = state.storage.load_tags(&vb, ix.as_deref()).await?;
     for k in keys {
         tags.remove(&k);
@@ -1914,6 +2057,7 @@ pub async fn put_vector_bucket_default_index_mode(
         input.vector_bucket_arn.as_deref(),
     )?;
     require_bucket(&state, &name).await?;
+    require_write_lock(&state, &name).await?;
     state
         .storage
         .set_default_index_mode(&name, &input.default_index_mode)
@@ -1944,6 +2088,7 @@ pub async fn update_index_mode(
         input.index_arn.as_deref(),
     )?;
     resolve_index(&state, &vb, &ix).await?;
+    require_write_lock(&state, &vb).await?;
     state
         .storage
         .set_index_mode(&vb, &ix, &input.index_mode)
@@ -2038,26 +2183,26 @@ mod tests {
     use tower::ServiceExt;
 
     fn state(dir: &std::path::Path) -> AppState {
-        AppState {
-            storage: std::sync::Arc::new(store::Storage::file(dir)),
-            creds: None, // --no-auth
-            region: "us-east-1".into(),
-            account: "000000000000".into(),
-            trace: false,
-            ingest: None,
-        }
+        AppState::new(
+            std::sync::Arc::new(store::Storage::file(dir)),
+            None, // --no-auth
+            "us-east-1".into(),
+            "000000000000".into(),
+            false,
+            None,
+        )
     }
 
     /// `--backend memory` state: volatile store, no filesystem at all.
     fn memory_state() -> AppState {
-        AppState {
-            storage: std::sync::Arc::new(store::Storage::memory()),
-            creds: None,
-            region: "us-east-1".into(),
-            account: "000000000000".into(),
-            trace: false,
-            ingest: None,
-        }
+        AppState::new(
+            std::sync::Arc::new(store::Storage::memory()),
+            None,
+            "us-east-1".into(),
+            "000000000000".into(),
+            false,
+            None,
+        )
     }
 
     /// The memory backend must run the four operations end to end (it is the

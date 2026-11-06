@@ -65,8 +65,8 @@ impl Preset {
     /// Model cache directory the init-time prefetch / guidance refers to.
     /// `explicit` is the `--models-dir` flag (container volume); without it
     /// the bare-metal default `<data-dir>/.vectorfs/models` applies
-    /// (pipeline::models::default_models_dir — kept inside the reserved
-    /// prefix so scope scans exclude it).
+    /// (pipeline::models::default_models_dir — the daemon home, outside
+    /// every bucket's namespace by construction, design-v3.md §4).
     pub fn models_cache_dir(&self, data_dir: &Path, explicit: Option<&Path>) -> std::path::PathBuf {
         explicit
             .map(Path::to_path_buf)
@@ -102,7 +102,7 @@ kind = \"md\"
 kind = \"txt\"
 
 [ingest.docs]
-# scope omitted = the whole instance root (.vectorfs/ is always excluded)
+# include/exclude omitted = the whole source bucket (design-v3.md R5)
 extract = {{ pdf = \"pdf\", md = \"md\", default = \"t\" }}
 chunk = {{ kind = \"token-window\", size = 512, overlap = 64 }}
 embedders = [\"text\"]
@@ -128,7 +128,7 @@ kind = \"md\"
 kind = \"txt\"
 
 [ingest.docs]
-# scope omitted = the whole instance root (.vectorfs/ is always excluded)
+# include/exclude omitted = the whole source bucket (design-v3.md R5)
 extract = {{ pdf = \"pdf\", md = \"md\", default = \"t\" }}
 chunk = {{ kind = \"token-window\", size = 512, overlap = 64 }}
 embedders = [\"local\"]
@@ -210,7 +210,10 @@ mod tests {
         );
         assert_eq!(cfg.extractors.len(), 3);
         let ingest = &cfg.ingest["docs"];
-        assert_eq!(ingest.scope, None, "scope omitted = whole root");
+        assert!(
+            ingest.include.is_empty() && ingest.exclude.is_empty(),
+            "whole bucket"
+        );
         assert_eq!(ingest.embedders, ["text"]);
         // online + empty cache: OK — load-time prefetch is allowed (§5.10.4)
         cfg.validate_model_availability(dir.path()).unwrap();

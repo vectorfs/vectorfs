@@ -150,10 +150,15 @@ fn store_err(e: object_store::Error) -> ApiError {
     ApiError::internal(format!("object store: {e}"))
 }
 
-/// Instance-root key of a USER object (Source bytes live outside `.vectorfs/`;
-/// same mapping the scanner uses — ingest::domain).
-fn user_key(state: &AppState, key: &str) -> object_store::path::Path {
-    crate::ingest::domain::user_object_key(state.storage.backend(), key)
+/// Bucket-relative key of a USER object (design-v3.md R1/R5: the SOURCE
+/// bucket IS the vb's namespace — keys address the bucket's store directly).
+fn user_key(_state: &AppState, key: &str) -> object_store::path::Path {
+    object_store::path::Path::from(key)
+}
+
+/// The bucket's SOURCE store (where PutSource writes / GetSourceData reads).
+fn source_store(state: &AppState, bucket: &str) -> Arc<dyn object_store::ObjectStore> {
+    state.storage.source_store(bucket)
 }
 
 /// Marker-file key hash of an instance-root object key.
@@ -167,11 +172,12 @@ fn key_hash(key: &str) -> String {
 /// files — see `domain::user_object_key_candidates`).
 async fn head_user_object(
     state: &AppState,
+    bucket: &str,
     key: &str,
 ) -> Result<Option<object_store::ObjectMeta>, ApiError> {
     use object_store::ObjectStoreExt as _;
-    for okey in crate::ingest::domain::user_object_key_candidates(state.storage.backend(), key) {
-        match state.storage.catalog().head(&okey).await {
+    for okey in crate::ingest::domain::user_object_key_candidates(key) {
+        match source_store(state, bucket).head(&okey).await {
             Ok(meta) => return Ok(Some(meta)),
             Err(object_store::Error::NotFound { .. }) => continue,
             Err(e) => return Err(store_err(e)),
@@ -180,13 +186,19 @@ async fn head_user_object(
     Ok(None)
 }
 
-/// Write one user object (PutSource): plain put below the multipart
+/// Write one user object into the bucket's SOURCE store (PutSource, R3 lazy
+/// bucket creation handled by the caller): plain put below the multipart
 /// threshold, WriteMultipart above it. Whole-body in memory either way
 /// (M2 tradeoff, see [`X_VF_MAX_BODY`]).
-async fn write_user_object(state: &AppState, key: &str, body: Bytes) -> Result<(), ApiError> {
+async fn write_user_object(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    body: Bytes,
+) -> Result<(), ApiError> {
     use object_store::{ObjectStoreExt as _, PutPayload};
     let okey = user_key(state, key);
-    let catalog = state.storage.catalog();
+    let catalog = source_store(state, bucket);
     if body.len() > MULTIPART_THRESHOLD {
         let upload = catalog.put_multipart(&okey).await.map_err(store_err)?;
         let mut writer =
@@ -204,10 +216,14 @@ async fn write_user_object(state: &AppState, key: &str, body: Bytes) -> Result<(
 
 /// Read one user object whole (GetSourceData). Same candidate-key rule as
 /// [`head_user_object`].
-async fn read_user_object(state: &AppState, key: &str) -> Result<Option<Bytes>, ApiError> {
+async fn read_user_object(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<Bytes>, ApiError> {
     use object_store::ObjectStoreExt as _;
-    for okey in crate::ingest::domain::user_object_key_candidates(state.storage.backend(), key) {
-        match state.storage.catalog().get(&okey).await {
+    for okey in crate::ingest::domain::user_object_key_candidates(key) {
+        match source_store(state, bucket).get(&okey).await {
             Ok(get) => return Ok(Some(get.bytes().await.map_err(store_err)?)),
             Err(object_store::Error::NotFound { .. }) => continue,
             Err(e) => return Err(store_err(e)),
@@ -220,10 +236,10 @@ async fn read_user_object(state: &AppState, key: &str) -> Result<Option<Bytes>, 
 /// the caller decides what "already gone" means). Deletes under BOTH key
 /// forms (an external raw-name twin must not survive a canonical-form
 /// delete).
-async fn delete_user_object(state: &AppState, key: &str) -> Result<(), ApiError> {
+async fn delete_user_object(state: &AppState, bucket: &str, key: &str) -> Result<(), ApiError> {
     use object_store::ObjectStoreExt as _;
-    for okey in crate::ingest::domain::user_object_key_candidates(state.storage.backend(), key) {
-        match state.storage.catalog().delete(&okey).await {
+    for okey in crate::ingest::domain::user_object_key_candidates(key) {
+        match source_store(state, bucket).delete(&okey).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => continue,
             Err(e) => return Err(store_err(e)),
         }
@@ -296,6 +312,7 @@ fn pending_marker(key: &str, sig: &str, fingerprint: &str) -> SourceMarker {
         status_reason: None,
         retries: 0,
         retries_exhausted: false,
+        misses: 0,
         updated_at: crate::ingest::marker::now_rfc3339(),
         chunks: None,
         engines: None,
@@ -397,20 +414,31 @@ pub async fn put_source(
     }
 
     let handle = require_ingest(&state, &bucket)?;
-    // the key must be a SOURCE this pipeline claims (scope + extractor
-    // routing): otherwise the marker below would sit forever un-scanned.
+    // the key must be a SOURCE this pipeline claims (include/exclude claim
+    // filter + extractor routing, R5): otherwise the marker below would sit
+    // forever un-scanned.
     if !handle.shared().claims_key(&bucket, &key) {
         return Err(ApiError::validation(format!(
-            "key {key:?} is outside bucket {bucket:?}'s ingest scope or has no routed extractor \
-             — the file layer would never ingest it. Check the section's `scope` and `extract` \
-             routing in vectorfs.toml"
+            "key {key:?} is outside bucket {bucket:?}'s ingest claim filter or has no routed \
+             extractor — the file layer would never ingest it. Check the section's \
+             `include`/`exclude` and `extract` routing in vectorfs.toml"
         )));
     }
 
-    write_user_object(&state, &key, body).await?;
-    let meta = state
-        .storage
-        .catalog()
+    // writer lock (lazy), then the R3 lazy SOURCE-bucket creation: the first
+    // PutSource materializes bucket `X` when it does not exist yet (adoption
+    // on a lost create race is benign, §5.2).
+    if let Err(e) = state.locks.ensure_held(&bucket).await {
+        return Err(match e {
+            crate::lock::LockError::Held(who) => ApiError::conflict(format!(
+                "vector bucket {bucket} is locked by another writer ({who})"
+            )),
+            crate::lock::LockError::Backend(e) => ApiError::internal(e),
+        });
+    }
+    state.storage.ensure_source_bucket(&bucket).await?;
+    write_user_object(&state, &bucket, &key, body).await?;
+    let meta = source_store(&state, &bucket)
         .head(&user_key(&state, &key))
         .await
         .map_err(store_err)?;
@@ -459,7 +487,7 @@ pub async fn get_source(State(state): State<AppState>, body: Bytes) -> Result<Re
     let handle = require_ingest(&state, &input.bucket)?;
     let hash = key_hash(&input.key);
     let marker = state.storage.load_source(&input.bucket, &hash).await?;
-    match head_user_object(&state, &input.key).await? {
+    match head_user_object(&state, &input.bucket, &input.key).await? {
         Some(meta) => {
             let m = marker.unwrap_or_else(|| {
                 // live but unmarked: report the pending transient under the
@@ -494,7 +522,7 @@ pub async fn get_source_data(
 ) -> Result<Response, ApiError> {
     let input: BucketKeyInput = parse_body(&body)?;
     require_ingest(&state, &input.bucket)?;
-    match read_user_object(&state, &input.key).await? {
+    match read_user_object(&state, &input.bucket, &input.key).await? {
         Some(bytes) => Ok(Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, crate::ingest::mime_for(&input.key))
@@ -555,10 +583,11 @@ pub async fn list_sources(
         },
     };
 
-    // markers (object_key-sorted by the store) x live listing (one pass)
+    // markers (object_key-sorted by the store) x live listing (one pass,
+    // over THIS bucket's source store — v3 buckets are separate namespaces)
     let markers = state.storage.list_sources(&input.bucket).await?;
     let listing: HashMap<String, object_store::ObjectMeta> =
-        crate::ingest::list_root_at(state.storage.catalog(), state.storage.backend())
+        crate::ingest::list_source_bucket(&state.storage, &input.bucket)
             .await
             .map_err(ApiError::internal)?
             .into_iter()
@@ -623,7 +652,16 @@ pub async fn delete_source(
 ) -> Result<Response, ApiError> {
     let input: BucketKeyInput = parse_body(&body)?;
     let handle = require_ingest(&state, &input.bucket)?;
-    delete_user_object(&state, &input.key).await?;
+    if let Err(e) = state.locks.ensure_held(&input.bucket).await {
+        return Err(match e {
+            crate::lock::LockError::Held(who) => ApiError::conflict(format!(
+                "vector bucket {} is locked by another writer ({who})",
+                input.bucket
+            )),
+            crate::lock::LockError::Backend(e) => ApiError::internal(e),
+        });
+    }
+    delete_user_object(&state, &input.bucket, &input.key).await?;
     let hash = key_hash(&input.key);
     if let Some(m) = state.storage.load_source(&input.bucket, &hash).await?
         && let Some(mut d) =
@@ -887,6 +925,15 @@ pub async fn reindex(State(state): State<AppState>, body: Bytes) -> Result<Respo
     }
     let input: ReindexInput = parse_body(&body)?;
     let handle = require_ingest(&state, &input.bucket)?;
+    if let Err(e) = state.locks.ensure_held(&input.bucket).await {
+        return Err(match e {
+            crate::lock::LockError::Held(who) => ApiError::conflict(format!(
+                "vector bucket {} is locked by another writer ({who})",
+                input.bucket
+            )),
+            crate::lock::LockError::Backend(e) => ApiError::internal(e),
+        });
+    }
     let outcome = crate::ingest::reindex_bucket(&state, handle.shared(), &input.bucket)
         .await
         .map_err(ApiError::internal)?;
@@ -1040,7 +1087,7 @@ mod tests {
         let text = format!(
             "[extractor.plain]\nkind = \"txt\"\n\n\
              [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = true\n\n\
-             [ingest.docs]\nscope = \"docs/**\"\nextract = {{ txt = \"plain\" }}\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ txt = \"plain\" }}\n\
              chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
              embedders = [\"tiny\"]\nscan_interval_secs = 1\n",
             fixture_dir().display().to_string()
@@ -1064,14 +1111,14 @@ mod tests {
             .await
             .expect("fixture embedder loads");
         let handle = Arc::new(IngestHandle::new(IngestShared::new(core)));
-        let state = Arc::new(AppState {
-            storage: Arc::new(crate::store::Storage::file(dir.path())),
-            creds: Some(creds()),
-            region: "us-east-1".into(),
-            account: "000000000000".into(),
-            trace: false,
-            ingest: Some(handle.clone()),
-        });
+        let state = Arc::new(AppState::new(
+            Arc::new(crate::store::Storage::file(dir.path())),
+            Some(creds()),
+            "us-east-1".into(),
+            "000000000000".into(),
+            false,
+            Some(handle.clone()),
+        ));
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let rt = IngestRuntime::new(
             Arc::clone(handle.shared()),
@@ -1284,10 +1331,13 @@ mod tests {
         assert_eq!(st, StatusCode::FORBIDDEN);
         assert_eq!(b["__type"], json!("AccessDeniedException"));
 
-        // key outside the pipeline's scope -> 400 with the config pointer
+        // key outside the pipeline's claim filter -> 400 with the config pointer
         let (st, _, b) = put_source_call(&f, "docs", "notes.txt", b"z".to_vec()).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
-        assert!(b["message"].as_str().unwrap().contains("scope"), "{b}");
+        assert!(
+            b["message"].as_str().unwrap().contains("claim filter"),
+            "{b}"
+        );
     }
 
     // ---------------- GetSource / GetSourceData ----------------
@@ -1815,14 +1865,14 @@ mod tests {
 
         // pure protocol face (no ingest sections): the aggregate is []
         let dir = tempfile::tempdir().unwrap();
-        let state = AppState {
-            storage: Arc::new(crate::store::Storage::file(dir.path())),
-            creds: None,
-            region: "us-east-1".into(),
-            account: "000000000000".into(),
-            trace: false,
-            ingest: None,
-        };
+        let state = AppState::new(
+            Arc::new(crate::store::Storage::file(dir.path())),
+            None,
+            "us-east-1".into(),
+            "000000000000".into(),
+            false,
+            None,
+        );
         let router = crate::build_router(state);
         let req = Request::post("/x-vf/GetIngestStatus")
             .header("host", "127.0.0.1:8787")
@@ -1842,8 +1892,10 @@ mod tests {
     #[tokio::test]
     async fn s3_direct_object_reports_pending() {
         let f = fixture().await;
-        std::fs::create_dir_all(f.dir.path().join("docs")).unwrap();
-        std::fs::write(f.dir.path().join("docs/direct.txt"), b"raw s3 put").unwrap();
+        // v3: a "direct s3 put" of key docs/direct.txt lands inside the
+        // source bucket dir, under the docs/ key prefix
+        std::fs::create_dir_all(f.dir.path().join("docs").join("docs")).unwrap();
+        std::fs::write(f.dir.path().join("docs/docs/direct.txt"), b"raw s3 put").unwrap();
         let (st, _, b) = call_json(
             &f,
             "/x-vf/GetSource",

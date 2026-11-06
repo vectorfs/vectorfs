@@ -61,6 +61,14 @@ pub struct FileConfig {
     pub account_id: String,
     pub access_key_id: String,
     pub secret_access_key: String,
+    /// `bucket_suffix` (design-v3.md §3-R6/D3): vector bucket `X` ⇔ source
+    /// bucket `X` + system bucket `X<suffix>`. Default `-vf`; file-only
+    /// (no env/flag — a namespace identity constant, not a tuning knob);
+    /// install-time constant (changing it switches namespaces — old system
+    /// buckets vanish from enumeration until it changes back). Validated
+    /// by [`crate::backends::validate_bucket_suffix`] at resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_suffix: Option<String>,
     /// `[extractor.<name>]` sections (raw; parsed by pipeline::config).
     #[serde(default)]
     pub extractor: Option<toml::Table>,
@@ -124,6 +132,9 @@ pub struct ResolvedConfig {
     pub s3_region: String,
     pub s3_access_key: Option<String>,
     pub s3_secret_key: Option<String>,
+    /// `bucket_suffix` resolved from vectorfs.toml (default `-vf`; R6 —
+    /// file-only constant, validated at resolution).
+    pub bucket_suffix: String,
 }
 
 pub const DEFAULT_PORT: u16 = 8787;
@@ -163,6 +174,8 @@ pub struct StorageConfig {
     pub s3_region: String,
     pub s3_access_key: Option<String>,
     pub s3_secret_key: Option<String>,
+    /// `bucket_suffix` from vectorfs.toml (default `-vf`, R6).
+    pub bucket_suffix: String,
 }
 
 impl ResolvedConfig {
@@ -180,6 +193,12 @@ impl ResolvedConfig {
             cfg.secret_key = self.s3_secret_key.clone();
         }
         Ok(backend)
+    }
+
+    /// Open the [`crate::store::Storage`] this config resolves to (backend
+    /// + bucket_suffix, v3 R1/R6).
+    pub fn storage(&self) -> Result<crate::store::Storage, String> {
+        crate::store::Storage::new(self.backend()?, &self.bucket_suffix)
     }
 }
 
@@ -206,6 +225,12 @@ impl StorageConfig {
     pub fn is_file_backend(&self) -> bool {
         matches!(self.backend_spec.as_str(), "file") || self.backend_spec.starts_with("file:")
     }
+
+    /// Open the [`crate::store::Storage`] this config resolves to (backend
+    /// + bucket_suffix, v3 R1/R6).
+    pub fn storage(&self) -> Result<crate::store::Storage, String> {
+        crate::store::Storage::new(self.backend()?, &self.bucket_suffix)
+    }
 }
 
 /// Test seam, same as [`resolve_with`].
@@ -215,13 +240,32 @@ pub fn resolve_storage_with(
 ) -> Result<StorageConfig, String> {
     let env = &env as &dyn Fn(&str) -> Option<String>;
     let (s3_region, s3_access_key, s3_secret_key) = s3_conn_of(flags, env);
+    let data_dir = data_dir_of(flags, env);
+    let bucket_suffix = suffix_of(&data_dir)?;
     Ok(StorageConfig {
-        data_dir: data_dir_of(flags, env),
+        data_dir,
         backend_spec: backend_spec_of(flags, env),
         s3_region,
         s3_access_key,
         s3_secret_key,
+        bucket_suffix,
     })
+}
+
+/// `bucket_suffix` from `<data-dir>/.vectorfs/vectorfs.toml` (default
+/// `-vf`). Missing file = default; a PRESENT but invalid suffix fails fast
+/// (R6: it is a namespace identity constant — a typo silently renaming
+/// every system bucket is the worse failure).
+fn suffix_of(data_dir: &Path) -> Result<String, String> {
+    match read_config(data_dir)? {
+        None => Ok(crate::backends::DEFAULT_BUCKET_SUFFIX.to_string()),
+        Some(c) => match c.bucket_suffix {
+            None => Ok(crate::backends::DEFAULT_BUCKET_SUFFIX.to_string()),
+            Some(s) => crate::backends::validate_bucket_suffix(&s)
+                .map_err(|e| format!("corrupt {}: {e}", config_path(data_dir).display()))
+                .map(|()| s),
+        },
+    }
 }
 
 /// The production entry: storage-only resolution against the real environment.
@@ -389,6 +433,16 @@ fn resolve_impl(
     // S3 backend connection config (shared helper).
     let (s3_region, s3_access_key, s3_secret_key) = s3_conn_of(flags, env);
 
+    // bucket_suffix (R6): file-only constant, validated fail-fast.
+    let bucket_suffix = match file_cfg.as_ref().and_then(|c| c.bucket_suffix.clone()) {
+        None => crate::backends::DEFAULT_BUCKET_SUFFIX.to_string(),
+        Some(s) => {
+            crate::backends::validate_bucket_suffix(&s)
+                .map_err(|e| format!("corrupt {}: {e}", config_path(&data_dir).display()))?;
+            s
+        }
+    };
+
     Ok(ResolvedConfig {
         port,
         bind_host,
@@ -402,6 +456,7 @@ fn resolve_impl(
         s3_region,
         s3_access_key,
         s3_secret_key,
+        bucket_suffix,
     })
 }
 
@@ -534,6 +589,10 @@ pub fn init_with(data_dir: &Path, force: bool, opts: &InitOptions) -> Result<Ini
         account_id: DEFAULT_ACCOUNT.to_string(),
         access_key_id: generate_access_key(),
         secret_access_key: generate_secret_key(),
+        // bucket_suffix stays ABSENT (the `-vf` default applies; it is a
+        // namespace identity constant, not something init should surprise
+        // operators with)
+        bucket_suffix: None,
         // raw section tables stay None: the preset template is appended as
         // TEXT below (typed round-tripping of the template through
         // FileConfig would reorder and re-quote it for zero benefit — the
@@ -1032,7 +1091,7 @@ fn resolved_backend_carries_s3_credentials_regression() {
     let dir = tempfile::tempdir().unwrap();
     let c = resolve_with(
         &ServeFlags {
-            backend: Some("s3+https://h.example/b".into()),
+            backend: Some("s3+https://h.example".into()),
             no_auth: true,
             data_dir: Some(dir.path().to_path_buf()),
             ..Default::default()

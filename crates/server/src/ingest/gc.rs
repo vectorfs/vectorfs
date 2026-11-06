@@ -166,36 +166,32 @@ pub(crate) async fn reap_source(
     Ok(deleted)
 }
 
-/// 周期孤儿清扫 (idle-gated; see module doc): every managed index of every
-/// catalog bucket, deleting derived chunks whose `x-vf-src-uri` matches no
-/// LIVE object. All three GC 判据 layers apply (`managed_indexes` = layer 1,
-/// `chunk_keys_by_uri` = layers 2+3a, the live-join below = layer 3b).
-/// Returns the number of vector keys deleted.
+/// 周期孤儿清扫 (idle-gated; see module doc) — ONE bucket per call
+/// (design-v3.md R5: GC 作用域 = 本 daemon 持锁的桶集合, driven by the
+/// caller): every managed index of the bucket, deleting derived chunks whose
+/// `x-vf-src-uri` matches no LIVE object of THAT bucket's FULL listing (the
+/// include/exclude claim filter never narrows this live set — 收窄不得
+/// 触发 mass-flip). All three GC 判据 layers apply (`managed_indexes` =
+/// layer 1, `chunk_keys_by_uri` = layers 2+3a, the live-join below =
+/// layer 3b). Returns the number of vector keys deleted.
 pub(crate) async fn orphan_sweep(
     state: &AppState,
+    vb: &str,
     live_uris: &BTreeSet<String>,
 ) -> Result<usize, String> {
     let mut deleted = 0usize;
-    for bucket in state
-        .storage
-        .list_buckets()
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        let vb = bucket.vector_bucket_name;
-        for meta in managed_indexes(&state.storage, &vb).await? {
-            let by_uri = chunk_keys_by_uri(&state.storage, &vb, &meta.index_name).await?;
-            let keys: Vec<String> = by_uri
-                .into_iter()
-                .filter(|(uri, _)| !live_uris.contains(uri))
-                .flat_map(|(_, ks)| ks)
-                .collect();
-            if keys.is_empty() {
-                continue;
-            }
-            delete_chunk_keys(state, &vb, &meta.index_name, &keys).await?;
-            deleted += keys.len();
+    for meta in managed_indexes(&state.storage, vb).await? {
+        let by_uri = chunk_keys_by_uri(&state.storage, vb, &meta.index_name).await?;
+        let keys: Vec<String> = by_uri
+            .into_iter()
+            .filter(|(uri, _)| !live_uris.contains(uri))
+            .flat_map(|(_, ks)| ks)
+            .collect();
+        if keys.is_empty() {
+            continue;
         }
+        delete_chunk_keys(state, vb, &meta.index_name, &keys).await?;
+        deleted += keys.len();
     }
     Ok(deleted)
 }

@@ -107,13 +107,13 @@ pub fn signature_from_parts(e_tag: Option<&str>, size: u64, mtime_ns: i64) -> St
 }
 
 // ---------------------------------------------------------------------------
-// scope matching (§5.10.4: "scope = 前缀/glob; 省略 = 整根")
+// claim filtering (design-v3.md §3-R5: include/exclude glob 桶内认领过滤;
+// 省缺 = 整桶 — the source bucket IS the namespace)
 // ---------------------------------------------------------------------------
 
-/// Compiled ingest scope. `None` = the whole instance root.
-///
-/// Matching rules (deliberately tiny — a full glob engine would be policy
-/// surface no user asked for):
+/// Compiled glob pattern (the §5.10.4 matcher, repurposed as an in-bucket
+/// claim filter). Matching rules (deliberately tiny — a full glob engine
+/// would be policy surface no user asked for):
 /// * no metacharacter (`docs`): plain PREFIX match;
 /// * otherwise segment glob: `*` matches within one `/`-segment, `**`
 ///   matches across segments (`docs/**` = strictly everything under `docs/`,
@@ -133,7 +133,7 @@ impl Scope {
         }
     }
 
-    /// Does an instance-root-relative object key fall inside this scope?
+    /// Does a bucket-relative object key match this pattern?
     pub fn matches(&self, key: &str) -> bool {
         let Some(pattern) = &self.raw else {
             return true;
@@ -150,9 +150,51 @@ impl Scope {
     }
 }
 
-/// Segment-recursion glob: `**` consumes any number of segments (but a
-/// TRAILING `**` requires at least one — `a/**` ≠ `a`), `*` stays inside its
-/// segment, everything else is literal.
+/// One bucket's claim filter (R5): `(include empty OR any include matches)
+/// AND no exclude matches`. Affects claiming and vanish-flips ONLY — the GC
+/// orphan live-set is ALWAYS the full bucket listing (include/exclude
+/// narrowing must never trigger a mass-flip).
+#[derive(Debug, Clone, Default)]
+pub struct ClaimFilter {
+    pub include: Vec<Scope>,
+    pub exclude: Vec<Scope>,
+}
+
+impl ClaimFilter {
+    pub fn new(include: &[String], exclude: &[String]) -> ClaimFilter {
+        ClaimFilter {
+            include: include
+                .iter()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| Scope::new(Some(s)))
+                .collect(),
+            exclude: exclude
+                .iter()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| Scope::new(Some(s)))
+                .collect(),
+        }
+    }
+
+    /// Empty filter (no include/exclude keys): claims the whole bucket.
+    pub fn whole_bucket() -> ClaimFilter {
+        ClaimFilter::default()
+    }
+
+    /// Is a bucket-relative key claimed by this filter?
+    pub fn matches(&self, key: &str) -> bool {
+        (self.include.is_empty() || self.include.iter().any(|p| p.matches(key)))
+            && !self.exclude.iter().any(|p| p.matches(key))
+    }
+}
+
+/// Segment-recursion glob: a bare `**` segment consumes any number of
+/// segments (but a TRAILING `**` requires at least one — `a/**` ≠ `a`); a
+/// segment EMBEDDING `**` with literal parts (`**.pdf`, `docs**`) matches
+/// any ONE segment satisfying the single-segment glob while allowing any
+/// number of segments before it (the design-v3.md R6 example spells
+/// include = ["**.pdf"]); `*` stays inside its segment; everything else is
+/// literal.
 fn match_segments(pat: &[&str], key: &[&str]) -> bool {
     match pat.split_first() {
         None => key.is_empty(),
@@ -161,6 +203,11 @@ fn match_segments(pat: &[&str], key: &[&str]) -> bool {
                 return !key.is_empty();
             }
             (0..=key.len()).any(|i| match_segments(rest, &key[i..]))
+        }
+        Some((p, rest)) if p.contains("**") => {
+            // embedded cross-segment wildcard: p may consume any number of
+            // LEADING segments; one of them must satisfy the segment glob
+            (0..key.len()).any(|i| seg_glob(p, key[i]) && match_segments(rest, &key[i + 1..]))
         }
         Some((p, rest)) => match key.split_first() {
             None => false,
@@ -233,6 +280,10 @@ pub enum ScanPlan {
     Enqueue,
     /// Completed marker, unchanged signature: nothing to do.
     Settled,
+    /// Marker carried N-strike residue (misses > 0) and the object is BACK:
+    /// persist the reset counter WITHOUT enqueueing (a stale strike count
+    /// must not make the next absence flip early — R5).
+    Refresh(SourceMarker),
     /// FAILED + retries_exhausted: never auto-retried, whatever the
     /// signature (§5.10.5 — the operator's remedy is `vf reindex`, T7, or
     /// deleting the marker).
@@ -257,11 +308,18 @@ pub fn plan_present(
             status_reason: None,
             retries: 0,
             retries_exhausted: false,
+            misses: 0,
             updated_at: now.to_string(),
             chunks: None,
             engines: None,
         });
     };
+    // any present sighting resets the N-strike counter (R5): a stale count
+    // from an old absence must not make the NEXT vanish flip after one
+    // strike — and the reset must PERSIST (Refresh) when nothing else would
+    // rewrite the marker
+    let had_misses = m.misses > 0;
+    m.misses = 0;
     if m.status == SourceStatus::Failed && m.retries_exhausted {
         return ScanPlan::Parked;
     }
@@ -276,10 +334,14 @@ pub fn plan_present(
         m.chunks = None;
         m.retries = 0;
         m.retries_exhausted = false;
+        m.misses = 0;
         m.updated_at = now.to_string();
         return ScanPlan::Update(m);
     }
     if m.etag_sig == sig {
+        if had_misses {
+            return ScanPlan::Refresh(m);
+        }
         return if is_terminal(&m) {
             ScanPlan::Settled
         } else {
@@ -301,9 +363,40 @@ pub fn plan_present(
     }
 }
 
-/// Scanner decision for a marker whose object is GONE from the listing: flip
-/// to DELETING (this task only sets the state; T7's GC reaps the chunks and
-/// the marker itself). `None` = already DELETING.
+/// Scanner decision for a marker whose object is ABSENT from the listing —
+/// the N-strike reaper gate (design-v3.md R5: an object must be gone for
+/// VANISH_STRIKES consecutive scans before the DELETING flip; a transient
+/// empty/partial listing must not reap chunks).
+#[derive(Debug, PartialEq)]
+pub enum AbsentPlan {
+    /// Strike counted, not yet at the threshold: persist the incremented
+    /// counter, no flip, no enqueue.
+    WaitForStrike(SourceMarker),
+    /// Threshold reached: flip to DELETING (GC owns the chunks + marker).
+    FlipDeleting(SourceMarker),
+}
+
+/// Consecutive absent scans required before the DELETING flip (R5: N=2).
+pub const VANISH_STRIKES: u32 = 2;
+
+pub fn plan_absent(existing: SourceMarker, now: &str) -> AbsentPlan {
+    let mut m = existing;
+    if m.status == SourceStatus::Deleting {
+        return AbsentPlan::FlipDeleting(m); // already flipped; GC owns it
+    }
+    m.misses += 1;
+    m.updated_at = now.to_string();
+    if m.misses >= VANISH_STRIKES {
+        m.status = SourceStatus::Deleting;
+        AbsentPlan::FlipDeleting(m)
+    } else {
+        AbsentPlan::WaitForStrike(m)
+    }
+}
+
+/// The DeleteSource path's IMMEDIATE flip (the 202 contract polls DELETING —
+/// it must not wait out the strikes; the op itself is the definitive signal,
+/// and the GC still re-verifies gone-ness before reaping).
 pub fn plan_vanished(existing: SourceMarker, now: &str) -> Option<SourceMarker> {
     if existing.status == SourceStatus::Deleting {
         return None;
@@ -351,6 +444,7 @@ mod tests {
             status_reason: None,
             retries: 1,
             retries_exhausted: false,
+            misses: 0,
             updated_at: "t0".into(),
             chunks: None,
             engines: None,
@@ -535,7 +629,7 @@ mod tests {
     #[test]
     fn scope_matching_rules() {
         let whole = Scope::new(None);
-        assert!(whole.matches(".vectorfs/anything")); // exclusion is the SCAN's job, not scope's
+        assert!(whole.matches("anything"));
         assert!(whole.matches("docs/a.txt"));
 
         let prefix = Scope::new(Some("docs"));
@@ -566,6 +660,67 @@ mod tests {
         assert!(!mid.matches("docs/x/other/a.txt"));
 
         let empty = Scope::new(Some("  "));
-        assert!(empty.matches("anything"), "blank scope = whole root");
+        assert!(empty.matches("anything"), "blank pattern matches all");
+    }
+
+    /// Claim filter rules (design-v3.md R5): include absent = whole bucket;
+    /// exclude wins over include; narrowing NEVER touches the GC live-set
+    /// (which joins against the FULL listing — asserted in ingest tests).
+    #[test]
+    fn claim_filter_rules() {
+        let whole = ClaimFilter::whole_bucket();
+        assert!(whole.matches("docs/a.txt"));
+        assert!(whole.matches("anything/at/all"));
+
+        let inc = ClaimFilter::new(&["**.pdf".to_string()], &[]);
+        assert!(inc.matches("docs/a.pdf"));
+        assert!(inc.matches("b.pdf"));
+        assert!(!inc.matches("docs/a.txt"));
+
+        let multi = ClaimFilter::new(
+            &["docs/**".to_string(), "notes/**".to_string()],
+            &["**.tmp".to_string()],
+        );
+        assert!(multi.matches("docs/a.txt"));
+        assert!(multi.matches("notes/b.txt"));
+        assert!(!multi.matches("other/a.txt"));
+        assert!(!multi.matches("docs/a.tmp"), "exclude wins");
+
+        // blank entries are ignored, not empty-string patterns
+        let blanks = ClaimFilter::new(&["  ".to_string()], &["".to_string()]);
+        assert!(blanks.matches("x"), "blank = whole bucket");
+    }
+
+    /// N-strike vanish gate (R5): one absent scan is a strike, two flips;
+    /// a present sighting resets the counter.
+    #[test]
+    fn absent_needs_two_strikes_and_resets_on_return() {
+        let m = completed(SourceStatus::Indexed);
+        // strike 1: wait
+        let AbsentPlan::WaitForStrike(w1) = plan_absent(m.clone(), "t1") else {
+            panic!("first absence must wait")
+        };
+        assert_eq!(w1.misses, 1);
+        assert_eq!(w1.status, SourceStatus::Indexed);
+        // strike 2: flip
+        let AbsentPlan::FlipDeleting(d) = plan_absent(w1.clone(), "t2") else {
+            panic!("second absence must flip")
+        };
+        assert_eq!(d.status, SourceStatus::Deleting);
+        // already DELETING stays DELETING (idempotent for the GC pass)
+        assert!(matches!(
+            plan_absent(d.clone(), "t3"),
+            AbsentPlan::FlipDeleting(_)
+        ));
+        // object returns after one strike: Refresh persists the reset (the
+        // next absence then needs two strikes again)
+        let ScanPlan::Refresh(r) = plan_present(Some(w1), "docs/a.txt", SIG, "fp", "t4") else {
+            panic!("return-after-strike must persist the reset")
+        };
+        assert_eq!(r.misses, 0);
+        let AbsentPlan::WaitForStrike(w2) = plan_absent(r, "t5") else {
+            panic!("fresh absence must wait")
+        };
+        assert_eq!(w2.misses, 1);
     }
 }

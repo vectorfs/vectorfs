@@ -59,6 +59,14 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
+/// Hex sha256 of a request payload — the `x-amz-content-sha256` value (the
+/// S3 admin egress in the server signs it explicitly, s3admin.rs; the wire
+/// gate reads the header when present). Public since v3.1: the outbound S3
+/// admin calls share this canonicalization with the inbound gate.
+pub fn payload_hash_hex(body: &[u8]) -> String {
+    hex(&sha256(body))
+}
+
 /// Percent-encode per general (non-S3) SigV4 rules: keep unreserved `A-Za-z0-9-_.~`
 /// and (optionally) `/`; everything else as `%XX` uppercase hex.
 fn uri_encode(s: &str, encode_slash: bool) -> String {

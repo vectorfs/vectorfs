@@ -10,6 +10,9 @@
 #                 aws-sdk-go-v2) against a freshly `vectorfs init`'d
 #                 file-backend daemon (M1 Task 7; steps 1:1 with
 #                 conformance/boto3_check.py)
+#   s3-conformance — the v3 s3 backend against a dockerized SeaweedFS with
+#                 IAM enforced: raw bucket-admin verbs + the full dual-bucket
+#                 lifecycle (design-v3.md §10-G2; PR2 suite, PR3 job)
 #
 # NOTE: aws-lc-sys (via object_store "aws") needs cmake + a C toolchain — both
 # preinstalled on ubuntu-latest runners (design.md §8 risk #11).
@@ -206,6 +209,87 @@ jobs:
       - name: dump server stderr tail (last 50 lines, on failure)
         if: failure()
         run: tail -50 server.log
+
+  # G2 s3 conformance (design-v3.md §3-R8/§9/§10-G2; PR2 test suite, PR3
+  # job): the env-gated --ignored tests in crates/server/tests/
+  # s3_conformance.rs against a dockerized SeaweedFS with IAM ENFORCED —
+  # the exact invocation verified locally against the vf-seaweed container
+  # (2026-11-06, 2/2 green). Layer 1 drives the raw admin face
+  # (create/head/list/delete + the CreateBucket idempotency fork —
+  # SeaweedFS answers 409 BucketAlreadyOwnedByYou, folded to
+  # AlreadyExists — + underscore/invalid name rules + the
+  # wrong-credential ListBuckets 403 row). Layer 2 drives the full v3
+  # dual-bucket lifecycle through a real serve process on the s3 backend
+  # (create → lazy source bucket on PutSource → scan ingest → QueryVectors
+  # → DeleteVectorBucket 删净, source bucket survives). The R8 matrix's
+  # MinIO row stays pending a reachable community image (no community
+  # distro, docker hub pull denied — design-v3.md §14 item 10).
+  s3-conformance:
+    name: s3 conformance (dockerized SeaweedFS, IAM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: install protoc (lance-encoding build dep)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # same key as build-test — share the compiled dependency tree
+          shared-key: debug-workspace
+
+      # the full-daemon-path test embeds through the real ort runtime and
+      # refuses to skip without the pinned .so (the M2 honest-failure rule;
+      # pdfium is not needed by this suite but rides the same cache key)
+      - name: fetch pinned runtime libs (onnxruntime)
+        run: ./scripts/fetch_runtime_libs.sh onnxruntime
+      - uses: actions/cache@v4
+        with:
+          path: runtime-libs
+          key: runtime-libs-${{ runner.os }}-${{ runner.arch }}-pdfium-8066-ort-1.31.0
+
+      - name: start SeaweedFS + enforce IAM (user vfconf)
+        run: |
+          set -euo pipefail
+          docker run -d --name vf-seaweed -p 127.0.0.1:19000:8333 \
+            chrislusf/seaweedfs:latest \
+            server -s3 -s3.port=8333 -master.volumeSizeLimitMB=256
+          # readiness = ANY http answer from the S3 gate. Once IAM is
+          # configured it answers 403 to anonymous GET /, and before IAM an
+          # anonymous GET / answers 200-empty — either way `curl -sf` is the
+          # WRONG probe here (it would loop on the 403).
+          code=000
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:19000/ || true)
+            [[ -n "$code" && "$code" != "000" ]] && break
+            sleep 1
+          done
+          if [[ -z "$code" || "$code" == "000" ]]; then
+            echo "## SeaweedFS S3 gate never answered (last code: $code); logs:"
+            docker logs vf-seaweed 2>&1 | tail -30
+            exit 1
+          fi
+          # IAM is a DEPLOYMENT PRECONDITION, not a nice-to-have: SeaweedFS
+          # scopes ListBuckets to the account, so an anonymous endpoint
+          # enumerates as an empty list for every caller (design-v3.md §9) —
+          # R9 bucket enumeration and the VF_S3CP_LIST_403 row below both
+          # need real credentials.
+          printf 's3.configure -access_key vfconf -secret_key vfconf-secret -user vfconf -actions Read,Write,List,Tagging,Admin -apply\n' \
+            | docker exec -i vf-seaweed weed shell
+
+      - name: cargo test s3_conformance (live endpoint)
+        env:
+          VF_S3CP_URI: s3+http://127.0.0.1:19000
+          VF_S3_ACCESS_KEY: vfconf
+          VF_S3_SECRET_KEY: vfconf-secret
+          VF_S3CP_LIST_403: "1"
+        run: cargo test -p vectorfs-server --test s3_conformance -- --ignored
+
+      - name: dump seaweed logs (on failure)
+        if: failure()
+        run: docker logs vf-seaweed 2>&1 | tail -50
 
   # Enabled 2026-11-04: repository turned public — arm64 and macOS hosted
   # runners are free for public repos (design.md §5.7 "Linux x64+arm64 首发,

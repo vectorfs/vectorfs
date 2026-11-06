@@ -9,7 +9,7 @@
 - All 21 `s3vectors-2025-07-15` operations, verified through unmodified boto3 and
   aws-sdk-go-v2 (32-step conformance each, green in CI), SigV4-authenticated,
   strongly consistent read-after-write.
-- **v0.2 file layer (text modality)**: drop files into the instance root, a built-in
+- **v0.2 file layer (text modality)**: drop files into a source bucket, a built-in
   pipeline extracts → chunks → embeds them locally (default model
   [`gte-multilingual-base`](https://huggingface.co/Alibaba-NLP/gte-multilingual-base),
   Apache-2.0), and `vf search` returns hits that point back at the source file.
@@ -66,9 +66,10 @@ vf search "capacity planning" --bucket docs
 #  1  0.71    510da8…-text-0       text-fcdd…    report.pdf     Capacity planning for …
 ```
 
-Files placed by ANY standard tool (aws s3 cp on the s3 backend, plain file copy on
-the file backend) are picked up by the periodic scan (default 30 s) — the instance
-root IS the data source; deletions are reconciled the same way (chunks GC'd).
+Files placed by ANY standard tool (aws s3 cp into the source bucket on the s3
+backend, plain file copy on the file backend) are picked up by the periodic scan
+(default 30 s) — the source bucket IS the data source; deletions are reconciled
+the same way (chunks GC'd).
 `vf` verbs: `put` (`--async`), `search`, `sources list|status`, `get`, `rm`,
 `reindex`, `status`. Everything is also on the wire as eight `/x-vf/<Op>`
 operations (design.md appendix E) — same SigV4, same error shapes.
@@ -127,17 +128,58 @@ res, err := client.QueryVectors(ctx, &s3vectors.QueryVectorsInput{
 })
 ```
 
+## Bucket model
+
+Every vector bucket `X` is a **pair of physical buckets** — the naming
+convention *is* the placement, zero configuration (design-v3.md §4):
+
+```
+endpoint bucket root                <data-dir>/.vectorfs/ (daemon home)
+(or <data-dir>/ on the file          ├── vectorfs.toml   config + credentials
+ backend; one key space on memory)   ├── models/
+├── docs/     ← source bucket:       └── flock           same-host double-start lock
+│   └── a.pdf     pure user namespace — plain objects,
+│                 zero system objects; the periodic scan
+│                 watches the WHOLE bucket
+└── docs-vf/  ← system bucket: its root IS the system area
+    ├── LOCK        per-bucket writer lock (TTL heartbeat, writer id)
+    ├── bucket.json ownership marker (deployment identity)
+    ├── sources/…   per-file ingest markers
+    └── indexes/<ix>/…  index metadata + Lance datasets
+```
+
+- The `-vf` suffix is the default and configurable once per deployment
+  (`bucket_suffix` in `vectorfs.toml` — file-only knob, install-time constant;
+  changing it selects a different namespace, it never migrates data).
+- The source bucket is created **lazily** by the first `vf put` / PutSource;
+  `DeleteVectorBucket` removes `X-vf` entirely and **never deletes** `X` —
+  your files survive a vector bucket deletion.
+- Vector bucket names: 3–60 chars (63 minus the suffix), lowercase/digits/
+  hyphens, no dots (stricter than general S3 bucket names), and the name must
+  not end with the configured suffix.
+- Single writer **per bucket**. One daemon managing every bucket is the
+  default deployment; multiple daemons may share one endpoint only over
+  **disjoint bucket sets**, and a pure protocol-face fan-out in front of one
+  bucket needs external bucket-aware routing (the lazy locks are the
+  enforcement, not the declaration).
+
 ## Backends
 
-- `file` (default) — the instance root is a local directory; zero configuration.
-  Your files live there as plain files; vectorfs keeps everything it owns under
-  the reserved `.vectorfs/` prefix (git-style mental model).
+- `file` (default) — the data dir plays bucket root: each vector bucket is the
+  directory pair `X/` + `X-vf/`; your files are plain files inside `X/`; the
+  daemon home `.vectorfs/` (vectorfs.toml + models) sits beside them. Zero
+  configuration.
 - `memory` — volatile, for CI and emulator use: `vectorfs serve --backend memory
   --no-auth` (no SigV4, no persistence; start/stop in seconds, deterministic).
-- `s3` — any S3-compatible endpoint: `vectorfs serve --backend
-  's3+http://host:8333/bucket[/prefix]'` with `--s3-access-key/--s3-secret-key/
-  --s3-region` (or `VF_S3_*`/`AWS_*` env). Verified end-to-end on SeaweedFS 4.52
-  and Cloudflare R2 (dual-SDK conformance, conditional writes, multipart).
+- `s3` — any S3-compatible endpoint, in **endpoint form** (no bucket path —
+  buckets come from the dual-bucket model above): `vectorfs serve --backend
+  's3+http://host:8333'` with `--s3-access-key/--s3-secret-key/--s3-region`
+  (or `VF_S3_*`/`AWS_*` env). Credentials are required for bucket operations —
+  SeaweedFS scopes ListBuckets to the account, so an anonymous endpoint simply
+  enumerates as empty. Verified end-to-end on SeaweedFS 4.52 and Cloudflare R2
+  (dual-SDK conformance, conditional writes, multipart); the raw bucket admin
+  verbs (create/head/list/delete) run a dockerized-SeaweedFS conformance suite
+  in CI.
 
 ## The file layer in brief
 
@@ -175,8 +217,11 @@ Image: `ghcr.io/vectorfs/vectorfs` (multi-arch linux/amd64+arm64, debian-slim,
 non-root, binaries + pinned onnxruntime/pdfium `.so`; models stay on the volume,
 never in image layers). `VF_PRESET=text-rag` materializes the config on first
 boot. An `emulator` compose profile runs the volatile `memory --no-auth` variant —
-a seconds-to-start s3vectors stand-in for CI/testcontainers. One container per
-instance root (single-writer LOCK semantics).
+a seconds-to-start s3vectors stand-in for CI/testcontainers. Locking is **per
+bucket** (a TTL-heartbeat LOCK object inside each `X-vf`): one container
+managing every bucket is the default deployment — do NOT scale this service
+over the same bucket set; daemons may share an endpoint only over disjoint
+bucket sets (pure protocol-face fan-out needs external bucket-aware routing).
 
 ## Limits: AWS vs local
 
@@ -206,8 +251,8 @@ stored by default — disable per ingest section with `store_chunk_text = false`
 
 ## MCP
 
-`vectorfs mcp` is a stdio MCP server for agent single-user mode — the only writer of
-its data root (same lock as `vectorfs serve`):
+`vectorfs mcp` is a stdio MCP server for agent single-user mode — the only writer
+of its buckets (same per-bucket locks as `vectorfs serve`):
 
 ```json
 {"vectorfs": {"command": "vectorfs", "args": ["mcp", "--data-dir", "/path/to/data"]}}
@@ -226,8 +271,8 @@ Add `"--tools", "ro"` for a read-only toolset. Data-plane tools:
 - No homegrown versioning, embedding-model hosting/training platform, chat UI,
   write-time entity extraction, kernel-mode implementation, plugin marketplace,
   AWS-console UI clone, non-AWS native API faces.
-- No distributed multi-writer coordination (one writer per instance root; the LOCK
-  object heartbeats and takeovers follow TTL semantics).
+- No distributed multi-writer coordination (one writer per bucket; each bucket's
+  LOCK object heartbeats and takeovers follow TTL semantics).
 
 ## Compatibility notes
 
@@ -247,6 +292,8 @@ Add `"--tools", "ro"` for a read-only toolset. Data-plane tools:
 
 - [design.md](design.md) — positioning, protocol spec, architecture, milestones,
   and appendix E (the CLI/`/x-vf` command tables — the authoritative list).
+- [design-v3.md](design-v3.md) — the v3 bucket model: dual-bucket mapping,
+  lifecycle/crash rules, per-bucket locks, invariants, implementation log.
 - [spike/REPORT.md](spike/REPORT.md) — M0 measurements (latency, binary size);
   [conformance/](conformance/) — the 32-step dual-SDK conformance suite.
 

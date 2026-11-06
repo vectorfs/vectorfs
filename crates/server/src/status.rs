@@ -69,12 +69,13 @@ fn now_epoch() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Read the LOCK object and classify it. A LOCK that exists but does not
-/// parse is reported as [`LockState::Stale`] debris with no daemon details
-/// (the same fail-open takeover rule lock.rs applies to a real writer).
-pub async fn probe_lock(backend: &Backend, storage: &Storage) -> Result<LockProbe, String> {
-    let key = backend.object_key("LOCK");
-    let raw = backends::read_json::<serde_json::Value>(storage.catalog(), &key).await?;
+/// Read ONE bucket's LOCK object and classify it (design-v3.md §5.1: locks
+/// are per vb, at `X-vf/LOCK`). A LOCK that exists but does not parse is
+/// reported as [`LockState::Stale`] debris with no daemon details (the same
+/// fail-open takeover rule lock.rs applies to a real writer).
+pub async fn probe_lock(storage: &Storage, vb: &str) -> Result<LockProbe, String> {
+    let key = object_store::path::Path::from("LOCK");
+    let raw = backends::read_json::<serde_json::Value>(&*storage.system_store(vb), &key).await?;
     let ttl_s = LOCK_TTL.as_secs();
     match raw {
         None => Ok(LockProbe {
@@ -109,6 +110,14 @@ pub async fn probe_lock(backend: &Backend, storage: &Storage) -> Result<LockProb
             })
         }
     }
+}
+
+/// One bucket row of the per-vb lock table.
+#[derive(Debug, Serialize)]
+pub struct BucketLockRow {
+    pub bucket: String,
+    #[serde(flatten)]
+    pub probe: LockProbe,
 }
 
 /// One index row of the status table.
@@ -157,9 +166,11 @@ pub struct StatusReport {
     pub mode: &'static str,
     /// {"kind": "file"|"memory"|"s3", "spec": "<display form>"}
     pub backend: BackendSummary,
-    /// Local data dir (where .vectorfs/ and the file root live).
+    /// Local data dir (bucket root + the `.vectorfs/` daemon home).
     pub data_root: String,
-    pub lock: LockProbe,
+    /// Per-vb LOCK probes (v3 §5.1: one lock per bucket at `X-vf/LOCK`);
+    /// empty when no buckets exist.
+    pub locks: Vec<BucketLockRow>,
     pub buckets: usize,
     pub indexes: usize,
     /// Sum over indexes whose count succeeded.
@@ -196,35 +207,56 @@ pub async fn gather(cfg: &StorageConfig) -> Result<StatusReport, Failure> {
         Failure::new(
             "BACKEND_INVALID",
             e,
-            "backend must be file | memory | s3+http(s)://host:port/bucket[/prefix]",
+            "backend must be file | memory | s3+http(s)://host:port",
         )
     })?;
-    let storage = Storage::new(backend.clone()).map_err(|e| {
+    let storage = cfg.storage().map_err(|e| {
         Failure::new(
             "BACKEND_INIT",
             format!("cannot open backend {backend}: {e}"),
             "check the data dir / S3 endpoint and credentials (VF_S3_*, AWS_*)",
         )
     })?;
-
-    let lock = probe_lock(&backend, &storage).await.map_err(|e| {
-        Failure::new(
-            "LOCK_UNREADABLE",
-            format!("cannot read the LOCK object: {e}"),
-            "inspect the LOCK object at the data root; if unreadable, remove it while no writer runs",
-        )
-    })?;
+    // deployment identity from the config file (region/account) + backend
+    let (region, account) = crate::config::read_config(&cfg.data_dir)
+        .ok()
+        .flatten()
+        .map(|c| (c.region, c.account_id))
+        .unwrap_or_else(|| {
+            (
+                crate::config::DEFAULT_REGION.to_string(),
+                crate::config::DEFAULT_ACCOUNT.to_string(),
+            )
+        });
+    let identity = storage.deployment_identity(&region, &account);
 
     let mut index_details = Vec::new();
     let mut vectors_total = 0u64;
     let mut bucket_count = 0usize;
     let mut failures = Vec::new();
+    let mut locks = Vec::new();
     for bucket in storage
-        .list_buckets()
+        .list_buckets(&identity)
         .await
         .map_err(store_failure("list buckets"))?
     {
         bucket_count += 1;
+        locks.push(BucketLockRow {
+            bucket: bucket.vector_bucket_name.clone(),
+            probe: probe_lock(&storage, &bucket.vector_bucket_name)
+                .await
+                .map_err(|e| {
+                    Failure::new(
+                        "LOCK_UNREADABLE",
+                        format!(
+                            "cannot read the LOCK of bucket {}: {e}",
+                            bucket.vector_bucket_name
+                        ),
+                        "inspect the LOCK object in the bucket's system bucket; if unreadable, \
+                         remove it while no writer runs",
+                    )
+                })?,
+        });
         let indexes = storage
             .list_indexes(&bucket.vector_bucket_name)
             .await
@@ -273,21 +305,28 @@ pub async fn gather(cfg: &StorageConfig) -> Result<StatusReport, Failure> {
         );
     }
 
-    // Whole-root volume: object sizes from list metadata only. On S3 the
-    // store is rooted at the bucket, so the configured prefix scopes it.
-    let prefix = match &backend {
-        Backend::S3(_) => Some(backend.object_key("")),
-        _ => None,
-    };
-    let (objects, size_bytes) = backends::prefix_stats(storage.catalog(), prefix.as_ref())
-        .await
-        .map_err(|e| {
-            Failure::new(
-                "BACKEND_LIST",
-                format!("cannot enumerate the data root: {e}"),
-                "check backend reachability (vectorfs doctor probes it in depth)",
-            )
-        })?;
+    // Volume accounting per BUCKET PAIR (design-v3.md §6 status row): both
+    // the source bucket (user data) and the system bucket (catalog + Lance
+    // datasets) of every vb, from list metadata only.
+    let mut objects = 0usize;
+    let mut size_bytes = 0u64;
+    for row in &locks {
+        let vb = &row.bucket;
+        for stats in [
+            backends::prefix_stats(&*storage.source_store(vb), None).await,
+            backends::prefix_stats(&*storage.system_store(vb), None).await,
+        ] {
+            let (o, sz) = stats.map_err(|e| {
+                Failure::new(
+                    "BACKEND_LIST",
+                    format!("cannot enumerate bucket {vb}: {e}"),
+                    "check backend reachability (vectorfs doctor probes it in depth)",
+                )
+            })?;
+            objects += o;
+            size_bytes += sz;
+        }
+    }
 
     let kind = match backend {
         Backend::File { .. } => "file",
@@ -303,7 +342,7 @@ pub async fn gather(cfg: &StorageConfig) -> Result<StatusReport, Failure> {
             spec: backend.to_string(),
         },
         data_root: cfg.data_dir.display().to_string(),
-        lock,
+        locks,
         buckets: bucket_count,
         indexes: index_details.len(),
         vectors_total,
@@ -400,44 +439,50 @@ pub fn render_human(r: &StatusReport) -> String {
     let _ = writeln!(out, "vectorfs status (schema v{})", r.schema_version);
     let _ = writeln!(out, "  data root : {}", r.data_root);
     let _ = writeln!(out, "  backend   : {} ({})", r.backend.spec, r.backend.kind);
-    match (&r.lock.state, &r.lock.daemon) {
-        (LockState::Free, _) => {
-            let _ = writeln!(out, "  lock      : free (no writer holds this data root)");
-        }
-        (state, daemon) => {
-            let label = match state {
-                LockState::Held => "held",
-                LockState::Stale => "STALE",
-                LockState::Free => unreachable!("matched above"),
-            };
-            match daemon {
-                Some(d) => {
-                    let _ = writeln!(
-                        out,
-                        "  lock      : {label} by pid {} (owner {}, host {}, since {}, heartbeat {}s ago)",
-                        d.pid, d.owner, d.host, d.started_rfc3339, d.heartbeat_age_s
-                    );
-                    if matches!(state, LockState::Held) {
+    // per-vb LOCK lines (v3 §5.1): each row names its bucket
+    for row in &r.locks {
+        match (&row.probe.state, &row.probe.daemon) {
+            (LockState::Free, _) => {
+                let _ = writeln!(out, "  lock/{:<8}: free", row.bucket);
+            }
+            (state, daemon) => {
+                let label = match state {
+                    LockState::Held => "held",
+                    LockState::Stale => "STALE",
+                    LockState::Free => unreachable!("matched above"),
+                };
+                match daemon {
+                    Some(d) => {
                         let _ = writeln!(
                             out,
-                            "              port unknown — probe with: vectorfs status --endpoint http://127.0.0.1:8787"
+                            "  lock/{:<8}: {label} by pid {} (owner {}…, host {}, heartbeat {}s ago)",
+                            row.bucket,
+                            d.pid,
+                            &d.owner[..8.min(d.owner.len())],
+                            d.host,
+                            d.heartbeat_age_s
                         );
-                    } else {
+                        if matches!(state, LockState::Stale) {
+                            let _ = writeln!(
+                                out,
+                                "              heartbeat older than TTL ({}s) — the next writer takes over",
+                                row.probe.ttl_s
+                            );
+                        }
+                    }
+                    None => {
                         let _ = writeln!(
                             out,
-                            "              heartbeat older than TTL ({}s) — the next writer takes over",
-                            r.lock.ttl_s
+                            "  lock/{:<8}: {label} but unparseable (debris; next writer takes over)",
+                            row.bucket
                         );
                     }
                 }
-                None => {
-                    let _ = writeln!(
-                        out,
-                        "  lock      : {label} but unparseable (debris; next writer takes over)"
-                    );
-                }
             }
         }
+    }
+    if r.locks.is_empty() {
+        let _ = writeln!(out, "  locks     : none (no vector buckets)");
     }
     let _ = writeln!(out, "  buckets   : {}", r.buckets);
     let _ = writeln!(
@@ -669,7 +714,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use crate::store::{BucketMeta, DerivedIndexInfo, IndexMeta};
+    use crate::store::{DerivedIndexInfo, IndexMeta};
 
     fn storage_cfg(dir: &std::path::Path) -> StorageConfig {
         StorageConfig {
@@ -678,19 +723,14 @@ mod tests {
             s3_region: "us-east-1".into(),
             s3_access_key: None,
             s3_secret_key: None,
+            bucket_suffix: crate::backends::DEFAULT_BUCKET_SUFFIX.into(),
         }
     }
 
     async fn seed(dir: &std::path::Path) -> Arc<Storage> {
         let storage = Storage::file(dir);
         storage
-            .create_bucket(&BucketMeta {
-                vector_bucket_name: "docs".into(),
-                vector_bucket_arn: "arn:aws:s3vectors:us-east-1:0:bucket/docs".into(),
-                creation_time_rfc3339: "2026-11-04T00:00:00.000Z".into(),
-                creation_time_epoch: 0.0,
-                default_index_mode: None,
-            })
+            .create_bucket(&crate::store::test_bucket_meta(&storage, "docs"))
             .await
             .unwrap();
         for (ix, dim) in [("chunks", 4i32), ("titles", 2i32)] {
@@ -747,7 +787,12 @@ mod tests {
         assert_eq!(report.vectors_total, 2);
         assert!(report.size_bytes > 0, "lance data must account for bytes");
         assert!(report.objects > 0);
-        assert!(matches!(report.lock.state, LockState::Free));
+        assert!(
+            report
+                .locks
+                .iter()
+                .all(|r| matches!(r.probe.state, LockState::Free))
+        );
         // deterministic row order: (bucket, index) ascending
         let names: Vec<(String, String)> = report
             .index_details
@@ -775,8 +820,9 @@ mod tests {
     async fn status_reports_held_and_stale_lock() {
         let dir = tempfile::tempdir().unwrap();
         let storage = seed(dir.path()).await;
-        let backend = storage.backend().clone();
-        let key = backend.object_key("LOCK");
+        // v3: the LOCK lives per bucket, at docs-vf/LOCK
+        let key = object_store::path::Path::from("LOCK");
+        let lock_store = storage.system_store("docs");
 
         // a live daemon: fresh heartbeat -> Held, with owner details
         let live = crate::lock::LockInfo {
@@ -786,31 +832,28 @@ mod tests {
             started_at: now_epoch() - 60.0,
             heartbeat_at: now_epoch() - 2.0,
         };
-        backends::put_json_overwrite(storage.catalog(), &key, &serde_json::to_vec(&live).unwrap())
+        backends::put_json_overwrite(&*lock_store, &key, &serde_json::to_vec(&live).unwrap())
             .await
             .unwrap();
         let report = gather(&storage_cfg(dir.path())).await.unwrap();
-        assert!(matches!(report.lock.state, LockState::Held));
-        let d = report.lock.daemon.as_ref().unwrap();
+        let row = report.locks.iter().find(|r| r.bucket == "docs").unwrap();
+        assert!(matches!(row.probe.state, LockState::Held));
+        let d = row.probe.daemon.as_ref().unwrap();
         assert_eq!(d.pid, 4242);
         assert_eq!(d.host, "probe-host");
         assert!(d.started_rfc3339.starts_with("20"), "{}", d.started_rfc3339);
         let text = render_human(&report);
         assert!(text.contains("held by pid 4242"), "{text}");
-        assert!(text.contains("--endpoint"), "{text}");
 
         // same LOCK ten TTLs later -> Stale
         let mut stale = live.clone();
         stale.heartbeat_at = now_epoch() - 600.0;
-        backends::put_json_overwrite(
-            storage.catalog(),
-            &key,
-            &serde_json::to_vec(&stale).unwrap(),
-        )
-        .await
-        .unwrap();
+        backends::put_json_overwrite(&*lock_store, &key, &serde_json::to_vec(&stale).unwrap())
+            .await
+            .unwrap();
         let report = gather(&storage_cfg(dir.path())).await.unwrap();
-        assert!(matches!(report.lock.state, LockState::Stale));
+        let row = report.locks.iter().find(|r| r.bucket == "docs").unwrap();
+        assert!(matches!(row.probe.state, LockState::Stale));
         assert!(render_human(&report).contains("STALE"));
     }
 
@@ -837,7 +880,7 @@ mod tests {
                 "[extractor.plain]\nkind = \"txt\"\n\n\
                  [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {fixture_dir:?}\n\
                  offline = true\n\n\
-                 [ingest.docs]\nscope = \"docs/**\"\nextract = {{ txt = \"plain\" }}\n\
+                 [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ txt = \"plain\" }}\n\
                  chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
                  embedders = [\"tiny\"]\n"
             ),
@@ -896,6 +939,7 @@ mod tests {
                     status_reason: None,
                     retries: 0,
                     retries_exhausted: false,
+                    misses: 0,
                     updated_at: "t".into(),
                     chunks: None,
                     engines: None,

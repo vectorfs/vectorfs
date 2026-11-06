@@ -3,10 +3,13 @@
 # scalar overrides ride VF_* env (endpoint/credentials/preset/backend —
 # complex structure belongs in the volume's vectorfs.toml, §5.10.7 boundary).
 #
-# ONE INSTANCE ROOT PER CONTAINER: the daemon is a single writer (LOCK
-# object, §5.1) — do NOT scale this service (`--scale vectorfs=2` will have
-# the second container refuse to start). Point multiple deployments at
-# distinct data volumes or an S3-backed instance root per container instead.
+# ONE DAEMON PER BUCKET SET (v3: lock granularity = BUCKET, design.md §5.1 /
+# design-v3.md §5.1 — every system bucket X-vf carries its own LOCK object).
+# A single daemon managing every bucket remains the DEFAULT deployment form —
+# do NOT scale this service over the same bucket set (`--scale vectorfs=2`
+# fights the per-bucket LOCKs). Multiple daemons may share one S3 endpoint
+# only over DISJOINT bucket sets; a pure protocol-face fan-out in front of
+# the same buckets needs external bucket-aware routing.
 #
 # K8s: run the image with the same volumes/env; no chart by design.
 #
@@ -33,7 +36,10 @@ services:
       # - VF_PRESET=air-gapped   # no download; mount the model under models/
       # --- scalar overrides (flag > VF_* env > vectorfs.toml > default) -----
       # - VF_PORT=8787
-      # - VF_BACKEND=s3+http://minio:9000/my-bucket   # per-invocation backend
+      # - VF_BACKEND=s3+http://minio:9000   # s3 backend, ENDPOINT form (no bucket
+      #                                      # path — v3 fail-fasts on one): each vector
+      #                                      # bucket X is the pair X (source) + X-vf
+      #                                      # (system), created on the endpoint
       # - VF_ACCESS_KEY=…        # client-facing SigV4 creds override
       # - VF_SECRET_KEY=…
       # - VF_S3_ACCESS_KEY=…     # backend S3 connection creds

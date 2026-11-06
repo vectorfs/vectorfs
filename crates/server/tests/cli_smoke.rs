@@ -81,7 +81,12 @@ fn config_toml_unscoped(data_dir: &Path) -> String {
 }
 
 fn config_toml_scoped(data_dir: &Path, scoped: bool) -> String {
-    let scope = if scoped { "scope = \"docs/**\"\n" } else { "" };
+    // v3 (R5): the claim filter replaces scope — keys under docs/ only
+    let scope = if scoped {
+        "include = [\"docs/**\"]\n"
+    } else {
+        ""
+    };
     format!(
         r#"version = 1
 region = "us-east-1"
@@ -748,7 +753,8 @@ fn cli_s3_style_forms_smoke() {
 /// The reindex flow restarts daemons on ONE data root, so it applies that
 /// remedy between kills instead of waiting out the 60s TTL.
 fn remove_stale_lock(data_dir: &Path) {
-    let lock = data_dir.join(".vectorfs/LOCK");
+    // v3: the per-bucket LOCK of the reindex flow's bucket
+    let lock = data_dir.join("docs-vf/LOCK");
     if lock.exists() {
         std::fs::remove_file(&lock).expect("remove stale LOCK");
     }
