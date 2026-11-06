@@ -46,6 +46,7 @@
 | **M3 图像模态链交付（2026-11-06，T1-T5 五连提交，验收门 PASS with notes）** | 图像链按执行序闭环：**T1** 机械地基 d3a90a1（Modality::Image / Part 图像载荷 / Query::Image / chunker 旁路图像原子入索引 / 模态集合路由接线 / image crate 进树+magic 嗅探校验，additive 红线全守）；**T2** siglip2 双塔 7390954（vision 预处理纯 Rust + ort load-dynamic 全复用；text 塔复用 M2 既有 tokenizers **零新依赖**；doc=[Image]、query=[Image,Text]；BUILTIN_MODELS 增 siglip2-base）；**T3** pdf-pages f7180a2（pdfium image_latest 逐页渲染、dpi 旋钮入指纹、512 页护栏、PNG 编码实测胜出、scan-dominant=Preferred）；**T4** 用户面 ecfab9a（image extractor 入 img 族、/x-vf/Search `query.image` additive、`vf search --image`、multimodal+image-search presets+预取接线）；**T5** 验收门（真模型六样本三类路由行如实、同图 top1 1.0000 回源、文字搜图为真、boto3 直查 x-vf-modality=image、dpi 指纹拒启→`--reindex` 恢复、双 SDK 32+32、docker 实机 healthy、CLI 全形态、门禁全家绿；显示面 chunks 计数三处全模态求和修复 4425e1b）。**默认档位 siglip2-base-patch16-224 为主会话暂定**（M2 gte 先例同构——轻量优先；so400m 一行换，preset 注释有指引），待用户确认或推翻 | 量级记录：put→INDEXED 0.5s/样本；以图搜图 91-114ms；文本查询 51-122ms；server 167.2MiB（无硬顶）、vf 8.5MiB（双线内）、镜像 489MB；观察项：base 档文字搜图排序质量一般（so400m 属后续质量线）、MCP search 图像查询待一行接入、engines.rs dead_code 警告在基线内 |
 | **M3-T6 text 面交付（2026-11-06，18d0c1a，验收过）** | `docx`（leaf kind：word/document.xml 是内部序列化非可路由文档 ⇒ 格式智力归 kind，quick-xml 严格 XML + zip 256 条目/256MiB 边读边查炸弹门）、`html`（leaf kind）、`markdown` chunker（chunker 轴第二 kind，注册机制补齐四视图+奇偶锚；窗口递提为轴共享模块，两 kind 一次实现）。**html 解析器裁决：html5ever**——quick-xml 宽容模式在 14 形状对抗基准两例取消资格（script 体内 `<` 静默吞余页、裸 `&` 硬错——embeddings 索引幻觉半页的最恶劣形态），html5ever 14/14（WHATWG 合规）；代价 9 个纯 Rust crate + 手写最小 Rc-DOM TreeSink（不取 markup5ever_rcdom——unofficial 且钉旧版）。CJK 规则：两侧皆 CJK 的空白串整体丢弃。markdown chunker 启用 text-splitter 既有 markdown feature **零新 crate**。新依赖 zip 9.4（T7 地基）+quick-xml（object_store 已锁同版本）+html5ever；auto 不认领 docx/html 族（豁免先例延续） | 实证：443/0 全量；tag_soup 基准测试钉住；docx/html e2e CJK 全链存活、title/script/style 零泄漏；markdown 标题切分过真 worker；体积 +0.98MiB |
 | **M3-T7 容器与 normalize 增补（2026-11-06，2505c56，验收过；本行回填其 §0 指纹语义裁决）** | 三容器 kind + charset normalizer 落地：**epub**（格式智力 = OPF spine 定序；unpack 出 spine 序 XHTML 子文档走用户 html 链——§0「配置贯通」闭环；非 spine 资源零产出；10 损坏形状响亮）、**zip**（条目 mime 经唯一表按名推断，未知扩展 octet-stream 透传不预截断——机制 skip 策略住在 worker，kind 复制它即越层）、**eml**（mailparse 拆 multipart，alternative 双 body 都产出，part charset 解码属 kind 非 normalizer——格式元数据）。**charset→UTF-8 normalizer**：BOM+严格 UTF-8 校验机械判定 + 配置 fallback 转码（chardetng 式猜测明确不采），仅 text/* 生效，表序 gz 后（x.txt.gz 装 GBK 组合证明）。**§0「指纹零变化」语义修正（本行即裁决）**：normalize 裁决原文的「不可配/指纹零变化」指**表成员与顺序**（编译期固定，轴禁令完整）；内建变换可携标量参数（dpi 先例移植到 stage）——charset_fallback 落 ingest section，**入指纹**（改 chunk 字节），默认值省略 ⇒ pre-T7 部署指纹逐字节不变。**默认 fallback = gbk**（中文部署主导遗留编码；纯 ASCII 是 GBK/1252 唯一交集且永不触达旋钮；西文一行 windows-1252）；cp936 是 Windows 名非 WHATWG 标签，诚实拒绝 | 实证：479/0 全量；epub e2e 断言 chunk 序=spine 序（fixture 刻意乱序）且非 spine 资源零泄漏；混合 zip（txt+md+docx）各走各链；eml plain/html 双链；GBK fixture 真字节转码 INDEXED 零替换符；指纹三态测试；zip-in-zip 一层过三层拒；体积 server 168MiB；盲区记录：无 BOM UTF-16 机械不可判定 |
+| **词法内核改判：Lance 原生 FTS，tantivy 侧车退役（2026-11-06，用户裁决；全文见 [ADR 0002](docs/adr/0002-lexical-kernel-lance-native-fts.md)）** | M3 词法检索（$textMatch）的 BM25 内核**直用 Lance 原生 FTS**——锁定版本线 lancedb 0.41/lance 14.0.2 已含（依赖树无 tantivy，registry 源码核验），`Index::FTS` + `full_text_search` + BM25 分数物化；tantivy 侧车方案（X-vf/indexes/ 持久放置、代际元数据、重建自愈）**整套退役**——索引挂派生表，双索引一致性问题按构造不存在，未索引行 flat 兜底 + optimize_index 增量并段。**原「CJK 零词典 bigram 自研 ≤150 行」裁决前提消失**：分词在 lance 菜单内选（默认 icu，选项 ngram 2,2；tokenizer 进指纹；jieba/lindera 维持禁引）。前置：chunk 文本升派生表顶层 string 列；`/x-vf/Search` 增 searchMode 超集参数；内核薄 trait 隔离保留换核退路；协议面 QueryVectors 保持纯语义。block_size 守默认 128；lance#8812 JSON tokenizer panic 不触 | 源于用户质询「直接使用 Lance 原生 FTS？」；机制研究 research/2026-11-retrieval-friction-mechanisms.md §1 核验背书；真实语料 F1 摩擦证据（friction-backlog：专有名词检索 top-20 零命中被迫 18MB×5 手工 grep）。本表 2026-11-05 行及 §5.7/§5.10.2/§7 的 tantivy 字样已按本行改写 |
 
 ## 1. 定位
 
@@ -260,7 +261,7 @@ S3 endpoint（或 <data-dir>/ 作桶根，或 memory）      <data-dir>/.vectorf
 | 引擎 | lancedb 0.41（锁 minor，API 只经一个内部 crate 出现） | 双 arrow 版本风险 M0 第一周 `cargo tree -d` 验证 |
 | object_store | 随 lancedb | s3 特性按需开 |
 | ~~rusqlite~~ | **移出 v1** | catalog 即对象存储里的 JSON；无本地持久状态（G4 赢） |
-| ~~tantivy~~ | **推迟到 M3** | v1 过滤由 Lance 标量谓词承担；全文只在超集需要；顺带推迟 arrow 去重风险 |
+| ~~tantivy~~ | **永不引入**（2026-11-06 改判，ADR 0002）：词法内核直用 Lance 原生 FTS（锁定版本线 lancedb 0.41/lance 14.0.2 已含） | v1 过滤由 Lance 标量谓词承担；M3 词法检索复用树内 Lance，零新依赖；arrow 去重风险彻底不引入 |
 | CLI/MCP | clap + rmcp(3.x stable)；**双薄 bin**：`vectorfs`（服务端）/`vf`（客户端） | 同 crate 共享 lib，单发布物 |
 | 配置 | toml + serde（`vectorfs.toml`，deny_unknown_fields；不做 vf.json 兼容） | 解析链 flag > `VF_*` env > 文件 > 默认 |
 | 文件层 | pdfium-render（.so load-dynamic）、image（default-features=false：png/jpeg/webp）、text-splitter（char/tokenizers 计数，禁 tiktoken 联网特性）、ort（.so load-dynamic，**不引 fastembed**——自管模型清单与 load-dynamic 冲突）；openai provider 走**自研 HTTP**（复用 hyper 树 ~150 行，与自研 SigV4 同先例，零 reqwest）；音视频（M4）：symphonia（纯 Rust 音频解码）、ffmpeg（.so load-dynamic，解复用） | v2.1：deny.toml ban openssl-sys；.so pin 版本+SHA；CI 加 ldd + 小模型真实 embed 冒烟 |
@@ -282,7 +283,7 @@ S3 endpoint（或 <data-dir>/ 作桶根，或 memory）      <data-dir>/.vectorf
 | flock 拉起协议 | 保留（本地层）+ LOCK 对象（跨机层） | |
 | 四步写序 + SQLite intent journal | **废弃** | §5.1：Lance 原子提交即事务边界 |
 | rusqlite | **移出 v1** | catalog 即对象 |
-| tantivy + CJK bigram tokenizer | **推迟 M3** | 仅超集 $textMatch 需要 |
+| ~~tantivy + CJK bigram tokenizer~~ | **作废**（ADR 0002）：lance 无自定义 tokenizer 钩子，分词在 lance 菜单内选——默认 `icu`（内置词典、中英混排稳），选项 `ngram 2,2`（真 bigram、中文最优但 Latin 同被 bigram 化）；tokenizer 进管线指纹；jieba/lindera 外部模型目录**维持禁引** | 「CJK 零词典 bigram 自研 ≤150 行」原裁决前提消失，随侧车方案一并退役 |
 | ort load-dynamic / models.toml / .so 内嵌释放管线 | **解冻进 M2 文件层**（2026-11-04 裁决）：ort/pdfium 走 load-dynamic .so；模型清单并入 `vectorfs.toml` 的 `[embedder.*]` | §5.10 |
 | agent 接口契约 / `vf` 短名 / 结构化错误 | 保留 | `vf` 在 cargo/brew/apt 可用（fish 用户的 VirtualFish 冲突已知，文档注明）；命令角色改为客户端 CLI（服务端命令为 `vectorfs`） |
 
@@ -303,7 +304,7 @@ S3 endpoint（或 <data-dir>/ 作桶根，或 memory）      <data-dir>/.vectorf
 | Chunk | **vector 的文件层视图**（非新实体）：key = f(**对象键**, 模态, 序号)（保持短）——**含对象键防同内容文件互踩**（两个相同内容的文件是两个 Source 各自成 chunk；内容哈希用于 etag 变更后"内容未变跳过重嵌"）。metadata 带 `x-vf-src-*` 回源键——**完整键集**：`x-vf-src-uri`（对象键短哈希 ≤100B，filterable，**GC join 键**）/ `x-vf-src-name`（对象键全文，non-filterable）/ `x-vf-src-page`（页/帧/段号，M3）/ `x-vf-modality` / `x-vf-model` / `x-vf-chunk-text`（non-filterable，**默认存、可关**——Search 直接返回文本，对齐官方 embed-cli 的 SRC-CONTENT 先例） | Lance index 行 |
 | `[ingest.<bucket>]` | 每 bucket 的摄取配置节（缺省 ⇒ 纯协议面，文件层不介入） | vectorfs.toml |
 
-路由规则（机制，非配置）：Part 模态 → **所有** doc-模态匹配的 embedder 实例（同模态多实例 = fan-out 全写；查询侧对称 fan-out 后合并）——不需要"模态槽位"配置项。模态为封闭枚举（`text` / `page-image` / `image` / `audio` / …，增量加值）；**视频不设独立模态**——video extractor 解复用为帧（image）+ 音轨（audio）+ 可选 ASR 转写（text），三种既有模态全复用，路由机制零改动。稀疏检索不走向量列：由 M3 `$textMatch`（tantivy）承担，规避 sparse 向量在 float32 定长协议下的表达问题。
+路由规则（机制，非配置）：Part 模态 → **所有** doc-模态匹配的 embedder 实例（同模态多实例 = fan-out 全写；查询侧对称 fan-out 后合并）——不需要"模态槽位"配置项。模态为封闭枚举（`text` / `page-image` / `image` / `audio` / …，增量加值）；**视频不设独立模态**——video extractor 解复用为帧（image）+ 音轨（audio）+ 可选 ASR 转写（text），三种既有模态全复用，路由机制零改动。稀疏检索不走向量列：由 M3 `$textMatch`（**Lance 原生 FTS，ADR 0002——tantivy 侧车 2026-11-06 退役**）承担，规避 sparse 向量在 float32 定长协议下的表达问题。
 
 #### 5.10.2 插件系统：一个模式，四个策略轴 + 查询选项
 
@@ -447,7 +448,7 @@ ghcr multi-arch（amd64/arm64 对齐发布矩阵）debian-slim non-root，内含
 
 ### M3 — v0.3 图像模态 / 质量 / 规模 / 超集（图像模态链已闭环：T1-T5 于 2026-11-06 过验收门，证据见 §0「M3 图像模态链交付」行）
 
-范围：image 模态（pdf-pages + siglip2 + multimodal/image-search preset，以图搜图查询输入）；S3 事件通知加速（可选，扫描模型之上的低延迟增强）；pdf-ocr + scanned-docs preset（OCR 引擎选型补 §5.10.2）；docx/html extractor + markdown chunker；**epub 容器 kind**（unpack OPF spine 定序→XHTML 子文档走 html 链——机制已就绪，2026-11-05 裁决）**+ normalize 表增补**（charset→UTF-8、eml/mime-multipart 拆分、通用 zip 展开）；Reranker；$textMatch + tantivy（稀疏检索由此承担）；merge weighted；IVF_PQ；统一多模态 embedder 评估（Qwen3-VL 作 GPU/远端 provider）；后端矩阵扩展（Ceph/Garage）；bench 报告；策略最小实施（可选）。
+范围：image 模态（pdf-pages + siglip2 + multimodal/image-search preset，以图搜图查询输入）；S3 事件通知加速（可选，扫描模型之上的低延迟增强）；pdf-ocr + scanned-docs preset（OCR 引擎选型补 §5.10.2）；docx/html extractor + markdown chunker；**epub 容器 kind**（unpack OPF spine 定序→XHTML 子文档走 html 链——机制已就绪，2026-11-05 裁决）**+ normalize 表增补**（charset→UTF-8、eml/mime-multipart 拆分、通用 zip 展开）；Reranker；$textMatch 走 **Lance 原生 FTS**（tantivy 侧车退役，ADR 0002——前置：chunk 文本升派生表顶层 string 列、`/x-vf/Search` 增 `searchMode: semantic|keyword|hybrid` 超集参数、内核薄 trait 隔离保留换核退路；协议面 QueryVectors 保持纯语义）；merge weighted；IVF_PQ；统一多模态 embedder 评估（Qwen3-VL 作 GPU/远端 provider）；后端矩阵扩展（Ceph/Garage）；bench 报告；策略最小实施（可选）。
 
 ### M4 — v0.4 音视频模态（门槛：M3 过门）
 
