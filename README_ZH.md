@@ -284,6 +284,18 @@ CI/testcontainers 用。加锁**按桶**（每个 `X-vf` 里一个 TTL 心跳 LO
 `vectorfs mcp` 是本地存储上的写者本体；`vf mcp` 驱动远端 daemon——s3vectors
 数据面工具留在服务端。
 
+### Agent Skill
+
+[skills/vectorfs/](skills/vectorfs/) 是面向 coding agent（Claude Code、
+Codex、ZCode……）的官方 Agent Skill：`SKILL.md` 决策树 + 参考文件（vf CLI、
+两个 MCP 入口、daemon 运维、两张 wire 面）。一行装进任一 agent 的 skills
+目录：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vectorfs/vectorfs/main/skills/vectorfs/install.sh | bash
+# 或: … | bash -s -- --to ~/.zcode/skills    （任一 agent 的 skills 根目录）
+```
+
 ## 非目标
 
 - 不自研对象存储后端或存储引擎——持久化永远是既有对象存储或本地目录。文件以
@@ -313,6 +325,8 @@ CI/testcontainers 用。加锁**按桶**（每个 `X-vf` 里一个 TTL 心跳 LO
   按桶锁、不变量、实现日志。
 - [CONTEXT.md](CONTEXT.md)——领域术语表：两张 API 面、桶模型、文件层、后端
   （命名裁决见 [ADR 0001](docs/adr/0001-two-layer-api-naming.md)）。
+- [skills/vectorfs/](skills/vectorfs/)——官方 Agent Skill（SKILL.md +
+  references）：装进 Claude Code / Codex / 任何支持 skills 的 agent。
 - [spike/REPORT.md](spike/REPORT.md)——M0 实测（延迟、二进制体积）；
   [conformance/](conformance/)——双 SDK 32 步 conformance 套件。
 

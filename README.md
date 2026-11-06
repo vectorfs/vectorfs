@@ -314,6 +314,18 @@ for a foreground wait), `delete_source`, `reindex`. Division of labor:
 `vectorfs mcp` IS the writer on local storage; `vf mcp` drives a remote
 daemon — the s3vectors data-plane tools stay server-side.
 
+### Agent Skill
+
+[skills/vectorfs/](skills/vectorfs/) is the official Agent Skill for coding
+agents (Claude Code, Codex, ZCode, …): a `SKILL.md` decision tree plus
+reference files for the `vf` CLI, both MCP entries, daemon ops, and the wire
+faces. One-line install into any agent's skills directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vectorfs/vectorfs/main/skills/vectorfs/install.sh | bash
+# or: … | bash -s -- --to ~/.zcode/skills    (any agent's skills root)
+```
+
 ## Non-goals
 
 - No own object-storage backend or storage engine — persistence is always an
@@ -349,6 +361,8 @@ daemon — the s3vectors data-plane tools stay server-side.
 - [CONTEXT.md](CONTEXT.md) — the ubiquitous language: two API faces, bucket
   model, file layer, backends ([ADR 0001](docs/adr/0001-two-layer-api-naming.md)
   records the naming decision).
+- [skills/vectorfs/](skills/vectorfs/) — the official Agent Skill (SKILL.md +
+  references): install into Claude Code / Codex / any agent that loads skills.
 - [spike/REPORT.md](spike/REPORT.md) — M0 measurements (latency, binary size);
   [conformance/](conformance/) — the 32-step dual-SDK conformance suite.
 
