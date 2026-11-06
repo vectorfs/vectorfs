@@ -14,6 +14,10 @@
 #   s3-conformance — the v3 s3 backend against a dockerized SeaweedFS with
 #                 IAM enforced: raw bucket-admin verbs + the full dual-bucket
 #                 lifecycle (design-v3.md §10-G2; PR2 suite, PR3 job)
+#   s3-conformance-garage / s3-conformance-ceph — the SAME suite against two
+#                 more self-hostable backends (M3 backend-matrix expansion,
+#                 design-v3.md §9 M3-backfilled rows / §14 items 11-14;
+#                 both verified locally first, 2026-11-07, 2/2 green each)
 #
 # NOTE: aws-lc-sys (via object_store "aws") needs cmake + a C toolchain — both
 # preinstalled on ubuntu-latest runners (design.md §8 risk #11).
@@ -291,6 +295,196 @@ jobs:
       - name: dump seaweed logs (on failure)
         if: failure()
         run: docker logs vf-seaweed 2>&1 | tail -50
+
+  # M3 backend-matrix expansion, backend 2: Garage (dxflrs/garage:v2.0.0,
+  # 25.8MB). The exact container form + IAM steps verified locally first
+  # (2026-11-07, layer1+layer2 2/2 green). Garage deployment preconditions
+  # pinned by the design-v3.md §9 M3 backfill: (a) s3_region in garage.toml
+  # MUST equal the daemon's SigV4 region (S3BackendConfig hard-defaults
+  # us-east-1 — Garage enforces it, 400 AuthorizationHeaderMalformed
+  # otherwise); (b) the key needs `garage key allow --create-bucket` (v2.0.0
+  # keys cannot CreateBucket by default); (c) ListBuckets is key-scoped
+  # (owner-only), so the fresh-key enumeration starts empty — R9 relies on
+  # vf-created buckets making the key owner, which S3 CreateBucket grants.
+  # Layer-1 knobs beyond SeaweedFS's: VF_S3CP_INVALID_NAME_403=1 (special
+  # chars like `!` die at Garage's signature re-canonicalization — 403
+  # AccessDenied — before name validation; our signer is spec-general).
+  # KNOWN capability gap, documented not worked around (§9 new row): Garage
+  # does not enforce If-None-Match/If-Match conditional PUTs (structurally
+  # impossible without consensus, per their known-issues) — LOCK CAS degrades
+  # to plain writes; the single-daemon dual-bucket lifecycle is unaffected
+  # (that is exactly what layer 2 proves green here).
+  s3-conformance-garage:
+    name: s3 conformance (dockerized Garage, IAM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: install protoc (lance-encoding build dep)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # same key as build-test — share the compiled dependency tree
+          shared-key: debug-workspace
+
+      - name: fetch pinned runtime libs (onnxruntime)
+        run: ./scripts/fetch_runtime_libs.sh onnxruntime
+      - uses: actions/cache@v4
+        with:
+          path: runtime-libs
+          key: runtime-libs-${{ runner.os }}-${{ runner.arch }}-pdfium-8066-ort-1.31.0
+
+      - name: start Garage + layout + key (vfconf, create-bucket granted)
+        run: |
+          set -euo pipefail
+          rpc=$(openssl rand -hex 32)
+          cat > garage.toml <<EOF
+          metadata_dir = "/var/lib/garage/meta"
+          data_dir = "/var/lib/garage/data"
+          db_engine = "sqlite"
+          replication_factor = 1
+          rpc_bind_addr = "[::]:3901"
+          rpc_secret = "$rpc"
+
+          [s3_api]
+          s3_region = "us-east-1"
+          api_bind_addr = "[::]:3900"
+          root_domain = ".s3.garage.localhost"
+
+          [admin]
+          api_bind_addr = "[::]:3903"
+          EOF
+          docker volume create vf-garage-data >/dev/null
+          docker run -d --name vf-garage -p 127.0.0.1:39000:3900 \
+            -v "$PWD/garage.toml":/etc/garage.toml:ro \
+            -v vf-garage-data:/var/lib/garage \
+            dxflrs/garage:v2.0.0
+          # readiness = ANY http answer from the S3 gate (unsigned probes
+          # answer 403 — curl -sf would loop; same trap as the SeaweedFS job)
+          code=000
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:39000/ || true)
+            [[ -n "$code" && "$code" != "000" ]] && break
+            sleep 1
+          done
+          if [[ -z "$code" || "$code" == "000" ]]; then
+            echo "## Garage S3 gate never answered (last code: $code); logs:"
+            docker logs vf-garage 2>&1 | tail -30
+            exit 1
+          fi
+          # single-node layout (the node id is the 16-hex prefix in status)
+          node=$(docker exec vf-garage /garage status 2>/dev/null | grep -oE '^[0-9a-f]{16}' | head -1)
+          test -n "$node" || { docker logs vf-garage 2>&1 | tail -30; exit 1; }
+          docker exec vf-garage /garage layout assign -z dc1 -c 1G "$node" >/dev/null
+          docker exec vf-garage /garage layout apply --version 1 >/dev/null
+          # IAM: the key + the create-bucket flag (v2.0.0 default denies)
+          out=$(docker exec vf-garage /garage key create vfconf 2>/dev/null)
+          ak=$(printf '%s\n' "$out" | grep 'Key ID:' | awk '{print $3}')
+          sk=$(printf '%s\n' "$out" | grep 'Secret key:' | awk '{print $3}')
+          test -n "$ak" && test -n "$sk" || { echo "key create parse failed: $out"; exit 1; }
+          docker exec vf-garage /garage key allow --create-bucket vfconf >/dev/null
+          echo "VF_AK=$ak" >> "$GITHUB_ENV"
+          echo "VF_SK=$sk" >> "$GITHUB_ENV"
+
+      - name: cargo test s3_conformance (live Garage endpoint)
+        env:
+          VF_S3CP_URI: s3+http://127.0.0.1:39000
+          VF_S3_ACCESS_KEY: ${{ env.VF_AK }}
+          VF_S3_SECRET_KEY: ${{ env.VF_SK }}
+          VF_S3CP_LIST_403: "1"
+          VF_S3CP_INVALID_NAME_403: "1"
+        run: cargo test -p vectorfs-server --test s3_conformance -- --ignored
+
+      - name: dump garage logs (on failure)
+        if: failure()
+        run: docker logs vf-garage 2>&1 | tail -50
+
+  # M3 backend-matrix expansion, backend 3: Ceph RGW in the sqlite dbstore
+  # STANDALONE form (design-v3.md §14 item 11) — quay.io/ceph/ceph:v19 with
+  # rgw_backend_store/rgw_config_store = dbstore, beast frontend, NO mon/osd
+  # (image is 1.34GB but the runtime is a single light process; verified
+  # locally 2026-11-07, layer1+layer2 2/2 green on 19.2.7, admin-verb shapes
+  # identical on 20.2.5 Tentacle). IAM = radosgw-admin user create against
+  # the same conf (fixed creds, mirroring the SeaweedFS job). KNOWN gap,
+  # documented not worked around (design-v3.md §9 new row): the dbstore
+  # backend ignores If-None-Match/If-Match conditional PUTs (19.2.7 AND
+  # 20.2.5 both probed) — LOCK CAS degrades to plain writes; the
+  # single-daemon dual-bucket lifecycle is what layer 2 proves green here.
+  s3-conformance-ceph:
+    name: s3 conformance (dockerized Ceph RGW sqlite-standalone, IAM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: install protoc (lance-encoding build dep)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # same key as build-test — share the compiled dependency tree
+          shared-key: debug-workspace
+
+      - name: fetch pinned runtime libs (onnxruntime)
+        run: ./scripts/fetch_runtime_libs.sh onnxruntime
+      - uses: actions/cache@v4
+        with:
+          path: runtime-libs
+          key: runtime-libs-${{ runner.os }}-${{ runner.arch }}-pdfium-8066-ort-1.31.0
+
+      - name: start standalone RGW (dbstore) + create user vfconf
+        run: |
+          set -euo pipefail
+          cat > ceph.conf <<EOF
+          [global]
+          log to file = false
+
+          [client.rgw.vf]
+          rgw_backend_store = dbstore
+          rgw_config_store = dbstore
+          dbstore_db_dir = /var/lib/rgw/db
+          rgw_frontends = beast port=7333
+          EOF
+          docker volume create vf-ceph-db >/dev/null
+          docker run -d --name vf-ceph -p 127.0.0.1:39001:7333 \
+            -v "$PWD/ceph.conf":/etc/ceph/ceph.conf:ro \
+            -v vf-ceph-db:/var/lib/rgw/db \
+            --entrypoint bash \
+            quay.io/ceph/ceph:v19 \
+            -c 'exec radosgw --cluster ceph -c /etc/ceph/ceph.conf -n client.rgw.vf --foreground'
+          # readiness = ANY http answer from the RGW gate (unsigned probes
+          # answer 403/200 — curl -sf is the wrong probe, as above)
+          code=000
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:39001/ || true)
+            [[ -n "$code" && "$code" != "000" ]] && break
+            sleep 1
+          done
+          if [[ -z "$code" || "$code" == "000" ]]; then
+            echo "## RGW gate never answered (last code: $code); logs:"
+            docker logs vf-ceph 2>&1 | tail -30
+            exit 1
+          fi
+          docker exec vf-ceph radosgw-admin --cluster ceph \
+            -c /etc/ceph/ceph.conf -n client.rgw.vf \
+            user create --uid vfconf --display-name "vf conf" \
+            --access-key vfconf --secret-key vfconf-secret >/dev/null
+
+      - name: cargo test s3_conformance (live Ceph RGW endpoint)
+        env:
+          VF_S3CP_URI: s3+http://127.0.0.1:39001
+          VF_S3_ACCESS_KEY: vfconf
+          VF_S3_SECRET_KEY: vfconf-secret
+          VF_S3CP_LIST_403: "1"
+        run: cargo test -p vectorfs-server --test s3_conformance -- --ignored
+
+      - name: dump ceph rgw logs (on failure)
+        if: failure()
+        run: docker logs vf-ceph 2>&1 | tail -50
 
   # Enabled 2026-11-04: repository turned public — arm64 and macOS hosted
   # runners are free for public repos (design.md §5.7 "Linux x64+arm64 首发,
