@@ -115,7 +115,9 @@
 //!
 //! One SCHEDULER task per instance root: periodic scan (`scan_interval_secs`,
 //! default 30) + external wake ([`IngestHandle::wake`] — T6's `vf put` /
-//! PutSource immediate trigger) + shutdown, `select`ed together. It holds a
+//! PutSource immediate trigger; LOSSLESS: a wake landing mid-scan leaves a
+//! permit that drives one follow-up scan, so a burst upload's trailing
+//! files never wait a whole tick) + shutdown, `select`ed together. It holds a
 //! bounded mpsc (capacity 64) — scan-and-diff pushes jobs, a small set of
 //! WORKER tasks (one per CPU) consumes them. CPU segments (extract / chunk /
 //! ort embed) run through `spawn_blocking` behind a semaphore sized to the
@@ -1559,11 +1561,34 @@ impl IngestRuntime {
                 }
                 marker::ScanPlan::Refresh(m) => {
                     // object back after a strike: persist the counter reset
+                    let back_pending = !marker::is_terminal(&m);
                     storage
                         .save_source(vb, &key_hash, &m)
                         .await
                         .map_err(|e| e.to_string())?;
                     n_refresh += 1;
+                    // P1 2026-11-07 (bench §6.1's "negative scaling", via the
+                    // §6.2 listing-race): a NON-TERMINAL marker coming back
+                    // from a strike is a source whose queue slot was never
+                    // taken — a PENDING marker struck by a batch upload
+                    // racing the scan's listing snapshot, or IN_PROGRESS
+                    // crash residue. Enqueue it in the SAME pass; leaving
+                    // the enqueue to the NEXT scan costs a whole
+                    // `scan_interval` (30s default) per struck rump file,
+                    // which dominated the batch windows. Safe for exactly
+                    // the reason the Enqueue arm documents: in-flight dedup
+                    // + put_vectors upsert make re-enqueueing a non-terminal
+                    // source convergent. TERMINAL markers stay no-enqueue
+                    // (Settled would not enqueue them either).
+                    if back_pending {
+                        n_requeue += 1;
+                        self.enqueue(Job {
+                            vb: vb.to_string(),
+                            object_key: key.clone(),
+                            key_hash,
+                        })
+                        .await;
+                    }
                 }
                 marker::ScanPlan::Settled | marker::ScanPlan::Parked => {}
             }
@@ -3068,8 +3093,20 @@ impl IngestHandle {
 
     /// Immediate scan trigger: the scheduler wakes and runs one
     /// scan-and-diff pass right away (coalesced if already scanning).
+    ///
+    /// `notify_one`, not `notify_waiters`: a wake that fires while the
+    /// scheduler is mid-scan (no task awaiting `notified()`) must not be
+    /// LOST — `notify_one` leaves a stored permit, so the scheduler's next
+    /// loop iteration consumes it and runs one follow-up scan.
+    /// `notify_waiters` dropped such wakes on the floor (P1 2026-11-07,
+    /// bench §6.1's root cause): the trailing uploads of a
+    /// `vf put <batch> --async` woke a scanning scheduler, their fresh
+    /// markers then met that scan's STALE listing snapshot, took a vanish
+    /// strike, and waited whole `scan_interval` ticks to re-enter the
+    /// queue. One permit keeps the same coalescing (a wake burst during
+    /// one scan ⇒ one follow-up scan) minus the loss.
     pub fn wake(&self) {
-        self.notify.notify_waiters();
+        self.notify.notify_one();
     }
 
     pub(crate) fn register(&self, task: tokio::task::JoinHandle<()>) {
@@ -3610,6 +3647,126 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0, "every chunk of the gone source deleted");
+    }
+
+    /// P1 2026-11-07 (bench §6.1's root cause, the wake half): a wake that
+    /// fires while the scheduler is mid-scan (no task awaiting `notified()`)
+    /// must not evaporate — the PERMIT `notify_one` stores is what carries it
+    /// to the scheduler's next loop iteration. Pinned at the primitive
+    /// because the daemon race (trailing batch uploads waking a scanning
+    /// scheduler) is exactly "wake with no waiter": with `notify_waiters`
+    /// this assert FAILS (the wake is silently lost and the struck rump
+    /// files idle to the next `scan_interval` tick).
+    #[tokio::test]
+    async fn wake_permit_survives_no_waiter() {
+        let handle = IngestHandle::new(IngestShared::new(
+            IngestCore::load(&tiny_config("").1, Path::new("/nonexistent-models"))
+                .await
+                .unwrap(),
+        ));
+        handle.wake(); // NO one is awaiting notified() right now
+        let notified = tokio::time::timeout(Duration::from_millis(100), async {
+            handle.notify().notified().await;
+        })
+        .await;
+        assert!(
+            notified.is_ok(),
+            "a wake fired with no waiter must leave a permit: the trailing \
+             uploads of a `vf put --async` batch wake the scheduler exactly \
+             when it is mid-scan and not awaiting"
+        );
+    }
+
+    /// P1 2026-11-07 (bench §6.1's root cause, the Refresh half): a
+    /// NON-TERMINAL marker coming back from a listing-race strike re-enters
+    /// the queue IN THE SAME scan (the pre-fix behavior cost a whole
+    /// `scan_interval` — the struck rump of a batch waited one scan for the
+    /// Refresh, another for the Enqueue).
+    #[tokio::test]
+    async fn struck_pending_source_reenters_queue_on_return_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _h, state) = test_runtime(dir.path(), "").await;
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            docs.join("r.txt"),
+            "struck by the listing race, back one scan later",
+        )
+        .unwrap();
+
+        // index once for real, then hand-stamp the exact post-race state:
+        // PutSource seeded the marker PENDING; the in-flight scan's STALE
+        // listing snapshot missed the object, so the strike arm counted
+        // misses = 1 (same sig, evidence not yet earned).
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let done = status_of(&state, "docs", "docs/r.txt").await;
+        assert_eq!(done.status, SourceStatus::Indexed);
+        let struck = SourceMarker {
+            status: SourceStatus::Pending,
+            content_hash: String::new(),
+            chunks: None,
+            engines: None,
+            misses: 1,
+            ..done
+        };
+        state
+            .storage
+            .save_source("docs", &marker::object_key_hash("docs/r.txt"), &struck)
+            .await
+            .unwrap();
+
+        // ONE scan + drain must converge back to INDEXED (pre-fix: the
+        // Refresh arm reset misses but left the enqueue to a second scan,
+        // so the marker stayed PENDING here).
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let m = status_of(&state, "docs", "docs/r.txt").await;
+        assert_eq!(
+            m.status,
+            SourceStatus::Indexed,
+            "the return-from-strike scan must re-enqueue the non-terminal \
+             source in the same pass"
+        );
+        assert_eq!(m.misses, 0, "strike residue reset");
+    }
+
+    /// The terminal twin: a COMPLETED marker with strike residue coming
+    /// back must NOT re-embed — Refresh resets the counter, nothing runs
+    /// (Settled would not enqueue either; re-embedding a done source every
+    /// scan would be a re-embed storm).
+    #[tokio::test]
+    async fn struck_terminal_source_is_not_reenqueued() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _h, state) = test_runtime(dir.path(), "").await;
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("t.txt"), "indexed once, vanished once, back").unwrap();
+
+        // index it for real, then hand-stamp the strike residue
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let done = status_of(&state, "docs", "docs/t.txt").await;
+        assert_eq!(done.status, SourceStatus::Indexed);
+        let struck = SourceMarker {
+            misses: 1,
+            ..done.clone()
+        };
+        state
+            .storage
+            .save_source("docs", &marker::object_key_hash("docs/t.txt"), &struck)
+            .await
+            .unwrap();
+
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        let m = status_of(&state, "docs", "docs/t.txt").await;
+        assert_eq!(m.status, SourceStatus::Indexed);
+        assert_eq!(m.misses, 0, "strike residue reset");
+        // no job ran: the marker byte-for-byte kept the completion evidence
+        // (a rerun would stamp fresh engines + updated_at)
+        assert_eq!(m.updated_at, done.updated_at, "no re-embed happened");
+        assert_eq!(m.content_hash, done.content_hash);
     }
 
     #[tokio::test]
