@@ -326,6 +326,10 @@ curl -fsSL https://raw.githubusercontent.com/vectorfs/vectorfs/main/skills/vecto
 # or: … | bash -s -- --to ~/.zcode/skills    (any agent's skills root)
 ```
 
+A focused companion, [skills/vf-search/](skills/vf-search/), teaches just the
+search flow — query crafting, metadata filters, hit → full document — for
+agents whose users only ever search.
+
 ## Non-goals
 
 - No own object-storage backend or storage engine — persistence is always an
@@ -362,7 +366,8 @@ curl -fsSL https://raw.githubusercontent.com/vectorfs/vectorfs/main/skills/vecto
   model, file layer, backends ([ADR 0001](docs/adr/0001-two-layer-api-naming.md)
   records the naming decision).
 - [skills/vectorfs/](skills/vectorfs/) — the official Agent Skill (SKILL.md +
-  references): install into Claude Code / Codex / any agent that loads skills.
+  references): install into Claude Code / Codex / any agent that loads skills;
+  [skills/vf-search/](skills/vf-search/) is its focused search-only companion.
 - [spike/REPORT.md](spike/REPORT.md) — M0 measurements (latency, binary size);
   [conformance/](conformance/) — the 32-step dual-SDK conformance suite.
 

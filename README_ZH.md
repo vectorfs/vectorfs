@@ -296,6 +296,9 @@ curl -fsSL https://raw.githubusercontent.com/vectorfs/vectorfs/main/skills/vecto
 # 或: … | bash -s -- --to ~/.zcode/skills    （任一 agent 的 skills 根目录）
 ```
 
+聚焦的伴生 skill [skills/vf-search/](skills/vf-search/) 只教检索这一件事
+——查询构造、元数据过滤、命中→回源取全文——面向用户只做搜索的 agent。
+
 ## 非目标
 
 - 不自研对象存储后端或存储引擎——持久化永远是既有对象存储或本地目录。文件以
@@ -326,7 +329,8 @@ curl -fsSL https://raw.githubusercontent.com/vectorfs/vectorfs/main/skills/vecto
 - [CONTEXT.md](CONTEXT.md)——领域术语表：两张 API 面、桶模型、文件层、后端
   （命名裁决见 [ADR 0001](docs/adr/0001-two-layer-api-naming.md)）。
 - [skills/vectorfs/](skills/vectorfs/)——官方 Agent Skill（SKILL.md +
-  references）：装进 Claude Code / Codex / 任何支持 skills 的 agent。
+  references）：装进 Claude Code / Codex / 任何支持 skills 的 agent；
+  [skills/vf-search/](skills/vf-search/) 是其聚焦检索的伴生 skill。
 - [spike/REPORT.md](spike/REPORT.md)——M0 实测（延迟、二进制体积）；
   [conformance/](conformance/)——双 SDK 32 步 conformance 套件。
 
