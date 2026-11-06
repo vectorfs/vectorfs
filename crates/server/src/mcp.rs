@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::response::Response;
+use base64::Engine as _;
 use bytes::Bytes;
 use rmcp::ServerHandler;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -157,8 +158,20 @@ pub struct SearchParams {
     /// Vector bucket (must have an [ingest.<bucket>] section — the file
     /// layer fans the query out over its embedders).
     pub bucket: String,
-    /// Query text (M2: text only).
-    pub text: String,
+    /// Query text. Exactly one of `text` / `imagePath` (image query =
+    /// 以图搜图 through the image-capable embedders).
+    #[serde(default)]
+    pub text: Option<String>,
+    /// LOCAL path to an image file (.jpg/.jpeg/.png) for an image query —
+    /// the put_source precedent: this MCP server runs next to the agent's
+    /// files, so bytes ride the filesystem, never the tool-call context.
+    #[serde(default)]
+    pub image_path: Option<String>,
+    /// Search mode: "semantic" (default) | "keyword" (BM25; needs fts +
+    /// `vectorfs optimize`) | "hybrid" (both, merged). Same closed set as
+    /// `vf search --mode`; the server validates.
+    #[serde(default)]
+    pub mode: Option<String>,
     /// Results to return, 1..=1000.
     #[serde(default = "default_top_k")]
     pub top_k: i64,
@@ -168,6 +181,25 @@ pub struct SearchParams {
     /// Include each hit's stored chunk text (default true).
     #[serde(default = "default_true")]
     pub return_text: bool,
+}
+
+/// Extension → declared mime for an MCP image query, mirroring the CLI's
+/// `image_mime_of` (vf.rs). The daemon cross-checks the declaration against
+/// the file's actual container magic (ops_xvf `decode_image_query`), so a
+/// renamed-but-listed extension still routes honestly.
+fn image_query_mime(path: &str) -> Result<&'static str, ApiError> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "jpg" | "jpeg" => Ok("image/jpeg"),
+        "png" => Ok("image/png"),
+        other => Err(ApiError::validation_field(
+            "image_path",
+            format!("'.{other}' is not a supported image extension"),
+        )),
+    }
 }
 
 fn default_top_k() -> i64 {
@@ -630,9 +662,49 @@ impl VfMcp {
     // ---- file-layer tools: thin adapters onto the /x-vf handlers ----
 
     async fn call_search(&self, p: SearchParams) -> Result<serde_json::Value, ApiError> {
+        // query face: text XOR image_path (the wire/query shapes are the
+        // CLI's — `vf search "…"` / `vf search --image path`, appendix E.4)
+        let query = match (p.text.as_deref(), p.image_path.as_deref()) {
+            (Some(text), None) => json!({ "text": text }),
+            (None, Some(path)) => {
+                // extension gate first (the CLI's order): a typo'd extension
+                // is reported precisely even when the path is also wrong
+                let mime = image_query_mime(path)?;
+                let bytes = tokio::fs::read(path).await.map_err(|e| {
+                    ApiError::validation_field("image_path", format!("cannot read {path}: {e}"))
+                })?;
+                if bytes.is_empty() {
+                    return Err(ApiError::validation_field(
+                        "image_path",
+                        format!("{path} is empty"),
+                    ));
+                }
+                json!({
+                    "image": {
+                        "bytes": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                        "mime": mime,
+                    }
+                })
+            }
+            (Some(_), Some(_)) => {
+                return Err(ApiError::validation_field(
+                    "text",
+                    "text and imagePath are mutually exclusive; pass exactly one",
+                ));
+            }
+            (None, None) => {
+                return Err(ApiError::validation_field(
+                    "text",
+                    "pass either text or imagePath",
+                ));
+            }
+        };
         let body = json!({
             "bucket": p.bucket,
-            "query": { "text": p.text },
+            "query": query,
+            // always sent (the CLI does the same): semantic is the default
+            // and the server owns the closed-set validation
+            "searchMode": p.mode.as_deref().unwrap_or("semantic"),
             "topK": p.top_k,
             "returnText": p.return_text,
             "filter": p.filter.clone().filter(|f| !f.is_null()),
@@ -1253,7 +1325,9 @@ mod tests {
         let se = vf
             .search(Parameters(SearchParams {
                 bucket: "docs".into(),
-                text: "fox".into(),
+                text: Some("fox".into()),
+                image_path: None,
+                mode: None,
                 top_k: 5,
                 filter: None,
                 return_text: true,
@@ -1289,7 +1363,9 @@ mod tests {
         let se = vf
             .search(Parameters(SearchParams {
                 bucket: "other".into(),
-                text: "x".into(),
+                text: Some("x".into()),
+                image_path: None,
+                mode: None,
                 top_k: 1,
                 filter: None,
                 return_text: false,
@@ -1302,6 +1378,69 @@ mod tests {
             v["message"].as_str().unwrap().contains("[ingest.other]"),
             "{v}"
         );
+
+        // the M3 query faces are structured errors, never silent: text XOR
+        // image_path, a listed extension, and a readable non-empty file
+        let cases: Vec<(SearchParams, &str)> = vec![
+            (
+                SearchParams {
+                    bucket: "docs".into(),
+                    text: Some("t".into()),
+                    image_path: Some("x.png".into()),
+                    mode: None,
+                    top_k: 1,
+                    filter: None,
+                    return_text: false,
+                },
+                "mutually exclusive",
+            ),
+            (
+                SearchParams {
+                    bucket: "docs".into(),
+                    text: None,
+                    image_path: None,
+                    mode: None,
+                    top_k: 1,
+                    filter: None,
+                    return_text: false,
+                },
+                "either text or imagePath",
+            ),
+            (
+                SearchParams {
+                    bucket: "docs".into(),
+                    text: None,
+                    image_path: Some("no-such-file.png".into()),
+                    mode: None,
+                    top_k: 1,
+                    filter: None,
+                    return_text: false,
+                },
+                "cannot read",
+            ),
+            (
+                SearchParams {
+                    bucket: "docs".into(),
+                    text: None,
+                    image_path: Some("pic.gif".into()),
+                    mode: None,
+                    top_k: 1,
+                    filter: None,
+                    return_text: false,
+                },
+                "not a supported image extension",
+            ),
+        ];
+        for (params, needle) in cases {
+            let o = vf.search(Parameters(params)).await;
+            let (is_err, v) = text_of(o);
+            assert!(is_err, "{v}");
+            assert_eq!(v["code"], "Validation", "{v}");
+            assert!(
+                v["message"].as_str().unwrap().contains(needle),
+                "expected '{needle}' in: {v}"
+            );
+        }
     }
 
     /// ro mode over REAL JSON-RPC (duplex stdio pair, same harness as the
