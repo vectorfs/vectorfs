@@ -530,7 +530,10 @@ impl VfMcp {
         // riding the signature (non-ASCII keys percent-encoded)
         let headers = vec![
             ("x-vf-bucket".to_string(), bucket.clone()),
-            ("x-vf-file-name".to_string(), crate::encode_header_value(&key)),
+            (
+                "x-vf-file-name".to_string(),
+                crate::encode_header_value(&key),
+            ),
         ];
         let (_, _, body) = self
             .conn
@@ -882,8 +885,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let handle =
-            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{addr}"), shared, handle)
     }
 
@@ -988,7 +990,10 @@ mod tests {
         );
         assert!(is_err, "{v}");
         assert_eq!(v["code"], "NotFound", "{v}");
-        assert!(v["hint"].as_str().unwrap().contains("vf sources list"), "{v}");
+        assert!(
+            v["hint"].as_str().unwrap().contains("vf sources list"),
+            "{v}"
+        );
 
         // search: hit shape carries the source location (回源 join)
         let (is_err, v) = text_of(
