@@ -4,8 +4,9 @@
 #   deps-guard  — scripts/deps_guard.sh (zero AWS SDK + unified arrow/lance),
 #                 cargo-machete (unused deps), cargo-deny (licenses/bans;
 #                 advisories warn-only)
-#   size-guard  — release-prod build + binary size gate (warn >155MiB,
-#                 fail >175MiB, design.md §5.7)
+#   size-guard  — release-prod build + binary size gate (server: warn-only
+#                 signal >175MiB, no hard cap — 2026-11-06 ruling; client:
+#                 warn >10MiB / fail >15MiB; design.md §5.7)
 #   conformance — 32-step wire matrix through BOTH first-party SDKs (boto3 +
 #                 aws-sdk-go-v2) against a freshly `vectorfs init`'d
 #                 file-backend daemon (M1 Task 7; steps 1:1 with
@@ -109,7 +110,7 @@ jobs:
           command-arguments: licenses bans advisories
 
   size-guard:
-    name: release-prod binary size (warn >155MiB / fail >175MiB)
+    name: release-prod binary size (server warn-only >175MiB, client warn >10MiB / fail >15MiB)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

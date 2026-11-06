@@ -3,9 +3,11 @@
 # three-crate-split ruling 2026-11-05):
 #
 #   SERVER (`vectorfs`, vectorfs-server):
-#     fail  > 175 MiB (hard cap; M0 adjudication: engine (datafusion+arrow+
-#                      lance) is a fixed, non-croppable cost)
-#     warn  > 155 MiB (early-warning line)
+#     NO hard cap (2026-11-06 user ruling: model downloads are GB-scale, so
+#                  policing the server binary size buys nothing. Keep-it-lean
+#                  discipline — default-features = false posture — unchanged.)
+#     warn  > 175 MiB (signal only, non-blocking creep line; the 155 line is
+#                      retired: measured 166 MiB made it permanent noise)
 #   CLIENT (`vf`, vectorfs-client — its OWN lines since the split):
 #     fail  > 15 MiB (measured 6 MiB at the split; ~2.5x headroom — the
 #                     small-client guarantee is a dependency-list property,
@@ -51,26 +53,28 @@ done
 
 rc=0
 
-check() { # name bin warn fail
+check() { # name bin warn fail ("" = no hard cap, warn-only signal)
     local name="$1" bin="$2" warn="$3" fail="$4"
     local bytes mib line
     bytes=$(stat -c %s "$bin")
     mib=$((bytes / (1024 * 1024)))
-    line="${name} binary size [${bin}]: ${bytes} bytes (${mib} MiB) — warn >${warn}MiB, fail >${fail}MiB"
+    local limit_desc="warn >${warn}MiB"
+    [[ -n "$fail" ]] && limit_desc+=", fail >${fail}MiB" || limit_desc+=" (no hard cap)"
+    line="${name} binary size [${bin}]: ${bytes} bytes (${mib} MiB) — ${limit_desc}"
     echo "$line"
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         echo "$line" >>"$GITHUB_STEP_SUMMARY"
     fi
-    if (( mib > fail )); then
+    if [[ -n "$fail" ]] && (( mib > fail )); then
         echo "FAIL: ${name} ${mib} MiB exceeds the ${fail} MiB hard cap (design.md §5.7)" >&2
         rc=1
     elif (( mib > warn )); then
-        echo "WARN: ${name} ${mib} MiB exceeds the ${warn} MiB early-warning line (design.md §5.7)" >&2
+        echo "WARN: ${name} ${mib} MiB exceeds the ${warn} MiB signal line (design.md §5.7; non-blocking for the no-cap ruling)" >&2
     fi
 }
 
 if [[ -n "$SERVER_BIN" ]]; then
-    check vectorfs "$SERVER_BIN" 155 175
+    check vectorfs "$SERVER_BIN" 175 ""
 fi
 check vf "$CLIENT_BIN" 10 15
 
