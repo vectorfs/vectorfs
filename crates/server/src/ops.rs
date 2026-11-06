@@ -1169,6 +1169,11 @@ pub async fn put_vectors(State(state): State<AppState>, body: Bytes) -> Result<R
         // omitted metadata stores NULL — TODO: confirm against real service).
         let mut metadata_json = None;
         let mut filterable = std::collections::BTreeMap::new();
+        // chunk-text column mirror (M3-T9): extracted from the SAME parsed
+        // document that serializes into metadata_json — the ingest worker's
+        // `x-vf-chunk-text` key is the single source; the blob echoes it on
+        // the wire, the top-level `text` column feeds the FTS kernel.
+        let mut text = None;
         match v.metadata {
             None | Some(serde_json::Value::Null) => {}
             Some(m) => {
@@ -1199,6 +1204,12 @@ pub async fn put_vectors(State(state): State<AppState>, body: Bytes) -> Result<R
                         };
                         filterable.insert(k.clone(), mv);
                     }
+                    if let Some(t) = map
+                        .get(store::TEXT_COLUMN_KEY)
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        text = Some(t.to_string());
+                    }
                 }
                 metadata_json = Some(m.to_string());
             }
@@ -1208,6 +1219,7 @@ pub async fn put_vectors(State(state): State<AppState>, body: Bytes) -> Result<R
             vector: vec,
             metadata_json,
             filterable,
+            text,
         };
         match index_of.get(&v.key) {
             Some(&i) => rows[i] = row, // later duplicate replaces the earlier row

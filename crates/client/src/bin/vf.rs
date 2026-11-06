@@ -201,9 +201,42 @@ struct SearchArgs {
     #[arg(long)]
     no_text: bool,
 
+    /// Retrieval mode (M3-T9): semantic (default — embedding fan-out),
+    /// keyword (pure BM25 full-text match; needs the bucket's fts = true
+    /// and `vectorfs optimize`), hybrid (both arms fused by the bucket's
+    /// merge strategy). Text queries only.
+    #[arg(long, default_value_t = SearchModeArg::Semantic)]
+    mode: SearchModeArg,
+
     /// Structured output (schema_version'd JSON)
     #[arg(long)]
     json: bool,
+}
+
+/// The `--mode` enum (M3-T9): clap's ValueEnum turns an invalid value into
+/// a USAGE error (exit 2) — the client-side error face of the wire's
+/// searchMode validation.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchModeArg {
+    Semantic,
+    Keyword,
+    Hybrid,
+}
+
+impl std::fmt::Display for SearchModeArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.wire())
+    }
+}
+
+impl SearchModeArg {
+    fn wire(&self) -> &'static str {
+        match self {
+            SearchModeArg::Semantic => "semantic",
+            SearchModeArg::Keyword => "keyword",
+            SearchModeArg::Hybrid => "hybrid",
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -832,6 +865,7 @@ async fn search_cmd(args: SearchArgs) {
         "query": query_member,
         "topK": args.top_k,
         "returnText": !args.no_text,
+        "searchMode": args.mode.wire(),
     });
     if let Some(f) = filter {
         body["filter"] = f;

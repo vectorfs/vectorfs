@@ -37,6 +37,51 @@ use super::{Merge, Modality, PipelineError};
 /// realistic collision count of configured pipelines per data root.
 pub const FINGERPRINT_HEX_LEN: usize = 16;
 
+/// The FTS base tokenizer menu (M3-T9, ADR 0002): deliberately CLOSED at
+/// lance's built-in, model-directory-free options — jieba/lindera need
+/// external dictionaries and stay禁引 by the same ADR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FtsTokenizer {
+    /// ICU dictionary word segmentation (lance `base_tokenizer = "icu"`);
+    /// the default. Mixed zh/en corpora segment into whole words on both
+    /// sides — 中文按词典分词, Latin keeps whole-word units (stemmed/
+    /// lower-cased per engine defaults).
+    Icu,
+    /// True bigram `ngram 2,2` (lance `base_tokenizer = "ngram"` with
+    /// min=max=2; the engine disables stemming/stop-words for ngram so
+    /// every substring token stays searchable). Best CJK recall — no
+    /// dictionary can miss a word — but Latin is bigrammed too:
+    /// "vectorfs" indexes "ve","ec","ct",… and substring queries become
+    /// the unit (a whole-word query still works, it just matches via its
+    /// bigrams; a SUBSTRING query starts working, which icu refuses).
+    Ngram,
+}
+
+impl FtsTokenizer {
+    /// Parse the config string form (`icu` | `ngram`); anything else dies
+    /// at the config line (the closed-set discipline of [`Merge::parse`]).
+    pub fn parse(s: &str) -> Result<FtsTokenizer, String> {
+        match s {
+            "icu" => Ok(FtsTokenizer::Icu),
+            "ngram" => Ok(FtsTokenizer::Ngram),
+            other => Err(format!(
+                "unknown fts-tokenizer '{other}' (allowed: icu, ngram — jieba/lindera need \
+                 external model directories and are not supported, ADR 0002)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for FtsTokenizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            FtsTokenizer::Icu => f.write_str("icu"),
+            FtsTokenizer::Ngram => f.write_str("ngram"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // raw file shape
 // ---------------------------------------------------------------------------
@@ -131,6 +176,26 @@ struct IngestRaw {
     /// set `charset_fallback = "windows-1252"` in one line.
     #[serde(default = "default_charset_fallback")]
     charset_fallback: String,
+    /// Lexical search (FTS/BM25) switch for this bucket (M3-T9, ADR 0002):
+    /// `false` = the bucket has no keyword/hybrid face — the §7 ruling
+    /// ("M3 超集内容默认关闭，显式开启"): superset content ships OFF and
+    /// operators opt in explicitly. Flipping it never changes chunk bytes,
+    /// so like `merge` it stays OUT of the pipeline fingerprint; the
+    /// availability + index build ride `vectorfs optimize`.
+    #[serde(default)]
+    fts: bool,
+    /// The FTS base tokenizer (M3-T9, ADR 0002): `"icu"` (default — ICU
+    /// dictionary word segmentation, the safe mixed zh/en choice) or
+    /// `"ngram"` (true bigram 2,2 — best CJK recall, but Latin words are
+    /// bigrammed too: substring matching becomes the unit and whole-word
+    /// queries stop being special; jieba/lindera need external model
+    /// directories and stay禁引). TOML key kebab-case like `index-prefix`.
+    /// Unlike `fts` itself this one changes how the derived table's text
+    /// INDEX tokenizes — 换分词 = reindex — so it ENTERS the pipeline
+    /// fingerprint (elided at the default, the T7 charset three-state
+    /// precedent: pre-T9 fingerprints stay byte-stable).
+    #[serde(rename = "fts-tokenizer", default = "default_fts_tokenizer")]
+    fts_tokenizer: String,
 }
 
 fn default_scan_interval_secs() -> usize {
@@ -150,6 +215,9 @@ fn default_store_chunk_text() -> bool {
 }
 fn default_charset_fallback() -> String {
     "gbk".to_string()
+}
+fn default_fts_tokenizer() -> String {
+    "icu".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +489,17 @@ pub struct IngestConfig {
     /// enters the pipeline fingerprint ([`pipeline_fingerprint`], elided
     /// at its default so pre-T7 fingerprints stay byte-stable).
     pub charset_fallback: String,
+    /// Lexical face switch (M3-T9): `true` exposes `searchMode:
+    /// keyword|hybrid` on `/x-vf/Search` and makes `vectorfs optimize`
+    /// migrate + FTS-index this bucket's derived tables. Default false
+    /// (§7: M3 superset content OFF). Query-availability knob like `merge`
+    /// — EXCLUDED from the fingerprint (never changes chunk identity).
+    pub fts: bool,
+    /// The FTS base tokenizer, `"icu"` (default) or `"ngram"` (2,2 bigram).
+    /// Changes how the derived table's TEXT INDEX tokenizes, so unlike `fts`
+    /// it ENTERS the pipeline fingerprint (elided at the default — the T7
+    /// charset three-state precedent; 换分词 = reindex, ADR 0002).
+    pub fts_tokenizer: FtsTokenizer,
 }
 
 impl PipelineConfig {
@@ -627,6 +706,21 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
         let merge = Merge::parse(rawi.merge.as_deref().unwrap_or("rrf"))
             .map_err(|m| PipelineError::config(format!("[{section}]: {m}"), line))?;
 
+        // fts + fts-tokenizer (M3-T9): closed tokenizer menu; a tokenizer on
+        // an fts-off bucket is a dead knob and dies here (the merge-weights
+        // discipline: bad values die at the config line that carries them).
+        let fts_tokenizer = FtsTokenizer::parse(&rawi.fts_tokenizer)
+            .map_err(|m| PipelineError::config(format!("[{section}]: fts-tokenizer {m}"), line))?;
+        if !rawi.fts && fts_tokenizer != FtsTokenizer::Icu {
+            return Err(PipelineError::config(
+                format!(
+                    "[{section}]: fts-tokenizer is set but fts = false — the tokenizer only \
+                     applies to the lexical face; drop fts-tokenizer or set fts = true"
+                ),
+                line,
+            ));
+        }
+
         // merge-weights (M3-T8): dead knobs and bad values die here, at the
         // config line that carries them. Positive finite floats only (a zero
         // or negative weight is not "mute this embedder" — removing it from
@@ -795,6 +889,8 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
                 extract_timeout_secs: rawi.extract_timeout_secs,
                 store_chunk_text: rawi.store_chunk_text,
                 charset_fallback: canonical_charset(&rawi.charset_fallback, &section, line)?,
+                fts: rawi.fts,
+                fts_tokenizer,
             },
         );
     }
@@ -975,10 +1071,11 @@ fn canonical_charset(
 /// [`FINGERPRINT_HEX_LEN`] hex chars of `sha256(canonical TOML)` over the
 /// RELEVANT instance configuration — the referenced extractor instances,
 /// the extract ROUTING (M2.1: chain composition AND order; see below), the
-/// chunker, the listed embedder instances, and the charset fallback
-/// (M3-T7) — all name-keyed and BTreeMap-normalized so key order and
-/// formatting in the source file do not matter. Query-side (`merge` and,
-/// since M3-T8, `merge-weights`) and
+/// chunker, the listed embedder instances, the charset fallback
+/// (M3-T7), and the FTS tokenizer (M3-T9) — all name-keyed and
+/// BTreeMap-normalized so key order and
+/// formatting in the source file do not matter. Query-side (`merge`,
+/// `merge-weights`, and since M3-T9 the `fts` switch itself) and
 /// claim-only fields (`include`, `exclude`, `index-prefix` — v3.1 R5) are
 /// deliberately EXCLUDED: they never change chunk identity, so changing
 /// them must not invalidate completion markers. The same logic puts
@@ -988,7 +1085,10 @@ fn canonical_charset(
 /// chunk BYTES, so it fingerprints — with `skip_serializing_if` at the
 /// default keeping every pre-T7 deployment's fingerprint byte-stable (the
 /// implicit default and the explicit `gbk` behave identically and must
-/// fingerprint identically).
+/// fingerprint identically). The FTS tokenizer follows the SAME three-state
+/// rule (it decides how the derived table's text INDEX tokenizes — 换分词
+/// must demand a reindex, ADR 0002 — while the implicit and explicit `icu`
+/// elide identically).
 pub fn pipeline_fingerprint(
     ingest: &IngestConfig,
     extractors: &BTreeMap<String, ExtractorKind>,
@@ -999,6 +1099,11 @@ pub fn pipeline_fingerprint(
     /// identically).
     fn is_default_charset(s: &str) -> bool {
         s == "GBK"
+    }
+
+    /// `true` at the default tokenizer (`icu`) — elided (see fn docs).
+    fn is_default_fts_tokenizer(t: &FtsTokenizer) -> bool {
+        matches!(t, FtsTokenizer::Icu)
     }
 
     #[derive(serde::Serialize)]
@@ -1017,6 +1122,12 @@ pub fn pipeline_fingerprint(
         /// serialized when it departs from the default (fn docs).
         #[serde(skip_serializing_if = "is_default_charset")]
         charset_fallback: &'a str,
+        /// The FTS tokenizer (M3-T9) — same three-state rule: only the
+        /// non-default (`ngram`) serializes, so pre-T9 configs and
+        /// fts-off/default-tokenizer buckets keep their fingerprints
+        /// byte-stable while 换分词 genuinely moves it (reindex, ADR 0002).
+        #[serde(skip_serializing_if = "is_default_fts_tokenizer")]
+        fts_tokenizer: FtsTokenizer,
     }
 
     let mut fp_extractors: BTreeMap<&str, &ExtractorKind> = BTreeMap::new();
@@ -1045,6 +1156,7 @@ pub fn pipeline_fingerprint(
         chunk: &ingest.chunk,
         embedders: fp_embedders,
         charset_fallback: &ingest.charset_fallback,
+        fts_tokenizer: ingest.fts_tokenizer,
     })
     .expect("canonical TOML serialization of plain pipeline configs");
 
@@ -1180,7 +1292,7 @@ index-prefix = "docs"
                 "[ingest.d]: unknown field 'chunkder' (allowed: include, exclude, extract, \
                  chunk, embedders, merge, merge-weights, index-prefix, scan_interval_secs, \
                  max_file_size_mb, retries, extract_timeout_secs, store_chunk_text, \
-                 charset_fallback)"
+                 charset_fallback, fts, fts-tokenizer)"
             ),
             "{msg}"
         );
@@ -1214,6 +1326,8 @@ index-prefix = "docs"
         assert_eq!(d.extract_timeout_secs, 7);
         assert!(!d.store_chunk_text);
         assert_eq!(d.charset_fallback, "windows-1252");
+        assert!(!d.fts, "the lexical face ships OFF (§7)");
+        assert_eq!(d.fts_tokenizer, FtsTokenizer::Icu, "icu default");
         // zero-valued periods are refused (busy-loop guard)
         for bad in [
             "scan_interval_secs = 0",
@@ -1287,6 +1401,65 @@ chunk = { kind = "token-window", size = 32, overlap = 8 }
             fp(&base),
             fp(&changed),
             "a non-default fallback rewrites chunks — the fingerprint MUST move"
+        );
+    }
+
+    // ---- fts / fts-tokenizer (M3-T9) ---------------------------------------
+
+    #[test]
+    fn fts_switch_parses_with_default_off() {
+        // absent = off (§7: M3 superset content ships disabled)
+        let cfg = parse(FP_CFG).unwrap();
+        assert!(!cfg.ingest["docs"].fts);
+        assert_eq!(cfg.ingest["docs"].fts_tokenizer, FtsTokenizer::Icu);
+        // explicit on, default tokenizer
+        let cfg = parse(&format!("{FP_CFG}fts = true\n")).unwrap();
+        assert!(cfg.ingest["docs"].fts);
+        assert_eq!(cfg.ingest["docs"].fts_tokenizer, FtsTokenizer::Icu);
+        // explicit on + ngram
+        let cfg = parse(&format!("{FP_CFG}fts = true\nfts-tokenizer = \"ngram\"\n")).unwrap();
+        assert_eq!(cfg.ingest["docs"].fts_tokenizer, FtsTokenizer::Ngram);
+    }
+
+    #[test]
+    fn fts_tokenizer_closed_set_and_dead_knob_die_at_the_line() {
+        // unknown tokenizer: closed-set refusal with the menu (jieba/lindera
+        // named as deliberately absent, ADR 0002)
+        let err = parse(&format!("{FP_CFG}fts = true\nfts-tokenizer = \"jieba\"\n")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown fts-tokenizer 'jieba'"), "{msg}");
+        assert!(msg.contains("allowed: icu, ngram"), "{msg}");
+        assert!(msg.contains("at line"), "{msg}");
+        // tokenizer without fts: dead knob, refused (merge-weights rule)
+        let err = parse(&format!("{FP_CFG}fts-tokenizer = \"ngram\"\n")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fts-tokenizer is set but fts = false"),
+            "{msg}"
+        );
+    }
+
+    /// THE fingerprint pin for the lexical knobs (ADR 0002: 换分词 =
+    /// reindex): the switch itself and the DEFAULT tokenizer elide (an
+    /// fts-off config, `fts = true`, and `fts = true` + explicit `icu` all
+    /// fingerprint identically — availability never changed chunk identity,
+    /// and pre-T9 deployments keep their fingerprints), while `ngram`
+    /// MOVES it (the index tokenizes differently; a reindex must be
+    /// demanded).
+    #[test]
+    fn fts_tokenizer_fingerprints_when_ngram_switch_elides() {
+        let base = parse(FP_CFG).unwrap();
+        let switched = parse(&format!("{FP_CFG}fts = true\n")).unwrap();
+        let explicit_icu =
+            parse(&format!("{FP_CFG}fts = true\nfts-tokenizer = \"icu\"\n")).unwrap();
+        let ngram = parse(&format!("{FP_CFG}fts = true\nfts-tokenizer = \"ngram\"\n")).unwrap();
+        let fp = |c: &PipelineConfig| c.fingerprint("docs").unwrap();
+        assert_eq!(fp(&base), fp(&switched), "the fts switch elides");
+        assert_eq!(fp(&base), fp(&explicit_icu), "explicit icu elides too");
+        assert_ne!(
+            fp(&base),
+            fp(&ngram),
+            "ngram tokenizes differently — the fingerprint MUST move (reindex)"
         );
     }
 

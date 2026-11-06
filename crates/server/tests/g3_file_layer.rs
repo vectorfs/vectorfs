@@ -189,6 +189,7 @@ fn orphan_row(uri: &str, seq: u32) -> VectorRow {
             "x-vf-src-uri".to_string(),
             MetaMirror::Str(uri.to_string()),
         )]),
+        text: None,
     }
 }
 

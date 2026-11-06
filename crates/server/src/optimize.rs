@@ -9,19 +9,38 @@
 //! compaction rewrites data files — a different risk class than building a
 //! side index. Add it behind the same verb when evidence arrives.
 //!
+//! M3-T9 (ADR 0002) adds the LEXICAL half on the same verb: for buckets
+//! with `fts = true`, migrate each derived table (add the `text` column on
+//! pre-T9 tables, backfill NULLs from the metadata blob) and build/fold
+//! the FTS inverted index with the bucket's tokenizer. Why this verb and
+//! not table creation: (a) T8's discipline — the daemon never builds
+//! indexes on its own, and the ingest worker IS the daemon; (b) FTS is
+//! config-carrying (tokenizer), so creation must be gated on the bucket's
+//! `[ingest.<bucket>]` config which only this sweep reads; (c) unlike
+//! IVF_PQ there is NO training gate — an inverted index builds at any row
+//! count, and until the verb runs keyword queries stay CORRECT on lance's
+//! flat BM25 scan (the index buys speed, not correctness).
+//!
 //! Discipline (the M1 `optimize` ruling, design.md §6): explicit management
 //! verb, NEVER a background task — the daemon never builds indexes on its
 //! own. IVF_PQ is an index PHYSICAL form, not pipeline semantics: zero
 //! config keys (nothing in vectorfs.toml, nothing in the pipeline
 //! fingerprint), zero protocol-face surface. Until the verb runs, every
-//! query stays on the flat exact path — byte-identical to pre-T8.
+//! query stays on the flat exact path — byte-identical to pre-T8. The FTS
+//! half is the deliberate exception on the config axis (an
+//! availability-carrying knob, `[ingest.X] fts` + `fts-tokenizer`, the
+//! latter in the pipeline fingerprint — 换分词 = reindex) while keeping the
+//! verb discipline: same flock, same explicit run, zero background work.
 //!
 //! Single-writer: the bin takes the data root's local flock (the same one
 //! `vectorfs serve`/`mcp` hold) for the duration; on backends without a
 //! local home (memory/s3) it proceeds with an explicit warning — the
 //! maintenance window is then the operator's guarantee.
 
-use crate::store::{DeploymentIdentity, Storage, VectorIndexOutcome};
+use std::collections::BTreeMap;
+
+use crate::pipeline::config::FtsTokenizer;
+use crate::store::{DeploymentIdentity, FtsIndexOutcome, Storage, VectorIndexOutcome};
 
 /// One index's result line.
 #[derive(Debug, PartialEq)]
@@ -29,6 +48,13 @@ pub struct OptimizeLine {
     pub bucket: String,
     pub index: String,
     pub outcome: VectorIndexOutcome,
+    /// The lexical pass (M3-T9): `Some` iff this target is a DERIVED index
+    /// of an `fts = true` bucket — its migration (column + backfill) and
+    /// FTS build/fold ran this pass.
+    pub fts: Option<FtsIndexOutcome>,
+    /// The tokenizer the FTS pass used (rendered on build lines; meaningful
+    /// only when `fts.is_some()`).
+    pub tokenizer: FtsTokenizer,
 }
 
 /// What `run` did. The bin turns this into stdout lines + an exit code:
@@ -71,6 +97,28 @@ impl OptimizeReport {
                     crate::store::IVF_PQ_MIN_TRAIN_ROWS
                 )),
             }
+            if let Some(fts) = l.fts {
+                match fts {
+                    crate::store::FtsIndexOutcome::Built { rows, backfilled } => {
+                        out.push_str(&format!(
+                            "{target}: fts index built on {rows} rows (tokenizer {}; {backfilled} \
+                             chunk texts backfilled) — keyword/hybrid search now uses the \
+                             index\n",
+                            l.tokenizer
+                        ))
+                    }
+                    crate::store::FtsIndexOutcome::Folded { rows, backfilled } => {
+                        out.push_str(&format!(
+                            "{target}: folded new rows into the existing fts index ({rows} rows \
+                             total; {backfilled} chunk texts backfilled)\n"
+                        ))
+                    }
+                    crate::store::FtsIndexOutcome::NoTable => out.push_str(&format!(
+                        "{target}: fts SKIPPED — the derived table does not exist yet (nothing \
+                         ingested); keyword search will work after the first ingest + optimize\n"
+                    )),
+                }
+            }
         }
         out
     }
@@ -82,11 +130,18 @@ impl OptimizeReport {
 /// (appendix E.4 `optimize [--bucket] [--index]`; `--index` requires
 /// `--bucket` — index names are per-bucket). Unknown names fail loudly with
 /// what DOES exist.
+///
+/// `fts` (M3-T9) maps FTS-ENABLED bucket names to their tokenizer (the
+/// bin's read of `[ingest.<bucket>] fts/fts-tokenizer`); buckets absent
+/// from the map keep the pure-T8 pass. The lexical half only touches
+/// DERIVED indexes (`x_vf_derived` stamped) — protocol-face indexes never
+/// carry the ingest pipeline's chunk semantics.
 pub async fn run(
     storage: &Storage,
     identity: &DeploymentIdentity,
     bucket: Option<&str>,
     index: Option<&str>,
+    fts: &BTreeMap<String, FtsTokenizer>,
 ) -> Result<OptimizeReport, vectorfs_common::report::Failure> {
     if index.is_some() && bucket.is_none() {
         return Err(vectorfs_common::report::Failure::new(
@@ -178,10 +233,24 @@ pub async fn run(
             .optimize_vector_index(&vb, &ix, &meta.distance_metric)
             .await
             .map_err(|e| store_err_ctx(e, &vb, &ix))?;
+        // lexical half (M3-T9): derived indexes of fts-enabled buckets only
+        let tokenizer = fts.get(&vb).copied().unwrap_or(FtsTokenizer::Icu);
+        let fts_outcome = if fts.get(&vb).is_some() && meta.x_vf_derived.is_some() {
+            Some(
+                storage
+                    .ensure_fts_index(&vb, &ix, &tokenizer.to_string())
+                    .await
+                    .map_err(|e| store_err_ctx(e, &vb, &ix))?,
+            )
+        } else {
+            None
+        };
         lines.push(OptimizeLine {
             bucket: vb,
             index: ix,
             outcome,
+            fts: fts_outcome,
+            tokenizer,
         });
     }
     Ok(OptimizeReport { lines })
@@ -281,6 +350,7 @@ mod tests {
                         vector: r.clone(),
                         metadata_json: None,
                         filterable: BTreeMap::new(),
+                        text: None,
                     }
                 })
                 .collect();
@@ -292,34 +362,45 @@ mod tests {
     #[tokio::test]
     async fn sweep_trains_and_named_unknowns_fail_loudly() {
         let storage = seeded(16, 300).await;
+        let no_fts = BTreeMap::new();
 
         // unknown bucket / index: NOT_FOUND naming what exists
         let id = storage.deployment_identity("us-east-1", "000000000000");
-        let err = run(&storage, &id, Some("nope"), None).await.unwrap_err();
+        let err = run(&storage, &id, Some("nope"), None, &no_fts)
+            .await
+            .unwrap_err();
         assert!(err.message.contains("'nope' does not exist"), "{err:?}");
-        let err = run(&storage, &id, Some("vb"), Some("ghost"))
+        let err = run(&storage, &id, Some("vb"), Some("ghost"), &no_fts)
             .await
             .unwrap_err();
         assert!(err.message.contains("'vb/ghost' does not exist"), "{err:?}");
         // --index without --bucket is ambiguous: refused
-        let err = run(&storage, &id, None, Some("ix")).await.unwrap_err();
+        let err = run(&storage, &id, None, Some("ix"), &no_fts)
+            .await
+            .unwrap_err();
         assert!(err.message.contains("--index requires --bucket"));
 
         // named target: trains
-        let report = run(&storage, &id, Some("vb"), Some("ix")).await.unwrap();
+        let report = run(&storage, &id, Some("vb"), Some("ix"), &no_fts)
+            .await
+            .unwrap();
         assert_eq!(
             report.lines,
             vec![OptimizeLine {
                 bucket: "vb".into(),
                 index: "ix".into(),
-                outcome: VectorIndexOutcome::Trained { rows: 300 }
+                outcome: VectorIndexOutcome::Trained { rows: 300 },
+                fts: None, // protocol-shaped index (no x_vf_derived): no FTS
+                tokenizer: FtsTokenizer::Icu,
             }]
         );
         assert!(!report.named_below_gate(Some("vb"), Some("ix")));
         assert!(report.render().contains("ivf_pq trained on 300 rows"));
 
         // re-run folds
-        let report = run(&storage, &id, Some("vb"), Some("ix")).await.unwrap();
+        let report = run(&storage, &id, Some("vb"), Some("ix"), &no_fts)
+            .await
+            .unwrap();
         assert_eq!(
             report.lines[0].outcome,
             VectorIndexOutcome::Folded { rows: 300 }
@@ -330,9 +411,10 @@ mod tests {
     async fn named_below_gate_fails_but_sweep_skips() {
         let storage = seeded(16, 100).await; // below gate
         let id = storage.deployment_identity("us-east-1", "000000000000");
+        let no_fts = BTreeMap::new();
 
         // sweep (no flags): loud SKIPPED line, not an error
-        let report = run(&storage, &id, None, None).await.unwrap();
+        let report = run(&storage, &id, None, None, &no_fts).await.unwrap();
         assert_eq!(
             report.lines[0].outcome,
             VectorIndexOutcome::BelowGate { rows: 100 }
@@ -344,7 +426,142 @@ mod tests {
         assert!(report.render().contains("SKIPPED — 100 rows < 256"));
 
         // named target below gate: the refusal IS the answer
-        let report = run(&storage, &id, Some("vb"), Some("ix")).await.unwrap();
+        let report = run(&storage, &id, Some("vb"), Some("ix"), &no_fts)
+            .await
+            .unwrap();
         assert!(report.named_below_gate(Some("vb"), Some("ix")));
+    }
+
+    // ---- M3-T9: the lexical half rides the same verb ----
+
+    /// A DERIVED-shaped index (x_vf_derived stamped) with chunk-text rows —
+    /// the FTS pass's actual customer.
+    async fn seeded_derived(dim: i32, texts: &[&str]) -> Storage {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::file(dir.path());
+        std::mem::forget(dir);
+        storage
+            .create_bucket(&bucket_meta(&storage, "vb"))
+            .await
+            .unwrap();
+        let mut meta = index_meta("vb", "ix", dim);
+        meta.x_vf_derived = Some(crate::store::DerivedIndexInfo {
+            key: "0".repeat(64),
+            embedder: "tiny".into(),
+            model: "tiny-fixture".into(),
+            dim: dim as usize,
+        });
+        storage.create_index(&meta).await.unwrap();
+        let rows: Vec<crate::store::VectorRow> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let mut blob = serde_json::json!({ "x-vf-src-uri": "h1" });
+                blob["x-vf-chunk-text"] = serde_json::json!(t);
+                crate::store::VectorRow {
+                    key: format!("k{i:03}"),
+                    vector: vec![0.5; dim as usize],
+                    metadata_json: Some(blob.to_string()),
+                    filterable: BTreeMap::new(),
+                    text: Some(t.to_string()),
+                }
+            })
+            .collect();
+        storage.upsert_vectors("vb", "ix", dim, rows).await.unwrap();
+        storage
+    }
+
+    #[tokio::test]
+    async fn fts_pass_builds_and_folds_derived_indexes_only() {
+        let storage = seeded_derived(8, &["hello world", "goodbye moon"]).await;
+        let id = storage.deployment_identity("us-east-1", "000000000000");
+        let mut fts = BTreeMap::new();
+        fts.insert("vb".to_string(), FtsTokenizer::Icu);
+
+        let report = run(&storage, &id, Some("vb"), Some("ix"), &fts)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.lines[0].fts,
+            Some(FtsIndexOutcome::Built {
+                rows: 2,
+                backfilled: 0
+            })
+        );
+        assert!(
+            report
+                .render()
+                .contains("fts index built on 2 rows (tokenizer icu")
+        );
+
+        // keyword search works through the built index
+        let hits = storage
+            .keyword_search("vb", "ix", "hello", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, "k000");
+
+        // re-run folds (no retrain) and stays idempotent
+        let report = run(&storage, &id, Some("vb"), Some("ix"), &fts)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.lines[0].fts,
+            Some(FtsIndexOutcome::Folded {
+                rows: 2,
+                backfilled: 0
+            })
+        );
+    }
+
+    /// Young-bucket edges stay loud and harmless: a derived index that was
+    /// never materialized (nothing ingested) reports the NoTable skip, and
+    /// an EMPTY table (created, zero rows) builds a zero-row FTS index
+    /// without failing the sweep — the next ingest + optimize pass fills it.
+    #[tokio::test]
+    async fn fts_pass_no_table_skips_and_empty_table_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::file(dir.path());
+        std::mem::forget(dir);
+        storage
+            .create_bucket(&bucket_meta(&storage, "vb"))
+            .await
+            .unwrap();
+        let mut meta = index_meta("vb", "ghost", 8);
+        meta.x_vf_derived = Some(crate::store::DerivedIndexInfo {
+            key: "0".repeat(64),
+            embedder: "tiny".into(),
+            model: "tiny-fixture".into(),
+            dim: 8,
+        });
+
+        // never-materialized (no index.json, no table): loud NoTable skip
+        assert_eq!(
+            storage
+                .ensure_fts_index("vb", "ghost", "icu")
+                .await
+                .unwrap(),
+            FtsIndexOutcome::NoTable
+        );
+
+        // empty table (created, zero rows): builds a zero-row index fine
+        storage.create_index(&meta).await.unwrap();
+        assert_eq!(
+            storage
+                .ensure_fts_index("vb", "ghost", "icu")
+                .await
+                .unwrap(),
+            FtsIndexOutcome::Built {
+                rows: 0,
+                backfilled: 0
+            }
+        );
+        // and keyword search on the empty indexed table is an honest empty
+        let hits = storage
+            .keyword_search("vb", "ghost", "anything", 10, None)
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
     }
 }

@@ -760,6 +760,7 @@ mod tests {
                         vector: vec![1.0; dim as usize],
                         metadata_json: None,
                         filterable: Default::default(),
+                        text: None,
                     }],
                 )
                 .await
@@ -922,6 +923,7 @@ mod tests {
                     vector: vec![1.0; 8],
                     metadata_json: None,
                     filterable: Default::default(),
+                    text: None,
                 }],
             )
             .await

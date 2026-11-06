@@ -536,11 +536,42 @@ async fn optimize_cmd(args: OptimizeArgs) {
         });
     let identity = storage.deployment_identity(&region, &account);
 
+    // the lexical half (M3-T9) needs the pipeline config: which buckets are
+    // `fts = true` and with what tokenizer. Same resolution as serve
+    // (<data-dir>/.vectorfs/vectorfs.toml); a missing file is the
+    // pure-protocol face (no FTS pass — exactly the T8 behavior), but a
+    // PRESENT file that fails to parse is a loud error, not a silent skip.
+    let mut fts: std::collections::BTreeMap<
+        String,
+        vectorfs_server::pipeline::config::FtsTokenizer,
+    > = std::collections::BTreeMap::new();
+    if let Ok(text) = std::fs::read_to_string(config::config_path(&cfg.data_dir)) {
+        match vectorfs_server::pipeline::config::load_pipeline_config(&text) {
+            Ok(pcfg) => {
+                for (bucket, icfg) in &pcfg.ingest {
+                    if icfg.fts {
+                        fts.insert(bucket.clone(), icfg.fts_tokenizer);
+                    }
+                }
+            }
+            Err(e) => {
+                Failure::new(
+                    "CONFIG",
+                    format!("cannot parse the pipeline config for the FTS pass: {e}"),
+                    "fix vectorfs.toml (vectorfs pipelines check) and re-run; the IVF_PQ pass \
+                     was NOT started (half an optimize run is worse than a refused one)",
+                )
+                .fail(false, 1);
+            }
+        }
+    }
+
     match vectorfs_server::optimize::run(
         &storage,
         &identity,
         args.bucket.as_deref(),
         args.index.as_deref(),
+        &fts,
     )
     .await
     {

@@ -98,6 +98,28 @@
 //! deployments query embedding output (clustered), not noise; operators
 //! needing tuned recall on pathological data get the nprobes/refine knobs
 //! as the evidence-gated follow-up.
+//!
+//! FTS 对照 (M3-T9, 2026-11-07, `cargo test --release -p
+//! vectorfs-server --lib perf_fts_1m -- --ignored --nocapture`, icu
+//! tokenizer, engine defaults — no knobs): 1,000,000 synthetic 12-word
+//! sentences (91-word vocabulary + coined needles), file backend, dim=4,
+//! topK=10. Ingest 26.4s (500 batches of 2000); FTS index BUILD over the
+//! full 1M rows 4.2s; then 3 probe terms × 9 flat / 30 indexed iterations
+//! (first discarded, P50/P99 ms):
+//!
+//! | probe             | flat P50/P99  | indexed P50/P99 | speedup P50 |
+//! |-------------------|---------------|-----------------|-------------|
+//! | zxqwibble (rare)  | 177.8 / 199.9 |   3.4 /   4.9   |   53x       |
+//! | consensus quorum  | 200.3 / 204.8 |   4.6 /   5.2   |   43x       |
+//! | retrieval (common)| 169.9 / 191.1 |   3.2 /   3.7   |   54x       |
+//!
+//! The FLAT row is the correctness promise of the pre-optimize window:
+//! ~200ms per keyword query at 1M rows — usable, and the top hits are the
+//! SAME keys the index returns (pinned by `keyword_flat_fallback_without_
+//! fts_index_is_correct` at small scale; same top keys observed here). The
+//! indexed row is what `vectorfs optimize` buys. Raw BM25 scores differ by
+//! a small flat-vs-indexed delta (corpus-statistics computation differs
+//! between the paths) — the ranking is stable, the score is an ordering.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -123,6 +145,31 @@ use crate::backends::{self, Backend};
 use crate::filter::{Filter, MetaCol};
 
 pub(crate) const TABLE_NAME: &str = "vectors";
+
+/// The chunk-text top-level column (M3-T9, ADR 0002): a nullable utf8
+/// column carrying the SAME string as the metadata blob's `x-vf-chunk-text`
+/// key — the blob stays authoritative for every read-back path (the wire
+/// never changes), the column exists purely so the FTS/BM25 kernel can
+/// index and match the text (lance `Index::FTS` hangs off real columns, not
+/// JSON blobs).
+///
+/// Lifecycle (the old-table migration ruling, pinned by tests):
+/// * WRITE path: additive schema evolution, the proven T5 mirror dance —
+///   the first batch that carries chunk text adds the column (AllNulls),
+///   new rows populate it, existing rows keep NULL (never rewritten).
+/// * `vectorfs optimize` (FTS-enabled buckets): adds the column if a
+///   pre-T9 table lacks it, BACKFILLS NULLs from the blob (partial-schema
+///   merge_insert — columns the source omits are neither read nor written,
+///   lance merge_insert contract), then builds/folds the FTS index.
+/// * keyword queries on a table without the column fail LOUD
+///   (ValidationException naming the verb); with the column they are
+///   always CORRECT — lance flat-scans BM25 over unindexed rows — the
+///   index only adds speed.
+pub(crate) const TEXT_COLUMN: &str = "text";
+
+/// The metadata-blob key the column mirrors (ingest's `x-vf-chunk-text`,
+/// §5.10.1). The blob stays authoritative; the column is the FTS fodder.
+pub(crate) const TEXT_COLUMN_KEY: &str = "x-vf-chunk-text";
 
 // ---------------------------------------------------------------------------
 // deployment identity + ownership marker (design-v3.md §3-R2/D8)
@@ -1172,12 +1219,19 @@ impl Storage {
         // batch against the live mirror columns, evolve for genuinely new
         // scalar keys, REOPEN (stale handles keep the pre-evolution schema),
         // then merge_insert under the full target schema.
-        let existing = mirror_columns(table.schema().await.map_err(internal)?.as_ref());
+        let schema = table.schema().await.map_err(internal)?;
+        let existing = mirror_columns(schema.as_ref());
         let needed = classify_batch(&existing, &rows)?;
-        let table = if needed.is_empty() {
+        let has_text = schema.field_with_name(TEXT_COLUMN).is_ok();
+        let table = if needed.is_empty() && (has_text || !rows.iter().any(|r| r.text.is_some())) {
             table
         } else {
-            evolve_metadata(&table, &needed).await?;
+            if !has_text && rows.iter().any(|r| r.text.is_some()) {
+                evolve_text_column(&table).await?;
+            }
+            if !needed.is_empty() {
+                evolve_metadata(&table, &needed).await?;
+            }
             self.open_table(vb, ix).await?
         };
         upsert_table(&table, dim, rows).await
@@ -1432,6 +1486,303 @@ impl Storage {
             Ok(VectorIndexOutcome::Trained { rows })
         }
     }
+
+    /// BM25 keyword search over one index's [`TEXT_COLUMN`] — the engine face
+    /// of `/x-vf/Search` `searchMode: keyword|hybrid` (M3-T9, ADR 0002: the
+    /// lexical kernel is Lance's native FTS). Reached ONLY through the
+    /// [`crate::lexical::LexicalKernel`] seam, never called from the protocol
+    /// face (QueryVectors stays pure-vector by ADR ruling).
+    ///
+    /// Semantics:
+    /// * table WITHOUT the text column (pre-T9, never migrated) → LOUD
+    ///   ValidationException naming `vectorfs optimize` — a silent empty
+    ///   result would recreate the F1 friction this whole task exists to
+    ///   kill;
+    /// * table WITH the column → always CORRECT results: lance plans the
+    ///   FTS match query through the inverted index when one exists and
+    ///   flat-scans BM25 over unindexed fragments/rows otherwise (lance
+    ///   scanner contract, verified against 14.0.2 — the index only buys
+    ///   speed; `vectorfs optimize` is the verb that builds it);
+    /// * `filter` reuses the QueryVectors engine: predicate pushdown over
+    ///   the mirror columns as the FTS prefilter, then the exact blob
+    ///   post-filter (the pushed predicate is only a necessary condition),
+    ///   with the TIE_SLACK over-fetch so post-filtering cannot under-return;
+    /// * output is (score desc, key asc) — deterministic total order, the
+    ///   same discipline as `query_vectors`.
+    ///
+    /// SCORE SEMANTICS (pinned for the wire docs): the score is lance's raw
+    /// BM25 — corpus-statistics-dependent (IDF/length normalization are per
+    /// index), so it is comparable WITHIN one index's ranking but never a
+    /// calibrated relevance across corpora or queries. Fusion across routes
+    /// therefore runs on RANKS (the existing rrf/weighted merge), exactly
+    /// like semantic distances.
+    pub async fn keyword_search(
+        &self,
+        vb: &str,
+        ix: &str,
+        query: &str,
+        top_k: usize,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<KeywordHit>, StoreError> {
+        let table = self.open_table(vb, ix).await?;
+        let schema = table.schema().await.map_err(internal)?;
+        if schema.field_with_name(TEXT_COLUMN).is_err() {
+            return Err(StoreError::Validation(format!(
+                "index {vb}/{ix} has no '{TEXT_COLUMN}' column — its rows predate the lexical \
+                 layer (M3-T9); run `vectorfs optimize` to migrate the derived table (adds the \
+                 column, backfills chunk texts, builds the FTS index), then retry the keyword \
+                 search"
+            )));
+        }
+        let cols = mirror_columns(schema.as_ref());
+        let pred = filter.and_then(|f| f.pushdown(&cols));
+        let fts = lancedb::index::scalar::FullTextSearchQuery::new(query.to_string())
+            .with_column(TEXT_COLUMN.to_string())
+            .map_err(internal)?;
+        let mut q = table
+            .query()
+            .full_text_search(fts)
+            .limit(top_k + if filter.is_some() { TIE_SLACK } else { 0 });
+        if let Some(p) = pred {
+            q = q.only_if_expr(p);
+        }
+        let stream = q.execute().await.map_err(internal)?;
+        let mut hits: Vec<KeywordHit> = Vec::new();
+        let mut stream = stream;
+        use futures_util::StreamExt;
+        while let Some(batch) = stream.next().await {
+            hits.extend(keyword_hits_from_batch(&batch.map_err(internal)?)?);
+        }
+        if let Some(f) = filter {
+            hits.retain(|h| f.eval(h.metadata.as_ref().unwrap_or(&serde_json::Value::Null)));
+        }
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        hits.truncate(top_k);
+        Ok(hits)
+    }
+
+    /// The FTS half of `vectorfs optimize` (M3-T9): migrate + index one
+    /// derived table for lexical search. Never called by the daemon on its
+    /// own — same explicit-verb discipline as [`Storage::optimize_vector_index`].
+    ///
+    /// Pass (in order): add [`TEXT_COLUMN`] if the table predates T9;
+    /// backfill NULL `text` values from the metadata blob (partial-schema
+    /// merge_insert on `key` — blob is authoritative, columns the source
+    /// omits are untouched); then create the FTS index (engine defaults +
+    /// the configured base tokenizer) or, when one already exists, fold the
+    /// rows written since the last pass (`optimize(Index)` — the same call
+    /// T8's vector pass uses; it maintains every index on the table).
+    ///
+    /// Tokenizer menu (ADR 0002): `"icu"` (default — ICU dictionary
+    /// segmentation, mixed zh/en corpora) or `"ngram"` (true bigram 2,2 —
+    /// best CJK recall, but Latin words are bigrammed too: `vectorfs`
+    /// matches `ec`,`ct`,… and whole-word queries stop being the unit).
+    /// Everything else stays at engine defaults; block_size keeps its 128
+    /// default (256 is the experimental v3 format); the JSON tokenizer is
+    /// never set (lance#8812 panic).
+    pub async fn ensure_fts_index(
+        &self,
+        vb: &str,
+        ix: &str,
+        tokenizer: &str,
+    ) -> Result<FtsIndexOutcome, StoreError> {
+        let table = match self.open_table(vb, ix).await {
+            Ok(t) => t,
+            Err(e) => {
+                return if e.to_string().contains("Table not found")
+                    || e.to_string().contains("was not found")
+                {
+                    Ok(FtsIndexOutcome::NoTable)
+                } else {
+                    Err(e)
+                };
+            }
+        };
+        // ---- migrate: add the column on pre-T9 tables ----
+        if table
+            .schema()
+            .await
+            .map_err(internal)?
+            .field_with_name(TEXT_COLUMN)
+            .is_err()
+        {
+            evolve_text_column(&table).await?;
+        }
+        // reopen: the evolution above (if any) leaves this handle stale
+        let table = self.open_table(vb, ix).await?;
+        // ---- backfill NULLs from the blob (old rows) ----
+        let backfilled = backfill_text_column(&table).await?;
+        // ---- index: build or fold ----
+        let rows = table.count_rows(None).await.map_err(internal)?;
+        let indexed = table
+            .list_indices()
+            .await
+            .map_err(internal)?
+            .iter()
+            // only WE create indexes: one on `text` IS the FTS index (the
+            // vector pass owns `vector`; no other scalar-index face exists)
+            .any(|c| c.columns.iter().any(|col| col == TEXT_COLUMN));
+        if indexed {
+            table
+                .optimize(lancedb::table::OptimizeAction::Index(
+                    lancedb::table::OptimizeOptions::default(),
+                ))
+                .await
+                .map_err(internal)?;
+            Ok(FtsIndexOutcome::Folded { rows, backfilled })
+        } else {
+            let mut builder = lancedb::index::scalar::FtsIndexBuilder::default();
+            builder = match tokenizer {
+                "ngram" => builder
+                    .base_tokenizer("ngram".to_string())
+                    .ngram_min_length(2)
+                    .ngram_max_length(2),
+                _ => builder.base_tokenizer("icu".to_string()),
+            };
+            table
+                .create_index(&[TEXT_COLUMN], lancedb::index::Index::FTS(builder))
+                .execute()
+                .await
+                .map_err(internal)?;
+            Ok(FtsIndexOutcome::Built { rows, backfilled })
+        }
+    }
+}
+
+/// One BM25 hit (the keyword-search counterpart of [`QueryHit`]): raw lance
+/// BM25 score (see `Storage::keyword_search` for the comparability caveat),
+/// key, and the stored metadata blob.
+#[derive(Debug, Clone)]
+pub struct KeywordHit {
+    pub key: String,
+    pub score: f64,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Outcome of one explicit FTS pass ([`Storage::ensure_fts_index`], the
+/// lexical half of `vectorfs optimize`, M3-T9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtsIndexOutcome {
+    /// Created the FTS index over `rows` rows (`backfilled` of them had
+    /// their `text` column populated from the metadata blob this pass).
+    Built { rows: usize, backfilled: usize },
+    /// An existing FTS index absorbed the delta written since the last
+    /// pass (queries in the interim were still correct — flat BM25).
+    Folded { rows: usize, backfilled: usize },
+    /// The derived index was never materialized (nothing ever ingested):
+    /// loud skip, nothing built.
+    NoTable,
+}
+
+/// Backfill NULL [`TEXT_COLUMN`] values from the metadata blob's
+/// `x-vf-chunk-text` key: scan `(key, metadata_json)`, build `(key, text)`
+/// source batches for the rows that have text in the blob but NULL in the
+/// column, and merge_insert them with `when_matched_update_all` and NO
+/// insert clause — a partial-schema update (lance merge_insert contract:
+/// columns the source omits are neither read nor written), so vector,
+/// metadata and blob stay untouched. Returns how many rows were filled
+/// (0 when the table is already current — the common idempotent re-run).
+async fn backfill_text_column(table: &Table) -> Result<usize, StoreError> {
+    let stream = table
+        .query()
+        .select(lancedb::query::Select::columns(&[
+            "key",
+            TEXT_COLUMN,
+            "metadata_json",
+        ]))
+        .execute()
+        .await
+        .map_err(internal)?;
+    let mut pending: Vec<(String, String)> = Vec::new();
+    let mut stream = stream;
+    use futures_util::StreamExt;
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(internal)?;
+        let Some(keys) = batch.column_by_name("key") else {
+            return Err(StoreError::Internal("missing key column".into()));
+        };
+        let keys = keys
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| StoreError::Internal("key column not utf8".into()))?;
+        let texts = batch
+            .column_by_name(TEXT_COLUMN)
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let metas = batch
+            .column_by_name("metadata_json")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        for i in 0..batch.num_rows() {
+            if texts.is_some_and(|t| !t.is_null(i)) {
+                continue; // already carries its text
+            }
+            let Some(blob) = metadata_at(metas, i) else {
+                continue;
+            };
+            if let Some(t) = blob
+                .get(TEXT_COLUMN_KEY)
+                .and_then(serde_json::Value::as_str)
+            {
+                pending.push((keys.value(i).to_string(), t.to_string()));
+            }
+        }
+    }
+    let n = pending.len();
+    if n == 0 {
+        return Ok(0);
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new(TEXT_COLUMN, DataType::Utf8, true),
+    ]));
+    for chunk in pending.chunks(500) {
+        let keys: StringArray = chunk.iter().map(|(k, _)| Some(k.as_str())).collect();
+        let texts: StringArray = chunk.iter().map(|(_, t)| Some(t.as_str())).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(keys) as Arc<dyn Array>, Arc::new(texts)],
+        )
+        .map_err(internal)?;
+        let reader = RecordBatchIterator::new(vec![Ok::<_, ArrowError>(batch)], schema.clone());
+        let mut merge = table.merge_insert(&["key"]);
+        merge.when_matched_update_all(None); // no insert clause: every key exists
+        merge.execute(Box::new(reader)).await.map_err(internal)?;
+    }
+    Ok(n)
+}
+
+/// Read (key, _score, metadata) from an FTS batch (the BM25 counterpart of
+/// [`hits_from_batch`]).
+fn keyword_hits_from_batch(batch: &RecordBatch) -> Result<Vec<KeywordHit>, StoreError> {
+    let Some(keys) = batch.column_by_name("key") else {
+        return Err(StoreError::Internal("missing key column".into()));
+    };
+    let keys = keys
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| StoreError::Internal("key column not utf8".into()))?;
+    let Some(dist) = batch
+        .column_by_name("_score")
+        .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
+    else {
+        return Err(StoreError::Internal("missing _score column".into()));
+    };
+    let metas = batch
+        .column_by_name("metadata_json")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        out.push(KeywordHit {
+            key: keys.value(i).to_string(),
+            score: dist.value(i) as f64,
+            metadata: metadata_at(metas, i),
+        });
+    }
+    Ok(out)
 }
 
 /// s3admin create errors → StoreError (§5.2): InvalidBucketName/400 becomes
@@ -1485,6 +1836,12 @@ pub struct VectorRow {
     /// values, `List` marks list-valued keys (never mirrored, blob-only —
     /// but still drift-checked against any existing mirror column).
     pub filterable: BTreeMap<String, MetaMirror>,
+    /// Chunk text for the [`TEXT_COLUMN`] mirror (M3-T9): extracted by the
+    /// ops layer from the SAME parsed metadata document that serializes
+    /// into `metadata_json` (the `x-vf-chunk-text` key) — one source, two
+    /// writes (blob = wire echo, column = FTS fodder). `None` when the
+    /// document carries no chunk text.
+    pub text: Option<String>,
 }
 
 /// What a filterable metadata key looks like in one row (see VectorRow).
@@ -1579,6 +1936,26 @@ fn classify_batch(
     Ok(needed)
 }
 
+/// Additive AllNulls evolution adding the [`TEXT_COLUMN`] top-level utf8
+/// field — the same `NewColumnTransform::AllNulls` mechanism `evolve_metadata`
+/// uses (M0 Q10-proven shape), applied to a plain column. Pre-T9 tables take
+/// this path on their first chunk-text write; existing rows read back NULL
+/// until `vectorfs optimize` backfills them from the blob.
+async fn evolve_text_column(table: &Table) -> Result<(), StoreError> {
+    let evolved = Arc::new(Schema::new(vec![Field::new(
+        TEXT_COLUMN,
+        DataType::Utf8,
+        true,
+    )]));
+    table
+        .add_columns()
+        .transform(lance::dataset::NewColumnTransform::AllNulls(evolved))
+        .execute()
+        .await
+        .map_err(internal)?;
+    Ok(())
+}
+
 /// AllNulls evolution with ONLY the new struct children — the exact shape M0
 /// Q10 proved (a full struct including existing children is rejected with
 /// "Column ... already exists"; a flat "metadata.k" name is rejected too).
@@ -1613,7 +1990,12 @@ async fn evolve_metadata(
 /// already carry every mirror column the batch needs (see
 /// [`Storage::upsert_vectors`]).
 async fn upsert_table(table: &Table, dim: i32, rows: Vec<VectorRow>) -> Result<(), StoreError> {
-    let cols = mirror_columns(table.schema().await.map_err(internal)?.as_ref());
+    let schema = table.schema().await.map_err(internal)?;
+    let cols = mirror_columns(schema.as_ref());
+    // the chunk-text column rides in the batch iff the table carries it
+    // (a source omitting a target column would insert NULLs — right for
+    // text-less protocol batches, wrong for chunk rows)
+    let has_text = schema.field_with_name(TEXT_COLUMN).is_ok();
 
     let keys: StringArray = rows.iter().map(|r| Some(r.key.as_str())).collect();
     let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
@@ -1637,6 +2019,11 @@ async fn upsert_table(table: &Table, dim: i32, rows: Vec<VectorRow>) -> Result<(
         Arc::new(vectors) as Arc<dyn Array>,
         Arc::new(metas) as Arc<dyn Array>,
     ];
+    if has_text {
+        let texts: StringArray = rows.iter().map(|r| r.text.as_deref()).collect();
+        fields.push(Field::new(TEXT_COLUMN, DataType::Utf8, true));
+        arrays.push(Arc::new(texts));
+    }
     if !cols.is_empty() {
         // struct child arrays in schema order; each row contributes its value
         // for the child (typed per the schema) or NULL
@@ -2119,6 +2506,7 @@ mod tests {
                 Some(meta.to_string())
             },
             filterable,
+            text: None,
         }
     }
 
@@ -2194,6 +2582,18 @@ mod tests {
     /// A row whose vector is GIVEN (not LCG-derived) — the IVF_PQ tests'
     /// needle rows.
     fn row_with(key: &str, vector: Vec<f32>, meta: serde_json::Value) -> VectorRow {
+        row_with_text(key, vector, meta, None)
+    }
+
+    /// [`row_with`] plus the chunk-text column value (the T9 tests: `text`
+    /// mirrors the metadata blob's `x-vf-chunk-text`, exactly what the ops
+    /// layer's single-parse extraction produces).
+    fn row_with_text(
+        key: &str,
+        vector: Vec<f32>,
+        meta: serde_json::Value,
+        text: Option<&str>,
+    ) -> VectorRow {
         let mut filterable = BTreeMap::new();
         if let serde_json::Value::Object(map) = &meta {
             for (k, v) in map {
@@ -2218,6 +2618,7 @@ mod tests {
                 Some(meta.to_string())
             },
             filterable,
+            text: text.map(str::to_string),
         }
     }
 
@@ -2732,6 +3133,7 @@ mod tests {
                     vector: unit(&mut rng),
                     metadata_json: None,
                     filterable: BTreeMap::new(),
+                    text: None,
                 })
                 .collect();
             storage
@@ -3035,6 +3437,540 @@ mod tests {
     }
 
     use serde_json::json;
+
+    /// 1M-scale FTS reference (M3-T9 delivery numbers; run manually —
+    /// RELEASE profile, the T8 `perf_ivf_pq_vs_flat_1m` precedent):
+    ///
+    ///   cargo test --release -p vectorfs-server --lib perf_fts_1m -- --ignored --nocapture
+    ///
+    /// 口径: engine-direct `Storage::keyword_search` (no HTTP/SigV4 stack),
+    /// file backend on a temp dir, 1,000,000 synthetic 12-word sentences
+    /// (200-word vocabulary + rare needles), dim=4 vectors (the vector
+    /// column is irrelevant to the lexical path), ingested in 500
+    /// merge_insert batches of 2000, icu tokenizer (the default), topK=10.
+    /// Phase 1 measures FLAT BM25 (no FTS index — the pre-optimize path);
+    /// phase 2 builds the FTS index (timed) and re-measures. Last run's
+    /// numbers live in the module header ("FTS 对照" note) and the M3-T9
+    /// delivery report.
+    #[tokio::test]
+    #[ignore = "manual perf run: 1M-row ingest + FTS build (~minutes, ~1GB disk)"]
+    async fn perf_fts_1m() {
+        let dim: i32 = 4;
+        let total = 1_000_000usize;
+        let batch = 2_000usize;
+
+        let words: Vec<&str> = "capacity planning queue backpressure scheduler retry idempotent
+        handler autoscaling budget envelope regional placement streaming batch workload
+        latency throughput percentile objective slo error signal dashboard alert window
+        cache eviction policy consistency vector index fragment compaction checkpoint
+        snapshot isolation ledger consensus quorum election partition replica shard
+        failure detector probe gossip member protocol transport encryption mTLS gateway
+        routing load balancer circuit breaker fallback degradation graceful drain
+        observability trace span metric log ingestion pipeline transform enrich
+        normalize tokenize embed rank fusion retrieval lexical semantic hybrid bm25
+        inverted posting document corpus vocabulary token stem lowercase fold"
+            .split_whitespace()
+            .collect();
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::file(dir.path());
+        std::mem::forget(dir);
+        storage
+            .create_bucket(&test_bucket_meta(&storage, "vb"))
+            .await
+            .unwrap();
+        storage
+            .create_index(&IndexMeta {
+                vector_bucket_name: "vb".into(),
+                index_name: "ix1m".into(),
+                index_arn: "arn:aws:s3vectors:us-east-1:0:bucket/vb/index/ix1m".into(),
+                creation_time_rfc3339: "2026-11-06T00:00:00.000Z".into(),
+                creation_time_epoch: 0.0,
+                data_type: "float32".into(),
+                dimension: dim,
+                distance_metric: "cosine".into(),
+                non_filterable_metadata_keys: None,
+                index_mode: None,
+                x_vf_derived: None,
+            })
+            .await
+            .unwrap();
+
+        // deterministic corpus: 12 words per row; every 100,000th row hides
+        // a coined needle ("zxqwibble") so the probe queries have real hits
+        let mut rng = lcg(20261106);
+        let t0 = std::time::Instant::now();
+        for b in 0..total.div_ceil(batch) {
+            let rows: Vec<VectorRow> = (0..batch)
+                .map(|i| {
+                    let n = b * batch + i;
+                    let text = if n.is_multiple_of(100_000) {
+                        format!(
+                            "zxqwibble migration gate {}",
+                            words[(rng() % words.len() as u64) as usize]
+                        )
+                    } else {
+                        (0..12)
+                            .map(|_| words[(rng() % words.len() as u64) as usize])
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    };
+                    let vec: Vec<f32> = (0..dim).map(|_| (rng() % 1000) as f32 / 1000.0).collect();
+                    let meta = json!({
+                        "x-vf-src-uri": format!("h{n:08}"),
+                        "x-vf-src-name": format!("docs/{n:08}.txt"),
+                    });
+                    row_with_text(&format!("k{n:08}"), vec, meta, Some(&text))
+                })
+                .collect();
+            storage
+                .upsert_vectors("vb", "ix1m", dim, rows)
+                .await
+                .unwrap();
+            if b % 100 == 0 {
+                eprintln!(
+                    "ingest {}/{} ({:.0}s)",
+                    b * batch,
+                    total,
+                    t0.elapsed().as_secs()
+                );
+            }
+        }
+        eprintln!(
+            "ingest: {total} rows (12-word sentences) in {:.1}s",
+            t0.elapsed().as_secs_f64()
+        );
+
+        let probes = ["zxqwibble", "consensus quorum", "retrieval"];
+        async fn time(storage: &Storage, q: &str, iters: usize) -> (f64, f64) {
+            let mut times = Vec::with_capacity(iters);
+            for it in 0..=iters {
+                let t = std::time::Instant::now();
+                let hits = storage
+                    .keyword_search("vb", "ix1m", q, 10, None)
+                    .await
+                    .unwrap();
+                let dt = t.elapsed().as_secs_f64() * 1000.0;
+                if it > 0 {
+                    times.push(dt);
+                }
+                if it == 0 {
+                    eprintln!(
+                        "  probe {q:?}: {} hits, top={:?}",
+                        hits.len(),
+                        hits.first().map(|h| h.key.clone())
+                    );
+                }
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p = |q: f64| times[((times.len() as f64 - 1.0) * q).round() as usize];
+            (p(0.50), p(0.99))
+        }
+
+        // ---- phase 1: FLAT (no index; the pre-optimize correctness path) ----
+        let mut flat: Vec<(&str, f64, f64)> = Vec::new();
+        for q in &probes {
+            let (p50, p99) = time(&storage, q, 9).await;
+            eprintln!("flat    {q:<18} P50 {p50:>9.1} ms  P99 {p99:>9.1} ms");
+            flat.push((q, p50, p99));
+        }
+
+        // ---- build the FTS index (the optimize verb's engine call) ----
+        let t = std::time::Instant::now();
+        let outcome = storage.ensure_fts_index("vb", "ix1m", "icu").await.unwrap();
+        eprintln!(
+            "fts build (icu): {outcome:?} in {:.1}s",
+            t.elapsed().as_secs_f64()
+        );
+
+        // ---- phase 2: INDEXED ----
+        for (q, f50, f99) in &flat {
+            let (p50, p99) = time(&storage, q, 29).await;
+            eprintln!(
+                "indexed {q:<18} P50 {p50:>9.1} ms  P99 {p99:>9.1} ms   (flat was {f50:.1}/{f99:.1} — {:.0}x P50)",
+                f50 / p50
+            );
+        }
+    }
+
+    // ---- M3-T9: the lexical layer (Lance native FTS, ADR 0002) ----
+
+    /// Chunk rows WITH text (the T9 write shape: column mirrors the blob's
+    /// `x-vf-chunk-text` — what ops::put_vectors extracts in one parse).
+    fn text_rows(dim: i32, texts: &[&str]) -> Vec<VectorRow> {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let meta = json!({
+                    "i": i,
+                    "x-vf-chunk-text": t,
+                    "x-vf-src-name": format!("docs/{i}.txt"),
+                });
+                row_with_text(
+                    &format!("k{:03}", i),
+                    lcg_vec(i as u64 + 7, dim),
+                    meta,
+                    Some(t),
+                )
+            })
+            .collect()
+    }
+
+    fn lcg_vec(seed: u64, dim: i32) -> Vec<f32> {
+        let mut r = lcg(seed);
+        (0..dim).map(|_| (r() % 1000) as f32 / 1000.0).collect()
+    }
+
+    /// The full lexical contract: build → BM25 ranking (tf moves the rank,
+    /// non-matching rows absent) → top_k truncation → determinism (score
+    /// desc, key asc).
+    #[tokio::test]
+    async fn fts_build_query_and_bm25_order() {
+        let dim = 4;
+        let texts = [
+            "alpha beta gamma delta",     // no needle
+            "needle alpha beta",          // tf 1
+            "needle needle alpha beta",   // tf 2 — BM25's favorite
+            "completely unrelated words", // no needle
+        ];
+        let storage = setup_metric("ixfts", vec![text_rows(dim, &texts)], dim, "cosine").await;
+        assert_eq!(
+            storage
+                .ensure_fts_index("vb", "ixfts", "icu")
+                .await
+                .unwrap(),
+            FtsIndexOutcome::Built {
+                rows: 4,
+                backfilled: 0
+            }
+        );
+
+        let hits = storage
+            .keyword_search("vb", "ixfts", "needle", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+            vec!["k002", "k001"],
+            "tf=2 outranks tf=1; non-matching rows are absent"
+        );
+        assert!(hits[0].score > hits[1].score, "BM25 desc");
+        assert!(hits[0].score > 0.0, "a raw BM25 score, not a rank");
+        // the metadata blob rides along (the wire echo needs it)
+        assert_eq!(
+            hits[0].metadata.as_ref().unwrap()["x-vf-src-name"],
+            json!("docs/2.txt")
+        );
+
+        // top_k truncation keeps the best
+        let top1 = storage
+            .keyword_search("vb", "ixfts", "needle", 1, None)
+            .await
+            .unwrap();
+        assert_eq!(top1.len(), 1);
+        assert_eq!(top1[0].key, "k002");
+
+        // filter discipline: the pushdown + exact post-filter over the SAME
+        // $-grammar the vector routes use
+        let filter = Filter::compile(&json!({"i": {"$lte": 1}})).unwrap();
+        let hits = storage
+            .keyword_search("vb", "ixfts", "needle", 10, Some(&filter))
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+            vec!["k001"],
+            "only the matching row survives the filter"
+        );
+    }
+
+    /// THE tokenizer ruling (ADR 0002): icu (default) segments mixed zh/en
+    /// into whole words — dictionary CJK, whole Latin words; ngram 2,2
+    /// bigrams EVERYTHING — CJK substring hits work, Latin substrings work,
+    /// and that is exactly the trade the preset comment records. The
+    /// assertions are differential: what one tokenizer matches the other
+    /// refuses, on both sides of the script boundary.
+    #[tokio::test]
+    async fn fts_tokenizer_icu_vs_ngram_mixed_corpus() {
+        let dim = 4;
+        let texts = [
+            "向量数据库与全文检索的混合引擎 vectorfs",
+            "北京是一座大城市 the city",
+            "完全无关的另一些内容 unrelated filler",
+        ];
+        let icu = setup_metric("ixicu", vec![text_rows(dim, &texts)], dim, "cosine").await;
+        let ngram = setup_metric("ixngram", vec![text_rows(dim, &texts)], dim, "cosine").await;
+        icu.ensure_fts_index("vb", "ixicu", "icu").await.unwrap();
+        ngram
+            .ensure_fts_index("vb", "ixngram", "ngram")
+            .await
+            .unwrap();
+
+        async fn hit_keys(s: &Storage, ix: &str, q: &str) -> Vec<String> {
+            s.keyword_search("vb", ix, q, 10, None)
+                .await
+                .unwrap()
+                .iter()
+                .map(|h| h.key.as_str().to_string())
+                .collect()
+        }
+
+        // CJK through icu (the default's reason to exist): a Chinese word
+        // lands its document
+        assert_eq!(hit_keys(&icu, "ixicu", "北京").await, vec!["k001"]);
+        // Latin whole words through icu
+        assert_eq!(hit_keys(&icu, "ixicu", "vectorfs").await, vec!["k000"]);
+        // icu does NOT substring: a Latin mid-word fragment refuses…
+        assert!(
+            hit_keys(&icu, "ixicu", "ectorf").await.is_empty(),
+            "icu keeps whole Latin words"
+        );
+        // …and a bigram CRAFTED to cross dictionary words (向量|数据|库)
+        // refuses too — segmentation, not bigrams
+        assert!(
+            hit_keys(&icu, "ixicu", "量数").await.is_empty(),
+            "icu segments; it does not bigram"
+        );
+
+        // ngram 2,2: the same two queries that icu refused both HIT (every
+        // adjacent bigram of doc and query is indexed) — the Latin
+        // bigramization trade in one assertion
+        assert_eq!(hit_keys(&ngram, "ixngram", "量数").await, vec!["k000"]);
+        assert_eq!(hit_keys(&ngram, "ixngram", "ectorf").await, vec!["k000"]);
+        // and whole-word queries still work through their bigrams
+        assert_eq!(hit_keys(&ngram, "ixngram", "北京").await, vec!["k001"]);
+    }
+
+    /// The old-table ruling: a pre-T9 table (blob carries chunk text, no
+    /// top-level column) refuses keyword search LOUDLY with the fix —
+    /// never a silent empty result (the F1 friction this layer kills).
+    #[tokio::test]
+    async fn old_table_without_text_column_refuses_keyword_loudly() {
+        let dim = 4;
+        // pre-T9 shape: metadata blob HAS x-vf-chunk-text, the column does
+        // not exist (no T9 write ever ran against this table)
+        let rows: Vec<VectorRow> = ["hello needle world", "other content"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let meta = json!({ "x-vf-chunk-text": t });
+                row_with(&format!("k{i:03}"), lcg_vec(i as u64 + 3, dim), meta)
+            })
+            .collect();
+        let storage = setup_metric("ixold", vec![rows], dim, "cosine").await;
+        let err = storage
+            .keyword_search("vb", "ixold", "needle", 10, None)
+            .await
+            .unwrap_err();
+        match &err {
+            StoreError::Validation(m) => {
+                assert!(m.contains("vectorfs optimize"), "{m}");
+                assert!(m.contains("text"), "{m}");
+            }
+            other => panic!("expected loud Validation, got {other:?}"),
+        }
+        // and the refusal is honest: the column really is absent
+        let table = storage.open_table("vb", "ixold").await.unwrap();
+        assert!(
+            table
+                .schema()
+                .await
+                .unwrap()
+                .field_with_name(TEXT_COLUMN)
+                .is_err()
+        );
+    }
+
+    /// The migration path end to end: write-path evolution adds the column
+    /// (NEW rows populated, old rows NULL — never silently searchable),
+    /// then the optimize pass backfills old rows from the blob and builds
+    /// the index; afterwards every row is keyword-reachable.
+    #[tokio::test]
+    async fn write_path_adds_column_new_rows_only_then_backfill_fills_old() {
+        let dim = 4;
+        let old_rows: Vec<VectorRow> = ["the needle rests here", "and here too"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let meta = json!({ "x-vf-chunk-text": t });
+                row_with(&format!("old{i}"), lcg_vec(i as u64 + 11, dim), meta)
+            })
+            .collect();
+        let storage = setup_metric("ixmig", vec![old_rows], dim, "cosine").await;
+
+        // a T9-era write lands: the column appears, the NEW row is
+        // searchable, the OLD rows are NOT (NULL text — the honest
+        // not-yet-migrated state, not a silent full-coverage lie)
+        let new_rows = text_rows(dim, &["needle freshly written"]);
+        let new_key = new_rows[0].key.clone();
+        storage
+            .upsert_vectors("vb", "ixmig", dim, new_rows)
+            .await
+            .unwrap();
+        let hits = storage
+            .keyword_search("vb", "ixmig", "needle", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+            vec![new_key.as_str()],
+            "flat BM25 over the new row only — old rows still NULL"
+        );
+
+        // the optimize pass: backfill 2 old rows from the blob + build
+        let out = storage
+            .ensure_fts_index("vb", "ixmig", "icu")
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            FtsIndexOutcome::Built {
+                rows: 3,
+                backfilled: 2
+            }
+        );
+        // every row carrying the term is reachable now (old0 + the new row;
+        // old1's text "and here too" never contained the term)
+        let hits = storage
+            .keyword_search("vb", "ixmig", "needle", 10, None)
+            .await
+            .unwrap();
+        let mut keys: Vec<&str> = hits.iter().map(|h| h.key.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["k000", "old0"], "backfilled old row reachable");
+
+        // idempotent re-run: nothing left to backfill, index folds
+        assert_eq!(
+            storage
+                .ensure_fts_index("vb", "ixmig", "icu")
+                .await
+                .unwrap(),
+            FtsIndexOutcome::Folded {
+                rows: 3,
+                backfilled: 0
+            }
+        );
+    }
+
+    /// The flat fallback ruling (lance semantics, verified against 14.0.2):
+    /// a table WITH the column but WITHOUT the FTS index answers keyword
+    /// queries CORRECTLY — the scanner flat-computes BM25 — so until the
+    /// optimize verb runs, keyword search works and the index only buys
+    /// speed. Pinned by comparing flat and indexed answers key-for-key.
+    #[tokio::test]
+    async fn keyword_flat_fallback_without_fts_index_is_correct() {
+        let dim = 4;
+        let texts = [
+            "capacity planning for winter",
+            "needle in the haystack chapter",
+            "needle needle double",
+            "nothing to see",
+        ];
+        let storage = setup_metric("ixflat", vec![text_rows(dim, &texts)], dim, "cosine").await;
+
+        // NO ensure_fts_index: the flat path answers
+        let flat = storage
+            .keyword_search("vb", "ixflat", "needle", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            flat.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+            vec!["k002", "k001"],
+            "flat BM25 orders by relevance too"
+        );
+
+        // build the index: the indexed answers keep the SAME keys in the
+        // SAME order. (The raw SCORES differ by a small flat-vs-indexed
+        // delta — the two paths compute BM25 corpus statistics slightly
+        // differently, which is precisely why `keyword_search` docs say
+        // the score is an ordering, not a calibrated number.)
+        storage
+            .ensure_fts_index("vb", "ixflat", "icu")
+            .await
+            .unwrap();
+        let indexed = storage
+            .keyword_search("vb", "ixflat", "needle", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            flat.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+            indexed.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+            "index changes speed, not the ranking"
+        );
+        for (f, i) in flat.iter().zip(indexed.iter()) {
+            assert!(
+                (f.score - i.score).abs() < 0.5,
+                "same relevance ballpark: {f:?} vs {i:?}"
+            );
+        }
+    }
+
+    /// Ingest continues after optimize (the T8 delta contract, lexical
+    /// edition): rows written after the FTS build are found by the NEXT
+    /// query (flat over the delta), and the next pass folds them in.
+    #[tokio::test]
+    async fn fts_fold_absorbs_delta_rows() {
+        let dim = 4;
+        let storage = setup_metric(
+            "ixdelta",
+            vec![text_rows(dim, &["stable first row"])],
+            dim,
+            "cosine",
+        )
+        .await;
+        storage
+            .ensure_fts_index("vb", "ixdelta", "icu")
+            .await
+            .unwrap();
+
+        // delta row AFTER the index build (a FRESH key — an upsert of k000
+        // would replace, not append)
+        let delta = vec![row_with_text(
+            "delta0",
+            lcg_vec(99, dim),
+            json!({"x-vf-chunk-text": "zephyr delta row written later"}),
+            Some("zephyr delta row written later"),
+        )];
+        storage
+            .upsert_vectors("vb", "ixdelta", dim, delta)
+            .await
+            .unwrap();
+        let hits = storage
+            .keyword_search("vb", "ixdelta", "zephyr", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "delta row is searchable pre-fold (flat)");
+
+        // fold: the delta joins the index, answers unchanged
+        assert_eq!(
+            storage
+                .ensure_fts_index("vb", "ixdelta", "icu")
+                .await
+                .unwrap(),
+            FtsIndexOutcome::Folded {
+                rows: 2,
+                backfilled: 0
+            }
+        );
+        let hits = storage
+            .keyword_search("vb", "ixdelta", "zephyr", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // deletes agree with the index (deletion vectors, the same contract
+        // as the vector index)
+        storage
+            .delete_vectors("vb", "ixdelta", &["k000".to_string()])
+            .await
+            .unwrap();
+        let hits = storage
+            .keyword_search("vb", "ixdelta", "stable", 10, None)
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "deleted row is gone from keyword search");
+    }
 
     // ---- M2 T3: Source markers + derived-index meta tolerance ----
 

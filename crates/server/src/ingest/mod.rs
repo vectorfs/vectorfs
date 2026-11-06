@@ -275,6 +275,12 @@ pub(crate) struct BucketPlan {
     retries: u32,
     extract_timeout: Duration,
     store_chunk_text: bool,
+    /// Lexical face switch + tokenizer (M3-T9): carried so the `/x-vf`
+    /// query face can gate `searchMode: keyword|hybrid` on it and
+    /// `vectorfs optimize` can build the FTS index with the bucket's
+    /// tokenizer. Query-availability like `merge` — never chunk identity.
+    pub(crate) fts: bool,
+    pub(crate) fts_tokenizer: crate::pipeline::config::FtsTokenizer,
     /// The normalize charset entry's fallback (M3-T7), resolved ONCE at
     /// load from the config's canonical name (config.rs validated the
     /// label at parse) and threaded to BOTH normalize call sites — the
@@ -1073,6 +1079,8 @@ impl IngestCore {
                     retries: icfg.retries,
                     extract_timeout: Duration::from_secs(icfg.extract_timeout_secs),
                     store_chunk_text: icfg.store_chunk_text,
+                    fts: icfg.fts,
+                    fts_tokenizer: icfg.fts_tokenizer,
                     charset_fallback: encoding_rs::Encoding::for_label(
                         icfg.charset_fallback.as_bytes(),
                     )
@@ -2594,6 +2602,19 @@ impl IngestShared {
     /// see `pipeline::merge_hitlists_weighted`.
     pub fn merge_weights_of(&self, bucket: &str) -> Option<&BTreeMap<String, f64>> {
         self.core.buckets.get(bucket).map(|p| &p.merge_weights)
+    }
+
+    /// Lexical-face switch of one bucket (M3-T9): `false` (the §7 default)
+    /// means `/x-vf/Search` refuses `searchMode: keyword|hybrid` for it and
+    /// `vectorfs optimize` skips its FTS pass.
+    pub fn fts_of(&self, bucket: &str) -> Option<bool> {
+        self.core.buckets.get(bucket).map(|p| p.fts)
+    }
+
+    /// The bucket's FTS tokenizer (`icu` default; `ngram` = 2,2 bigram) —
+    /// what `vectorfs optimize` builds the FTS index with (M3-T9).
+    pub fn fts_tokenizer_of(&self, bucket: &str) -> Option<crate::pipeline::config::FtsTokenizer> {
+        self.core.buckets.get(bucket).map(|p| p.fts_tokenizer)
     }
 
     /// Derived-index specs of one bucket, config embedder order.
@@ -4153,6 +4174,7 @@ pub(crate) mod tests {
                 "x-vf-src-uri".to_string(),
                 crate::store::MetaMirror::Str(uri),
             )]),
+            text: None,
         };
         state
             .storage

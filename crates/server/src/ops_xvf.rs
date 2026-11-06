@@ -131,6 +131,19 @@ struct SearchInput {
     top_k: Option<i64>,
     filter: Option<serde_json::Value>,
     return_text: Option<bool>,
+    /// Retrieval mode (M3-T9, ADR 0002): `semantic` (default — the
+    /// pre-T9 behavior, old clients unchanged), `keyword` (pure BM25 via
+    /// the lexical kernel), `hybrid` (semantic fan-out + BM25 fused by the
+    /// bucket's merge strategy). Unknown values are ValidationExceptions.
+    search_mode: Option<String>,
+}
+
+/// The parsed `searchMode` (see [`SearchInput::search_mode`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchMode {
+    Semantic,
+    Keyword,
+    Hybrid,
 }
 
 #[derive(Deserialize)]
@@ -760,21 +773,40 @@ fn decode_image_query(img: &SearchImageInput) -> Result<(Vec<u8>, String), ApiEr
 /// text-query embedder — including siglip2's IMAGE index, 文字搜图 (the
 /// dual-tower default route; the merge treats it like any second list).
 ///
+/// `searchMode` (M3-T9, ADR 0002; default `semantic` — absent = old
+/// behavior, old clients zero-change):
+/// * `semantic` — the pre-T9 fan-out above;
+/// * `keyword` — pure BM25: per route, the lexical kernel
+///   ([`crate::lexical`], Lance native FTS) runs `query.text` against the
+///   derived table's `text` column; lists merge with the bucket's strategy
+///   exactly like semantic routes. Requires a TEXT query (an image has no
+///   lexical side) and the bucket's `fts = true` (`[ingest.<bucket>]`); a
+///   table that predates the lexical layer fails LOUD with the
+///   `vectorfs optimize` fix (never a silent empty result — that is the F1
+///   friction this mode exists to kill);
+/// * `hybrid` — BOTH arms per route: the semantic list plus the BM25 list,
+///   all lists fused by the same bucket strategy (rrf, or `weighted` where
+///   BOTH arms of a route share the embedder instance's weight).
+///
 /// Hit shape, field by field (appendix E.2):
 /// * `content{text?, type: "TEXT"|"IMAGE"}` — `type` follows the CHUNK's
 ///   modality (`x-vf-modality`; image chunks answer IMAGE whatever the
 ///   query's modality was); `text` = the stored `x-vf-chunk-text`, omitted
 ///   when `returnText=false`, `store_chunk_text=false`, or the chunk is an
 ///   image (image chunks store no text — the source file is the content);
-/// * `score` — the merged score. Single route: passthrough of
-///   `1/(1+distance)` (monotone in distance, so thresholds stay meaningful —
-///   fusion scores only make sense across lists). Multiple routes: the rrf
-///   sum, or with `merge = "weighted"` (M3-T8) the per-embedder-instance
-///   weight times each rank contribution — RANK-based either way, never raw
-///   distances (different embedders are dimensionally incomparable; see
+/// * `score` — the merged score. Single list: passthrough of the route's
+///   own score — semantic `1/(1+distance)` (monotone in distance, so
+///   thresholds stay meaningful), keyword the kernel's RAW BM25
+///   (corpus-statistics-dependent: comparable within one index's ranking,
+///   never a calibrated relevance across corpora or queries — treat it as
+///   an ordering, not a number). Multiple lists: the rrf sum, or with
+///   `merge = "weighted"` (M3-T8) the per-embedder-instance weight times
+///   each rank contribution — RANK-based either way, never raw scores
+///   (different embedders/kernels are dimensionally incomparable; see
 ///   `pipeline::merge_hitlists_weighted`);
-/// * `distance` — emitted only for single-route queries (appendix E.2:
-///   "单路查询时有意义"; a merged hit has no single distance);
+/// * `distance` — emitted only for single-LIST semantic queries (appendix
+///   E.2: "单路查询时有意义"; keyword hits have no vector distance and a
+///   fused hit has no single distance);
 /// * `index`/`key` — derived index name + chunk key; attribution is the
 ///   FIRST route (config order) containing the key when several do;
 /// * `location{type:"source", key}` — `key` = the full object key
@@ -784,6 +816,21 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
     let input: SearchInput = parse_body(&body)?;
     let handle = require_ingest(&state, &input.bucket)?;
     let shared = handle.shared();
+
+    let mode = match input.search_mode.as_deref() {
+        None | Some("semantic") => SearchMode::Semantic,
+        Some("keyword") => SearchMode::Keyword,
+        Some("hybrid") => SearchMode::Hybrid,
+        Some(other) => {
+            return Err(ApiError::validation_field(
+                "searchMode",
+                format!(
+                    "unknown searchMode {other:?} (allowed: semantic, keyword, hybrid) — \
+                     semantic is the default"
+                ),
+            ));
+        }
+    };
 
     let query = input.query.ok_or_else(|| {
         ApiError::validation("query is required (query.text or query.image; audio arrives in M4)")
@@ -823,6 +870,18 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
             Query::Text(t)
         }
         (None, Some(img)) => {
+            // keyword/hybrid are lexical faces: they need TEXT (an image
+            // query has no tokens to match)
+            if mode != SearchMode::Semantic {
+                return Err(ApiError::validation_field(
+                    "searchMode",
+                    format!(
+                        "searchMode {:?} needs query.text — the lexical arm matches tokens; \
+                         use semantic for image queries",
+                        input.search_mode.as_deref().unwrap_or("semantic")
+                    ),
+                ));
+            }
             let (bytes, mime) = decode_image_query(&img)?;
             Query::Image(bytes, mime)
         }
@@ -831,6 +890,21 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
         Query::Text(_) => Modality::Text,
         Query::Image(_, _) => Modality::Image,
     };
+
+    // the lexical face is opt-in per bucket (§7: M3 superset content ships
+    // OFF); refusing here — not returning empty hits — makes the config
+    // gap a one-line fix instead of a mystery
+    if mode != SearchMode::Semantic && shared.fts_of(&input.bucket) != Some(true) {
+        return Err(ApiError::validation_field(
+            "searchMode",
+            format!(
+                "bucket {:?} has the lexical face disabled — set `fts = true` under \
+                 [ingest.{}] in vectorfs.toml and run `vectorfs optimize` to build the FTS \
+                 index (restart the daemon for the config change)",
+                input.bucket, input.bucket
+            ),
+        ));
+    }
 
     let top_k = match input.top_k {
         None => 10,
@@ -868,13 +942,25 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
     // query side declares [Image, Text], INCLUDES the image index (文字搜图,
     // the research-file default dual route); an IMAGE query fans out to the
     // image-query embedders only (a text tower cannot embed bytes).
+    // M3-T9: hybrid appends the BM25 list of the SAME route after its
+    // semantic list — one route contributes two lists (both named by the
+    // embedder instance, so merge-weights weigh a route's both arms alike).
+    let lexical = crate::lexical::kernel();
+    let query_text = match &query {
+        Query::Text(t) => Some(t.as_str()),
+        Query::Image(_, _) => None,
+    };
     let mut lists: Vec<HitList> = Vec::new();
     // route identity parallel to `lists` (M3-T8): the embedder INSTANCE name
     // of each list — the key merge-weights are looked up by
     let mut routes: Vec<String> = Vec::new();
     let mut matched_any = false;
-    // key -> (index name, distance, stored metadata); first route wins
-    let mut attribution: HashMap<String, (String, f64, Option<serde_json::Value>)> = HashMap::new();
+    // key -> (index name, distance?, stored metadata); first route wins.
+    // distance is None for keys whose only evidence is a BM25 hit (keyword
+    // mode / a hybrid-only key) — the wire emits it for single-LIST
+    // semantic queries only anyway.
+    let mut attribution: HashMap<String, (String, Option<f64>, Option<serde_json::Value>)> =
+        HashMap::new();
     for name in &names {
         let Some(loaded) = shared.embedder(name) else {
             continue;
@@ -917,51 +1003,84 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
                 }
             }
         }
-        let qvec = loaded.embed_query(&query).await.map_err(|e| {
-            ApiError::internal(format!("embedder '{name}' failed to embed the query: {e}"))
-        })?;
-        if qvec.len() != meta.dimension as usize {
-            return Err(ApiError::internal(format!(
-                "embedder '{name}' produced a {}-dim query vector but derived index {} has \
-                 dimension {} — the pipeline config and the index drifted; run reindex",
-                qvec.len(),
-                spec.index_name,
-                meta.dimension
-            )));
+        if mode != SearchMode::Keyword {
+            let qvec = loaded.embed_query(&query).await.map_err(|e| {
+                ApiError::internal(format!("embedder '{name}' failed to embed the query: {e}"))
+            })?;
+            if qvec.len() != meta.dimension as usize {
+                return Err(ApiError::internal(format!(
+                    "embedder '{name}' produced a {}-dim query vector but derived index {} has \
+                     dimension {} — the pipeline config and the index drifted; run reindex",
+                    qvec.len(),
+                    spec.index_name,
+                    meta.dimension
+                )));
+            }
+            let outcome = state
+                .storage
+                .query_vectors(
+                    &input.bucket,
+                    &spec.index_name,
+                    meta.dimension,
+                    &meta.distance_metric,
+                    &qvec,
+                    top_k,
+                    compiled.as_ref(),
+                    QueryRoute::Pushdown,
+                    None,
+                )
+                .await?;
+            let list: HitList = outcome
+                .hits
+                .iter()
+                .map(|h| {
+                    attribution.entry(h.key.clone()).or_insert_with(|| {
+                        (
+                            spec.index_name.clone(),
+                            Some(h.distance as f64),
+                            h.metadata.clone(),
+                        )
+                    });
+                    crate::pipeline::Hit {
+                        key: h.key.clone(),
+                        score: 1.0 / (1.0 + h.distance as f64),
+                    }
+                })
+                .collect();
+            lists.push(list);
+            routes.push(name.clone());
         }
-        let outcome = state
-            .storage
-            .query_vectors(
-                &input.bucket,
-                &spec.index_name,
-                meta.dimension,
-                &meta.distance_metric,
-                &qvec,
-                top_k,
-                compiled.as_ref(),
-                QueryRoute::Pushdown,
-                None,
-            )
-            .await?;
-        let list: HitList = outcome
-            .hits
-            .iter()
-            .map(|h| {
-                attribution.entry(h.key.clone()).or_insert_with(|| {
-                    (
-                        spec.index_name.clone(),
-                        h.distance as f64,
-                        h.metadata.clone(),
-                    )
-                });
-                crate::pipeline::Hit {
-                    key: h.key.clone(),
-                    score: 1.0 / (1.0 + h.distance as f64),
-                }
-            })
-            .collect();
-        lists.push(list);
-        routes.push(name.clone());
+        if mode != SearchMode::Semantic
+            && let Some(text) = query_text
+        {
+            // the lexical arm rides the lexical-kernel seam (ADR 0002's
+            // swap path); StoreError::Validation (pre-T9 table) surfaces as
+            // a ValidationException carrying the optimize fix
+            let hits = lexical
+                .search(
+                    &state.storage,
+                    &input.bucket,
+                    &spec.index_name,
+                    text,
+                    top_k,
+                    compiled.as_ref(),
+                )
+                .await?;
+            let list: HitList = hits
+                .iter()
+                .map(|h| {
+                    attribution
+                        .entry(h.key.clone())
+                        .or_insert_with(|| (spec.index_name.clone(), None, h.metadata.clone()));
+                    crate::pipeline::Hit {
+                        key: h.key.clone(),
+                        score: h.score,
+                    }
+                })
+                .collect();
+            lists.push(list);
+            routes.push(name.clone());
+        }
     }
     if !matched_any {
         return Err(ApiError::validation(format!(
@@ -972,13 +1091,15 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
     }
 
     let merge = shared.merge_of(&input.bucket).unwrap_or(Merge::Rrf);
-    let single_route = lists.len() == 1;
+    let single_list = lists.len() == 1;
     let mut merged = match merge {
         Merge::Rrf => merge_hitlists(Merge::Rrf, &lists),
         // weighted (M3-T8): per-embedder-instance weights on each rank
         // contribution (pipeline::merge_hitlists_weighted documents why the
         // fusion is RANK-based — raw distances of different embedders are
-        // dimensionally incomparable). Weightless instances count 1.0.
+        // dimensionally incomparable). Weightless instances count 1.0. A
+        // hybrid route's semantic and BM25 lists share the instance name,
+        // so its weight weighs both arms alike.
         Merge::Weighted => {
             let empty = std::collections::BTreeMap::new();
             let weights = shared.merge_weights_of(&input.bucket).unwrap_or(&empty);
@@ -1027,7 +1148,7 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
                 "index": index,
                 "key": h.key,
             });
-            if single_route {
+            if single_list && mode == SearchMode::Semantic {
                 o["distance"] = json!(distance);
             }
             if let Some(m) = &metadata {
@@ -1244,6 +1365,26 @@ mod tests {
              [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ txt = \"plain\" }}\n\
              chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
              embedders = [\"tiny\"]\nscan_interval_secs = 1\n",
+            fixture_dir().display().to_string()
+        );
+        load_pipeline_config(&text).unwrap()
+    }
+
+    /// [`tiny_config`] + the lexical face ON (M3-T9): `fts = true`, default
+    /// icu tokenizer; `weighted` appends the M3-T8 weighted-merge shape the
+    /// hybrid-weighted test needs.
+    fn tiny_fts_config(weighted: bool) -> crate::pipeline::config::PipelineConfig {
+        let merge = if weighted {
+            "merge = \"weighted\"\nmerge-weights = { tiny = 2.5 }\n"
+        } else {
+            ""
+        };
+        let text = format!(
+            "[extractor.plain]\nkind = \"txt\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = true\n\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ txt = \"plain\" }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"tiny\"]\nscan_interval_secs = 1\n{merge}fts = true\n",
             fixture_dir().display().to_string()
         );
         load_pipeline_config(&text).unwrap()
@@ -2131,6 +2272,336 @@ mod tests {
             // no `distance` on multi-route hits (appendix E.2)
             assert!(hits.iter().all(|h| h.get("distance").is_none()), "{b}");
         }
+    }
+
+    // ---------------- Search searchMode (M3-T9) ----------------
+
+    /// The F1 friction corpus (research/2026-11-friction-backlog.md): a
+    /// COINED word that appears in exactly one chunk of one document, buried
+    /// in enough sibling material that embedding retrieval cannot see it —
+    /// the exact shape that forced 18MB×5 manual greps in the field.
+    fn f1_corpus() -> Vec<(&'static str, String)> {
+        let filler = |seed: usize| {
+            format!(
+                "topic {seed} discusses capacity planning queues and backpressure \
+                 across distributed schedulers with retries and idempotent handlers \
+                 covering cold starts warm pools and autoscaling limits while \
+                 reviewers debate budgets cost envelopes and regional placement \
+                 strategies for long running batch and streaming workloads alike "
+            )
+            .repeat(2)
+        };
+        let mut docs = vec![
+            ("docs/plan.txt", filler(1)),
+            ("docs/queue.txt", filler(2)),
+            ("docs/cost.txt", filler(3)),
+            ("docs/regions.txt", filler(4)),
+            ("docs/retry.txt", filler(5)),
+        ];
+        // THE needle doc: the coined term appears exactly once, mid-text
+        docs.push((
+            "docs/needle.txt",
+            format!(
+                "{} the zxqwibble migration gate owns every rollout decision {}",
+                filler(6),
+                filler(7)
+            ),
+        ));
+        docs
+    }
+
+    /// THE F1 acceptance (M3-T9's reason to exist): semantic top-20 MISSES
+    /// the coined-term chunk; keyword mode puts it at TOP-1 with the right
+    /// document attribution; hybrid (rrf) surfaces it in the fused head.
+    /// Runs the documented flow: ingest → `vectorfs optimize`'s engine call
+    /// (FTS build) → search in all three modes.
+    #[tokio::test]
+    async fn f1_coined_term_semantic_misses_keyword_hits_hybrid_fuses() {
+        let f = fixture_with(tiny_fts_config(false)).await;
+        for (key, body) in f1_corpus() {
+            put_source_call(&f, "docs", key, body.into_bytes()).await;
+        }
+        drive(&f).await;
+
+        // the operator verb's engine call (what `vectorfs optimize` runs)
+        let spec = f
+            .handle
+            .shared()
+            .derived_specs("docs")
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            f.state
+                .storage
+                .ensure_fts_index("docs", &spec.index_name, "icu")
+                .await
+                .unwrap(),
+            crate::store::FtsIndexOutcome::Built {
+                rows: f
+                    .state
+                    .storage
+                    .count_vectors("docs", &spec.index_name)
+                    .await
+                    .unwrap(),
+                backfilled: 0
+            },
+            "fresh T9 ingest: every row carried its text at write time"
+        );
+
+        // ---- keyword: the coined term is a top-1 hit, attributed right ----
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"zxqwibble"},"topK":10,
+                   "searchMode":"keyword"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "{b}");
+        assert_eq!(hits[0]["location"]["key"], json!("docs/needle.txt"), "{b}");
+        assert!(
+            hits[0]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("zxqwibble"),
+            "{b}"
+        );
+        assert!(hits[0]["score"].as_f64().unwrap() > 0.0, "raw BM25: {b}");
+        assert!(
+            hits.iter().all(|h| h.get("distance").is_none()),
+            "keyword hits carry no vector distance: {b}"
+        );
+        let needle_key = hits[0]["key"].as_str().unwrap().to_string();
+
+        // ---- semantic: top-20 does NOT contain the coined chunk (F1) ----
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"zxqwibble migration gate"},
+                   "topK":20}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let semantic_keys: Vec<&str> = b["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(semantic_keys.len(), 20, "{b}");
+        assert!(
+            !semantic_keys.contains(&needle_key.as_str()),
+            "the tiny embedder cannot see the coined term — F1's shape: {semantic_keys:?}"
+        );
+
+        // ---- hybrid (rrf): BM25 rank-1 contribution fuses it into the head ----
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"zxqwibble migration gate"},
+                   "topK":10,"searchMode":"hybrid"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hybrid_keys: Vec<&str> = b["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["key"].as_str().unwrap())
+            .collect();
+        let rank = hybrid_keys
+            .iter()
+            .position(|k| *k == needle_key.as_str())
+            .unwrap_or_else(|| panic!("hybrid must surface the needle: {hybrid_keys:?}"));
+        assert!(rank < 10, "well inside the fused head: {hybrid_keys:?}");
+        // single-route hybrid is a REAL fusion (2 lists) — no passthrough
+        // distance, and the score is an rrf sum
+        assert!(
+            b["hits"].as_array().unwrap()[rank]
+                .get("distance")
+                .is_none()
+        );
+
+        // ---- old-client zero change: absent == explicit "semantic" ----
+        let (st, _, explicit) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"capacity planning"},
+                   "topK":10,"searchMode":"semantic"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, implicit) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"capacity planning"},"topK":10}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(explicit, implicit, "searchMode is additive");
+    }
+
+    /// CJK through the default icu tokenizer: a Chinese word retrieves its
+    /// document in keyword mode (the center-of-gravity corpus, ADR 0002's
+    /// default-tokenizer rationale).
+    #[tokio::test]
+    async fn keyword_mode_cjk_icu_default_hits() {
+        let f = fixture_with(tiny_fts_config(false)).await;
+        put_source_call(
+            &f,
+            "docs",
+            "docs/zh.txt",
+            "这是一份中文文档。北京是这座城市章节的主题，全文围绕北京的历史与规划展开。"
+                .as_bytes()
+                .to_vec(),
+        )
+        .await;
+        put_source_call(
+            &f,
+            "docs",
+            "docs/en.txt",
+            b"an english language document about cities and history".to_vec(),
+        )
+        .await;
+        drive(&f).await;
+        let spec = f
+            .handle
+            .shared()
+            .derived_specs("docs")
+            .unwrap()
+            .pop()
+            .unwrap();
+        f.state
+            .storage
+            .ensure_fts_index("docs", &spec.index_name, "icu")
+            .await
+            .unwrap();
+
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"北京"},"topK":5,
+                   "searchMode":"keyword"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "the Chinese word lands: {b}");
+        assert_eq!(hits[0]["location"]["key"], json!("docs/zh.txt"), "{b}");
+        // and it is SELECTIVE — every hit is the Chinese document, never the
+        // english one (the doc chunked into several pieces; both carrying
+        // 北京 legitimately match)
+        assert!(
+            hits.iter()
+                .all(|h| h["location"]["key"] == json!("docs/zh.txt")),
+            "{b}"
+        );
+    }
+
+    /// Hybrid under `merge = "weighted"` (M3-T8's weights, naturally
+    /// applying to the M3-T9 two-arm fan-out): the lexical arm's find
+    /// survives the weighted fusion.
+    #[tokio::test]
+    async fn hybrid_weighted_merge_keeps_the_lexical_find() {
+        let f = fixture_with(tiny_fts_config(true)).await;
+        for (key, body) in f1_corpus() {
+            put_source_call(&f, "docs", key, body.into_bytes()).await;
+        }
+        drive(&f).await;
+        let spec = f
+            .handle
+            .shared()
+            .derived_specs("docs")
+            .unwrap()
+            .pop()
+            .unwrap();
+        f.state
+            .storage
+            .ensure_fts_index("docs", &spec.index_name, "icu")
+            .await
+            .unwrap();
+
+        // learn the needle key via keyword mode (BM25 rank 1)
+        let (_, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"zxqwibble"},"topK":5,
+                   "searchMode":"keyword"}),
+        )
+        .await;
+        let needle_key = b["hits"][0]["key"].as_str().unwrap().to_string();
+
+        // weighted hybrid: both arms of the route carry tiny's 2.5 weight
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"zxqwibble migration gate"},
+                   "topK":10,"searchMode":"hybrid"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let keys: Vec<&str> = b["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["key"].as_str().unwrap())
+            .collect();
+        let rank = keys
+            .iter()
+            .position(|k| *k == needle_key.as_str())
+            .unwrap_or_else(|| panic!("weighted hybrid must keep the needle: {keys:?}"));
+        assert!(rank < 5, "the 2.5-weighted lexical rank-1 leads: {keys:?}");
+    }
+
+    /// The gate faces: unknown mode, keyword+image, and the fts-off bucket
+    /// all refuse with field-addressable ValidationExceptions.
+    #[tokio::test]
+    async fn search_mode_gates_refuse_loudly() {
+        // fts OFF bucket (the §7 default): keyword demands the config line
+        let f = fixture().await;
+        put_source_call(&f, "docs", "docs/a.txt", b"some body text".to_vec()).await;
+        drive(&f).await;
+        let (st, headers, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"body"},"searchMode":"keyword"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(errortype(&headers), Some("ValidationException"));
+        assert!(b["message"].as_str().unwrap().contains("fts = true"), "{b}");
+
+        // unknown mode: closed set
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"body"},"searchMode":"lexical"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert!(
+            b["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown searchMode"),
+            "{b}"
+        );
+
+        // keyword + image: the lexical arm needs text
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"image":{"bytes":"AAAA","mime":"image/png"}},
+                   "searchMode":"hybrid"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert!(
+            b["message"].as_str().unwrap().contains("needs query.text"),
+            "{b}"
+        );
     }
 
     // ---------------- Reindex + GetIngestStatus ----------------

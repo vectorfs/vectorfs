@@ -14,6 +14,7 @@ pub mod config;
 pub mod doctor;
 pub mod filter;
 pub mod ingest;
+pub mod lexical;
 pub mod lock;
 pub mod mcp;
 pub mod ops;

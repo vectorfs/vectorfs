@@ -139,6 +139,13 @@ extract = {{ pdf = \"pdf\", md = \"md\", default = \"t\" }}
 chunk = {{ kind = \"token-window\", size = 512, overlap = 64 }}
 embedders = [\"text\"]
 merge = \"rrf\"
+# Lexical search (exact-term/BM25 via `vf search --mode keyword|hybrid`) is
+# OFF by default (M3 superset content, §7). To enable (then run
+# `vectorfs optimize` to build the FTS index):
+#   fts = true
+#   # fts-tokenizer = \"icu\"    # default: dictionary zh/en word segmentation
+#   # fts-tokenizer = \"ngram\"  # 2,2 bigram: best CJK recall, but Latin words
+#   #                         # are bigrammed too (substring matches fire)
 ",
                 model = Self::DEFAULT_MODEL
             ),
@@ -208,6 +215,13 @@ extract = {{ pdf = [\"pdf\", \"pages\"], md = \"md\", img = \"imgs\", default = 
 chunk = {{ kind = \"token-window\", size = 512, overlap = 64 }}
 embedders = [\"text\", \"image\"]
 merge = \"rrf\"
+# Lexical search (exact-term/BM25 via `vf search --mode keyword|hybrid`) is
+# OFF by default (M3 superset content, §7). To enable (then run
+# `vectorfs optimize` to build the FTS index):
+#   fts = true
+#   # fts-tokenizer = \"icu\"    # default: dictionary zh/en word segmentation
+#   # fts-tokenizer = \"ngram\"  # 2,2 bigram: best CJK recall, but Latin words
+#   #                         # are bigrammed too (substring matches fire)
 ",
                 model = Self::DEFAULT_MODEL,
                 image_model = Self::DEFAULT_IMAGE_MODEL
