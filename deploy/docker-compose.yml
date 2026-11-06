@@ -45,6 +45,15 @@ services:
       # - VF_S3_ACCESS_KEY=…     # backend S3 connection creds
       # - VF_S3_SECRET_KEY=…
       - VF_PRESET=${VF_PRESET:-}
+      # Proxy passthrough (mainland): compose does NOT inherit shell env into
+      # containers — only ${...} interpolation, so an `HTTPS_PROXY=… docker
+      # compose up` needs these lines to reach the daemon (its connector
+      # tunnels via CONNECT; empty values are filtered to direct). NO_PROXY
+      # default keeps the healthcheck's 127.0.0.1 probe — and any internal
+      # VF_BACKEND S3 host — off the proxy; extend it, don't remove it.
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1}
     restart: unless-stopped
     # mirrors the image's built-in healthcheck (vf probes GET /health —
     # credential-less by design, §5.10.7)
