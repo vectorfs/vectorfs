@@ -18,8 +18,9 @@
 //! failures, zero interaction, idempotent verbs, deterministic output.
 //!
 //! Verbs (附录E.4): put / search / sources list|status / get / rm / reindex /
-//! status. API fields are camelCase, flags kebab-case, one to one
-//! (`--top-k` -> topK, `--max-results` -> maxResults).
+//! status — plus `mcp`, the stdio MCP server that exposes the same verbs to
+//! agents (client/src/mcp.rs). API fields are camelCase, flags kebab-case,
+//! one to one (`--top-k` -> topK, `--max-results` -> maxResults).
 
 use std::time::{Duration, Instant};
 
@@ -81,6 +82,16 @@ enum Command {
     Reindex(ReindexArgs),
     /// /health + ingest status summary of the daemon
     Status(StatusArgs),
+    /// Run the stdio MCP server (agent remote mode: every tool call proxies
+    /// to the daemon over the same signed HTTP as the verbs above — vf
+    /// holds no lock, the daemon owns the data)
+    ///
+    /// Examples (for an MCP client config):
+    ///
+    ///   vf mcp
+    ///
+    ///   vf mcp --tools ro
+    Mcp(McpArgs),
     /// Manage `~/.config/vectorfs/config.toml` — the file layer of the
     /// connection chain (flag > env > file)
     Config(ConfigArgs),
@@ -327,6 +338,20 @@ struct StatusArgs {
     json: bool,
 }
 
+/// `vf mcp` — the agent-facing stdio MCP server. Connection knobs resolve
+/// exactly like every verb (flag > env > config.toml), so an MCP client
+/// config usually needs no args at all once `vf config init` ran.
+#[derive(Args, Debug)]
+struct McpArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
+    /// Tool set: `ro` = search/list/get only; `rw` adds
+    /// put/delete/reindex [default: rw]
+    #[arg(long, default_value = "rw")]
+    tools: client::mcp::ToolsMode,
+}
+
 /// `vf config init` — write `~/.config/vectorfs/config.toml` (XDG-aware)
 /// seeded from the CommonArgs flags over the VF_* env (`vf config init` with
 /// VF_ENDPOINT exported bakes that endpoint in). Absent knobs land as
@@ -371,6 +396,7 @@ async fn main() {
         Command::Ls(args) => ls_cmd(args).await,
         Command::Reindex(args) => reindex_cmd(args).await,
         Command::Status(args) => status_cmd(args).await,
+        Command::Mcp(args) => mcp_cmd(args).await,
         Command::Config(args) => match args.command {
             ConfigCommand::Init(a) => config_init_cmd(a),
         },
@@ -1200,5 +1226,26 @@ async fn status_cmd(args: StatusArgs) {
                 r["progress"]["total"]
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mcp
+// ---------------------------------------------------------------------------
+
+/// `vf mcp` — the stdio MCP server for agent remote mode (design.md §5.8):
+/// tool calls proxy to the daemon through the same signed Connection as
+/// every verb above; this process holds no lock. stdout is the protocol
+/// channel — all diagnostics ride stderr (mcp::run's contract).
+async fn mcp_cmd(args: McpArgs) {
+    let conn = args.common.connect().unwrap_or_else(|f| f.fail(false, 2));
+    match client::mcp::run(conn, args.tools).await {
+        client::mcp::McpExit::Ok => {}
+        client::mcp::McpExit::Failed(msg) => Failure::new(
+            "MCP_START_FAILED",
+            msg,
+            "check the endpoint (vf status) and that stdin/stdout are a pipe pair",
+        )
+        .fail(false, 2),
     }
 }

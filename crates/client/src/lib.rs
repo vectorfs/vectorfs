@@ -28,6 +28,7 @@ use http_body_util::BodyExt as _;
 use http_body_util::Full;
 
 pub mod config;
+pub mod mcp;
 
 use vectorfs_common::http;
 use vectorfs_common::report::Failure;

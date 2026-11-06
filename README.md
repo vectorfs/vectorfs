@@ -286,6 +286,27 @@ Add `"--tools", "ro"` for a read-only toolset. s3vectors API data-plane tools:
 `delete_vectors`; vectorfs API tools: `search`, `list_sources`, `put_source`
 (`put_source` is rw-only).
 
+### `vf mcp` — agent remote mode
+
+`vf mcp` is the second MCP entry: a stdio server run on the AGENT's machine
+that proxies every tool call to a `vectorfs serve` daemon over the same signed
+HTTP as the vf verbs (endpoint/credentials resolve from `--endpoint` / `VF_*`
+env / `~/.config/vectorfs/config.toml` — usually no args once `vf config init`
+ran). It holds no lock; the daemon's SigV4 gate sees every call:
+
+```json
+{"vf": {"command": "vf", "args": ["mcp"]}}
+```
+
+Tools (the file layer): `search` (the RAG entry — merged, source-attributed
+hits carrying `content.text` and `location.key`), `list_buckets`,
+`list_sources`, `get_source`, `get_source_data` (the whole original file),
+`status`; with `--tools rw` (the default) also `put_source` (a local file via
+`path` OR inline text via `content`, returning immediately — `waitSeconds`
+for a foreground wait), `delete_source`, `reindex`. Division of labor:
+`vectorfs mcp` IS the writer on local storage; `vf mcp` drives a remote
+daemon — the s3vectors data-plane tools stay server-side.
+
 ## Non-goals
 
 - No own object-storage backend or storage engine — persistence is always an

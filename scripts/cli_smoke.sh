@@ -134,6 +134,22 @@ list_out="$("$VF" sources list --bucket docs)"
 echo "$list_out"
 grep -q "docs/fox.txt" <<<"$list_out" || fail "sources list missing the file"
 
+echo "== mcp (stdio JSON-RPC) =="
+# vf mcp speaks newline-delimited JSON-RPC on stdin/stdout (credentials from
+# the VF_* env exported above); the session ends at EOF and the process must
+# exit 0. initialize -> tools/list -> tools/call search: serverInfo "vf",
+# the rw toolset, and a hit referencing the uploaded source.
+mcp_out="$("$VF" mcp 2>"$WORK/mcp.log" <<'EOF'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"cli-smoke","version":"0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"bucket":"docs","text":"quick brown fox","topK":3}}}
+EOF
+)" || { cat "$WORK/mcp.log" >&2; fail "vf mcp exited non-zero"; }
+[[ "$mcp_out" == *'"name":"vf"'* ]] || { cat "$WORK/mcp.log" >&2; fail "mcp initialize did not answer serverInfo vf"; }
+[[ "$mcp_out" == *'"put_source"'* ]] || fail "mcp tools/list missing put_source (rw default)"
+[[ "$mcp_out" == *'docs/fox.txt'* ]] || { cat "$WORK/mcp.log" >&2; fail "mcp search hit does not reference the source"; }
+
 echo "== rm =="
 rm_out="$("$VF" rm docs/fox.txt --bucket docs)"
 echo "rm -> $rm_out"

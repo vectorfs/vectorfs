@@ -39,8 +39,26 @@ toml = "1"
 http = "1"
 http-body-util = "0.1"
 
+# `vf mcp` (2026-11-06): the stdio MCP server for AGENT REMOTE mode — tool
+# calls proxy to the daemon through Connection's signed HTTP, so no engine
+# enters here. Same official Rust SDK and the same MINIMAL feature set the
+# server's `vectorfs mcp` already validated (crates/server/Cargo.toml):
+# server (tool system + schemars schema generation + async-rw transport),
+# macros (#[tool]…), transport-io (stdio); defaults REPLACED to drop the
+# base64-0.23 image-content feature. rmcp brings no AWS-SDK/arrow crates
+# (deps_guard green server-side on the same feature set, green again here);
+# measured vf release-prod went 6 -> 7.5 MiB against the 15 MiB size_guard
+# line (warn 10).
+rmcp = { version = "3.8", default-features = false, features = [
+  "server",
+  "macros",
+  "transport-io",
+] }
+
 # #[tokio::main] + the shared HTTP leaf's connector + the client verbs' own
-# needs: fs (put/get read/write files), time (poll timeouts/backoff).
+# needs: fs (put/get read/write files), time (poll timeouts/backoff),
+# io-util (the MCP tests' tokio::io::duplex pairs; rmcp's transports pull
+# it in too, but this package declares what IT uses).
 # Declared EXPLICITLY for this package — a workspace-wide build would
 # unify server's feature set in and hide an omission (the dependency list
 # is the small-client guarantee; `cargo build -p vectorfs-client` must
@@ -51,6 +69,7 @@ tokio = { version = "1", features = [
   "net",
   "fs",
   "time",
+  "io-util",
 ] }
 
 [dev-dependencies]
@@ -65,3 +84,7 @@ axum = { version = "0.8", default-features = false, features = [
 percent-encoding = "2"
 # config.toml tests write throwaway files (dev-only — never in the binary).
 tempfile = "3"
+# rmcp "client" role for the in-process MCP e2e tests (duplex pair + raw
+# JSON-RPC, the same harness the server's mcp.rs tests use). Test builds
+# only — the shipped binary never links the client half (adds tokio-stream).
+rmcp = { version = "3.8", features = ["client"] }

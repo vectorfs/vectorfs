@@ -6603,6 +6603,7 @@ dependencies = [
  "http",
  "http-body-util",
  "percent-encoding",
+ "rmcp",
  "serde",
  "serde_json",
  "tempfile",

@@ -258,6 +258,26 @@ CI/testcontainers 用。加锁**按桶**（每个 `X-vf` 里一个 TTL 心跳 LO
 `put_vectors`、`delete_vectors`；vectorfs API 工具：`search`、`list_sources`、
 `put_source`（`put_source` 仅 rw）。
 
+### `vf mcp`——agent 远程模式
+
+`vf mcp` 是第二个 MCP 入口：跑在 **agent 本机** 的 stdio 服务器，把每个工具
+调用经与 vf 动词相同的签名 HTTP 代理到 `vectorfs serve` daemon（端点/凭据按
+`--endpoint` / `VF_*` 环境变量 / `~/.config/vectorfs/config.toml` 解析——
+`vf config init` 之后通常无需任何参数）。它不持锁；daemon 的 SigV4 闸门看得
+见每一次调用：
+
+```json
+{"vf": {"command": "vf", "args": ["mcp"]}}
+```
+
+工具（文件层，两个 MCP 入口同形）：`search`（RAG 入口——融合排序、带回源的
+命中，带 `content.text` 与 `location.key`）、`list_buckets`、`list_sources`、
+`get_source`、`get_source_data`（取整篇原文）、`status`；`--tools rw`（默认）
+再加 `put_source`（`path` 上传本地文件 **或** `content` 内联文本，默认立即
+返回——`waitSeconds` 可选前台等待）、`delete_source`、`reindex`。分工：
+`vectorfs mcp` 是本地存储上的写者本体；`vf mcp` 驱动远端 daemon——s3vectors
+数据面工具留在服务端。
+
 ## 非目标
 
 - 不自研对象存储后端或存储引擎——持久化永远是既有对象存储或本地目录。文件以
