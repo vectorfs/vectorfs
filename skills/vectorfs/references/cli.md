@@ -51,13 +51,18 @@ stdout: one `STATUS<TAB>key` line per file; progress on stderr. Exit 1 if any
 file failed. Failed file? `vf sources status <key> --bucket B` shows
 `statusReason`.
 
-### `vf search <TEXT> [BUCKET]`
+### `vf search <TEXT> [BUCKET]` / `vf search --image <PATH> [BUCKET]`
 
 The one retrieval verb: fan-out + merge + source attribution over the bucket's
-embedders.
+embedders. Query = text positional **XOR** `--image` (以图搜图: the image runs
+through the bucket's image-capable embedders; `.jpg/.jpeg/.png`, the daemon
+cross-checks the real container).
 
 | Flag | Meaning |
 |---|---|
+| `--image PATH` | image query (XOR the text positional; bucket stays positional) |
+| `--mode M` | `semantic` (default) \| `keyword` (BM25 lexical — needs `[ingest] fts = true` + `vectorfs optimize`; exact terms/proper nouns, the semantic blind spot) \| `hybrid` (both, merged) |
+| `--rerank` | cross-encoder re-scoring of the merged top-K (needs `[ingest] rerank = true`; semantic/hybrid only — keyword refuses: BM25 order IS that mode's contract) |
 | `--bucket B` | explicit form (XOR the bare-name positional) |
 | `--top-k K` | 1..=1000, default 10 |
 | `--filter JSON` | metadata filter, `$`-operator syntax (below); invalid JSON = usage error |
@@ -66,7 +71,8 @@ embedders.
 
 Human output columns: `#  SCORE  KEY  INDEX  SOURCE  TEXT` (score 4 decimals;
 TEXT is the first 60 chars of the chunk). Deterministic order: score desc,
-key asc.
+key asc. Scores are orderings, not calibrated values (different modes/embedders
+are not comparable).
 
 Filter operators (bare value = implicit `$eq`): `$eq $ne $gt $gte $lt $lte
 $startsWith $in $nin $exists $and $or`. Example:
