@@ -812,6 +812,7 @@ pub(crate) mod tests {
                 bytes: bytes::Bytes::from(solid_png((8, 8), rgb)),
                 mime: "image/png".to_string(),
             }),
+            kind: crate::pipeline::ChunkKind::Body,
         };
         let chunks = vec![mk([255, 255, 255]), mk([0, 0, 0])];
         let docs = e.embed_documents(&chunks).await.unwrap();
@@ -839,6 +840,7 @@ pub(crate) mod tests {
                 bytes: bytes::Bytes::from(solid_png((16, 8), [255, 0, 0])),
                 mime: "image/png".to_string(),
             }),
+            kind: crate::pipeline::ChunkKind::Body,
         };
         let red = e.embed_documents(&[wide]).await.unwrap();
         // red channel = +1.0, green/blue = −1.0 → channel means [1, −1, −1]
@@ -903,6 +905,7 @@ pub(crate) mod tests {
                 index: 0,
                 text: "stray text chunk".into(),
                 image: None,
+                kind: crate::pipeline::ChunkKind::Body,
             }])
             .await
             .unwrap_err();
@@ -986,6 +989,7 @@ pub(crate) mod tests {
                 bytes: bytes::Bytes::from(solid_png((8, 8), [i as u8 * 40, 3, 200])),
                 mime: "image/png".to_string(),
             }),
+            kind: crate::pipeline::ChunkKind::Body,
         };
         let batch: Vec<_> = (0..5).map(mk).collect();
         let split = e.embed_documents(&batch).await.unwrap();

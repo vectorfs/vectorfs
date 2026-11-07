@@ -536,6 +536,8 @@ impl Extractor for PdfOcrExtractor {
                 modality: Modality::Text,
                 text: lines.join("\n"),
                 image: None,
+                labels: Vec::new(),
+                pages: Vec::new(),
             });
         }
         if parts.is_empty() {

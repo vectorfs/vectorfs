@@ -75,6 +75,8 @@ impl Extractor for TxtExtractor {
             modality: Modality::Text,
             text: text.to_owned(),
             image: None,
+            labels: Vec::new(),
+            pages: Vec::new(),
         }])
     }
 }

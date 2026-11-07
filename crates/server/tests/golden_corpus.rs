@@ -64,10 +64,52 @@ fn reconstruct(chunks: &[Chunk], overlap: usize) -> String {
 }
 
 /// Minimal multi-page PDF builder (no external tool): N pages, each drawing
-/// the same paragraph plus its own page marker. Objects, exact `/Length`s
-/// and a correct xref table are assembled with byte offsets — the same
-/// hand-assembly discipline as the committed hello.pdf fixture.
-fn build_multipage_pdf(pages: usize, paragraph: &str) -> Vec<u8> {
+/// its own page marker (12pt) plus the 10pt body paragraph supplied by
+/// `paragraph_for(i)`. Objects, exact `/Length`s and a correct xref table
+/// are assembled with byte offsets — the same hand-assembly discipline as
+/// the committed hello.pdf fixture.
+///
+/// # T12 uniquification (adversarial review of D-4)
+///
+/// The pre-T12 fixture drew the IDENTICAL paragraph on every page, which
+/// T12's furniture rules (≥20% of pages repeating a line ⇒ furniture) would
+/// later wholesale-delete — every page's body and the fixture's point with
+/// it. `paragraph_for` is therefore PER-PAGE by contract: callers compose
+/// [`unique_head`] (page number + rotating words) with a shared filler tail
+/// for the "huge" mass, and the tests pin each probed page's unique head
+/// surviving extraction so the uniqueness cannot silently rot.
+///
+/// # Recorded engine behaviors this shape threads (all probed, 2026-11)
+///
+/// * pdfium CLIPS a single overflowing `Tj` line at the page box (~156
+///   chars of a long line extract) — the unique head must LEAD the
+///   paragraph, never trail it;
+/// * pdf-inspector 1.25.2's markdown pipeline emits an EMPTY page whenever
+///   a synthetic page carries two same-size (12pt) text lines (the
+///   pre-T12 fixture's own "page 0001 vanishes" quirk was exactly this:
+///   only its first page kept two lines after header/footer stripping) —
+///   the 10pt body font gives the pipeline the size contrast it needs,
+///   which is why the marker is 12pt and the body 10pt here.
+/// Per-page-unique paragraph-prefix words (letters only, rotating with the
+/// page index — see [`unique_head`]).
+const UNIQUE_TAIL_WORDS: [&str; 12] = [
+    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet",
+    "kilo", "lima",
+];
+
+/// The per-page-unique head of a page's paragraph (probe-assertable: tests
+/// recompute it with the same page index). Embeds the page number so no two
+/// pages share a paragraph even after any digit-normalizing furniture rule.
+fn unique_head(i: usize) -> String {
+    format!(
+        "golden body {:04} {} {}",
+        i + 1,
+        UNIQUE_TAIL_WORDS[i % UNIQUE_TAIL_WORDS.len()],
+        UNIQUE_TAIL_WORDS[(i + 5) % UNIQUE_TAIL_WORDS.len()]
+    )
+}
+
+fn build_multipage_pdf(pages: usize, paragraph_for: impl Fn(usize) -> String) -> Vec<u8> {
     let escape = |s: &str| {
         s.replace('\\', "\\\\")
             .replace('(', "\\(")
@@ -75,10 +117,10 @@ fn build_multipage_pdf(pages: usize, paragraph: &str) -> Vec<u8> {
     };
     let content = |i: usize| {
         format!(
-            "BT /F1 12 Tf 72 720 Td (page {:04} of {:04}) Tj 0 -20 Td ({}) Tj ET\n",
+            "BT /F1 12 Tf 72 720 Td (page {:04} of {:04}) Tj /F1 10 Tf 0 -20 Td ({}) Tj ET\n",
             i + 1,
             pages,
-            escape(paragraph)
+            escape(&paragraph_for(i))
         )
     };
     // object numbering: 1 catalog, 2 pages, 3 font, then (page, contents)
@@ -369,12 +411,18 @@ fn golden_huge_txt_5mib_chunks_losslessly() {
 #[test]
 fn golden_huge_multipage_pdf_extracts_every_page() {
     // 300 pages * ~1 KiB of drawn text per page: the "multi-page PDF
-    // concatenation" huge shape, generated at test time.
+    // concatenation" huge shape, generated at test time. Each paragraph is
+    // per-page-unique (furniture-rule armor — see build_multipage_pdf's
+    // doc): unique head + shared filler tail for the mass.
     const PAGES: usize = 300;
-    let paragraph = std::iter::repeat("lorem ipsum dolor sit amet consectetur ")
-        .take(18)
-        .collect::<String>();
-    let pdf_bytes = build_multipage_pdf(PAGES, &paragraph);
+    let paragraph_for = |i: usize| {
+        format!(
+            "{} {}",
+            unique_head(i),
+            "lorem ipsum dolor sit amet consectetur ".repeat(17)
+        )
+    };
+    let pdf_bytes = build_multipage_pdf(PAGES, paragraph_for);
     assert!(pdf_bytes.len() > 200_000, "pdf size: {}", pdf_bytes.len());
 
     let x = pdf();
@@ -388,6 +436,14 @@ fn golden_huge_multipage_pdf_extracts_every_page() {
         assert!(
             text.contains(&format!("page {probe:04} of {PAGES:04}")),
             "page {probe} marker missing"
+        );
+        // the per-page-unique paragraph head survived too (uniqueness
+        // pinned — a regressed shared-paragraph builder fails here, not in
+        // T12). The head must LEAD the paragraph: pdfium clips an
+        // overflowing Tj line at the page box (~156 chars extract)
+        assert!(
+            text.contains(&format!("golden body {probe:04} ")),
+            "page {probe} unique body head missing"
         );
     }
     assert!(
@@ -508,12 +564,18 @@ fn golden_pdf_inspector_truncated_tail_never_panics() {
 #[test]
 fn golden_pdf_inspector_multipage_and_config_path() {
     // the shared in-test 300-page builder: the pure-Rust engine must get
-    // every page's marker out of the same generated bytes pdfium does
+    // every page's marker out of the same generated bytes pdfium does (the
+    // per-page-unique short line rides along — the furniture-rule armor,
+    // same as the pdfium run above)
     const PAGES: usize = 300;
-    let paragraph = std::iter::repeat("lorem ipsum dolor sit amet consectetur ")
-        .take(18)
-        .collect::<String>();
-    let pdf_bytes = build_multipage_pdf(PAGES, &paragraph);
+    let paragraph_for = |i: usize| {
+        format!(
+            "{} {}",
+            unique_head(i),
+            "lorem ipsum dolor sit amet consectetur ".repeat(17)
+        )
+    };
+    let pdf_bytes = build_multipage_pdf(PAGES, paragraph_for);
     let x = PdfInspectorExtractor::new();
     let parts = x
         .extract(&pdf_bytes, "application/pdf")
@@ -525,6 +587,12 @@ fn golden_pdf_inspector_multipage_and_config_path() {
                 .text
                 .contains(&format!("page {probe:04} of {PAGES:04}")),
             "page {probe} marker missing"
+        );
+        // the per-page-unique paragraph head survived the pure-Rust engine
+        // too (the furniture-rule armor, same pin as the pdfium run)
+        assert!(
+            parts[0].text.contains(&format!("golden body {probe:04} ")),
+            "page {probe} unique body head missing"
         );
     }
     // determinism on a large document
@@ -545,10 +613,13 @@ fn golden_pdf_inspector_multipage_and_config_path() {
         vectorfs_server::pipeline::extract::ExtractorKind::from_config("golden", &raw_md, None)
             .unwrap();
     let via_enum_md = kind_md.extract(&pdf_bytes, "application/pdf").unwrap();
-    // RECORDED quirk of pdf-inspector 1.25.2's markdown pipeline on these
-    // minimal synthetic pages: only the page-marker headings survive (the
-    // 12pt two-Tj bodies are dropped, and page 0001 vanishes — output starts
-    // at page 0002; probed). Non-emptiness is the honest assertion here; the
+    // RECORDED behavior of pdf-inspector 1.25.2's markdown pipeline on these
+    // minimal synthetic pages, re-probed for the T12 fixture rework: the
+    // pre-T12 all-12pt shape emitted only page-marker text (bodies dropped;
+    // page 0001 vanished — the two-same-size-lines empty-page behavior, see
+    // build_multipage_pdf's doc). With the 10pt body + per-page-unique
+    // paragraphs the pages carry real content; the honest assertions stay
+    // conservative (non-empty + markers through the registered route); the
     // markdown CONTENT path with real structure is covered on hello.pdf.
     assert!(!via_enum_md[0].text.is_empty());
     assert!(via_enum_md[0].text.contains("page 0002 of 0300"));

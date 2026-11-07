@@ -190,6 +190,8 @@ impl Extractor for PdfInspectorExtractor {
             modality: Modality::Text,
             text,
             image: None,
+            labels: Vec::new(),
+            pages: Vec::new(),
         }])
     }
 }

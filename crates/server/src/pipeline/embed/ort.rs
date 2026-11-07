@@ -706,11 +706,13 @@ pub(crate) mod tests {
                 index: 0,
                 text: "first chunk".into(),
                 image: None,
+                kind: crate::pipeline::ChunkKind::Body,
             },
             Chunk {
                 index: 1,
                 text: "第二个块".into(),
                 image: None,
+                kind: crate::pipeline::ChunkKind::Body,
             },
         ];
         let docs = e.embed_documents(&chunks).await.unwrap();
@@ -916,11 +918,13 @@ pub(crate) mod tests {
                     index: 0,
                     text: "The giant panda is a bear species endemic to China.".into(),
                     image: None,
+                    kind: crate::pipeline::ChunkKind::Body,
                 },
                 Chunk {
                     index: 1,
                     text: "大熊猫是中国特有的熊科动物。".into(),
                     image: None,
+                    kind: crate::pipeline::ChunkKind::Body,
                 },
             ])
             .await

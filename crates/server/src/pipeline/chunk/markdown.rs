@@ -133,12 +133,19 @@ impl Chunker for MarkdownChunker {
             }
             let chars: Vec<char> = part.text.chars().collect();
             let cuts = Self::semantic_cuts(&part.text, self.size);
-            let ranges = windowing::ranges(self.size, self.overlap, chars.len(), &cuts);
+            // T12 label consumption — identical wiring to token-window (the
+            // shared windowing seam is the point: both kinds derive forced
+            // endpoints and window kinds from the same LabelView, only
+            // their cut ORACLE differs)
+            let label_view = windowing::LabelView::new(&part.text, &part.labels);
+            let forced = label_view.forced_endpoints();
+            let ranges = windowing::ranges(self.size, self.overlap, chars.len(), &cuts, &forced);
             for (s, e) in ranges {
                 out.push(Chunk {
                     index,
                     text: chars[s..e].iter().collect(),
                     image: None,
+                    kind: label_view.window_kind(s, e),
                 });
                 index += 1;
             }
@@ -157,6 +164,8 @@ mod tests {
             modality: Modality::Text,
             text: text.to_string(),
             image: None,
+            labels: Vec::new(),
+            pages: Vec::new(),
         }])
         .unwrap()
         .into_iter()

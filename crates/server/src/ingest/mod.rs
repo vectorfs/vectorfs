@@ -4586,6 +4586,7 @@ pub(crate) mod tests {
             index: i,
             text: format!("t{i}"),
             image: None,
+            kind: crate::pipeline::ChunkKind::Body,
         };
         let image = |i: u32| Chunk {
             index: i,
@@ -4594,6 +4595,7 @@ pub(crate) mod tests {
                 bytes: bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\n"),
                 mime: "image/png".to_string(),
             }),
+            kind: crate::pipeline::ChunkKind::Body,
         };
         // the pre-image marker shape, byte-stable: text-only file
         assert_eq!(
@@ -4629,6 +4631,7 @@ pub(crate) mod tests {
             index: i,
             text: format!("t{i}"),
             image: None,
+            kind: crate::pipeline::ChunkKind::Body,
         };
         let image = |i: u32| Chunk {
             index: i,
@@ -4637,6 +4640,7 @@ pub(crate) mod tests {
                 bytes: bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\n"),
                 mime: "image/png".to_string(),
             }),
+            kind: crate::pipeline::ChunkKind::Body,
         };
 
         // text-only chunks: covered (the M2 world — gate silent)

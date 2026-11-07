@@ -138,6 +138,45 @@ impl Modality {
     }
 }
 
+/// STRUCTURAL kind of a text region (T12, retrieval-quality solution D-5):
+/// what a labeled span of a [`Part`]'s text IS, as opposed to what it
+/// carries ([`Modality`]). The vocabulary is closed exactly like
+/// `Modality`/`ContentClass` — four values, kebab-case `Display`, adding one
+/// is a designed-for compiler-walked event.
+///
+/// NOT a registration axis: unlike `ExtractorKind`/`ChunkerKind` there is no
+/// config string to parse and no availability list to keep in parity — the
+/// kind_REGISTRY_views-agree discipline does not apply. The string form is
+/// still load-bearing downstream (`x-vf-chunk-kind` metadata, filterable,
+/// default-`"body"` — later T12 slices), which is why `Display` is pinned by
+/// a unit test instead of a registry table.
+///
+/// `Body` is the DEFAULT in both directions: unlabeled text is body, and a
+/// window the chunker cannot confidently attribute is body (the
+/// recall-protection arbitration — 宁可漏排不可误排, D-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ChunkKind {
+    /// Ordinary prose — the default and the ambiguity fallback.
+    Body,
+    /// Table-of-contents / index-like listing (line-level TOC spans, D-1).
+    Toc,
+    /// Figure/table caption text.
+    Caption,
+    /// Legend/key block (figure legends, symbol keys).
+    Legend,
+}
+
+impl std::fmt::Display for ChunkKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            ChunkKind::Body => f.write_str("body"),
+            ChunkKind::Toc => f.write_str("toc"),
+            ChunkKind::Caption => f.write_str("caption"),
+            ChunkKind::Legend => f.write_str("legend"),
+        }
+    }
+}
+
 /// Content CLASS of one source's bytes (M2.1 step 2: probe → affinity →
 /// route): what the bytes ARE, family-agnostic — the same vocabulary serves
 /// the pdf family today and the image family in M3.
@@ -226,6 +265,15 @@ pub enum Fit {
 /// the M2 shape and stays exactly that for `Modality::Text` parts; image
 /// parts (M3-T1) carry their bytes in [`Part::image`] with an EMPTY text
 /// channel — audio (M4) grows its own field the same additive way.
+///
+/// T12 (retrieval-quality solution §2-T12.2) adds two additive annotation
+/// channels, both anchored to `text` and both empty for every pre-T12
+/// producer/consumer: [`Part::labels`] (structural spans) and
+/// [`Part::pages`] (the page-offset table T13 shares). They are PLAIN Vecs,
+/// not Options, for the same reason `image` is additive-but-explicit: an
+/// absent annotation and an empty annotation mean the same thing here, and
+/// one-line `Vec::new()` literals keep every existing construction site
+/// honest about the new channels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Part {
     pub modality: Modality,
@@ -236,6 +284,37 @@ pub struct Part {
     /// field is deliberately additive: every existing text-part literal and
     /// assertion keeps compiling and passing unchanged.
     pub image: Option<ImagePayload>,
+    /// Structural labels over `text` (T12): BYTE ranges carrying a
+    /// [`ChunkKind`]. Anchored in bytes because the EXTRACTOR produces them
+    /// by slicing `text` as UTF-8; the CHUNKER owns the byte→char
+    /// conversion (D-1: "字节锚定，chunker 统一换算 char 域——windowing 的
+    /// CJK 防线") — it must never slice on a raw byte offset. Empty = no
+    /// structural annotation (the pre-T12 shape; every region is body).
+    pub labels: Vec<LabelSpan>,
+    /// Page-offset table (T12/T13 shared surgery): (1-based page number →
+    /// BYTE offset into `text` where that page's text begins). Empty = the
+    /// extractor has no page information (single-page or pageless sources;
+    /// D-7's fork判据 reads this same presence). The chunker does NOT
+    /// consume it in T12's foundation slice — it rides along so T13's
+    /// window-coordinate stamping needs no second Part operation.
+    pub pages: Vec<(u32, usize)>,
+}
+
+/// One structural label over a [`Part`]'s text (T12): a BYTE range plus its
+/// [`ChunkKind`]. Producers are the extractors (furniture/TOC/caption
+/// heuristics — later T12 slices); the consumer is the chunker axis, which
+/// derives forced window endpoints from NON-body spans and judges each
+/// window's kind (see `chunk::windowing`). Offsets are byte offsets into
+/// `Part::text` and are expected on char boundaries (producers slice text
+/// they themselves built); a consumer clamping defensively is documented at
+/// the conversion site.
+// (no Copy: `Range<usize>` is Clone-only; labels move, they never hot-path)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelSpan {
+    /// Half-open BYTE range into `Part::text` (start inclusive, end
+    /// exclusive).
+    pub range: std::ops::Range<usize>,
+    pub kind: ChunkKind,
 }
 
 /// The image content channel of a [`Part`] (M3-T1): raw container bytes
@@ -294,12 +373,17 @@ impl ChildDoc {
 
 impl Part {
     /// Convenience constructor for the M2 text-only shape (image channel
-    /// `None`).
+    /// `None`). Signature unchanged by the T12 surgery: the new
+    /// `labels`/`pages` channels open EMPTY (no structural annotation —
+    /// callers stay zero-diff; the label-aware path constructs the struct
+    /// directly or mutates the fields).
     pub fn text(s: impl Into<String>) -> Self {
         Part {
             modality: Modality::Text,
             text: s.into(),
             image: None,
+            labels: Vec::new(),
+            pages: Vec::new(),
         }
     }
 
@@ -307,6 +391,8 @@ impl Part {
     /// payload in the image channel. Infallible by design (it only moves
     /// values); the bytes-vs-mime honesty check happens at the mechanism
     /// seam ([`ImagePayload::validate`], called by the chunker bypass).
+    /// Image parts never carry labels/pages (nothing is anchored to an
+    /// empty text channel).
     pub fn image(mime: impl Into<String>, bytes: impl Into<bytes::Bytes>) -> Self {
         Part {
             modality: Modality::Image,
@@ -315,6 +401,8 @@ impl Part {
                 bytes: bytes.into(),
                 mime: mime.into(),
             }),
+            labels: Vec::new(),
+            pages: Vec::new(),
         }
     }
 }
@@ -364,6 +452,14 @@ pub struct Chunk {
     /// chunker-axis bypass materializes image Parts one-to-one). Empty for
     /// text windows — same additive shape and reasoning as [`Part::image`].
     pub image: Option<ImagePayload>,
+    /// Structural kind (T12): `Body` for unlabeled/ambiguous windows and
+    /// for atomic image chunks (an image carries no text structure to
+    /// label); a non-body kind only when the window falls entirely inside
+    /// one kind's label span (the chunker's judgment — see
+    /// `chunk::windowing`). Default `Body` keeps every pre-T12 producer
+    /// byte-compatible in the `Chunk::modality` sense: equality on old
+    /// fixtures changes only by the uniformly-added field.
+    pub kind: ChunkKind,
 }
 
 impl Chunk {
@@ -1074,6 +1170,13 @@ mod tests {
         // the pairing invariant the chunker bypass enforces loudly
         assert!(Part::text("x").image.is_none());
         assert!(Part::image("image/jpeg", Vec::<u8>::new()).image.is_some());
+        // T12: both convenience constructors open the annotation channels
+        // EMPTY (no structural annotation is the pre-T12 meaning; the
+        // label-aware producers build the struct directly)
+        assert!(Part::text("x").labels.is_empty());
+        assert!(Part::text("x").pages.is_empty());
+        assert!(Part::image("image/png", Vec::<u8>::new()).labels.is_empty());
+        assert!(Part::image("image/png", Vec::<u8>::new()).pages.is_empty());
     }
 
     #[test]
@@ -1082,6 +1185,7 @@ mod tests {
             index: 0,
             text: "window".to_string(),
             image: None,
+            kind: ChunkKind::Body,
         };
         let atomic = Chunk {
             index: 1,
@@ -1090,11 +1194,45 @@ mod tests {
                 bytes: bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\n"),
                 mime: "image/png".to_string(),
             }),
+            kind: ChunkKind::Body,
         };
         assert_eq!(text_window.modality(), Modality::Text);
         assert_eq!(atomic.modality(), Modality::Image);
         // the Display form is what chunk keys and metadata carry
         assert_eq!(atomic.modality().to_string(), "image");
+    }
+
+    #[test]
+    fn chunk_kind_display_vocabulary_is_pinned() {
+        // T12: ChunkKind is NOT a registry axis (no KIND_LABELS parity table
+        // applies), but its Display is load-bearing downstream (the
+        // `x-vf-chunk-kind` metadata value and the D-5 filter vocabulary
+        // `body|toc|caption|legend`) — pinned here so a future variant must
+        // land its string consciously. Same pinning style as
+        // modality_display_and_remedy_vocabulary.
+        let all = [
+            (ChunkKind::Body, "body"),
+            (ChunkKind::Toc, "toc"),
+            (ChunkKind::Caption, "caption"),
+            (ChunkKind::Legend, "legend"),
+        ];
+        for (k, s) in all {
+            assert_eq!(k.to_string(), s);
+        }
+        // closed vocabulary: the four values are pairwise distinct (a match
+        // on kind elsewhere may rely on exactly these discriminants)
+        for (i, (a, _)) in all.iter().enumerate() {
+            for (j, (b, _)) in all.iter().enumerate() {
+                assert_eq!(a == b, i == j);
+            }
+        }
+        // LabelSpan carries its kind by value (Copy) alongside the byte range
+        let span = LabelSpan {
+            range: 0..3,
+            kind: ChunkKind::Toc,
+        };
+        assert_eq!(span.kind.to_string(), "toc");
+        assert_eq!(span.range, 0..3);
     }
 
     #[test]

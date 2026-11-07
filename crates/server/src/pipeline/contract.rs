@@ -21,7 +21,9 @@
 //! suite are untouched by it, which is the point: a kind admitted here
 //! composes into any chain with zero framework changes.
 
-use super::{Chunker, Embedder, Extractor, Hit, HitList, Merge, Modality, Part, Query};
+use super::{
+    ChunkKind, Chunker, Embedder, Extractor, Hit, HitList, LabelSpan, Merge, Modality, Part, Query,
+};
 
 // ---------------------------------------------------------------------------
 // Extractor
@@ -297,6 +299,158 @@ fn assert_window_invariants(chunks: &[super::Chunk], text: &str, size: usize, ov
     assert_eq!(&recon, text, "de-overlapped concatenation != input");
 }
 
+/// Run the chunker contract's T12 LABEL extension against `c` — the
+/// closing of the gap the adversarial review found in the pre-T12 suite:
+/// [`chunker_contract`] only ever constructs unlabeled parts, so a chunker
+/// that IGNORED `Part::labels`/`Part::pages` entirely passed vacuously (the
+/// LSP defense line was blind on the new axis). The fixture part carries
+/// BOTH new channels; assertions, in the order the D-1 ruling demands:
+///
+/// 1. **forced window-breaking takes effect**: some window ends exactly at
+///    each non-body span edge, and the SAME text chunked label-free breaks
+///    nowhere near them (the contrast proves the bend comes from the
+///    labels, not from a lucky cut-lattice coincidence);
+/// 2. **the invariant battery still holds on the labeled output** — the
+///    anti-「平接」 pin at contract level: a chunker that abuts windows at
+///    the span edge (no overlap reach-back) drops `overlap` chars per
+///    boundary from the reconstruction and fails here;
+/// 3. **kind determination, all states**: a window wholly inside one kind's
+///    span ⇒ that kind (pure Toc and pure Caption windows must both
+///    exist); any window crossing a span edge — the mandated overlap
+///    reach-back (o|T), or straddling two different spans (T|C) — ⇒ Body
+///    (recall protection: 宁可漏排不可误排); unlabeled text ⇒ Body;
+/// 4. **`pages` rides along inertly**: T13 consumes it, not the chunker —
+///    identical chunk output with and without the page table;
+/// 5. determinism on the labeled path, as everywhere else.
+///
+/// Fixture shape: `b1 = size + overlap + 1` unlabeled chars, then a Toc
+/// span and a Caption span of `size + overlap + 2` chars each (long enough
+/// that a window fits wholly inside — the pure-kind states are reachable),
+/// then an unlabeled tail of the same length (the last span edge is never
+/// swallowed by the tail window). Separator-free runs put the cut oracle on
+/// its pure char-lattice fallback, so the geometry is deterministic for
+/// both kinds regardless of their oracle.
+pub fn chunker_contract_labels(c: &dyn Chunker, size: usize, overlap: usize) {
+    assert!(size > 0 && overlap < size, "fixture chunker params");
+    let b1 = size + overlap + 1;
+    let seg = size + overlap + 2;
+    let b2 = b1 + seg;
+    let b3 = b2 + seg;
+    let text = format!(
+        "{}{}{}{}",
+        "o".repeat(b1),
+        "T".repeat(seg),
+        "C".repeat(seg),
+        "o".repeat(seg)
+    );
+    // byte ranges == char ranges (ASCII fixture); non-body spans only —
+    // body is expressed by the absence of labels, the producer-side shape
+    let labels = vec![
+        LabelSpan {
+            range: b1..b2,
+            kind: ChunkKind::Toc,
+        },
+        LabelSpan {
+            range: b2..b3,
+            kind: ChunkKind::Caption,
+        },
+    ];
+    // a realistic page table over the same text — must be inert (T13's)
+    let pages = vec![(1u32, 0usize), (2, b1), (3, b2), (4, b3)];
+
+    let labeled = Part {
+        modality: Modality::Text,
+        text: text.clone(),
+        image: None,
+        labels,
+        pages,
+    };
+    let chunks = c
+        .chunk(std::slice::from_ref(&labeled))
+        .expect("labeled chunking");
+    // (2) the full battery: alignment, lossless reconstruction, budgets,
+    // sequential indices — under forced endpoints
+    assert_window_invariants(&chunks, &text, size, overlap);
+
+    // (1) forced breaking: window ends (derived chunk-side: each window
+    // starts at the previous end - overlap) sit exactly on the span edges
+    let mut ends = Vec::new();
+    let mut start = 0usize;
+    for ch in &chunks {
+        let len = ch.text.chars().count();
+        ends.push(start + len);
+        start += len - overlap;
+    }
+    for (name, b) in [
+        ("toc-open", b1),
+        ("toc-close/caption-open", b2),
+        ("caption-close", b3),
+    ] {
+        assert!(
+            ends.contains(&b),
+            "forced endpoint {name} {b} must bend some window end: {ends:?}"
+        );
+    }
+    // the contrast: the same text without labels breaks at none of them
+    let plain = c
+        .chunk(&[Part::text(text.clone())])
+        .expect("plain chunking");
+    let mut plain_ends = Vec::new();
+    let mut start = 0usize;
+    for ch in &plain {
+        let len = ch.text.chars().count();
+        plain_ends.push(start + len);
+        start += len - overlap;
+    }
+    for b in [b1, b2, b3] {
+        assert!(
+            !plain_ends.contains(&b),
+            "boundary {b} bent the UNLABELED walk too — fixture broken: {plain_ends:?}"
+        );
+    }
+
+    // (3) kind determination — every state present and correctly arbitrated
+    let is_all = |ch: &super::Chunk, x: char| ch.text.chars().all(|c| c == x);
+    assert!(
+        chunks
+            .iter()
+            .any(|ch| is_all(ch, 'T') && ch.kind == ChunkKind::Toc),
+        "a pure toc-span window must be judged Toc: {:?}",
+        chunks.iter().map(|c| (&c.text, c.kind)).collect::<Vec<_>>()
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|ch| is_all(ch, 'C') && ch.kind == ChunkKind::Caption),
+        "a pure caption-span window must be judged Caption"
+    );
+    for (a, b) in [('o', 'T'), ('T', 'C'), ('C', 'o')] {
+        assert!(
+            chunks.iter().any(|ch| {
+                ch.text.contains(a) && ch.text.contains(b) && ch.kind == ChunkKind::Body
+            }),
+            "a window crossing the {a}|{b} edge must arbitrate to Body (recall protection)"
+        );
+    }
+    assert!(
+        chunks
+            .iter()
+            .any(|ch| is_all(ch, 'o') && ch.kind == ChunkKind::Body),
+        "unlabeled windows must stay Body"
+    );
+
+    // (4) pages are inert for the chunker: same chunks with them dropped
+    let mut no_pages = labeled.clone();
+    no_pages.pages = Vec::new();
+    assert_eq!(
+        c.chunk(&[no_pages]).expect("pages-free chunking"),
+        chunks,
+        "the page table must not change chunk output (T13's channel)"
+    );
+    // (5) determinism on the labeled path
+    assert_eq!(c.chunk(&[labeled]).expect("labeled chunking (2nd)"), chunks);
+}
+
 // ---------------------------------------------------------------------------
 // Embedder
 // ---------------------------------------------------------------------------
@@ -333,11 +487,13 @@ pub async fn embedder_contract<E: Embedder + ?Sized>(e: &E) {
             index: 0,
             text: "first chunk".to_string(),
             image: None,
+            kind: ChunkKind::Body,
         },
         super::Chunk {
             index: 1,
             text: "第二个块".to_string(),
             image: None,
+            kind: ChunkKind::Body,
         },
     ];
     let docs = e
@@ -421,6 +577,7 @@ pub async fn image_embedder_contract<E: Embedder + ?Sized>(e: &E, png: &[u8]) {
                 bytes: bytes::Bytes::copy_from_slice(png),
                 mime: "image/png".to_string(),
             }),
+            kind: ChunkKind::Body,
         },
         super::Chunk {
             index: 1,
@@ -429,6 +586,7 @@ pub async fn image_embedder_contract<E: Embedder + ?Sized>(e: &E, png: &[u8]) {
                 bytes: bytes::Bytes::copy_from_slice(png),
                 mime: "image/png".to_string(),
             }),
+            kind: ChunkKind::Body,
         },
     ];
     let docs = e
@@ -894,8 +1052,10 @@ mod tests {
     fn token_window_passes_chunker_contract() {
         let c = TokenWindowChunker::new(8, 3).unwrap();
         chunker_contract(&c, 8, 3);
+        chunker_contract_labels(&c, 8, 3);
         let c = TokenWindowChunker::new(4, 2).unwrap();
         chunker_contract(&c, 4, 2);
+        chunker_contract_labels(&c, 4, 2);
     }
 
     #[test]
@@ -903,11 +1063,16 @@ mod tests {
         // M3-T6: the axis's second kind through the SAME suite — the
         // concatenation/overlap/budget invariants are kind-independent
         // (the shared windowing recurrence), so the markdown oracle must
-        // satisfy them on the contract's plain/CJK samples too
+        // satisfy them on the contract's plain/CJK samples too; the T12
+        // label extension rides along: forced endpoints and kind judgment
+        // live in the shared windowing seam, so the second kind must pass
+        // them with only its own cut oracle differing
         let c = MarkdownChunker::new(8, 3).unwrap();
         chunker_contract(&c, 8, 3);
+        chunker_contract_labels(&c, 8, 3);
         let c = MarkdownChunker::new(4, 2).unwrap();
         chunker_contract(&c, 4, 2);
+        chunker_contract_labels(&c, 4, 2);
     }
 
     #[tokio::test]

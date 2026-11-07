@@ -929,6 +929,7 @@ pub(crate) mod tests {
                 index: i as u32,
                 text: t.to_string(),
                 image: None,
+                kind: crate::pipeline::ChunkKind::Body,
             })
             .collect();
         let out = e.embed_documents(&docs).await.unwrap();
@@ -986,6 +987,7 @@ pub(crate) mod tests {
                     bytes: bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\n"),
                     mime: "image/png".to_string(),
                 }),
+                kind: crate::pipeline::ChunkKind::Body,
             }])
             .await
             .unwrap_err();
@@ -1004,6 +1006,7 @@ pub(crate) mod tests {
                 index: i,
                 text: format!("t{i}"),
                 image: None,
+                kind: crate::pipeline::ChunkKind::Body,
             })
             .collect();
         let out = e.embed_documents(&chunks).await.unwrap();
@@ -1030,6 +1033,7 @@ pub(crate) mod tests {
                 index: 0,
                 text: "x".into(),
                 image: None,
+                kind: crate::pipeline::ChunkKind::Body,
             }])
             .await
             .unwrap();
@@ -1053,6 +1057,7 @@ pub(crate) mod tests {
                 index: 0,
                 text: "x".into(),
                 image: None,
+                kind: crate::pipeline::ChunkKind::Body,
             }])
             .await
             .unwrap_err();
@@ -1073,6 +1078,7 @@ pub(crate) mod tests {
                 index: 0,
                 text: "x".into(),
                 image: None,
+                kind: crate::pipeline::ChunkKind::Body,
             }])
             .await
             .unwrap_err();
@@ -1198,6 +1204,7 @@ pub(crate) mod tests {
                 bytes: bytes::Bytes::from(bytes),
                 mime: mime.to_string(),
             }),
+            kind: crate::pipeline::ChunkKind::Body,
         }
     }
 
@@ -1206,6 +1213,7 @@ pub(crate) mod tests {
             index,
             text: text.to_string(),
             image: None,
+            kind: crate::pipeline::ChunkKind::Body,
         }
     }
 

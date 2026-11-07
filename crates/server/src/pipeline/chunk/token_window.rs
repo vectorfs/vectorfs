@@ -122,7 +122,18 @@ impl Chunker for TokenWindowChunker {
             // CJK glyphs can never be halved.
             let chars: Vec<char> = part.text.chars().collect();
             let cuts = Self::semantic_cuts(&part.text, self.size);
-            let ranges = super::windowing::ranges(self.size, self.overlap, chars.len(), &cuts);
+            // T12: consume the part's structural labels — byte-anchored
+            // spans convert ONCE to the char domain (LabelView owns the
+            // CJK-safe prefix table), non-body span edges become forced
+            // window endpoints (D-1 endpoint forcing), and each emitted
+            // window carries its kind judgment (pure span ⇒ its kind,
+            // crossing/ambiguous ⇒ Body). Empty labels = the pre-T12 path:
+            // no forced endpoints, every window Body — byte-identical
+            // output modulo the uniformly-defaulted kind field.
+            let label_view = super::windowing::LabelView::new(&part.text, &part.labels);
+            let forced = label_view.forced_endpoints();
+            let ranges =
+                super::windowing::ranges(self.size, self.overlap, chars.len(), &cuts, &forced);
             for (s, e) in ranges {
                 out.push(Chunk {
                     index,
@@ -130,6 +141,7 @@ impl Chunker for TokenWindowChunker {
                     // text windows never carry the image channel (the axis
                     // dispatch materializes image chunks; see chunk/mod.rs)
                     image: None,
+                    kind: label_view.window_kind(s, e),
                 });
                 index += 1;
             }
@@ -148,6 +160,8 @@ mod tests {
             modality: Modality::Text,
             text: text.to_string(),
             image: None,
+            labels: Vec::new(),
+            pages: Vec::new(),
         }])
         .unwrap()
         .into_iter()
@@ -339,5 +353,75 @@ mod tests {
         let w = chunks_of(&c, &text);
         assert!(w.len() > 64);
         assert_eq!(&reconstruct(&w, 64), &text);
+    }
+
+    /// T12 label path through the kind, on MULTIBYTE text — the byte→char
+    /// conversion duty exercised where it lives (LabelView is unit-tested
+    /// in windowing; this pins the wiring: byte-anchored spans over CJK
+    /// produce char-domain forced endpoints and per-window kinds, while the
+    /// overlap alignment/reconstruction invariants hold unchanged).
+    #[test]
+    fn labeled_cjk_text_chunks_with_forced_breaks_and_kinds() {
+        use crate::pipeline::LabelSpan;
+        let c = TokenWindowChunker::new(4, 2).unwrap();
+        // 12 CJK chars, 3 bytes each: body run, a toc run in the middle
+        // (chars 4..8 = bytes 12..24), legend-like tail (unlabeled)
+        let text = "正文正文目录目录图例图例";
+        let toc = text.char_indices().nth(4).unwrap().0..text.char_indices().nth(8).unwrap().0;
+        assert_eq!(toc, 12..24, "fixture self-check");
+        let part = Part {
+            modality: Modality::Text,
+            text: text.to_string(),
+            image: None,
+            labels: vec![LabelSpan {
+                range: toc,
+                kind: crate::pipeline::ChunkKind::Toc,
+            }],
+            pages: vec![(1, 0), (2, 24)],
+        };
+        let out = c.chunk(&[part]).unwrap();
+        // the invariant battery still holds (forced endpoints never bend it)
+        let windows: Vec<String> = out.iter().map(|ch| ch.text.clone()).collect();
+        assert_eq!(&reconstruct(&windows, 2), text);
+        for pair in windows.windows(2) {
+            let (prev, cur) = (&pair[0], &pair[1]);
+            let k = 2.min(cur.chars().count());
+            let suffix: String = prev.chars().skip(prev.chars().count() - k).collect();
+            let prefix: String = cur.chars().take(k).collect();
+            assert_eq!(suffix, prefix);
+        }
+        // forced break at the span edges: some window ends exactly at char
+        // 4 and some at char 8 (off the unlabeled stride lattice). Ends are
+        // derived chunk-side: each window starts at prev end - overlap.
+        let mut ends = Vec::new();
+        let mut start = 0usize;
+        for ch in &out {
+            let len = ch.text.chars().count();
+            ends.push(start + len);
+            start = start + len - 2;
+        }
+        assert!(
+            ends.contains(&4),
+            "span open forces an end: {ends:?} / {out:?}"
+        );
+        assert!(
+            ends.contains(&8),
+            "span close forces an end: {ends:?} / {out:?}"
+        );
+        // kind judgment: a window wholly inside the toc run is Toc; any
+        // window crossing an edge (the overlap reach-back) is Body — and
+        // pages ride along inertly (consumed by T13, not this kind)
+        assert!(
+            out.iter()
+                .any(|ch| ch.text.chars().all(|x| x == '目' || x == '录')
+                    && ch.kind == crate::pipeline::ChunkKind::Toc),
+            "pure toc window must exist: {out:?}"
+        );
+        assert!(
+            out.iter().any(|ch| ch.text.contains('目')
+                && ch.text.contains('正')
+                && ch.kind == crate::pipeline::ChunkKind::Body),
+            "edge-crossing window must arbitrate to Body: {out:?}"
+        );
     }
 }

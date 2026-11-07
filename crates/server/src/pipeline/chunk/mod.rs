@@ -175,6 +175,11 @@ impl Chunker for ChunkerKind {
                         index: next_index,
                         text: String::new(),
                         image: Some(payload),
+                        // an image atom carries no text, hence no text
+                        // structure to label — Body is the only honest
+                        // kind (T12; the modality channel, not ChunkKind,
+                        // is what routes image chunks)
+                        kind: super::ChunkKind::Body,
                     });
                     next_index += 1;
                     run_start = i + 1;
