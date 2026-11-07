@@ -165,7 +165,7 @@ pub(crate) mod tests {
 
     /// The jpeg twin of [`solid_png`] — exercises the second container
     /// through the sniff AND the decoder.
-    fn solid_jpeg(size: (u32, u32), rgb: [u8; 3]) -> Vec<u8> {
+    pub(crate) fn solid_jpeg(size: (u32, u32), rgb: [u8; 3]) -> Vec<u8> {
         let img = image::RgbImage::from_pixel(size.0, size.1, image::Rgb(rgb));
         let mut buf = std::io::Cursor::new(Vec::new());
         img.write_to(&mut buf, image::ImageFormat::Jpeg).unwrap();

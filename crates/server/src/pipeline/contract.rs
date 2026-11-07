@@ -928,6 +928,27 @@ mod tests {
         embedder_contract(&e).await;
     }
 
+    /// b1 (2026-11-07 §0 裁决): the openai kind with `multimodal = true`
+    /// is a UNIFIED embedder — it passes BOTH contract suites against the
+    /// same instance: the text routes (`embedder_contract`) AND the image
+    /// routes (`image_embedder_contract`). That bilateral pass is the
+    /// admission-level statement of the unified route (doc side [Text,
+    /// Image], query side [Text, Image] — text AND image documents embed,
+    /// text AND image queries embed, one declared dim for all four).
+    #[tokio::test]
+    async fn openai_multimodal_kind_passes_both_embedder_contracts() {
+        let (base, _fake) = openai::tests::fake_openai().await;
+        let e = super::super::embed::openai::OpenAiEmbedder::new(
+            &openai::tests::fake_multimodal_config(base, None, None),
+        )
+        .unwrap();
+        // the unified modality matrix, pinned as the admission view
+        assert_eq!(e.doc_modalities(), &[Modality::Text, Modality::Image]);
+        assert_eq!(e.query_modalities(), &[Modality::Text, Modality::Image]);
+        embedder_contract(&e).await;
+        image_embedder_contract(&e, &contract_png()).await;
+    }
+
     /// A solid-color PNG encoded in-test (the contract's known-good image
     /// sample — no committed image bytes needed).
     fn contract_png() -> Vec<u8> {

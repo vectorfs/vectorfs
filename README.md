@@ -105,6 +105,63 @@ client.query_vectors(..., queryVector={"float32": q}, returnMetadata=True)
 #   x-vf-model                x-vf-chunk-text
 ```
 
+### Unified multimodal embedding (remote, b1)
+
+The `openai` embedder kind speaks a multimodal `messages` dialect (the
+vLLM/IONOS extension of `/v1/embeddings`) behind a config gate: with
+`multimodal = true` it embeds **text AND images in one space** — doc side
+`[text, image]`, query side `[text, image]`, one index, one score. The
+reference model is **Qwen3-VL-Embedding** (Apache-2.0, MMEB-V2 73.2/77.8,
+MRL 64..=2048/4096); there is deliberately **no CPU path** (no official
+ONNX, prefill is TFLOPs-scale per image — research/2026-11-m3-unified-embedder-eval.md).
+
+Self-host on a GPU box with vLLM (≥0.14, pooling runner):
+
+```bash
+vllm serve Qwen/Qwen3-VL-Embedding-2B --runner pooling    # 2B: ~2.13 GiB weights;
+                                                          # 8B: 8.14 GiB, 4096-dim
+```
+
+then in vectorfs.toml (loopback http is allowed by the openai kind for
+on-box gateways):
+
+```toml
+[embedder.unified]
+kind = "openai"
+endpoint = "http://127.0.0.1:8000/v1"     # the vLLM server
+model = "Qwen/Qwen3-VL-Embedding-2B"
+dim = 2048
+api_key = "EMPTY"                          # vLLM ignores it; any non-empty string
+multimodal = true
+# query_instruction = "Find the matching document"   # optional, per side; the
+# doc_instruction  = "Represent the document."       # official default is used
+# dimensions = 1024                                  # MRL truncation (must equal dim)
+```
+
+or a managed endpoint (IONOS AI Model Hub serves `Qwen/Qwen3-VL-Embedding-8B`
+with the same dialect):
+
+```toml
+[embedder.unified]
+kind = "openai"
+endpoint = "https://openai.inference.de-txl.ionos.com/v1"
+model = "Qwen/Qwen3-VL-Embedding-8B"
+dim = 4096
+api_key = "<your IONOS key>"
+multimodal = true
+```
+
+Wire facts (verified against both stacks): every entry — text included —
+goes `messages` (`{role: system, content: [instruction]}` + `{role: user,
+content: [image data-URL?, text?]}`, one message per request), `dimensions`
+rides both wire forms, images are base64 data URLs capped at 20 MiB raw.
+**Pin your serving stack**: vLLM's pre-processing differs measurably from
+the official `qwen_vl_utils` examples, and the endpoint+model pair is part
+of the pipeline fingerprint — changing either requires `--reindex`, by
+design. Cost note: at full 2048-dim a text-dominant corpus pays ~2.7x the
+vector bytes of the 768-dim default; MRL `dimensions = 1024` brings it to
+~1.3x. TEI does not serve this model (open feature request).
+
 ### Protocol-only mode (SDK emulator)
 
 ```bash

@@ -2239,6 +2239,236 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // b1 (2026-11-07 §0 裁决): the openai kind's multimodal messages dialect
+    // over a fake vLLM-dialect endpoint — content-seeded vectors make
+    // identity observable (same content in ⇒ same vector out, doc and query
+    // sides alike, because both carry the same default system instruction).
+    // -----------------------------------------------------------------------
+
+    /// The unified-embedder pipeline: txt + image extractors, ONE
+    /// `[embedder.unified] kind = "openai" multimodal = true` pointed at a
+    /// seeded fake dialect server.
+    async fn unified_config() -> (
+        crate::pipeline::config::PipelineConfig,
+        crate::pipeline::embed::openai::tests::Fake,
+    ) {
+        let (base, fake) = crate::pipeline::embed::openai::tests::fake_openai_with(Some(8)).await;
+        let text = format!(
+            "[extractor.plain]\nkind = \"txt\"\n\n\
+             [extractor.imgs]\nkind = \"image\"\n\n\
+             [embedder.unified]\nkind = \"openai\"\nendpoint = \"{base}\"\n\
+             model = \"fake-qwen3vl\"\ndim = 8\napi_key = \"test-key\"\n\
+             multimodal = true\n\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\n\
+             extract = {{ txt = \"plain\", img = \"imgs\" }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"unified\"]\nscan_interval_secs = 1\n",
+        );
+        (load_pipeline_config(&text).unwrap(), fake)
+    }
+
+    /// b1 e2e #1 — txt+jpg mixed source → ONE unified embedder → ONE index:
+    /// both modalities' chunks land in the SAME derived index (x-vf-modality
+    /// each its own), the ingest wire is the messages dialect end to end
+    /// (image chunk = data:image/jpeg data URL, text chunk = text part), and
+    /// BOTH query modalities hit that one index — a text query returns TEXT
+    /// and IMAGE rows from it, an image query round-trips to its own source.
+    #[tokio::test]
+    async fn unified_multimodal_openai_txt_jpg_single_index() {
+        let (cfg, fake) = unified_config().await;
+        let f = fixture_with(cfg).await;
+        let fox_text = "the quick brown fox";
+        let red = crate::pipeline::extract::image::tests::solid_jpeg((16, 12), [255, 0, 0]);
+        put_source_call(&f, "docs", "docs/fox.txt", fox_text.as_bytes().to_vec()).await;
+        put_source_call(&f, "docs", "docs/red.jpg", red.clone()).await;
+        drive(&f).await;
+        for (key, modality) in [("docs/fox.txt", "text"), ("docs/red.jpg", "image")] {
+            let m = marker_of(&f, key).await.unwrap();
+            assert_eq!(m.status, SourceStatus::Indexed, "{key}: {m:?}");
+            assert_eq!(m.chunks.as_ref().unwrap()[modality], 1, "{key}");
+        }
+        // ingest wire: two requests, BOTH messages dialect, one per chunk
+        {
+            let seen = fake.seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "one request per chunk: {seen:?}");
+            for r in seen.iter() {
+                assert!(r.body.get("input").is_none(), "dialect only: {}", r.body);
+                assert!(r.body["messages"].is_array(), "{}", r.body);
+            }
+            let text_req = &seen[0].body;
+            assert_eq!(
+                text_req["messages"][1]["content"],
+                json!([{ "type": "text", "text": fox_text }])
+            );
+            let img_req = &seen[1].body;
+            let url = img_req["messages"][1]["content"][0]["image_url"]["url"]
+                .as_str()
+                .unwrap();
+            assert!(
+                url.starts_with("data:image/jpeg;base64,"),
+                "the jpg chunk rides its declared mime: {url}"
+            );
+        }
+        // ONE derived index holds BOTH modalities' rows
+        let indexes = f.state.storage.list_indexes("docs").await.unwrap();
+        let derived: Vec<&str> = indexes
+            .iter()
+            .map(|m| m.index_name.as_str())
+            .filter(|n| n.starts_with("unified-"))
+            .collect();
+        assert_eq!(derived.len(), 1, "{indexes:?}");
+        assert_eq!(
+            f.state
+                .storage
+                .count_vectors("docs", derived[0])
+                .await
+                .unwrap(),
+            2,
+            "text chunk + image chunk, same index"
+        );
+
+        let b64 = |b: &[u8]| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(b)
+        };
+        // text query (the exact chunk text): top hit = the TEXT chunk, and
+        // the IMAGE chunk ranks from the SAME index (cross-modal rows in one
+        // list — the unified-space shape)
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":fox_text},"topK":10}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2, "{b}");
+        assert_eq!(hits[0]["content"]["type"], json!("TEXT"), "{b}");
+        assert!(hits[0]["key"].as_str().unwrap().contains("-text-"), "{b}");
+        assert_eq!(hits[0]["metadata"]["x-vf-modality"], json!("text"), "{b}");
+        assert!(hits[0]["score"].as_f64().unwrap() > 0.99, "identity: {b}");
+        assert_eq!(hits[1]["content"]["type"], json!("IMAGE"), "{b}");
+        assert_eq!(hits[1]["metadata"]["x-vf-modality"], json!("image"), "{b}");
+        for h in hits {
+            assert_eq!(h["index"], json!(derived[0]), "single index: {b}");
+        }
+
+        // image query (red's exact bytes): round-trips to its own source —
+        // an IMAGE row from the SAME index, rank 1, distance ~0
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"image":{"bytes": b64(&red), "mime": "image/jpeg"}},"topK":10}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2, "{b}");
+        assert_eq!(hits[0]["content"]["type"], json!("IMAGE"), "{b}");
+        assert_eq!(hits[0]["location"]["key"], json!("docs/red.jpg"), "{b}");
+        assert_eq!(hits[0]["index"], json!(derived[0]), "{b}");
+        assert!(hits[0]["score"].as_f64().unwrap() > 0.99, "identity: {b}");
+        // and the TEXT row ranks from the same index (以图搜文 through the
+        // unified space — the capability the dual-tower form cannot have)
+        assert_eq!(hits[1]["content"]["type"], json!("TEXT"), "{b}");
+        assert_eq!(hits[1]["location"]["key"], json!("docs/fox.txt"), "{b}");
+    }
+
+    /// b1 e2e #2 — coexistence fan-out: the unified openai embedder AND
+    /// siglip2 side by side. The image chunk fans out to BOTH doc sides (two
+    /// derived indexes, one row each); an image query fans out to both query
+    /// sides (both declare Image) and merges; a text query fans out to the
+    /// unified index AND siglip2's text tower.
+    #[tokio::test]
+    async fn unified_openai_and_siglip2_coexist_fanout() {
+        let (base, fake) = crate::pipeline::embed::openai::tests::fake_openai_with(Some(8)).await;
+        let text = format!(
+            "[extractor.imgs]\nkind = \"image\"\n\n\
+             [embedder.unified]\nkind = \"openai\"\nendpoint = \"{base}\"\n\
+             model = \"fake-qwen3vl\"\ndim = 8\napi_key = \"test-key\"\n\
+             multimodal = true\n\n\
+             [embedder.clip]\nkind = \"siglip2\"\nmodel = \"tiny-siglip2\"\npath = {:?}\n\
+             offline = true\n\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\n\
+             extract = {{ img = \"imgs\" }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"unified\", \"clip\"]\nscan_interval_secs = 1\n",
+            siglip2_fixture_dir().display().to_string()
+        );
+        let cfg = load_pipeline_config(&text).unwrap();
+        let f = fixture_with(cfg).await;
+        let red = crate::pipeline::extract::image::tests::solid_png((8, 8), [255, 0, 0]);
+        put_source_call(&f, "docs", "docs/red.png", red.clone()).await;
+        drive(&f).await;
+        let m = marker_of(&f, "docs/red.png").await.unwrap();
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
+
+        // the image chunk reached BOTH doc sides: two derived indexes, one
+        // row each (store-level — the wire attribution only names route one)
+        let indexes = f.state.storage.list_indexes("docs").await.unwrap();
+        let names: Vec<&str> = indexes.iter().map(|m| m.index_name.as_str()).collect();
+        let unified_ix = names
+            .iter()
+            .find(|n| n.starts_with("unified-"))
+            .expect("{names:?}");
+        let clip_ix = names
+            .iter()
+            .find(|n| n.starts_with("clip-"))
+            .expect("{names:?}");
+        for ix in [unified_ix, clip_ix] {
+            assert_eq!(
+                f.state.storage.count_vectors("docs", ix).await.unwrap(),
+                1,
+                "the image chunk embedded into {ix}"
+            );
+        }
+        // the unified route rode the messages dialect; the clip route never
+        // touched the fake (it is a local ort session)
+        {
+            let seen = fake.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one doc request through the fake: {seen:?}");
+            assert!(seen[0].body["messages"].is_array());
+        }
+
+        let b64 = |b: &[u8]| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(b)
+        };
+        // image query: fans out to BOTH query sides (both declare Image),
+        // merges (rrf over the same key in two lists), red top
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"image":{"bytes": b64(&red), "mime": "image/png"}},"topK":5}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "{b}");
+        assert_eq!(hits[0]["location"]["key"], json!("docs/red.png"), "{b}");
+        assert_eq!(
+            hits[0]["index"],
+            json!(unified_ix),
+            "attribution = first route: {b}"
+        );
+
+        // text query: fans out to the unified index's text route AND
+        // siglip2's text tower (文字搜图) — both lists exist and merge
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"hello vectorfs"},"topK":5}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "both routes answered: {b}");
+        for h in hits {
+            assert_eq!(h["content"]["type"], json!("IMAGE"), "{b}");
+        }
+    }
+
     /// M3-T8 merge weighted over the wire, in-process: a DUAL-embedder
     /// bucket (txt->tiny text index + img->clip image index, `merge =
     /// "weighted"` with tiny=3.0 / clip=1.0). A TEXT query fans out to BOTH

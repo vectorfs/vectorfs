@@ -47,6 +47,56 @@
 //! `{index, embedding}` pairs — real providers may return them OUT OF ORDER,
 //! so vectors are realigned by `index` and the index set is validated to be
 //! exactly `0..n`.
+//!
+//! # Multimodal messages dialect (b1, 2026-11-07 design.md §0 裁决)
+//!
+//! `multimodal = true` turns this kind into a UNIFIED embedder (doc side
+//! [Text, Image], query side [Text, Image]) over the vLLM/IONOS messages
+//! extension of the same endpoint (research/2026-11-m3-unified-embedder-
+//! eval.md §3.2, wire verified verbatim against both):
+//!
+//! ```json
+//! { "model": "…",
+//!   "messages": [
+//!     { "role": "system", "content": [ { "type": "text", "text": "…" } ] },
+//!     { "role": "user", "content": [
+//!       { "type": "image_url", "image_url": { "url": "data:image/png;base64,…" } },
+//!       { "type": "text", "text": "…" } ] } ],
+//!   "dimensions": 1024 }
+//! ```
+//!
+//! * **one message per request**: vLLM treats the whole `messages` list as a
+//!   SINGLE prompt ("you can replace `inputs` with a list of `messages` …
+//!   which will be treated as a single prompt", vLLM embedding docs) — a
+//!   multi-message request would be a multi-TURN conversation yielding ONE
+//!   embedding of the concatenation, so batching N inputs into one request is
+//!   not expressible in this dialect. Each chunk/query therefore rides its
+//!   own POST, through the SAME retry/backoff loop (embeddings are a pure
+//!   function of the message, so a re-POST stays idempotent for the index —
+//!   the §5.10.5 invariant, adapted to endpoint-defined request granularity).
+//! * **everything goes messages when the gate is on** — pure text entries
+//!   included: the instruction rides a system message (only expressible in
+//!   `messages`), and vLLM applies the chat template on the messages path but
+//!   NOT on the `input` path, so mixing the two forms per entry would build
+//!   embeddings from different prompt constructions inside one index (the
+//!   §3.2 service-stack-consistency warning). IONOS documents text through
+//!   `messages` in its own multimodal example; vLLM documents it generally.
+//! * **instruction** (query/doc sides independently configurable) follows the
+//!   official `scripts/qwen3_vl_embedding.py`: a system message, defaulting
+//!   to "Represent the user's input.", punctuation-completed when the
+//!   operator's string lacks a trailing one.
+//! * **dimensions** (MRL truncation) is independent of the gate and rides
+//!   BOTH wire forms (vLLM documents it beside `input` and beside
+//!   `messages`); it must equal `dim` — the declared output dimensionality is
+//!   one number, not two.
+//! * **image budget**: images ride base64 data URLs (×4/3 on the wire); a
+//!   payload over [`MAX_IMAGE_BYTES`] is refused before any HTTP (the
+//!   OpenAI 20-MiB-per-image convention, the max_file_size discipline at the
+//!   provider boundary).
+//!
+//! **The additive red line**: with the new fields unset (every pre-b1
+//! config), the wire is byte-for-byte `{"model": …, "input": [texts…]}` and
+//! the modality matrix stays [Text]/[Text] — pinned by tests, not assumed.
 
 use std::time::Duration;
 
@@ -70,7 +120,25 @@ const DEFAULT_BACKOFF_BASE: Duration = Duration::from_millis(500);
 /// timeout, is the resilience mechanism.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The system instruction sent when the operator configures none — the
+/// official qwen3_vl_embedding.py default (both sides; the script always
+/// attaches a system message).
+pub const DEFAULT_INSTRUCTION: &str = "Represent the user's input.";
+
+/// Raw image-payload ceiling for the messages dialect (base64 inflates ×4/3
+/// on the wire, so the request body for a payload at the ceiling is
+/// ~26.7 MiB). A mechanism constant in the `max_file_size_mb` family: the
+/// OpenAI image-input convention is 20 MiB per image, gateway body caps
+/// cluster around it, and a 2B MLLM has no use for more pixels than that —
+/// refuse loudly BEFORE any HTTP rather than letting the provider 400 an
+/// opaque multi-MiB body.
+pub const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
 /// Per-kind config struct (§5.10.4: `{ kind, endpoint, model, dim, api_key? }`).
+///
+/// The b1 fields (`multimodal`, `query_instruction`, `doc_instruction`,
+/// `dimensions`) are all `skip`-at-default so a pre-b1 config serializes —
+/// fingerprint included — byte-identically to before (the additive red line).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenAiConfig {
@@ -81,8 +149,33 @@ pub struct OpenAiConfig {
     /// DECLARED output dimensionality (never probed over the network).
     pub dim: usize,
     /// Bearer token; when absent the env chain applies at construction.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// b1 gate: switch the wire to the vLLM/IONOS `messages` dialect and the
+    /// modality matrix to [Text, Image] on both sides (a unified embedder —
+    /// Qwen3-VL-Embedding behind vLLM `--runner pooling` or IONOS). Off =
+    /// the legacy pure-text `{"input": [texts]}` wire, byte-identical to
+    /// pre-b1 deployments.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multimodal: bool,
+    /// Query-side system instruction (Qwen3-VL-Embedding is
+    /// instruction-aware; the card reports 1–5% from instructions, English
+    /// recommended). Absent = the official default instruction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_instruction: Option<String>,
+    /// Document-side system instruction (query and doc sides may differ —
+    /// the official script takes the instruction per input, and its MMEB
+    /// usage passes one on queries while documents ride the default).
+    /// Absent = the official default instruction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_instruction: Option<String>,
+    /// MRL truncation size requested from the provider via the
+    /// `dimensions` request parameter (64..=model max per model card; the
+    /// endpoint validates the range). Must EQUAL `dim`: the declared output
+    /// dimensionality and the requested truncation are one number, not two.
+    /// Independent of `multimodal` (rides both wire forms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<usize>,
 }
 
 /// Literal tag: only deserializes from `"openai"`.
@@ -104,6 +197,12 @@ pub struct OpenAiEmbedder {
     model: String,
     dim: usize,
     api_key: String,
+    /// b1: the messages-dialect gate + the two RESOLVED system instructions
+    /// (punctuation-completed at construction; wire-ready strings).
+    multimodal: bool,
+    query_system: String,
+    doc_system: String,
+    dimensions: Option<usize>,
     /// Test seam: production uses [`DEFAULT_BACKOFF_BASE`].
     backoff_base: Duration,
 }
@@ -117,7 +216,24 @@ impl std::fmt::Debug for OpenAiEmbedder {
             .field("model", &self.model)
             .field("dim", &self.dim)
             .field("api_key", &"<redacted>")
+            .field("multimodal", &self.multimodal)
             .finish()
+    }
+}
+
+/// The official script's instruction normalization: trim, then append `.` if
+/// the last character is not punctuation (ASCII or the common CJK
+/// terminators — the script's `unicodedata.category(...).startswith('P')`
+/// check, covering what real instructions end with).
+fn complete_instruction(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let Some(last) = trimmed.chars().next_back() else {
+        return DEFAULT_INSTRUCTION.to_string();
+    };
+    if last.is_ascii_punctuation() || "。！？；：…）」』”".contains(last) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.")
     }
 }
 
@@ -176,6 +292,18 @@ impl OpenAiEmbedder {
             model: cfg.model.clone(),
             dim: cfg.dim,
             api_key,
+            multimodal: cfg.multimodal,
+            query_system: cfg
+                .query_instruction
+                .as_deref()
+                .map(complete_instruction)
+                .unwrap_or_else(|| DEFAULT_INSTRUCTION.to_string()),
+            doc_system: cfg
+                .doc_instruction
+                .as_deref()
+                .map(complete_instruction)
+                .unwrap_or_else(|| DEFAULT_INSTRUCTION.to_string()),
+            dimensions: cfg.dimensions,
             backoff_base: DEFAULT_BACKOFF_BASE,
         })
     }
@@ -191,13 +319,32 @@ impl OpenAiEmbedder {
     /// POST one batch of texts, returning one vector per text (realigned by
     /// the response's `index`). Retry policy in the module docs.
     async fn post_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, PipelineError> {
-        let url = format!("{}/embeddings", self.endpoint);
         let body = serde_json::to_vec(&Body {
             model: &self.model,
             input: texts,
+            dimensions: self.dimensions,
         })
         .map_err(|e| PipelineError::embed(format!("serializing request: {e}")))?;
+        let resp = self.post_json(&body).await?;
+        realign(resp.data, texts.len(), self.dim)
+    }
 
+    /// POST ONE messages-dialect entry (a chunk or a query), returning its
+    /// single vector. One message per request — the endpoint semantics the
+    /// module docs pin (vLLM: the whole `messages` list is a single prompt);
+    /// the retry loop is the shared [`post_json`] one.
+    async fn post_message(&self, body: &[u8]) -> Result<Vec<f32>, PipelineError> {
+        let resp = self.post_json(body).await?;
+        let mut v = realign(resp.data, 1, self.dim)?;
+        Ok(v.swap_remove(0))
+    }
+
+    /// The shared POST + retry core (module docs §Robustness): 429/5xx/
+    /// timeout/transport retry with exponential backoff, other 4xx fail
+    /// fast, `MAX_RETRIES` then Err. Response `data[]` is returned raw —
+    /// callers realign for their batch size.
+    async fn post_json(&self, body: &[u8]) -> Result<Resp, PipelineError> {
+        let url = format!("{}/embeddings", self.endpoint);
         let mut attempt: u32 = 0;
         loop {
             use http_body_util::BodyExt;
@@ -207,7 +354,7 @@ impl OpenAiEmbedder {
                     format!("Bearer {}", self.api_key),
                 )
                 .header(http::header::CONTENT_TYPE, "application/json")
-                .body(http_body_util::Full::new(bytes::Bytes::from(body.clone())))
+                .body(http_body_util::Full::new(bytes::Bytes::from(body.to_vec())))
                 .expect("static parts build a valid request");
 
             let outcome =
@@ -231,7 +378,7 @@ impl OpenAiEmbedder {
                                 "provider answered HTTP {status} with an unparsable body: {e}"
                             ))
                         })?;
-                        return realign(resp.data, texts.len(), self.dim);
+                        return Ok(resp);
                     }
                     let retryable = status.as_u16() == 429 || status.is_server_error();
                     if !retryable {
@@ -259,6 +406,74 @@ impl OpenAiEmbedder {
             attempt += 1;
         }
     }
+
+    /// Serialize ONE messages-dialect request body: the system message
+    /// (instruction) + a user message whose content parts are the image (as a
+    /// base64 data URL, first — both verified examples order it first) and/or
+    /// the text. Budget/refusal gates run BEFORE any bytes hit the wire.
+    fn messages_body(
+        &self,
+        system: &str,
+        image: Option<(&[u8], &str)>,
+        text: Option<&str>,
+    ) -> Result<Vec<u8>, PipelineError> {
+        let mut parts: Vec<WirePart> = Vec::with_capacity(2);
+        if let Some((bytes, mime)) = image {
+            if bytes.is_empty() {
+                return Err(PipelineError::embed(
+                    "openai embedder: refusing to embed an EMPTY image payload — the messages \
+                     dialect has no honest embedding of zero bytes (a routing bug upstream of \
+                     this kind)",
+                ));
+            }
+            if bytes.len() > MAX_IMAGE_BYTES {
+                return Err(PipelineError::embed(format!(
+                    "openai embedder: image payload is {} bytes — the multimodal messages \
+                     dialect carries images as base64 data URLs (×4/3 on the wire) and refuses \
+                     anything over {} MiB before any HTTP; downscale the image before ingesting \
+                     (the image extractor passes bytes through verbatim)",
+                    bytes.len(),
+                    MAX_IMAGE_BYTES / (1024 * 1024)
+                )));
+            }
+            use base64::Engine as _;
+            let url = format!(
+                "data:{mime};base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            );
+            parts.push(WirePart::ImageUrl {
+                image_url: WireImageUrl { url },
+            });
+        }
+        if let Some(t) = text.filter(|t| !t.is_empty()) {
+            parts.push(WirePart::Text {
+                text: t.to_string(),
+            });
+        }
+        if parts.is_empty() {
+            return Err(PipelineError::embed(
+                "openai embedder: messages request would carry no content (neither an image \
+                 payload nor non-empty text) — an empty entry has no honest embedding",
+            ));
+        }
+        serde_json::to_vec(&MessagesBody {
+            model: &self.model,
+            messages: vec![
+                WireMessage {
+                    role: "system",
+                    content: vec![WirePart::Text {
+                        text: system.to_string(),
+                    }],
+                },
+                WireMessage {
+                    role: "user",
+                    content: parts,
+                },
+            ],
+            dimensions: self.dimensions,
+        })
+        .map_err(|e| PipelineError::embed(format!("serializing request: {e}")))
+    }
 }
 
 fn env_nonempty(key: &str) -> Option<String> {
@@ -271,6 +486,44 @@ fn env_nonempty(key: &str) -> Option<String> {
 struct Body<'a> {
     model: &'a str,
     input: &'a [String],
+    /// MRL truncation, only when configured (skip-at-None keeps the legacy
+    /// wire byte-identical for every pre-b1 config).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<usize>,
+}
+
+/// One messages-dialect request (module docs: the b1 wire, field order
+/// matching the verified vLLM/IONOS samples — model, messages, dimensions).
+#[derive(serde::Serialize)]
+struct MessagesBody<'a> {
+    model: &'a str,
+    messages: Vec<WireMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+struct WireMessage {
+    role: &'static str,
+    content: Vec<WirePart>,
+}
+
+/// One content part, internally tagged by `type` — serializes to exactly
+/// `{"type":"text","text":…}` / `{"type":"image_url","image_url":{"url":…}}`
+/// (the verified dialect shape).
+#[derive(serde::Serialize)]
+#[serde(tag = "type")]
+enum WirePart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: WireImageUrl },
+}
+
+#[derive(serde::Serialize)]
+struct WireImageUrl {
+    /// `data:<mime>;base64,<payload>`
+    url: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -353,18 +606,52 @@ trait Realigned {
 #[async_trait::async_trait]
 impl Embedder for OpenAiEmbedder {
     async fn embed_query(&self, q: &Query) -> Result<Vec<f32>, PipelineError> {
-        let Query::Text(t) = q else {
-            // text-only kind (query_modalities = [text]); M3-T1 seam
-            return Err(super::query_modality_refusal(q));
-        };
-        self.post_batch(std::slice::from_ref(t))
-            .await
-            .map(|mut v| v.swap_remove(0))
+        match q {
+            Query::Text(t) => {
+                if self.multimodal {
+                    // text entries go messages too when the gate is on (the
+                    // dialect-consistency rule in the module docs)
+                    let body = self.messages_body(&self.query_system, None, Some(t))?;
+                    self.post_message(&body).await
+                } else {
+                    // the legacy route, byte-identical to pre-b1
+                    self.post_batch(std::slice::from_ref(t))
+                        .await
+                        .map(|mut v| v.swap_remove(0))
+                }
+            }
+            Query::Image(bytes, mime) => {
+                if !self.multimodal {
+                    // text-only kind (query_modalities = [text]); M3-T1 seam
+                    return Err(super::query_modality_refusal(q));
+                }
+                let body = self.messages_body(&self.query_system, Some((bytes, mime)), None)?;
+                self.post_message(&body).await
+            }
+        }
     }
 
     async fn embed_documents(&self, chunks: &[Chunk]) -> Result<Vec<Vec<f32>>, PipelineError> {
         if chunks.is_empty() {
             return Ok(Vec::new());
+        }
+        if self.multimodal {
+            // one message per chunk (the endpoint semantics: a messages list
+            // is ONE prompt — see module docs), each through the shared
+            // retry loop; order is preserved one-to-one with the chunks
+            let mut out = Vec::with_capacity(chunks.len());
+            for c in chunks {
+                let body = match &c.image {
+                    Some(img) => self.messages_body(
+                        &self.doc_system,
+                        Some((img.bytes.as_ref(), img.mime.as_str())),
+                        None,
+                    )?,
+                    None => self.messages_body(&self.doc_system, None, Some(&c.text))?,
+                };
+                out.push(self.post_message(&body).await?);
+            }
+            return Ok(out);
         }
         if let Some(c) = chunks.iter().find(|c| c.image.is_some()) {
             return Err(super::image_chunk_refusal(c));
@@ -382,11 +669,19 @@ impl Embedder for OpenAiEmbedder {
     }
 
     fn doc_modalities(&self) -> &'static [Modality] {
-        &[Modality::Text]
+        if self.multimodal {
+            &[Modality::Text, Modality::Image]
+        } else {
+            &[Modality::Text]
+        }
     }
 
     fn query_modalities(&self) -> &'static [Modality] {
-        &[Modality::Text]
+        if self.multimodal {
+            &[Modality::Text, Modality::Image]
+        } else {
+            &[Modality::Text]
+        }
     }
 }
 
@@ -402,9 +697,14 @@ pub(crate) mod tests {
     use serde_json::json;
 
     /// What the fake captured for one request (asserted by the tests).
+    /// `raw`/`body` carry the request VERBATIM (bytes + parsed view) — the
+    /// b1 dialect tests assert field-by-field against them, and the additive
+    /// red-line test asserts byte-for-byte.
     #[derive(Debug, Clone, PartialEq, serde::Serialize)]
     pub(crate) struct SeenRequest {
         pub auth: Option<String>,
+        pub raw: Vec<u8>,
+        pub body: serde_json::Value,
         pub model: String,
         pub input: Vec<String>,
     }
@@ -416,13 +716,43 @@ pub(crate) mod tests {
         /// scripts: each incoming request consumes the NEXT status; an empty
         /// list answers 200 forever.
         pub statuses: std::sync::Arc<std::sync::Mutex<Vec<u16>>>,
+        /// When Some(dim): answer with CONTENT-SEEDED vectors (a
+        /// deterministic pseudo-embedding of the whole request body) instead
+        /// of the canned index vectors — the e2e suites' identity oracle
+        /// (same content in ⇒ same vector out, across doc and query sides).
+        pub seeded_dim: Option<usize>,
+    }
+
+    /// A deterministic pseudo-embedding of `seed` (sha256-chained blocks
+    /// into [-1, 1] f32s) — identity-preserving: equal seeds ⇒ equal
+    /// vectors, different seeds ⇒ (overwhelmingly) different vectors.
+    pub(crate) fn seeded_vector(seed: &str, dim: usize) -> Vec<f32> {
+        use sha2::Digest;
+        let mut block = sha2::Sha256::digest(seed.as_bytes()).to_vec();
+        let mut out: Vec<f32> = Vec::with_capacity(dim);
+        while out.len() < dim {
+            for b in &block {
+                if out.len() < dim {
+                    out.push(*b as f32 / 255.0 * 2.0 - 1.0);
+                }
+            }
+            block = sha2::Sha256::digest(&block).to_vec();
+        }
+        out
     }
 
     /// Spawn the fake provider; returns (base_url, state).
     pub(crate) async fn fake_openai() -> (String, Fake) {
+        fake_openai_with(None).await
+    }
+
+    /// [`fake_openai`] with the content-seeded embedding mode (see
+    /// [`Fake::seeded_dim`]).
+    pub(crate) async fn fake_openai_with(seeded_dim: Option<usize>) -> (String, Fake) {
         let fake = Fake {
             seen: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             statuses: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            seeded_dim,
         };
         let state = fake.clone();
         let app = axum::Router::new()
@@ -441,6 +771,8 @@ pub(crate) mod tests {
                             serde_json::from_slice(&body).expect("request must be JSON");
                         st.seen.lock().unwrap().push(SeenRequest {
                             auth,
+                            raw: body.to_vec(),
+                            body: v.clone(),
                             model: v["model"].as_str().unwrap_or_default().to_string(),
                             input: v["input"]
                                 .as_array()
@@ -458,10 +790,46 @@ pub(crate) mod tests {
                                 axum::Json(json!({"error": {"message": "scripted failure"}})),
                             );
                         }
+                        // content-seeded mode: the whole request body is the
+                        // seed (input form: one vector per input string, so
+                        // text entries stay independently addressable)
+                        if let Some(dim) = st.seeded_dim {
+                            let data: Vec<serde_json::Value> = if v["input"].is_array() {
+                                v["input"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, s)| {
+                                        json!({
+                                            "index": i,
+                                            "embedding": seeded_vector(
+                                                s.as_str().unwrap_or_default(), dim),
+                                        })
+                                    })
+                                    .collect()
+                            } else {
+                                // messages dialect: one prompt per request
+                                vec![json!({
+                                    "index": 0,
+                                    "embedding": seeded_vector(&v.to_string(), dim),
+                                })]
+                            };
+                            return (
+                                AxStatus::OK,
+                                axum::Json(json!({ "data": data, "model": "fake" })),
+                            );
+                        }
                         // canned vectors: embedding of input i = [i as f32;
                         // dim], DELIBERATELY shuffled by index — the embedder
-                        // must realign by index, not by array order.
-                        let n = st.seen.lock().unwrap().last().unwrap().input.len();
+                        // must realign by index, not by array order. A
+                        // messages-dialect request is a batch of ONE (index
+                        // 0), regardless of the empty `input` field.
+                        let n = if v["input"].is_array() {
+                            v["input"].as_array().unwrap().len()
+                        } else {
+                            1
+                        };
                         let dim = 4usize;
                         let mut data: Vec<serde_json::Value> = (0..n)
                             .map(|i| {
@@ -496,6 +864,24 @@ pub(crate) mod tests {
             model: "embedding-fake".to_string(),
             dim: 4,
             api_key: Some("test-key".to_string()),
+            multimodal: false,
+            query_instruction: None,
+            doc_instruction: None,
+            dimensions: None,
+        }
+    }
+
+    /// [`fake_config`] + the b1 gate on, with per-side instructions.
+    pub(crate) fn fake_multimodal_config(
+        endpoint: String,
+        query_instruction: Option<&str>,
+        doc_instruction: Option<&str>,
+    ) -> OpenAiConfig {
+        OpenAiConfig {
+            multimodal: true,
+            query_instruction: query_instruction.map(str::to_string),
+            doc_instruction: doc_instruction.map(str::to_string),
+            ..fake_config(endpoint)
         }
     }
 
@@ -751,8 +1137,14 @@ pub(crate) mod tests {
         assert_eq!(
             toml::to_string(&cfg).unwrap().trim(),
             "kind = \"openai\"\nendpoint = \"https://api.bigmodel.cn/v1\"\nmodel = \
-             \"embedding-3\"\ndim = 2048"
+             \"embedding-3\"\ndim = 2048",
+            "every b1 field must ELIDE at its default — pre-b1 configs keep \
+             serializing (fingerprint included) byte-identically"
         );
+        assert!(!cfg.multimodal);
+        assert!(cfg.query_instruction.is_none());
+        assert!(cfg.doc_instruction.is_none());
+        assert!(cfg.dimensions.is_none());
         // dim is REQUIRED: no default, no probe
         let err = toml::from_str::<OpenAiConfig>(
             "kind = \"openai\"\nendpoint = \"https://x/v1\"\nmodel = \"m\"",
@@ -769,5 +1161,398 @@ pub(crate) mod tests {
         );
         // wrong kind literal rejected
         assert!(toml::from_str::<OpenAiConfig>("kind = \"ort\"").is_err());
+        // the b1 fields parse, and round-trip into the serialized form
+        let cfg: OpenAiConfig = toml::from_str(
+            "kind = \"openai\"\nendpoint = \"https://x/v1\"\nmodel = \"m\"\ndim = 8\n\
+             multimodal = true\nquery_instruction = \"find charts\"\n\
+             doc_instruction = \"Represent the document.\"\ndimensions = 8",
+        )
+        .unwrap();
+        assert!(cfg.multimodal);
+        assert_eq!(cfg.query_instruction.as_deref(), Some("find charts"));
+        assert_eq!(
+            cfg.doc_instruction.as_deref(),
+            Some("Represent the document.")
+        );
+        assert_eq!(cfg.dimensions, Some(8));
+        let out = toml::to_string(&cfg).unwrap();
+        assert!(out.contains("multimodal = true"), "{out}");
+        assert!(out.contains("dimensions = 8"), "{out}");
+    }
+
+    // -----------------------------------------------------------------------
+    // b1: the multimodal messages dialect
+    // -----------------------------------------------------------------------
+
+    /// A 1x1 red PNG (real container bytes; the wire must carry them
+    /// base64'd verbatim).
+    fn tiny_png() -> Vec<u8> {
+        crate::pipeline::extract::image::tests::solid_png((4, 4), [255, 0, 0])
+    }
+
+    fn image_chunk(index: u32, bytes: Vec<u8>, mime: &str) -> Chunk {
+        Chunk {
+            index,
+            text: String::new(),
+            image: Some(crate::pipeline::ImagePayload {
+                bytes: bytes::Bytes::from(bytes),
+                mime: mime.to_string(),
+            }),
+        }
+    }
+
+    fn text_chunk(index: u32, text: &str) -> Chunk {
+        Chunk {
+            index,
+            text: text.to_string(),
+            image: None,
+        }
+    }
+
+    /// THE additive red-line pin: with the b1 fields unset, the wire bytes
+    /// are EXACTLY the legacy object — no reordered keys, no new fields, no
+    /// `dimensions` — byte for byte (and the modality matrix stays
+    /// text/text; every pre-b1 deployment keeps its index and fingerprint).
+    #[tokio::test]
+    async fn legacy_wire_is_byte_identical_when_gate_unset() {
+        let (base, fake) = fake_openai().await;
+        let e = OpenAiEmbedder::new(&fake_config(base)).unwrap();
+        assert_eq!(e.doc_modalities(), &[Modality::Text]);
+        assert_eq!(e.query_modalities(), &[Modality::Text]);
+        let out = e
+            .embed_documents(&[text_chunk(0, "alpha"), text_chunk(1, "beta")])
+            .await
+            .unwrap();
+        assert_eq!(out, vec![vec![0.0; 4], vec![1.0; 4]]);
+        {
+            let seen = fake.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(
+                seen[0].raw,
+                serde_json::to_vec(&json!({"model": "embedding-fake", "input": ["alpha", "beta"]}))
+                    .unwrap(),
+                "byte-for-byte legacy wire (the pre-b1 shape)"
+            );
+        }
+        // the query route keeps the same legacy shape
+        e.embed_query(&Query::Text("qq".into())).await.unwrap();
+        let seen = fake.seen.lock().unwrap();
+        assert_eq!(
+            seen[1].raw,
+            serde_json::to_vec(&json!({"model": "embedding-fake", "input": ["qq"]})).unwrap(),
+            "byte-for-byte legacy wire on the query route"
+        );
+    }
+
+    /// The messages dialect, asserted FIELD BY FIELD against the verified
+    /// vLLM/IONOS shape: system message carries the instruction (query side
+    /// for queries, doc side for documents), the user message carries the
+    /// image data URL (image first) or the text, `dimensions` rides along,
+    /// and every entry — text included — goes messages.
+    #[tokio::test]
+    async fn messages_dialect_wire_shape_field_by_field() {
+        let (base, fake) = fake_openai().await;
+        let cfg = fake_multimodal_config(
+            base,
+            Some("Find the matching document"),
+            Some("Represent the document for retrieval"),
+        );
+        let e = OpenAiEmbedder::new(&cfg).unwrap();
+        assert_eq!(e.doc_modalities(), &[Modality::Text, Modality::Image]);
+        assert_eq!(e.query_modalities(), &[Modality::Text, Modality::Image]);
+
+        let png = tiny_png();
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+
+        // mixed batch: [text, image] — one request per chunk, order kept;
+        // every messages request is a batch of one, so the canned vector of
+        // index 0 comes back per chunk
+        let out = e
+            .embed_documents(&[
+                text_chunk(0, "hello chunk"),
+                image_chunk(1, png.clone(), "image/png"),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], vec![0.0; 4], "one vector per chunk, in order");
+        assert_eq!(out[1], vec![0.0; 4]);
+
+        // text query through messages with the QUERY instruction
+        e.embed_query(&Query::Text("q-text".into())).await.unwrap();
+        // image query through messages with the QUERY instruction
+        e.embed_query(&Query::Image(png.clone(), "image/png".to_string()))
+            .await
+            .unwrap();
+
+        let seen = fake.seen.lock().unwrap();
+        assert_eq!(seen.len(), 4, "one request per chunk + one per query");
+        for r in seen.iter() {
+            assert_eq!(r.model, "embedding-fake");
+            assert!(
+                r.body.get("input").is_none(),
+                "the gate routes EVERYTHING through messages: {}",
+                r.body
+            );
+            assert_eq!(r.body["dimensions"], json!(null), "dimensions unset here");
+        }
+        let doc_body = &seen[0].body;
+        assert_eq!(
+            doc_body["messages"][0],
+            json!({"role": "system", "content": [{"type": "text", "text": "Represent the \
+              document for retrieval."}]}),
+            "doc system message: configured instruction, punctuation-completed"
+        );
+        assert_eq!(
+            doc_body["messages"][1],
+            json!({"role": "user", "content": [{"type": "text", "text": "hello chunk"}]}),
+            "a text entry goes messages too (dialect consistency)"
+        );
+        let img_body = &seen[1].body;
+        assert_eq!(
+            img_body["messages"][0]["content"][0]["text"],
+            json!("Represent the document for retrieval.")
+        );
+        assert_eq!(
+            img_body["messages"][1]["role"],
+            json!("user"),
+            "image chunk: one user message"
+        );
+        let parts = img_body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1, "image-only chunk carries no text part");
+        assert_eq!(parts[0]["type"], json!("image_url"));
+        assert_eq!(
+            parts[0]["image_url"]["url"],
+            json!(format!("data:image/png;base64,{b64}")),
+            "data URL: declared mime + base64 of the payload bytes, verbatim"
+        );
+        let q_text_body = &seen[2].body;
+        assert_eq!(
+            q_text_body["messages"][0]["content"][0]["text"],
+            json!("Find the matching document."),
+            "query side carries the QUERY instruction (punctuation-completed)"
+        );
+        assert_eq!(
+            q_text_body["messages"][1]["content"],
+            json!([{"type": "text", "text": "q-text"}])
+        );
+        let q_img_body = &seen[3].body;
+        assert_eq!(
+            q_img_body["messages"][0]["content"][0]["text"],
+            json!("Find the matching document.")
+        );
+        assert_eq!(
+            q_img_body["messages"][1]["content"][0]["image_url"]["url"],
+            json!(format!("data:image/png;base64,{b64}")),
+            "image query: same data-URL shape as the doc side"
+        );
+        assert_eq!(
+            q_img_body["messages"][1]["content"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// No instruction configured ⇒ the official default rides the system
+    /// message on BOTH sides (the qwen3_vl_embedding.py behavior); an
+    /// instruction already ending in punctuation (ASCII or CJK) is left
+    /// alone; whitespace is trimmed.
+    #[tokio::test]
+    async fn instructions_default_and_punctuation_completion() {
+        let (base, fake) = fake_openai().await;
+        let cfg = fake_multimodal_config(base, None, None);
+        let e = OpenAiEmbedder::new(&cfg).unwrap();
+        e.embed_query(&Query::Text("t".into())).await.unwrap();
+        e.embed_documents(&[text_chunk(0, "d")]).await.unwrap();
+        {
+            let seen = fake.seen.lock().unwrap();
+            for r in seen.iter().take(2) {
+                assert_eq!(
+                    r.body["messages"][0]["content"][0]["text"],
+                    json!(DEFAULT_INSTRUCTION),
+                    "absent instruction = the official default: {}",
+                    r.body
+                );
+            }
+        }
+        // completion matrix, as a unit on the resolver itself
+        assert_eq!(complete_instruction("find cats"), "find cats.");
+        assert_eq!(complete_instruction("  find cats  "), "find cats.");
+        assert_eq!(complete_instruction("Find it!"), "Find it!");
+        assert_eq!(complete_instruction("以图搜文档"), "以图搜文档.");
+        assert_eq!(complete_instruction("找出图表。"), "找出图表。");
+    }
+
+    /// `dimensions` (MRL truncation) rides BOTH dialects — beside `input`
+    /// on the legacy wire (vLLM documents exactly that curl) and beside
+    /// `messages` on the dialect wire — and elides when unset (the red-line
+    /// test above pins that half).
+    #[tokio::test]
+    async fn dimensions_rides_both_wire_forms() {
+        let (base, fake) = fake_openai().await;
+        let mut cfg = fake_config(base.clone());
+        cfg.dimensions = Some(4); // == dim (4): the one-number rule
+        let e = OpenAiEmbedder::new(&cfg).unwrap();
+        e.embed_query(&Query::Text("legacy".into())).await.unwrap();
+        {
+            let seen = fake.seen.lock().unwrap();
+            assert_eq!(seen[0].body["dimensions"], json!(4));
+            assert_eq!(
+                seen[0].raw,
+                serde_json::to_vec(&json!({
+                    "model": "embedding-fake",
+                    "input": ["legacy"],
+                    "dimensions": 4
+                }))
+                .unwrap(),
+                "legacy wire + dimensions, exact bytes"
+            );
+        }
+        let mut mm = fake_multimodal_config(base, None, None);
+        mm.dimensions = Some(4);
+        let e = OpenAiEmbedder::new(&mm).unwrap();
+        e.embed_documents(&[text_chunk(0, "x")]).await.unwrap();
+        let seen = fake.seen.lock().unwrap();
+        assert_eq!(seen[1].body["dimensions"], json!(4));
+        assert!(
+            serde_json::to_string(&seen[1].body)
+                .unwrap()
+                .contains("\"dimensions\":4")
+                && seen[1].raw.windows(8).any(|w| w == b"messages"),
+            "messages body carries dimensions too"
+        );
+    }
+
+    /// The image budget: a payload over [`MAX_IMAGE_BYTES`] is refused
+    /// BEFORE any HTTP leaves (the max_file_size discipline at the provider
+    /// boundary), with the size and the ceiling in the message.
+    #[tokio::test]
+    async fn image_budget_refused_before_http() {
+        let (base, fake) = fake_openai().await;
+        let e = OpenAiEmbedder::new(&fake_multimodal_config(base, None, None)).unwrap();
+        let huge = vec![0u8; MAX_IMAGE_BYTES + 1];
+        let err = e
+            .embed_documents(&[image_chunk(0, huge, "image/png")])
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("refuses anything over 20 MiB"), "{msg}");
+        assert!(msg.contains("downscale"), "{msg}");
+        // and the empty-payload defensive refusal
+        let err = e
+            .embed_documents(&[image_chunk(0, Vec::new(), "image/png")])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("EMPTY image payload"), "{}", err);
+        assert!(
+            fake.seen.lock().unwrap().is_empty(),
+            "no HTTP call for budget refusals"
+        );
+    }
+
+    /// The retry/idempotency discipline is THE SAME loop in the messages
+    /// dialect: 429/5xx retried with backoff, success after failures, and
+    /// a re-POST is safe (the body is a pure function of the chunk).
+    #[tokio::test]
+    async fn messages_dialect_retries_on_5xx_then_succeeds() {
+        let (base, fake) = fake_openai().await;
+        *fake.statuses.lock().unwrap() = vec![500, 429];
+        let e = OpenAiEmbedder::new(&fake_multimodal_config(base, None, None))
+            .unwrap()
+            .with_backoff_base(Duration::from_millis(1));
+        let v = e
+            .embed_query(&Query::Image(tiny_png(), "image/png".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(v, vec![0.0; 4]);
+        let seen = fake.seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "2 failures + 1 success");
+        // every attempt POSTed the IDENTICAL body (idempotent re-POST)
+        assert_eq!(seen[0].raw, seen[1].raw);
+        assert_eq!(seen[1].raw, seen[2].raw);
+        assert!(seen[0].raw.windows(8).any(|w| w == b"messages"));
+    }
+
+    /// The modality matrix flip is the GATE's, and only the gate's: off ⇒
+    /// the M3-T1 refusals still fire verbatim for image queries and image
+    /// chunks (the pre-b1 behavior, unchanged); on ⇒ both sides accept
+    /// both modalities.
+    #[tokio::test]
+    async fn modality_matrix_flips_with_the_gate() {
+        let (base, fake) = fake_openai().await;
+        // off: image query refused loudly (the M3-T1 seam text)
+        let e = OpenAiEmbedder::new(&fake_config(base.clone())).unwrap();
+        let err = e
+            .embed_query(&Query::Image(vec![0x89, 0x50], "image/png".to_string()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not accept an image query"),
+            "{err}"
+        );
+        let err = e
+            .embed_documents(&[image_chunk(0, tiny_png(), "image/png")])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is an image chunk"), "{err}");
+        assert!(fake.seen.lock().unwrap().is_empty());
+        // on: both sides, both modalities
+        let e = OpenAiEmbedder::new(&fake_multimodal_config(base, None, None)).unwrap();
+        assert_eq!(e.doc_modalities(), &[Modality::Text, Modality::Image]);
+        assert_eq!(e.query_modalities(), &[Modality::Text, Modality::Image]);
+    }
+
+    /// Real-endpoint smoke (b1): driven by env — set
+    /// `VF_TEST_QWEN3VL_ENDPOINT` (e.g. `http://127.0.0.1:8000/v1`, a
+    /// `vllm serve Qwen/Qwen3-VL-Embedding-2B --runner pooling` on the box)
+    /// plus `VF_OPENAI_API_KEY` when the endpoint needs one, and optionally
+    /// `VF_TEST_QWEN3VL_MODEL` (default `Qwen/Qwen3-VL-Embedding-2B`) /
+    /// `VF_TEST_QWEN3VL_DIM` (default 2048). Without the env, the test is
+    /// skipped with a one-line reason — it must NEVER fake a network.
+    #[tokio::test]
+    #[ignore = "real endpoint required: set VF_TEST_QWEN3VL_ENDPOINT (vLLM --runner pooling or IONOS-style gateway)"]
+    async fn real_endpoint_multimodal_smoke() {
+        let Some(endpoint) = env_nonempty("VF_TEST_QWEN3VL_ENDPOINT") else {
+            eprintln!(
+                "skipping: VF_TEST_QWEN3VL_ENDPOINT not set — this smoke needs a real \
+                 Qwen3-VL-Embedding endpoint (vllm serve Qwen/Qwen3-VL-Embedding-2B \
+                 --runner pooling, or a managed one); no network is faked"
+            );
+            return;
+        };
+        let model = env_nonempty("VF_TEST_QWEN3VL_MODEL")
+            .unwrap_or_else(|| "Qwen/Qwen3-VL-Embedding-2B".to_string());
+        let dim = env_nonempty("VF_TEST_QWEN3VL_DIM")
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(2048);
+        let cfg = OpenAiConfig {
+            kind: OpenAiTag::OpenAi,
+            endpoint,
+            model,
+            dim,
+            api_key: env_nonempty("VF_OPENAI_API_KEY"),
+            multimodal: true,
+            query_instruction: Some("Find the matching document".to_string()),
+            doc_instruction: None,
+            dimensions: None,
+        };
+        let e = OpenAiEmbedder::new(&cfg).unwrap();
+        let t = e
+            .embed_query(&Query::Text("a unified embedder smoke".into()))
+            .await
+            .unwrap();
+        assert_eq!(t.len(), dim);
+        assert!(t.iter().all(|x| x.is_finite()));
+        let img = crate::pipeline::extract::image::tests::solid_png((64, 64), [10, 200, 30]);
+        let v = e
+            .embed_documents(&[image_chunk(0, img, "image/png")])
+            .await
+            .unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].len(), dim);
+        assert!(v[0].iter().all(|x| x.is_finite()));
     }
 }

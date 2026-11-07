@@ -128,6 +128,40 @@ impl EmbedderKind {
                 let cfg: OpenAiConfig = raw.clone().try_into().map_err(|e: toml::de::Error| {
                     super::config::stage2_error(section, Some(&kind), e.message(), line)
                 })?;
+                // b1 cross-field coherence, fail-fast at PARSE time with the
+                // section line (the siglip2 no-default precedent — these are
+                // pure config facts, knowable before any credential exists):
+                // * dimensions is the MRL truncation REQUESTED from the
+                //   provider; dim is the DECLARED output. One number, not
+                //   two — a mismatch would fail every realign at runtime.
+                // * the instruction fields need the messages dialect; the
+                //   legacy input wire has no instruction channel to carry
+                //   them (silently ignoring a configured field is worse).
+                if let Some(d) = cfg.dimensions.filter(|&d| d != cfg.dim) {
+                    return Err(PipelineError::config(
+                        format!(
+                            "[{section}]: dimensions = {d} must EQUAL dim = {} — dimensions \
+                             is the MRL truncation requested from the provider and dim is \
+                             the declared output dimensionality; set BOTH to the truncated \
+                             size (or drop dimensions for the model's native output)",
+                            cfg.dim
+                        ),
+                        line,
+                    ));
+                }
+                if !cfg.multimodal
+                    && (cfg.query_instruction.is_some() || cfg.doc_instruction.is_some())
+                {
+                    return Err(PipelineError::config(
+                        format!(
+                            "[{section}]: query_instruction / doc_instruction require \
+                             multimodal = true — the legacy {{input}} wire has no instruction \
+                             channel; the messages dialect carries instructions as the system \
+                             message"
+                        ),
+                        line,
+                    ));
+                }
                 Ok(EmbedderKind::OpenAi(cfg))
             }
             "siglip2" => {
@@ -175,10 +209,20 @@ impl EmbedderKind {
 
     /// Modalities accepted on the DOCUMENT side — drives the §5.10.3
     /// modality carry-over check at config time. The M2 kinds are text-only;
-    /// siglip2 (M3-T2) is the first image-document kind.
+    /// siglip2 (M3-T2) is the first image-document kind; the openai kind
+    /// with `multimodal = true` (b1) is the first kind accepting BOTH — a
+    /// unified embedder whose gate must stay config-driven so pre-b1
+    /// deployments keep their text/text matrix byte-identically.
     pub fn doc_modalities(&self) -> &'static [Modality] {
         match self {
-            EmbedderKind::Ort(_) | EmbedderKind::OpenAi(_) => &[Modality::Text],
+            EmbedderKind::Ort(_) => &[Modality::Text],
+            EmbedderKind::OpenAi(c) => {
+                if c.multimodal {
+                    &[Modality::Text, Modality::Image]
+                } else {
+                    &[Modality::Text]
+                }
+            }
             EmbedderKind::Siglip2(_) => &[Modality::Image],
         }
     }
@@ -186,7 +230,14 @@ impl EmbedderKind {
     /// Modalities accepted on the QUERY side.
     pub fn query_modalities(&self) -> &'static [Modality] {
         match self {
-            EmbedderKind::Ort(_) | EmbedderKind::OpenAi(_) => &[Modality::Text],
+            EmbedderKind::Ort(_) => &[Modality::Text],
+            EmbedderKind::OpenAi(c) => {
+                if c.multimodal {
+                    &[Modality::Text, Modality::Image]
+                } else {
+                    &[Modality::Text]
+                }
+            }
             // 以图搜图 (vision tower) + 文字搜图 (text tower; the tokenizers
             // investigation came back clean — see siglip2.rs module docs)
             EmbedderKind::Siglip2(_) => &[Modality::Image, Modality::Text],
@@ -212,8 +263,11 @@ impl EmbedderKind {
                 }
             },
             EmbedderKind::OpenAi(c) => format!(
-                "openai(model={}, dim={}, endpoint={})",
-                c.model, c.dim, c.endpoint
+                "openai(model={}, dim={}, endpoint={}{})",
+                c.model,
+                c.dim,
+                c.endpoint,
+                if c.multimodal { ", multimodal" } else { "" }
             ),
             EmbedderKind::Siglip2(c) => match &c.path {
                 Some(p) => format!("siglip2(path={p})"),
@@ -466,6 +520,80 @@ mod tests {
         assert_eq!(
             toml::to_string(&k).unwrap().trim(),
             "kind = \"openai\"\nendpoint = \"https://e/v1\"\nmodel = \"m\"\ndim = 8"
+        );
+    }
+
+    /// b1: the gate flips the openai kind's modality matrix — config-gated,
+    /// bilateral, and visible in `describe` (the `pipelines check` summary
+    /// face). Off = the pre-b1 text/text matrix, pinned right next to it.
+    #[test]
+    fn openai_multimodal_gate_flips_the_modality_matrix_and_describe() {
+        let raw = |extra: &str| {
+            toml::from_str(&format!(
+                "kind = \"openai\"\nendpoint = \"https://e/v1\"\nmodel = \"m\"\ndim = 8\n{extra}"
+            ))
+            .unwrap()
+        };
+        // off (the additive red line): text/text, no multimodal in describe
+        let off = EmbedderKind::from_config("e", &raw(""), None).unwrap();
+        assert_eq!(off.doc_modalities(), &[Modality::Text]);
+        assert_eq!(off.query_modalities(), &[Modality::Text]);
+        assert_eq!(
+            off.describe(),
+            "openai(model=m, dim=8, endpoint=https://e/v1)"
+        );
+        // on: BOTH sides [Text, Image] — a unified embedder
+        let on = EmbedderKind::from_config("e", &raw("multimodal = true"), None).unwrap();
+        assert_eq!(on.doc_modalities(), &[Modality::Text, Modality::Image]);
+        assert_eq!(on.query_modalities(), &[Modality::Text, Modality::Image]);
+        assert_eq!(
+            on.describe(),
+            "openai(model=m, dim=8, endpoint=https://e/v1, multimodal)"
+        );
+        // the fingerprint view: the gate moves the serialized form (a
+        // re-gate IS a reindex — the vectors change), and the b1 fields
+        // absent keep the flat pre-b1 form (pinned above)
+        assert!(toml::to_string(&on).unwrap().contains("multimodal = true"));
+    }
+
+    /// b1 parse-time coherence, fail-fast with the section line: dimensions
+    /// must equal dim (one number, not two), and the instruction fields
+    /// require the messages dialect (the legacy input wire has no
+    /// instruction channel).
+    #[test]
+    fn openai_b1_cross_field_rules_are_shaped_with_line() {
+        let raw = |extra: &str| {
+            toml::from_str(&format!(
+                "kind = \"openai\"\nendpoint = \"https://e/v1\"\nmodel = \"m\"\ndim = 8\n{extra}"
+            ))
+            .unwrap()
+        };
+        let err = EmbedderKind::from_config("e", &raw("dimensions = 4"), Some(9)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("dimensions = 4 must EQUAL dim = 8"), "{msg}");
+        assert!(msg.contains("set BOTH to the truncated size"), "{msg}");
+        assert!(msg.contains("at line 9"), "{msg}");
+        // equal is fine (the MRL form): parses
+        assert!(EmbedderKind::from_config("e", &raw("dimensions = 8"), None).is_ok());
+        // instructions without the gate: refused, naming the fix
+        let err =
+            EmbedderKind::from_config("e", &raw("query_instruction = \"find charts\""), Some(4))
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("require multimodal = true"), "{msg}");
+        assert!(msg.contains("no instruction channel"), "{msg}");
+        assert!(msg.contains("at line 4"), "{msg}");
+        let err =
+            EmbedderKind::from_config("e", &raw("doc_instruction = \"x\""), None).unwrap_err();
+        assert!(err.to_string().contains("require multimodal = true"));
+        // with the gate: both parse
+        assert!(
+            EmbedderKind::from_config(
+                "e",
+                &raw("multimodal = true\nquery_instruction = \"q\"\ndoc_instruction = \"d\""),
+                None
+            )
+            .is_ok()
         );
     }
 }
