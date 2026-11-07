@@ -364,6 +364,7 @@ pub fn chunker_contract_labels(c: &dyn Chunker, size: usize, overlap: usize) {
         image: None,
         labels,
         pages,
+        furniture_removed: 0,
     };
     let chunks = c
         .chunk(std::slice::from_ref(&labeled))

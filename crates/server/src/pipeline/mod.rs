@@ -267,13 +267,14 @@ pub enum Fit {
 /// channel — audio (M4) grows its own field the same additive way.
 ///
 /// T12 (retrieval-quality solution §2-T12.2) adds two additive annotation
-/// channels, both anchored to `text` and both empty for every pre-T12
-/// producer/consumer: [`Part::labels`] (structural spans) and
-/// [`Part::pages`] (the page-offset table T13 shares). They are PLAIN Vecs,
-/// not Options, for the same reason `image` is additive-but-explicit: an
-/// absent annotation and an empty annotation mean the same thing here, and
-/// one-line `Vec::new()` literals keep every existing construction site
-/// honest about the new channels.
+/// channels plus one audit counter, all anchored to `text` and all empty/0
+/// for every pre-T12 producer/consumer: [`Part::labels`] (structural
+/// spans), [`Part::pages`] (the page-offset table T13 shares), and
+/// [`Part::furniture_removed`]. They are PLAIN Vecs/ints, not Options, for
+/// the same reason `image` is additive-but-explicit: an absent annotation
+/// and an empty annotation mean the same thing here, and one-line
+/// `Vec::new()`/`0` literals keep every existing construction site honest
+/// about the new channels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Part {
     pub modality: Modality,
@@ -293,11 +294,22 @@ pub struct Part {
     pub labels: Vec<LabelSpan>,
     /// Page-offset table (T12/T13 shared surgery): (1-based page number →
     /// BYTE offset into `text` where that page's text begins). Empty = the
-    /// extractor has no page information (single-page or pageless sources;
-    /// D-7's fork判据 reads this same presence). The chunker does NOT
-    /// consume it in T12's foundation slice — it rides along so T13's
-    /// window-coordinate stamping needs no second Part operation.
+    /// extractor has no page information (pageless sources and the pre-T12
+    /// producers; the T12 pdf-text structure path emits its table for
+    /// EVERY page count, single-page included — the engine always knows
+    /// its pages. D-7's fork判据 reads this same presence). The chunker
+    /// does NOT consume it in T12's foundation slice — it rides along so
+    /// T13's window-coordinate stamping needs no second Part operation.
     pub pages: Vec<(u32, usize)>,
+    /// Furniture-removal audit count (T12): how many lines THIS extractor
+    /// dropped as cross-page furniture (headers/footers/copyright straps).
+    /// Default 0 — the pre-T12 producers and every non-PDF kind remove
+    /// nothing; a NON-zero count means the text channel is lossier than
+    /// the source by exactly that many lines, an auditable fact instead of
+    /// a silent behavior change (静默行为变可审计行为, solution §2-T12.3).
+    /// This slice only PRODUCES the count; the ingest-status consumer is
+    /// the later T12 slice.
+    pub furniture_removed: usize,
 }
 
 /// One structural label over a [`Part`]'s text (T12): a BYTE range plus its
@@ -374,9 +386,9 @@ impl ChildDoc {
 impl Part {
     /// Convenience constructor for the M2 text-only shape (image channel
     /// `None`). Signature unchanged by the T12 surgery: the new
-    /// `labels`/`pages` channels open EMPTY (no structural annotation —
-    /// callers stay zero-diff; the label-aware path constructs the struct
-    /// directly or mutates the fields).
+    /// `labels`/`pages`/`furniture_removed` channels open EMPTY (no
+    /// structural annotation — callers stay zero-diff; the label-aware
+    /// path constructs the struct directly or mutates the fields).
     pub fn text(s: impl Into<String>) -> Self {
         Part {
             modality: Modality::Text,
@@ -384,6 +396,7 @@ impl Part {
             image: None,
             labels: Vec::new(),
             pages: Vec::new(),
+            furniture_removed: 0,
         }
     }
 
@@ -403,6 +416,7 @@ impl Part {
             }),
             labels: Vec::new(),
             pages: Vec::new(),
+            furniture_removed: 0,
         }
     }
 }
@@ -1175,8 +1189,13 @@ mod tests {
         // label-aware producers build the struct directly)
         assert!(Part::text("x").labels.is_empty());
         assert!(Part::text("x").pages.is_empty());
+        assert_eq!(Part::text("x").furniture_removed, 0);
         assert!(Part::image("image/png", Vec::<u8>::new()).labels.is_empty());
         assert!(Part::image("image/png", Vec::<u8>::new()).pages.is_empty());
+        assert_eq!(
+            Part::image("image/png", Vec::<u8>::new()).furniture_removed,
+            0
+        );
     }
 
     #[test]

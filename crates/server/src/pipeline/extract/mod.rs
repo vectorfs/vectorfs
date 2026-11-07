@@ -49,6 +49,7 @@ pub mod pdf_inspector;
 pub mod pdf_ocr;
 pub mod pdf_pages;
 pub mod pdf_text;
+pub mod structure;
 pub mod txt;
 pub mod zip;
 
@@ -595,7 +596,16 @@ impl ExtractorKind {
     pub fn describe(&self) -> String {
         match self {
             ExtractorKind::Txt(_) => "txt".to_string(),
-            ExtractorKind::PdfText(_) => "pdf-text".to_string(),
+            // the knob shows only when it departs from the T12 default
+            // (structure on), keeping summary lines short — the
+            // pdf-inspector markdown discipline
+            ExtractorKind::PdfText(cfg) => {
+                if cfg.structure {
+                    "pdf-text".to_string()
+                } else {
+                    "pdf-text(structure=false)".to_string()
+                }
+            }
             ExtractorKind::Md(_) => "md".to_string(),
             ExtractorKind::Image(_) => "image".to_string(),
             // knob-free kinds (M3-T6): the label is the whole summary
@@ -654,7 +664,11 @@ impl Extractor for ExtractorKind {
     fn extract(&self, bytes: &[u8], mime: &str) -> Result<Vec<Part>, PipelineError> {
         match self {
             ExtractorKind::Txt(_) => TxtExtractor.extract(bytes, mime),
-            ExtractorKind::PdfText(_) => PdfTextExtractor::new().extract(bytes, mime),
+            // the T12 structure knob rides along (default on; `false` is
+            // the pre-T12 byte-exact path — see pdf_text.rs)
+            ExtractorKind::PdfText(cfg) => PdfTextExtractor::new()
+                .with_structure(cfg.structure)
+                .extract(bytes, mime),
             ExtractorKind::Md(_) => MdExtractor.extract(bytes, mime),
             ExtractorKind::PdfInspector(cfg) => {
                 let x = if cfg.markdown {
@@ -994,7 +1008,10 @@ mod tests {
                 pdf_text::tests::HELLO_PDF_MINIMAL,
                 "application/pdf",
                 &[Modality::Text],
-                "kind = \"pdf-text\"",
+                // the T12 `structure` knob ALWAYS serializes (value-as-
+                // canonical: it changes chunk identity; an elided default
+                // would let two behaviors share one fingerprint)
+                "kind = \"pdf-text\"\nstructure = true",
             ),
             (
                 "md",

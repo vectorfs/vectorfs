@@ -58,6 +58,42 @@
 //! * encrypted PDFs err (`Encrypted`); empty/non-PDF bytes err (`Not a
 //!   PDF: …`).
 //!
+//! # Structure labels (T12, markdown flavor only)
+//!
+//! The markdown flavor's product runs through
+//! [`super::structure::markdown_labels`] — the SELF-IMPLEMENTED TOC line
+//! heuristic + caption scan. Self-implemented by adjudication (review 1
+//! major): the crate's `is_toc_entry_line` and furniture functions are
+//! `pub(crate)` (unreachable), and its leader predicate is ASCII-dots-only
+//! (the 无导符 and full-width shapes of the evidence corpus never hit);
+//! TOC lines DO survive into the markdown output as plain text (probed
+//! 2026-11-08: entries render verbatim, leader and no-leader alike), so
+//! the path stands. The plain flavor gets NO labels: its output has no
+//! line structure at all (probed: positioned runs concatenate without
+//! separators) — the pre-T12 bypass stance of that flavor.
+//!
+//! **Caption/Legend honesty (D-5 尽力条款)**: the caption evidence is the
+//! lexical line shape mirrored from the crate's `pub(crate)`
+//! `classify::is_caption_line` — the crate's markdown converter emits
+//! caption lines as PLAIN text (probed: convert.rs's caption
+//! classification only drives a paragraph break; no marker survives into
+//! the output), so the prefix families (`Figure N…`, `Table N…`,
+//! `Source:`, …) are the one signal the output still exposes, and this
+//! kind labels it. **Legend is NOT produced on this path**: the crate
+//! carries no legend classification and no legend-side signal reaches the
+//! output (probed across `markdown/` — declared, not guessed). pdfium-side
+//! Caption labels come only from the furniture demotion (running titles),
+//! the pdfium engine having no caption classifier at all. The
+//! `furniture_removed` audit count stays 0 on this kind: the crate's own
+//! markdown furniture stripping (when it fires) happens INSIDE the crate,
+//! invisible to this layer — only pdf-text's own removals are counted.
+//!
+//! Page boundaries are NOT produced by either flavor in T12: the single
+//! string drops them, `include_page_numbers` would INJECT `<!-- Page N -->`
+//! markers into the indexed text (pollution to strip and re-offset), and
+//! the per-page API switch is a fingerprint-changing track left for T13's
+//! explicit adjudication (solution §2-T13.2).
+//!
 //! # Chain semantics (M2.1)
 //!
 //! Under an `extract` fallback chain this kind's Err IS its yield signal:
@@ -166,18 +202,32 @@ impl Extractor for PdfInspectorExtractor {
             gate::Accept::Exact("application/pdf"),
         )?;
         classify_or_refuse(bytes)?;
-        let text = if self.markdown {
+        let (text, labels) = if self.markdown {
             // Full pipeline: detect (again, cheap) + extract + Markdown. The
             // gate already ran; the result's own conservative OCR flags are
             // deliberately NOT re-checked (see module docs).
             let result = process_pdf_mem(bytes).map_err(|e| {
                 PipelineError::extract(format!("pdf-inspector markdown extraction failed: {e}"))
             })?;
-            result.markdown.unwrap_or_default()
+            let text = result.markdown.unwrap_or_default();
+            // T12: the self-implemented TOC run heuristic + caption scan
+            // over the crate's markdown product (module docs: why
+            // self-implemented, and the Legend non-production declaration).
+            // The process result's own page_count feeds the v2 range gate —
+            // the single string dropped the page boundaries, but the count
+            // itself survived (probed), so the markdown path runs the SAME
+            // gate set as pdfium with the document's true bound
+            let labels = super::structure::markdown_labels(&text, result.page_count);
+            (text, labels)
         } else {
-            pdf_inspector::extractor::extract_text_mem(bytes).map_err(|e| {
-                PipelineError::extract(format!("pdf-inspector text extraction failed: {e}"))
-            })?
+            // plain flavor: no line structure survives the crate's plain
+            // extractor (probed) — no labels, the pre-T12 shape
+            (
+                pdf_inspector::extractor::extract_text_mem(bytes).map_err(|e| {
+                    PipelineError::extract(format!("pdf-inspector text extraction failed: {e}"))
+                })?,
+                Vec::new(),
+            )
         };
         if text.trim().is_empty() {
             return Err(PipelineError::extract(
@@ -190,8 +240,9 @@ impl Extractor for PdfInspectorExtractor {
             modality: Modality::Text,
             text,
             image: None,
-            labels: Vec::new(),
+            labels,
             pages: Vec::new(),
+            furniture_removed: 0,
         }])
     }
 }
@@ -233,6 +284,7 @@ pub fn refusal_note(class: super::ContentClass) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::super::super::{ChunkKind, LabelSpan};
     use super::*;
 
     /// The committed minimal fixture (same file the pdf-text suite and the
@@ -455,6 +507,57 @@ pub(crate) mod tests {
         out
     }
 
+    /// The T12 shared line-fixture builder (probed shape, 2026-11-08): a
+    /// multi-page PDF whose pages draw the given LINES top-down — 12pt for
+    /// each page's FIRST line (the title position), 10pt after, 18pt
+    /// leading, a 40pt gap after the first line. Both engines extract this
+    /// shape line-faithfully: pdfium verbatim (lines joined `\r\n`), the
+    /// markdown flavor with entry lines kept separate and the title its
+    /// own paragraph. Callers pre-escape PDF string specials. `pub(crate)`:
+    /// the pdf-text suite's T12 equivalence test reuses it (the same bytes
+    /// through both engines is the corpus-reuse discipline).
+    pub(crate) fn build_t12_pdf(pages: impl IntoIterator<Item = Vec<String>>) -> Vec<u8> {
+        let content = |lines: &[String]| {
+            let mut ops = String::new();
+            let mut y = 720i32;
+            for (i, line) in lines.iter().enumerate() {
+                let size = if i == 0 { 12 } else { 10 };
+                if i == 1 {
+                    y -= 40; // the gap that keeps the markdown title alone
+                }
+                ops.push_str(&format!("BT /F1 {size} Tf 72 {y} Td ({line}) Tj ET\n"));
+                y -= 18;
+            }
+            ops
+        };
+        let pages: Vec<Vec<String>> = pages.into_iter().collect();
+        let mut kids = String::new();
+        for i in 0..pages.len() {
+            if i > 0 {
+                kids.push(' ');
+            }
+            kids.push_str(&format!("{} 0 R", 4 + 2 * i));
+        }
+        let mut bodies: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", pages.len()).into_bytes(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ];
+        for (i, page_lines) in pages.iter().enumerate() {
+            let c = content(page_lines);
+            bodies.push(
+                format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << \
+                     /F1 3 0 R >> >> /Contents {} 0 R >>",
+                    5 + 2 * i
+                )
+                .into_bytes(),
+            );
+            bodies.push(format!("<< /Length {} >>\nstream\n{}endstream", c.len(), c).into_bytes());
+        }
+        assemble(&bodies)
+    }
+
     #[test]
     fn extracts_text_from_real_pdf() {
         let parts = PdfInspectorExtractor::new()
@@ -495,6 +598,116 @@ pub(crate) mod tests {
             .extract(HELLO_PDF_MINIMAL, "application/pdf")
             .unwrap();
         assert_ne!(plain[0].text, parts[0].text);
+    }
+
+    /// T12: the markdown flavor's self-implemented TOC/caption scan over
+    /// the crate's REAL output (the gate matrix itself is unit-pinned in
+    /// structure.rs; this test pins the wiring and the probed output
+    /// shape: entries as separate plain lines — leader and no-leader both
+    /// survive, captions as their own paragraphs; the v2 range gate
+    /// consumes the process result's own page_count).
+    #[test]
+    fn markdown_flavor_labels_toc_and_captions_from_real_output() {
+        let esc = |s: &str| {
+            s.replace('\\', "\\\\")
+                .replace('(', "\\(")
+                .replace(')', "\\)")
+        };
+        // every entry points INSIDE the 6-page fixture (the v2 range
+        // gate: a TOC's numbers are bounded by its own document)
+        let entries: Vec<String> = [
+            ("Introduction", 1u32, true),
+            ("Methods and materials", 3, false),
+            ("Results overview", 3, true),
+            ("Discussion of findings", 4, false),
+            ("Related work survey", 5, true),
+            ("Conclusion and future work", 6, false),
+        ]
+        .iter()
+        .map(|(t, n, leader)| {
+            let pad = if *leader {
+                format!(" {}", ".".repeat(40))
+            } else {
+                String::new()
+            };
+            esc(&format!("{t}{pad} {n}"))
+        })
+        .collect();
+        // titleless entries (the flagship radar shape — v2); the extra
+        // body pages make the fixture large enough for the entry numbers
+        let mut toc_page = entries.clone();
+        toc_page.insert(0, esc("Contents"));
+        let pdf_bytes = build_t12_pdf([
+            toc_page,
+            vec![
+                esc("Chapter head one"),
+                esc("Figure 1.2 A sample caption line"),
+                esc("body prose one"),
+            ],
+            vec![
+                esc("Chapter head two"),
+                esc("Table 2 (ablation) results"),
+                esc("body prose two"),
+            ],
+            vec![esc("Chapter head three"), esc("body prose three")],
+            vec![esc("Chapter head four"), esc("body prose four")],
+            vec![esc("Chapter head five"), esc("body prose five")],
+        ]);
+        let parts = PdfInspectorExtractor::markdown()
+            .extract(&pdf_bytes, "application/pdf")
+            .expect("fixture must extract as markdown");
+        assert_eq!(parts.len(), 1);
+        let text = &parts[0].text;
+        let labels = &parts[0].labels;
+        // one Toc span over the whole entry block (6 hits, monotonic
+        // column, every number inside the 6-page document — the v2 gates)
+        let toc: Vec<&LabelSpan> = labels.iter().filter(|s| s.kind == ChunkKind::Toc).collect();
+        assert_eq!(toc.len(), 1, "text: {text:?}\nlabels: {labels:?}");
+        let slice = &text[toc[0].range.clone()];
+        assert!(slice.starts_with("Introduction"), "{slice:?}");
+        assert!(slice.contains("Methods and materials 3"), "{slice:?}");
+        assert!(slice.contains("Conclusion and future work 6"), "{slice:?}");
+        // captions: the Figure/Table prefix families over the real output
+        let captions: Vec<&str> = labels
+            .iter()
+            .filter(|s| s.kind == ChunkKind::Caption)
+            .map(|s| &text[s.range.clone()])
+            .collect();
+        assert_eq!(captions.len(), 2, "text: {text:?}");
+        assert!(
+            captions
+                .iter()
+                .any(|c| c.starts_with("Figure 1.2 A sample caption")),
+            "{captions:?}"
+        );
+        assert!(
+            captions.iter().any(|c| c.starts_with("Table 2 (ablation)")),
+            "{captions:?}"
+        );
+        // determinism WITH the labeled product in the equality (the
+        // extract contract's double-run rule, annotation channels included)
+        let again = PdfInspectorExtractor::markdown()
+            .extract(&pdf_bytes, "application/pdf")
+            .unwrap();
+        assert_eq!(parts, again);
+    }
+
+    /// T12: the plain flavor keeps the pre-T12 shape — no labels, no page
+    /// table, no audit count (its output has no line structure at all;
+    /// module docs). And the markdown flavor over a structure-free fixture
+    /// is label-free too: labels appear only when the evidence does.
+    #[test]
+    fn plain_flavor_stays_label_free() {
+        let parts = PdfInspectorExtractor::new()
+            .extract(HELLO_PDF_MINIMAL, "application/pdf")
+            .unwrap();
+        assert!(parts[0].labels.is_empty());
+        assert!(parts[0].pages.is_empty());
+        assert_eq!(parts[0].furniture_removed, 0);
+        let md = PdfInspectorExtractor::markdown()
+            .extract(HELLO_PDF_MINIMAL, "application/pdf")
+            .unwrap();
+        assert!(md[0].labels.is_empty(), "text: {:?}", md[0].text);
     }
 
     #[test]

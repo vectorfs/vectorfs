@@ -47,6 +47,18 @@
 //!   logical document, one extraction product; page-level chunking is the
 //!   chunker's job).
 //!
+//! # Structure detection (T12, the `structure` knob)
+//!
+//! `structure = true` (the default) routes the page loop through
+//! [`super::structure::assemble`]: `\r\n` normalization (pdfium's `.all()`
+//! separates lines with CR LF — the line-detection premise), cross-page
+//! furniture removal under the full D-1 gate set, per-page triple-gated
+//! TOC judgment emitting LINE-level spans, and the page-offset table —
+//! the extraction product carries `labels`/`pages` and the
+//! `furniture_removed` audit count. `structure = false` is the pre-T12
+//! path byte-for-byte (raw join, empty annotation channels); the
+//! equivalence is pinned against the real .so in the golden corpus.
+//!
 //! # Chain semantics (M2.1)
 //!
 //! Under an `extract` fallback chain this kind's Err or empty output IS
@@ -112,12 +124,17 @@ pub fn locate_library() -> Result<LibrarySource, String> {
     Ok(LibrarySource::System)
 }
 
-/// Runtime instance: the resolved library source, bound lazily on first use
-/// (binding is process-global anyway; lazy keeps config parsing and
-/// `pipelines check` .so-free).
+/// Runtime instance: the resolved library source plus the T12 structure
+/// knob, bound lazily on first use (binding is process-global anyway; lazy
+/// keeps config parsing and `pipelines check` .so-free).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PdfTextExtractor {
     source: LibrarySource,
+    /// T12 structure detection (furniture removal + TOC labels + page
+    /// table) — see the module docs; the DEFAULT (true) is the knob's
+    /// adjudicated default, mirrored by [`default_structure`] so the
+    /// constructor and the serde path cannot drift apart.
+    structure: bool,
 }
 
 impl Default for PdfTextExtractor {
@@ -154,13 +171,17 @@ pub(in crate::pipeline::extract) fn bind_pdfium(
 }
 
 impl PdfTextExtractor {
-    /// Default constructor: apply the documented resolution chain. The path
+    /// Default constructor: apply the documented resolution chain, with
+    /// structure detection ON (the T12 adjudicated default). The path
     /// snapshot is taken HERE (deterministic per process); a resolution
     /// failure is deferred to the first `extract` as an Err — construction
     /// stays infallible so config parsing never needs the binary present.
     pub fn new() -> Self {
         let source = locate_library().unwrap_or(LibrarySource::System);
-        PdfTextExtractor { source }
+        PdfTextExtractor {
+            source,
+            structure: true,
+        }
     }
 
     /// Explicit library path (tests, or a future config knob): bypasses the
@@ -169,7 +190,16 @@ impl PdfTextExtractor {
     pub fn with_library(path: impl Into<PathBuf>) -> Self {
         PdfTextExtractor {
             source: LibrarySource::File(path.into()),
+            structure: true,
         }
+    }
+
+    /// T12 structure-detection switch (`structure` config knob): `false`
+    /// restores the pre-T12 byte-exact behavior (the golden corpus pins
+    /// the equivalence against the real .so).
+    pub fn with_structure(mut self, structure: bool) -> Self {
+        self.structure = structure;
+        self
     }
 
     /// The process-global pdfium handle (see [`bind_pdfium`]).
@@ -197,6 +227,11 @@ impl Extractor for PdfTextExtractor {
         let pages = document.pages();
         // PdfPages::len() is pdfium-render's PdfPageIndex = c_int
         let page_count = pages.len() as usize;
+        if page_count == 0 {
+            return Err(PipelineError::extract(
+                "document has no pages — nothing to extract",
+            ));
+        }
         let mut texts = Vec::with_capacity(page_count);
         for page in pages.iter() {
             let text = page
@@ -205,12 +240,23 @@ impl Extractor for PdfTextExtractor {
                 .all();
             texts.push(text);
         }
-        if page_count == 0 {
-            return Err(PipelineError::extract(
-                "document has no pages — nothing to extract",
-            ));
-        }
-        let text = texts.join("\n\n");
+        // T12: the structure path detects between collection and join —
+        // furniture removal needs the WHOLE page set (cross-page
+        // evidence), the page-offset table needs the join. The knob-off
+        // path is the pre-T12 byte-exact join (raw `\r\n` separators,
+        // empty annotation channels).
+        let (text, labels, page_table, furniture_removed) = if self.structure {
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            let assembled = super::structure::assemble(&refs);
+            (
+                assembled.text,
+                assembled.labels,
+                assembled.pages,
+                assembled.furniture_removed,
+            )
+        } else {
+            (texts.join("\n\n"), Vec::new(), Vec::new(), 0)
+        };
         if text.trim().is_empty() {
             return Err(PipelineError::extract(
                 "no extractable text (a scanned/image-only PDF needs the pdf-ocr kind, M3) — \
@@ -221,8 +267,9 @@ impl Extractor for PdfTextExtractor {
             modality: Modality::Text,
             text,
             image: None,
-            labels: Vec::new(),
-            pages: Vec::new(),
+            labels,
+            pages: page_table,
+            furniture_removed,
         }])
     }
 }
@@ -241,8 +288,9 @@ impl Extractor for PdfTextExtractor {
 ///   (its own "no extractable text" refusal), so declaring it spares the
 ///   attempt and lets the router fail the file with a class-accurate reason.
 ///
-/// Static and knob-independent (this kind has no knobs; the library source
-/// is deployment state, never routing).
+/// Static and knob-independent (the T12 `structure` knob changes the
+/// product's annotation channels, never routing; the library source is
+/// deployment state, never routing).
 pub fn affinity(class: super::ContentClass) -> super::Fit {
     match class {
         ContentClass::TextNative => Fit::Preferred,
@@ -263,13 +311,33 @@ pub fn refusal_note(class: super::ContentClass) -> String {
     }
 }
 
-/// Per-kind config struct: `pdf-text` has no knobs in M2 (the .so location
-/// is environment/deployment state, §5.10.7, not pipeline policy — it must
-/// not change chunk identity, so it does not belong in the fingerprint).
+/// The T12 `structure` knob's default: ON. A NAMED function (not
+/// `#[serde(default)]`, which for `bool` can only mean `false`): the
+/// constructor path ([`PdfTextExtractor::new`]) and the deserialization
+/// path share this one definition, so the adjudicated default cannot
+/// split between them (the 协议路 3b implementation note — a default that
+/// lives in two places eventually disagrees).
+fn default_structure() -> bool {
+    true
+}
+
+/// Per-kind config struct: the .so location is environment/deployment
+/// state, §5.10.7, not pipeline policy — it must not change chunk
+/// identity, so it does not belong in the fingerprint. The T12
+/// `structure` knob DOES: furniture removal and TOC labeling change the
+/// extracted bytes and chunk identity, so the knob serializes into the
+/// fingerprint ALWAYS (value-as-canonical, the pdf-inspector `markdown`
+/// precedent — no elide at the default, an elided default would punch a
+/// hole in "the fingerprint owns chunk-set identity").
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PdfTextConfig {
     pub kind: PdfTextTag,
+    /// T12 structure detection: `\r\n` normalization + furniture removal +
+    /// TOC line labels + the page-offset table. `false` = the pre-T12
+    /// byte-exact extraction.
+    #[serde(default = "default_structure")]
+    pub structure: bool,
 }
 
 /// Literal tag: only deserializes from `"pdf-text"`.
@@ -277,6 +345,20 @@ pub struct PdfTextConfig {
 pub enum PdfTextTag {
     #[serde(rename = "pdf-text")]
     PdfText,
+}
+
+impl Default for PdfTextConfig {
+    /// The one construction path for the adjudicated defaults: serde's
+    /// `default = "default_structure"`, the extractor constructor, and
+    /// the ingest `auto` mapping's literal all read the SAME definition
+    /// (the 协议路 3b anti-drift note — a default living in two places
+    /// eventually disagrees).
+    fn default() -> Self {
+        PdfTextConfig {
+            kind: PdfTextTag::PdfText,
+            structure: default_structure(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -361,12 +443,91 @@ pub(crate) mod tests {
 
     #[test]
     fn config_roundtrip() {
+        // default: structure absent -> true (the adjudicated T12 default)
         let cfg: PdfTextConfig = toml::from_str("kind = \"pdf-text\"").unwrap();
         assert_eq!(cfg.kind, PdfTextTag::PdfText);
-        assert_eq!(toml::to_string(&cfg).unwrap().trim(), "kind = \"pdf-text\"");
+        assert!(cfg.structure);
+        // ...and the DEFAULT serializes into the fingerprint (value-as-
+        // canonical: the knob changes chunk identity, eliding it at the
+        // default would make two different behaviors share one
+        // fingerprint — the pdf-inspector markdown precedent)
+        assert_eq!(
+            toml::to_string(&cfg).unwrap().trim(),
+            "kind = \"pdf-text\"\nstructure = true"
+        );
+        // explicit opt-out parses and serializes its value
+        let cfg: PdfTextConfig = toml::from_str("kind = \"pdf-text\"\nstructure = false").unwrap();
+        assert!(!cfg.structure);
+        assert_eq!(
+            toml::to_string(&cfg).unwrap().trim(),
+            "kind = \"pdf-text\"\nstructure = false"
+        );
         // wrong literal rejected (stage-2 tag guards stage-1 dispatch)
         assert!(toml::from_str::<PdfTextConfig>("kind = \"txt\"").is_err());
+        // non-bool structure rejected by serde's typed parse
+        assert!(
+            toml::from_str::<PdfTextConfig>("kind = \"pdf-text\"\nstructure = \"on\"").is_err()
+        );
         // unknown field rejected
         assert!(toml::from_str::<PdfTextConfig>("kind = \"pdf-text\"\ndpi = 300").is_err());
+    }
+
+    /// T12 equivalence pin against the real .so: `structure = false` is the
+    /// pre-T12 extraction byte-for-byte — raw `\r\n` line separators, pages
+    /// joined `"\n\n"`, EMPTY annotation channels, zero audit count — while
+    /// `structure = true` over the same bytes differs only by the
+    /// normalization (no furniture, no TOC on this fixture). The strong
+    /// end-to-end matrix (furniture/TOC/price fixtures) lives in the golden
+    /// corpus; this is the unit-level equivalence anchor.
+    #[test]
+    fn structure_false_is_the_pre_t12_extraction_byte_for_byte() {
+        // 3-page PDF, two short drawn lines per page (no repetition, no
+        // TOC shape): both paths are fully predictable
+        let escape = |s: &str| {
+            s.replace('\\', "\\\\")
+                .replace('(', "\\(")
+                .replace(')', "\\)")
+        };
+        let lines_of = |i: usize| {
+            vec![
+                // middle digits: a line differing ONLY in a trailing page
+                // digit IS a furniture strap by design (digit
+                // normalization) — this fixture must have nothing
+                // furniture-shaped on it
+                format!("marker {} line", i + 1),
+                format!("body prose {} number", i + 1),
+            ]
+        };
+        let pdf_bytes = super::super::pdf_inspector::tests::build_t12_pdf((0..3).map(|i| {
+            lines_of(i)
+                .iter()
+                .map(|l| escape(l))
+                .collect::<Vec<String>>()
+        }));
+        let on = extractor_or_panic()
+            .extract(&pdf_bytes, "application/pdf")
+            .unwrap();
+        let off = extractor_or_panic()
+            .with_structure(false)
+            .extract(&pdf_bytes, "application/pdf")
+            .unwrap();
+        // the pre-T12 shape: raw separators, empty channels, no count
+        let expected_raw = (0..3)
+            .map(|i| lines_of(i).join("\r\n"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        assert_eq!(off[0].text, expected_raw, "byte-identical pre-T12 join");
+        assert!(off[0].labels.is_empty());
+        assert!(off[0].pages.is_empty());
+        assert_eq!(off[0].furniture_removed, 0);
+        // structure ON over the same bytes: identical except the \r\n ->
+        // \n normalization, plus the page table (single-page-worthy
+        // offsets included — the extractor always knows its pages)
+        let expected_norm = expected_raw.replace("\r\n", "\n");
+        assert_eq!(on[0].text, expected_norm);
+        assert!(on[0].labels.is_empty(), "nothing to label on this fixture");
+        assert_eq!(on[0].furniture_removed, 0);
+        assert_eq!(on[0].pages.len(), 3);
+        assert_eq!(on[0].pages[0], (1, 0));
     }
 }

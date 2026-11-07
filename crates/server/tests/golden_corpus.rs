@@ -25,7 +25,7 @@ use vectorfs_server::pipeline::extract::md::MdExtractor;
 use vectorfs_server::pipeline::extract::pdf_inspector::PdfInspectorExtractor;
 use vectorfs_server::pipeline::extract::pdf_text::{PdfTextExtractor, locate_library};
 use vectorfs_server::pipeline::extract::txt::TxtExtractor;
-use vectorfs_server::pipeline::{Chunk, Chunker, Extractor, Modality, Part};
+use vectorfs_server::pipeline::{Chunk, ChunkKind, Chunker, Extractor, LabelSpan, Modality, Part};
 
 // ---------------------------------------------------------------------------
 // harness
@@ -149,6 +149,13 @@ fn build_multipage_pdf(pages: usize, paragraph_for: impl Fn(usize) -> String) ->
         );
         bodies.push(format!("<< /Length {} >>\nstream\n{}endstream", c.len(), c).into_bytes());
     }
+    assemble_xref(&bodies)
+}
+
+/// Xref-exact assembly shared by the hand-built fixtures: object bodies in
+/// order (object id = index + 1), byte-exact offsets, correct trailer
+/// (same hand-assembly discipline as the committed hello.pdf).
+fn assemble_xref(bodies: &[Vec<u8>]) -> Vec<u8> {
     let mut out: Vec<u8> = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n".to_vec();
     let mut offsets = Vec::with_capacity(bodies.len());
     for (i, body) in bodies.iter().enumerate() {
@@ -171,6 +178,54 @@ fn build_multipage_pdf(pages: usize, paragraph_for: impl Fn(usize) -> String) ->
         .as_bytes(),
     );
     out
+}
+
+/// The T12 line-fixture builder (D-4): each page draws its own LINES
+/// top-down — 12pt for the page's first line, 10pt after, 18pt leading,
+/// a 40pt gap after the first line. The PROBED shape (2026-11-08) pdfium
+/// extracts line-faithfully: lines verbatim in draw order, `\r\n`
+/// separators, no trailing break, no blank lines for the gap. Callers
+/// pass RAW text (no PDF escaping needed for the D-4 fixtures —
+/// parentheses/backslashes stay out of the line texts).
+fn build_multipage_pdf_lines(pages: &[Vec<String>]) -> Vec<u8> {
+    let content = |lines: &[String]| {
+        let mut ops = String::new();
+        let mut y = 720i32;
+        for (i, line) in lines.iter().enumerate() {
+            let size = if i == 0 { 12 } else { 10 };
+            if i == 1 {
+                y -= 40; // the gap that keeps a title line visually alone
+            }
+            ops.push_str(&format!("BT /F1 {size} Tf 72 {y} Td ({line}) Tj ET\n"));
+            y -= 18;
+        }
+        ops
+    };
+    let mut kids = String::new();
+    for i in 0..pages.len() {
+        if i > 0 {
+            kids.push(' ');
+        }
+        kids.push_str(&format!("{} 0 R", 4 + 2 * i));
+    }
+    let mut bodies: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", pages.len()).into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+    for (i, page_lines) in pages.iter().enumerate() {
+        let c = content(page_lines);
+        bodies.push(
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << \
+                 /F1 3 0 R >> >> /Contents {} 0 R >>",
+                5 + 2 * i
+            )
+            .into_bytes(),
+        );
+        bodies.push(format!("<< /Length {} >>\nstream\n{}endstream", c.len(), c).into_bytes());
+    }
+    assemble_xref(&bodies)
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +508,265 @@ fn golden_huge_multipage_pdf_extracts_every_page() {
     // determinism on a large document
     let again = x.extract(&pdf_bytes, "application/pdf").unwrap();
     assert_eq!(parts, again);
+}
+
+// ---------------------------------------------------------------------------
+// T12 structure labels: the D-4 counterexample corpus (adjudicated shape)
+// through the REAL pdfium engine. Every gate that two adversarial-review
+// rounds landed has a fixture page here — the unit matrix lives in
+// src/pipeline/extract/structure.rs; this is the end-to-end pin that the
+// engine's real output (drawn lines -> \r\n text) feeds those gates
+// unchanged.
+// ---------------------------------------------------------------------------
+
+/// The furniture positive: a copyright strap on EVERY page head — repeated
+/// on 100% of pages, in the edge window, substantial ⇒ removed + audited.
+const D4_STRAP: &str = "(c) 2026 vectorfs radar monthly";
+
+/// The furniture negative (min-length gate): 2-char ring words at page
+/// heads, each on 50% of the pages — the radar four-ring-vocabulary shape
+/// (评估/试验/暂缓/采纳 are 2 CJK chars; ASCII stand-ins exercise the same
+/// gate through a Helvetica-only synthetic PDF, CJK needing a CID font).
+const D4_RING: [&str; 2] = ["go", "no"];
+
+/// The demotion positive (streak branch): running chapter heads, one per
+/// 3-page chapter — 15% of the 20 pages (< the 20% delete branch) with a
+/// 3-page streak ⇒ kept, Caption-spanned.
+const D4_CHAPTERS: [&str; 6] = [
+    "chapter alpha running head",
+    "chapter bravo running head",
+    "chapter charlie running head",
+    "chapter delta running head",
+    "chapter echo running head",
+    "chapter foxtrot running head",
+];
+
+/// The TOC positive (v2): a TITLELESS no-leader contents page — the
+/// flagship corpus's genuine shape (the radar TOC carries no 目录/
+/// Contents line; the v1 title hard gate rejected every one and the
+/// first flagship run came back with zero Toc spans). Entries monotonic,
+/// every number inside the 21-page document (the v2 range gate).
+const D4_TOC_ENTRIES: [(&str, u32); 8] = [
+    ("preface of the volume", 1),
+    ("glossary of terms", 2),
+    ("intro for chapter alpha", 4),
+    ("intro for chapter bravo", 7),
+    ("intro for chapter charlie", 10),
+    ("intro for chapter delta", 13),
+    ("intro for chapter echo", 16),
+    ("intro for chapter foxtrot", 19),
+];
+
+/// The TOC negative #1 (monotonicity gate alone): page-number-SIZED
+/// amounts in a non-monotonic column — the range gate cannot catch these
+/// (all ≤ 21), only the ordering evidence can.
+const D4_PRICES_UNORDERED: [(&str, u32); 6] = [
+    ("gadget alpha", 12),
+    ("gadget bravo", 3),
+    ("gadget charlie", 18),
+    ("gadget delta", 7),
+    ("gadget echo", 20),
+    ("gadget foxtrot", 5),
+];
+
+/// The TOC negative #2 (range gate alone): an ascending-sorted price
+/// column — monotonic, high ratio, exactly a TOC's shape — whose amounts
+/// OVERFLOW the document's 21 pages. The v2 successor of the demoted
+/// title gate's residual duty.
+const D4_PRICES_SORTED: [(&str, u32); 5] = [
+    ("widget alpha", 129),
+    ("widget bravo", 899),
+    ("widget charlie", 2499),
+    ("widget delta", 3299),
+    ("widget echo", 5999),
+];
+
+/// The D-4 document (v2): 21 pages — page 1 the TITLELESS TOC positive,
+/// page 2 the unordered-price negative (monotonicity alone), page 3 the
+/// sorted-price negative (range alone), pages 4-21 six 3-page chapters.
+/// Returns the per-page LINE lists (the raw expectations for both
+/// structure paths recompute from the same table — 对拍 without a second
+/// source of truth).
+fn d4_pages() -> Vec<Vec<String>> {
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    for i in 0..21 {
+        let mut lines = vec![D4_STRAP.to_string(), D4_RING[i % D4_RING.len()].to_string()];
+        match i {
+            0 => {
+                // no title line — the flagship radar shape (v2)
+                for (t, n) in D4_TOC_ENTRIES {
+                    lines.push(format!("{t} {n}"));
+                }
+            }
+            1 => {
+                for (t, n) in D4_PRICES_UNORDERED {
+                    lines.push(format!("{t} {n}"));
+                }
+                lines.push("price list closing prose line".to_string());
+            }
+            2 => {
+                for (t, n) in D4_PRICES_SORTED {
+                    lines.push(format!("{t} {n}"));
+                }
+                lines.push("second price list closing prose line".to_string());
+            }
+            i => {
+                let chapter = D4_CHAPTERS[(i - 3) / 3];
+                lines.push(chapter.to_string());
+                // middle page number: unique per page, never a trailing
+                // digit (a trailing page digit would make the line a
+                // furniture strap — by design)
+                lines.push(format!("body prose for page {i} of the document"));
+            }
+        }
+        pages.push(lines);
+    }
+    pages
+}
+
+fn build_d4_structure_pdf() -> Vec<u8> {
+    build_multipage_pdf_lines(&d4_pages())
+}
+
+#[test]
+fn golden_t12_structure_labels_furniture_and_toc() {
+    let pdf_bytes = build_d4_structure_pdf();
+    let x = pdf();
+    let parts = x
+        .extract(&pdf_bytes, "application/pdf")
+        .expect("D-4 fixture must extract");
+    assert_eq!(parts.len(), 1);
+    let part = &parts[0];
+
+    // ---- furniture positive: the strap is gone everywhere, audited ----
+    assert!(
+        !part.text.contains(D4_STRAP),
+        "the (c) strap must not survive: {:?}",
+        &part.text[..80.min(part.text.len())]
+    );
+    assert_eq!(part.furniture_removed, 21, "one removal per page");
+
+    // ---- page table: 1-based, byte-accurate, page slices carry their
+    // own content (the offset 对拍: every offset slices out exactly its
+    // page, first kept line = the ring word) ----
+    assert_eq!(part.pages.len(), 21);
+    assert_eq!(part.pages[0], (1, 0));
+    for i in 0..21 {
+        let (p, off) = part.pages[i];
+        assert_eq!(p, i as u32 + 1);
+        let end = part
+            .pages
+            .get(i + 1)
+            .map(|&(_, o)| o - 2) // strip the "\n\n" join
+            .unwrap_or(part.text.len());
+        let page_text = &part.text[off..end];
+        assert_eq!(
+            page_text.lines().next(),
+            Some(D4_RING[i % D4_RING.len()]),
+            "page {p} must open with its ring word (min-length gate, real engine)"
+        );
+    }
+
+    // ---- furniture negative: every ring word survives on its pages
+    // (11 and 10 of 21 — both well past the ≥20% repeat branch) ----
+    for (w, want) in [(D4_RING[0], 11), (D4_RING[1], 10)] {
+        assert_eq!(
+            part.text.matches(w).count(),
+            want,
+            "ring word {w:?} must survive all of its pages (min-length gate)"
+        );
+    }
+
+    // ---- demotion: running chapter heads KEPT, Caption-spanned (6 x 3) ----
+    let captions: Vec<&LabelSpan> = part
+        .labels
+        .iter()
+        .filter(|s| s.kind == ChunkKind::Caption)
+        .collect();
+    assert_eq!(captions.len(), 18, "per-page Caption spans");
+    for chapter in D4_CHAPTERS {
+        assert_eq!(
+            part.text.matches(chapter).count(),
+            3,
+            "running head {chapter:?} must stay in the text"
+        );
+    }
+    assert!(
+        captions
+            .iter()
+            .all(|s| D4_CHAPTERS.contains(&&part.text[s.range.clone()][..]))
+    );
+
+    // ---- TOC positive: exactly one Toc span, inside page 1, entries
+    // kept in the text (labels, never removal) ----
+    let toc: Vec<&LabelSpan> = part
+        .labels
+        .iter()
+        .filter(|s| s.kind == ChunkKind::Toc)
+        .collect();
+    assert_eq!(toc.len(), 1, "labels: {:?}", part.labels);
+    let toc_text = &part.text[toc[0].range.clone()];
+    assert!(toc_text.contains("preface of the volume 1"), "{toc_text:?}");
+    assert!(
+        toc_text.contains("intro for chapter foxtrot 19"),
+        "{toc_text:?}"
+    );
+    let page1_end = part.pages[1].1;
+    assert!(
+        toc[0].range.end <= page1_end,
+        "the Toc span must live inside page 1"
+    );
+
+    // ---- TOC negatives: BOTH price pages stay Toc-free through the real
+    // engine — page 2 (page-number-sized amounts, unordered column) is
+    // rejected by MONOTONICITY alone; page 3 (sorted amounts overflowing
+    // the 21-page document) is rejected by the RANGE gate alone ----
+    for (page_idx, note) in [(1usize, "monotonicity"), (2, "range")] {
+        let start = part.pages[page_idx].1;
+        let end = part
+            .pages
+            .get(page_idx + 1)
+            .map(|&(_, o)| o)
+            .unwrap_or(part.text.len());
+        assert!(
+            part.labels
+                .iter()
+                .filter(|s| s.kind == ChunkKind::Toc)
+                .all(|s| { s.range.start >= end || s.range.end <= start }),
+            "price page {} must stay Toc-free ({note} gate, real engine)",
+            page_idx + 1
+        );
+    }
+    assert!(part.text.contains("gadget alpha 12"), "prices stay");
+    assert!(part.text.contains("widget echo 5999"), "sorted prices stay");
+
+    // ---- determinism with the annotated product in the equality ----
+    let again = x.extract(&pdf_bytes, "application/pdf").unwrap();
+    assert_eq!(parts, again);
+}
+
+/// The structure=false equivalence pin against the real .so: the raw page
+/// texts joined `"\n\n"` with their `\r\n` line separators intact — the
+/// pre-T12 extraction byte-for-byte — and EMPTY annotation channels.
+#[test]
+fn golden_t12_structure_false_is_the_pre_t12_join() {
+    let pdf_bytes = build_d4_structure_pdf();
+    let x = pdf().with_structure(false);
+    let parts = x
+        .extract(&pdf_bytes, "application/pdf")
+        .expect("fixture must extract");
+    assert_eq!(parts.len(), 1);
+    let expected = d4_pages()
+        .iter()
+        .map(|lines| lines.join("\r\n"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    assert_eq!(parts[0].text, expected, "pre-T12 byte-exact join");
+    assert!(parts[0].labels.is_empty());
+    assert!(parts[0].pages.is_empty());
+    assert_eq!(parts[0].furniture_removed, 0);
+    // ...and the strap IS in the raw product (no removal on this path)
+    assert!(parts[0].text.contains(D4_STRAP));
 }
 
 // ---------------------------------------------------------------------------

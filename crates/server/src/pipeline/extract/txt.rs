@@ -77,6 +77,7 @@ impl Extractor for TxtExtractor {
             image: None,
             labels: Vec::new(),
             pages: Vec::new(),
+            furniture_removed: 0,
         }])
     }
 }

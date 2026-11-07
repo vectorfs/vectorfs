@@ -162,6 +162,7 @@ mod tests {
             image: None,
             labels: Vec::new(),
             pages: Vec::new(),
+            furniture_removed: 0,
         }])
         .unwrap()
         .into_iter()
@@ -378,6 +379,7 @@ mod tests {
                 kind: crate::pipeline::ChunkKind::Toc,
             }],
             pages: vec![(1, 0), (2, 24)],
+            furniture_removed: 0,
         };
         let out = c.chunk(&[part]).unwrap();
         // the invariant battery still holds (forced endpoints never bend it)

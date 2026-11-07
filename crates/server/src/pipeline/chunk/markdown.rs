@@ -166,6 +166,7 @@ mod tests {
             image: None,
             labels: Vec::new(),
             pages: Vec::new(),
+            furniture_removed: 0,
         }])
         .unwrap()
         .into_iter()

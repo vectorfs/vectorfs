@@ -160,7 +160,7 @@ use crate::pipeline::embed::LoadedEmbedder;
 use crate::pipeline::extract::{
     ExtractorKind,
     md::{MdConfig, MdTag},
-    pdf_text::{PdfTextConfig, PdfTextTag},
+    pdf_text::PdfTextConfig,
     txt::{TxtConfig, TxtTag},
 };
 use crate::pipeline::normalize::{NormalizeOutcome, normalize};
@@ -462,9 +462,7 @@ fn short_key_of(object_key: &str) -> Option<&'static str> {
 /// taken when `pdf-ocr` actually exists to chain onto.
 fn builtin_extractor(short_key: &str) -> Option<ExtractorKind> {
     match short_key {
-        "pdf" => Some(ExtractorKind::PdfText(PdfTextConfig {
-            kind: PdfTextTag::PdfText,
-        })),
+        "pdf" => Some(ExtractorKind::PdfText(PdfTextConfig::default())),
         "md" => Some(ExtractorKind::Md(MdConfig { kind: MdTag::Md })),
         "txt" => Some(ExtractorKind::Txt(TxtConfig { kind: TxtTag::Txt })),
         _ => None,
