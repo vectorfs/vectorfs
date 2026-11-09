@@ -789,6 +789,215 @@ fn decode_image_query(img: &SearchImageInput) -> Result<(Vec<u8>, String), ApiEr
 /// this list lives on the query face and touches no fingerprint).
 const SEARCH_DEFAULT_EXCLUDED_KINDS: [&str; 2] = ["toc", "legend"];
 
+// ---------------------------------------------------------------------------
+// src-name translation (T15, ADR 0004)
+// ---------------------------------------------------------------------------
+
+/// The superset face's source-NAME filter key (T15, ADR 0004): conditions
+/// on it are rewritten into [`SRC_URI_KEY`] hashes BEFORE filter compile.
+/// The key stays non-filterable everywhere else — the protocol face's
+/// QueryVectors 400 rejection is untouched, the translation lives ONLY on
+/// `/x-vf/Search`.
+const SRC_NAME_KEY: &str = "x-vf-src-name";
+
+/// What [`SRC_NAME_KEY`] conditions translate into: the 16-hex
+/// `object_key_hash` of the object key, stamped as `x-vf-src-uri` at ingest
+/// (the GC join key — filterable by protocol declaration).
+const SRC_URI_KEY: &str = "x-vf-src-uri";
+
+/// What the rewrite layer observed. `translated` drives the empty-hit note
+/// (a zero-hit search with a src-name filter must not read as "nothing
+/// relevant"); `constraints` (each `$eq` 1, each `$in` element 1 — the AWS
+/// accounting `filter.rs` caps) and `sample` drive the constraints-cap
+/// error's name echo.
+#[derive(Default)]
+struct SrcNameRewrite {
+    translated: bool,
+    constraints: usize,
+    sample: Vec<String>,
+}
+
+impl SrcNameRewrite {
+    fn record(&mut self, name: &str) {
+        self.translated = true;
+        self.constraints += 1;
+        if self.sample.len() < 3 {
+            self.sample.push(name.to_string());
+        }
+    }
+}
+
+/// Rewrite every `x-vf-src-name` condition into an `x-vf-src-uri` hash
+/// condition (T15, ADR 0004) — the serde_json layer, because the compiled
+/// `Filter` AST is private with no public rewrite surface. `$eq` (and the
+/// bare-value shorthand) and `$in` (element-wise) translate;
+/// [`vectorfs_common::chunkkey::object_key_hash`] is a pure function of the
+/// object key, so the translation is semantics-preserving. Every OTHER
+/// operator on the key is a field-addressable 400 pointing at `x-vf-src-uri`
+/// (fail loud: hashing destroys prefix/list structure, and quiet acceptance
+/// would smuggle a filterable key past the protocol declaration). `$and`/
+/// `$or` arrays recurse; structurally foreign shapes pass through for
+/// `Filter::compile` to report — this layer's only opinions are about the
+/// src-name key.
+fn rewrite_src_name_filter(
+    v: &serde_json::Value,
+) -> Result<(serde_json::Value, SrcNameRewrite), ApiError> {
+    let mut info = SrcNameRewrite::default();
+    let out = rewrite_src_name(v, &mut info)?;
+    Ok((out, info))
+}
+
+fn rewrite_src_name(
+    v: &serde_json::Value,
+    info: &mut SrcNameRewrite,
+) -> Result<serde_json::Value, ApiError> {
+    let serde_json::Value::Object(map) = v else {
+        return Ok(v.clone()); // non-objects are compile's structural errors
+    };
+    let mut out = serde_json::Map::with_capacity(map.len());
+    for (k, cond) in map {
+        match k.as_str() {
+            "$and" | "$or" => match cond {
+                serde_json::Value::Array(items) => {
+                    // recurse: a name nested under $and/$or translates too
+                    let rewritten = items
+                        .iter()
+                        .map(|it| rewrite_src_name(it, info))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    out.insert(k.clone(), serde_json::Value::Array(rewritten));
+                }
+                _ => {
+                    out.insert(k.clone(), cond.clone()); // compile reports
+                }
+            },
+            SRC_NAME_KEY => {
+                // both keys in ONE object would collapse on insert (the
+                // translated entry stomping the literal one) — refuse the
+                // combination loudly instead of silently dropping a leg
+                if map.contains_key(SRC_URI_KEY) {
+                    return Err(ApiError::validation_field(
+                        "filter",
+                        "x-vf-src-name and x-vf-src-uri cannot appear in the same filter \
+                         object — combine them with $and",
+                    ));
+                }
+                let translated = rewrite_src_name_cond(cond, info)?;
+                out.insert(SRC_URI_KEY.to_string(), translated);
+            }
+            _ => {
+                out.insert(k.clone(), cond.clone());
+            }
+        }
+    }
+    Ok(serde_json::Value::Object(out))
+}
+
+/// One `x-vf-src-name` condition (the field's operand): translate to the
+/// equivalent `x-vf-src-uri` condition, or refuse with guidance.
+fn rewrite_src_name_cond(
+    cond: &serde_json::Value,
+    info: &mut SrcNameRewrite,
+) -> Result<serde_json::Value, ApiError> {
+    // bare string == implicit $eq (the filter grammar's shorthand)
+    if let serde_json::Value::String(name) = cond {
+        info.record(name);
+        return Ok(json!(vectorfs_common::chunkkey::object_key_hash(name)));
+    }
+    let serde_json::Value::Object(ops) = cond else {
+        return Err(ApiError::validation_field(
+            "filter",
+            format!(
+                "x-vf-src-name condition must be a string (implicit $eq) or a $-operator \
+                 object, got {}",
+                json_type_name(cond)
+            ),
+        ));
+    };
+    let hash = vectorfs_common::chunkkey::object_key_hash;
+    let mut out = serde_json::Map::new();
+    for (op, arg) in ops {
+        match op.as_str() {
+            "$eq" => {
+                let name = src_name_string_arg(arg)?;
+                info.record(&name);
+                out.insert("$eq".into(), json!(hash(&name)));
+            }
+            "$in" => {
+                let serde_json::Value::Array(items) = arg else {
+                    return Err(ApiError::validation_field(
+                        "filter",
+                        "filter.x-vf-src-name.$in requires an array of source-name strings",
+                    ));
+                };
+                if items.is_empty() {
+                    return Err(ApiError::validation_field(
+                        "filter",
+                        "filter.x-vf-src-name.$in array must not be empty",
+                    ));
+                }
+                let names = items
+                    .iter()
+                    .map(src_name_string_arg)
+                    .collect::<Result<Vec<_>, _>>()?;
+                for n in &names {
+                    info.record(n);
+                }
+                out.insert(
+                    "$in".into(),
+                    serde_json::Value::Array(names.iter().map(|n| json!(hash(n))).collect()),
+                );
+            }
+            other => {
+                return Err(ApiError::validation_field(
+                    "filter",
+                    format!(
+                        "operator {other:?} does not support x-vf-src-name (source-name) \
+                         filtering — only $eq (or a bare value) and $in translate to \
+                         x-vf-src-uri; use x-vf-src-uri for other operators"
+                    ),
+                ));
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(ApiError::validation_field(
+            "filter",
+            "filter.x-vf-src-name condition object must not be empty (supported operators: \
+             $eq, $in)",
+        ));
+    }
+    Ok(serde_json::Value::Object(out))
+}
+
+/// A src-name condition value must be a STRING (it is an object key):
+/// numbers/booleans can never match a stored name, so compile would accept
+/// them into a silent no-match — fail loud instead (the F5 discipline).
+fn src_name_string_arg(v: &serde_json::Value) -> Result<String, ApiError> {
+    match v {
+        serde_json::Value::String(s) => Ok(s.clone()),
+        other => Err(ApiError::validation_field(
+            "filter",
+            format!(
+                "x-vf-src-name values must be strings (they are object keys), got {}",
+                json_type_name(other)
+            ),
+        )),
+    }
+}
+
+/// JSON type name for the rewrite layer's own error messages (filter.rs's
+/// `json_type` is private to that module).
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 /// Compile the Search filter: the user's `$`-operator filter, conjoined
 /// with the default kind exclusion unless `include_kinds` admits every
 /// excluded kind (T12).
@@ -804,10 +1013,16 @@ const SEARCH_DEFAULT_EXCLUDED_KINDS: [&str; 2] = ["toc", "legend"];
 /// `include_kinds` values are validated against the closed kind
 /// vocabulary — an unknown kind is a field-addressable ValidationException
 /// (the m5 discipline), never a silent no-match.
+///
+/// T15: before compiling, the user filter passes the src-name rewrite
+/// ([`rewrite_src_name_filter`]) — `/x-vf/Search` accepts `x-vf-src-name`
+/// `$eq`/`$in` conditions and translates them to `x-vf-src-uri` hashes.
+/// The returned [`SrcNameRewrite`] tells the caller whether translation
+/// was active (the empty-hit note's trigger).
 fn search_filter(
     user: &Option<serde_json::Value>,
     include_kinds: &Option<Vec<String>>,
-) -> Result<Option<crate::filter::Filter>, ApiError> {
+) -> Result<(Option<crate::filter::Filter>, SrcNameRewrite), ApiError> {
     // validate + resolve the admitted set first (unknown kinds fail loud
     // even when the exclusion would end up empty — a typo'd kind name must
     // not silently pass as "no-op")
@@ -830,16 +1045,27 @@ fn search_filter(
         .into_iter()
         .filter(|k| !admitted.contains(k))
         .collect();
+    // T15 rewrite FIRST — the translation is what the user wrote, the kind
+    // injection below composes with the TRANSLATED filter
+    let (user, src_names) = match user {
+        None | Some(serde_json::Value::Null) => (None, SrcNameRewrite::default()),
+        Some(f) => {
+            let (rewritten, info) = rewrite_src_name_filter(f)?;
+            (Some(rewritten), info)
+        }
+    };
     // everything admitted: no injection, the user filter stands alone
-    // (byte-identical compile + error path of the pre-T12 behavior)
+    // (byte-identical compile + error path of the pre-T12 behavior for
+    // src-name-free filters; with src-name conditions the rewrite has
+    // already applied by design)
     if excluded.is_empty() {
-        return match user {
-            None | Some(serde_json::Value::Null) => Ok(None),
-            Some(f) => Ok(Some(
-                crate::filter::Filter::compile(f)
-                    .map_err(|e| ApiError::validation_field("filter", e.0))?,
-            )),
-        };
+        return Ok((
+            match user {
+                None => None,
+                Some(f) => Some(compile_filter(&f, &src_names)?),
+            },
+            src_names,
+        ));
     }
     // conjoin at the JSON level ($and composes with any user grammar):
     // `user AND kind $nin excluded` — one compiled filter both routes run
@@ -847,13 +1073,42 @@ fn search_filter(
         "x-vf-chunk-kind": { "$nin": excluded },
     });
     let combined = match user {
-        None | Some(serde_json::Value::Null) => injection,
+        None => injection,
         Some(f) => serde_json::json!({ "$and": [f, injection] }),
     };
-    Ok(Some(
-        crate::filter::Filter::compile(&combined)
-            .map_err(|e| ApiError::validation_field("filter", e.0))?,
-    ))
+    Ok((Some(compile_filter(&combined, &src_names)?), src_names))
+}
+
+/// Compile + error mapping: ValidationException(path = filter), and when
+/// the 100-constraint cap ([`crate::filter::MAX_CONSTRAINTS`]) fires with
+/// translated source names aboard, the message echoes a sample of the
+/// NAMES the user wrote (a `$in` of 150 keys busts the cap; the error must
+/// teach which filter element did it — never leave the user staring at
+/// hash values they never typed). The `"the maximum per query is"` probe
+/// matches the cap error's phrasing in `filter.rs` — same crate, one
+/// definition site away.
+fn compile_filter(
+    f: &serde_json::Value,
+    src: &SrcNameRewrite,
+) -> Result<crate::filter::Filter, ApiError> {
+    crate::filter::Filter::compile(f).map_err(|e| {
+        let msg = if src.constraints > 0 && e.0.contains("the maximum per query is") {
+            format!(
+                "{} — the x-vf-src-name filter contributes {} of them (translated from names \
+                 like {}); narrow the source list, or filter x-vf-src-uri hashes directly",
+                e.0,
+                src.constraints,
+                src.sample
+                    .iter()
+                    .map(|n| format!("{n:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else {
+            e.0
+        };
+        ApiError::validation_field("filter", msg)
+    })
 }
 
 /// `POST /x-vf/Search` (appendix E.2) — the flagship superset op: embed the
@@ -863,6 +1118,13 @@ fn search_filter(
 /// configured strategy (M2: rrf), and emit hits shaped like KB's
 /// KnowledgeBaseRetrievalResult plus the fan-out fields
 /// (`index`/`key`/`distance`).
+///
+/// src-name translation (T15, ADR 0004): this face accepts
+/// `x-vf-src-name` `$eq`/`$in` (bare value = `$eq`) conditions and
+/// translates them to `x-vf-src-uri` hashes before compile — the ONE
+/// superset extension to the filter grammar; every other operator on the
+/// key is a 400 pointing at `x-vf-src-uri`. The protocol face
+/// (QueryVectors) rejects the same key as non-filterable, unchanged.
 ///
 /// Query modalities (appendix E.2 `query{text|image|audio(M4)}`): text since
 /// M2; IMAGE since M3-T4 — `{bytes: base64, mime}` (see
@@ -926,6 +1188,11 @@ fn search_filter(
 /// * `metadata` — the chunk's stored metadata verbatim (the protocol face
 ///   needs no coord member: QueryVectors returns this same metadata, which
 ///   already carries the `x-vf-*` coordinate keys).
+///
+/// Response-level member (T15): `note` appears BESIDE `hits` — never on
+/// hits — exactly when a translated src-name filter is active and the hit
+/// set is empty (a wrong name hashes to a value no indexed source
+/// carries; the note points at key verification, 打错字 ≠ 没搜到).
 pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Response, ApiError> {
     let input: SearchInput = parse_body(&body)?;
     let handle = require_ingest(&state, &input.bucket)?;
@@ -1072,12 +1339,16 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
     let return_text = input.return_text.unwrap_or(true);
 
     // filter: `$` short-name syntax, same compile + non-filterable rejection
-    // as QueryVectors (appendix E.5: the two official grammars stay as-is).
-    // T12 kind governance composes INTO the same compiled filter (see
-    // [`search_filter`]): one filter object is what BOTH routes consume —
-    // the semantic routes' pushdown and the lexical kernel's pre/post
-    // filter — so the default exclusion covers every searchMode at once.
-    let compiled = search_filter(&input.filter, &input.include_kinds)?;
+    // as QueryVectors (appendix E.5: the two official grammars stay as-is)
+    // — PLUS the T15 superset extension: `x-vf-src-name` `$eq`/`$in`
+    // conditions translate to `x-vf-src-uri` hashes before compile (the
+    // protocol face rejects the same key; the two faces differ by design,
+    // ADR 0004). T12 kind governance composes INTO the same compiled
+    // filter (see [`search_filter`]): one filter object is what BOTH
+    // routes consume — the semantic routes' pushdown and the lexical
+    // kernel's pre/post filter — so the default exclusion covers every
+    // searchMode at once.
+    let (compiled, src_names) = search_filter(&input.filter, &input.include_kinds)?;
 
     let names = shared.embedder_names(&input.bucket).unwrap_or_default();
     if names.is_empty() {
@@ -1377,7 +1648,25 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
             o
         })
         .collect();
-    Ok(Json(json!({ "hits": hits })).into_response())
+    // T15 empty-hit note (adversarial-review disposition): a src-name
+    // filter that yields ZERO hits is indistinguishable on the wire from a
+    // typo'd key — the wrong name hashes to a value no indexed source
+    // carries, and the silent empty list reads as "nothing relevant".
+    // One restrained member, only when translation was active AND the hit
+    // set is empty (打错字 ≠ 没搜到).
+    let mut body = serde_json::Map::with_capacity(2);
+    body.insert("hits".into(), json!(hits));
+    if hits.is_empty() && src_names.translated {
+        body.insert(
+            "note".into(),
+            json!(
+                "x-vf-src-name filter matched no indexed sources — verify the exact key \
+                 (e.g. `vf ls`, ListSources); a source whose chunks simply did not match \
+                 the query also yields zero hits"
+            ),
+        );
+    }
+    Ok(Json(serde_json::Value::Object(body)).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -2158,19 +2447,26 @@ mod tests {
             "{b}"
         );
 
-        // filter on a non-filterable key -> 400 (QueryVectors semantics)
+        // T15: the same name now TRANSLATES on the superset face — the
+        // shorthand narrows to fox exactly like the x-vf-src-uri $in above
+        // (the pre-T15 400 is now the PROTOCOL face's contract, pinned in
+        // `search_src_name_translation_and_two_face_rejection` below)
         let (st, _, b) = call_json(
             &f,
             "/x-vf/Search",
-            json!({"bucket":"docs","query":{"text":"x"},
-                   "filter":{"x-vf-src-name":"docs/fox.txt"},"topK":1}),
+            json!({"bucket":"docs","query":{"text":"the"},
+                   "filter":{"x-vf-src-name":"docs/fox.txt"},"topK":10}),
         )
         .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "{b}");
         assert!(
-            b["message"].as_str().unwrap().contains("non-filterable"),
+            hits.iter()
+                .all(|h| h["location"]["key"] == json!("docs/fox.txt")),
             "{b}"
         );
+        assert!(b.get("note").is_none(), "hits present: no note: {b}");
 
         // returnText=false omits content.text (type stays)
         let (st, _, b) = call_json(
@@ -2293,6 +2589,257 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
         assert_eq!(b["fieldList"][0]["path"], json!("topK"));
+    }
+
+    /// T15 src-name translation (ADR 0004), end to end through the real
+    /// compile + both retrieval routes: the three translatable spellings
+    /// ($eq explicit, the bare-value shorthand, $in multi-source), $and/$or
+    /// recursion, the untranslatable-operator 400 (path=filter, guidance
+    /// pointing at x-vf-src-uri), and the TWO-FACE pin — the very same
+    /// filter on the protocol face (QueryVectors) stays a non-filterable
+    /// 400. Plus the rewrite layer's own guards (name+uri collision,
+    /// non-string values) and the empty-hit note both ways.
+    #[tokio::test]
+    async fn search_src_name_translation_and_two_face_rejection() {
+        let f = fixture().await;
+        put_source_call(
+            &f,
+            "docs",
+            "docs/fox.txt",
+            b"the quick brown fox jumps over the lazy dog".to_vec(),
+        )
+        .await;
+        put_source_call(
+            &f,
+            "docs",
+            "docs/sea.txt",
+            b"whales and dolphins swim in the deep blue ocean".to_vec(),
+        )
+        .await;
+        drive(&f).await;
+
+        // ---- $eq (explicit operator): narrows to fox, exactly what the
+        // equivalent x-vf-src-uri filter does ----
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"the"},
+                   "filter":{"x-vf-src-name":{"$eq":"docs/sea.txt"}},"topK":10}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "{b}");
+        assert!(
+            hits.iter()
+                .all(|h| h["location"]["key"] == json!("docs/sea.txt")),
+            "{b}"
+        );
+
+        // ---- $in multi-source: BOTH files, and only those two ----
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"the"},
+                   "filter":{"x-vf-src-name":{"$in":["docs/fox.txt","docs/sea.txt"]}},"topK":10}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let mut seen: Vec<String> = b["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|h| h["location"]["key"].as_str().map(String::from))
+            .collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen, vec!["docs/fox.txt", "docs/sea.txt"], "{b}");
+
+        // ---- recursion: a name nested under $and AND under $or translates
+        // (the rewrite drills the boolean operators; the second $and leg is
+        // a trivially-true exists on a key every chunk carries) ----
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"the"},
+                   "filter":{"$and":[
+                       {"$or":[{"x-vf-src-name":{"$eq":"docs/fox.txt"}}]},
+                       {"x-vf-modality":{"$exists":true}}
+                   ]},"topK":10}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert!(
+            b["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|h| h["location"]["key"] == json!("docs/fox.txt")),
+            "{b}"
+        );
+
+        // ---- untranslatable operators: 400, path=filter, guidance naming
+        // the escape hatch (each on its own, and mixed into $eq's object) ----
+        for filter in [
+            json!({"x-vf-src-name":{"$ne":"docs/fox.txt"}}),
+            json!({"x-vf-src-name":{"$startsWith":"docs/"}}),
+            json!({"x-vf-src-name":{"$eq":"docs/fox.txt","$ne":"docs/sea.txt"}}),
+        ] {
+            let (st, _, b) = call_json(
+                &f,
+                "/x-vf/Search",
+                json!({"bucket":"docs","query":{"text":"the"},"filter":filter,"topK":1}),
+            )
+            .await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+            assert_eq!(b["fieldList"][0]["path"], json!("filter"), "{b}");
+            let msg = b["message"].as_str().unwrap();
+            assert!(
+                msg.contains("does not support x-vf-src-name") && msg.contains("use x-vf-src-uri"),
+                "{msg}"
+            );
+        }
+
+        // ---- the rewrite layer's own guards ----
+        // name + uri in one object would silently collapse: loud 400
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"the"},
+                   "filter":{"x-vf-src-name":"docs/fox.txt",
+                             "x-vf-src-uri":"0123456789abcdef"},"topK":1}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert!(
+            b["message"]
+                .as_str()
+                .unwrap()
+                .contains("cannot appear in the same filter"),
+            "{b}"
+        );
+        // a non-string name compiles into a silent no-match; fail loud
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"the"},
+                   "filter":{"x-vf-src-name":7},"topK":1}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        let msg = b["message"].as_str().unwrap();
+        assert!(msg.contains("must be a string"), "{msg}");
+        // ...and inside an operator the value-level wording carries
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"the"},
+                   "filter":{"x-vf-src-name":{"$in":["docs/a.txt", 7]}},"topK":1}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert!(
+            b["message"].as_str().unwrap().contains("must be strings"),
+            "{b}"
+        );
+
+        // ---- empty-hit note: PRESENT when a translated filter yields zero
+        // hits (a typo'd name hashes to a value nothing carries — 打错字 ≠
+        // 没搜到), ABSENT for a zero-hit query with NO src-name filter ----
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"the"},
+                   "filter":{"x-vf-src-name":"docs/typo-misspelled.txt"},"topK":10}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["hits"].as_array().unwrap().len(), 0, "{b}");
+        let note = b["note"].as_str().expect("the note rides the response");
+        assert!(note.contains("matched no indexed sources"), "{note}");
+        // no translation active: zero hits stay a bare empty list
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"the"},
+                   "filter":{"x-vf-src-uri":"0123456789abcdef"},"topK":10}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["hits"].as_array().unwrap().len(), 0, "{b}");
+        assert!(b.get("note").is_none(), "no src-name filter: no note: {b}");
+
+        // ---- the TWO-FACE pin: the identical filter on the PROTOCOL face
+        // (QueryVectors) stays the non-filterable 400 — the translation is
+        // the superset face's alone (ADR 0004) ----
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"the"},"topK":1}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let index = b["hits"][0]["index"].as_str().unwrap().to_string();
+        let meta = f
+            .state
+            .storage
+            .load_index("docs", &index)
+            .await
+            .unwrap()
+            .expect("derived index exists");
+        let qvec = vec![0.1f64; meta.dimension as usize];
+        let (st, headers, b) = call_json(
+            &f,
+            "/QueryVectors",
+            json!({"vectorBucketName":"docs","indexName":index,
+                   "topK":1,"queryVector":{"float32":qvec},
+                   "filter":{"x-vf-src-name":"docs/fox.txt"}}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(errortype(&headers), Some("ValidationException"), "{b}");
+        assert!(
+            b["message"].as_str().unwrap().contains("non-filterable"),
+            "{b}"
+        );
+    }
+
+    /// T15 constraints-cap name echo: a src-name `$in` busting the
+    /// 100-constraint limit (filter.rs MAX_CONSTRAINTS — translated or
+    /// not, each element counts one) fails with a message that points at
+    /// the NAMES the user wrote, not at hashes they never typed.
+    #[tokio::test]
+    async fn search_src_name_constraints_cap_echoes_names() {
+        let f = fixture().await;
+        put_source_call(
+            &f,
+            "docs",
+            "docs/a.txt",
+            b"the quick brown fox jumps over the lazy dog".to_vec(),
+        )
+        .await;
+        drive(&f).await;
+
+        let names: Vec<String> = (0..150).map(|i| format!("docs/src-{i:03}.txt")).collect();
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"the"},
+                   "filter":{"x-vf-src-name":{"$in":names}},"topK":1}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["fieldList"][0]["path"], json!("filter"), "{b}");
+        let msg = b["message"].as_str().unwrap();
+        // the generic cap accounting, the src-name attribution, and the
+        // sample of the USER'S spellings (never a hash)
+        assert!(msg.contains("constraints"), "{msg}");
+        assert!(msg.contains("x-vf-src-name filter contributes"), "{msg}");
+        assert!(msg.contains("\"docs/src-000.txt\""), "{msg}");
+        assert!(
+            !msg.contains(&crate::ingest::marker::object_key_hash("docs/src-000.txt")),
+            "the echo must speak names, not hashes: {msg}"
+        );
     }
 
     /// T13 LINE coordinates end to end on a pageless source (the `nl` 对拍

@@ -81,7 +81,12 @@ pub struct SearchParams {
     pub top_k: i64,
     /// Optional metadata filter ($-operator syntax, same operator set as
     /// the daemon's QueryVectors: $eq $ne $gt $gte $lt $lte $startsWith
-    /// $in $nin $exists $and $or; a bare value is an implicit $eq).
+    /// $in $nin $exists $and $or; a bare value is an implicit $eq). ONE
+    /// key differs between the two faces: `x-vf-src-name` ($eq/$in/bare
+    /// value — filter by source FILE key, no hash digging) is translated
+    /// server-side on this search face, while the same filter sent to
+    /// query_vectors is a 400 (the key is non-filterable on the protocol
+    /// face — filter x-vf-src-uri there).
     #[serde(default)]
     pub filter: Option<serde_json::Value>,
     /// Include each hit's stored chunk text (default true).
@@ -293,7 +298,7 @@ impl VfMcp {
 
     /// Hybrid file-layer search — the RAG entry point.
     #[tool(
-        description = "RAG retrieval (the entry point): the query text is embedded once per the bucket's configured embedders, each derived index is queried (topK 1..=1000, optional $-operator metadata filter — $eq $ne $gt $gte $lt $lte $startsWith $in $nin $exists $and $or, bare values are implicit $eq), and the per-index rankings are merged. Every hit carries score, content.text (the chunk — usable as context directly), key (chunk id), index and location.key (the source file — fetch it whole with get_source_data). Errors are {code,message,hint} (Validation when the bucket lacks an [ingest.*] section — list_buckets shows the valid names)."
+        description = "RAG retrieval (the entry point): the query text is embedded once per the bucket's configured embedders, each derived index is queried (topK 1..=1000, optional $-operator metadata filter — $eq $ne $gt $gte $lt $lte $startsWith $in $nin $exists $and $or, bare values are implicit $eq), and the per-index rankings are merged. Every hit carries score, content.text (the chunk — usable as context directly), key (chunk id), index and location.key (the source file — fetch it whole with get_source_data). Filter face note (T15): filter by source file with x-vf-src-name ($eq/$in/bare value) HERE — the daemon translates names to x-vf-src-uri hashes for search; the same key against the daemon's query_vectors is rejected (protocol face — x-vf-src-uri only). toc/legend chunks are excluded from search results by default. Errors are {code,message,hint} (Validation when the bucket lacks an [ingest.*] section — list_buckets shows the valid names)."
     )]
     async fn search(&self, p: Parameters<SearchParams>) -> CallToolResult {
         match self.call_search(p.0).await {
@@ -471,11 +476,17 @@ impl VfMcp {
             .call_json("Search", &body)
             .await
             .map_err(|e| self.err(e))?;
-        Ok(json!({
+        // T15: pass the server's empty-hit note through (a src-name filter
+        // that matched no indexed source — the typo signal agents need)
+        let mut out = json!({
             "schema_version": SCHEMA_VERSION,
             "bucket": p.bucket,
             "hits": v["hits"],
-        }))
+        });
+        if let Some(note) = v.get("note").and_then(Value::as_str) {
+            out["note"] = json!(note);
+        }
+        Ok(out)
     }
 
     /// put_source, MCP semantics (2026-11-06 user ruling): path XOR content

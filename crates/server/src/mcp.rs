@@ -182,7 +182,13 @@ pub struct SearchParams {
     /// Results to return, 1..=1000.
     #[serde(default = "default_top_k")]
     pub top_k: i64,
-    /// Optional metadata filter ($-operator syntax, same as query_vectors).
+    /// Optional metadata filter ($-operator syntax, same operator set as
+    /// query_vectors). ONE semantic difference: `x-vf-src-name` conditions
+    /// ($eq / $in / bare value) are TRANSLATED server-side to x-vf-src-uri
+    /// hashes on this search face — the same key sent to query_vectors is
+    /// REJECTED (non-filterable on the protocol face). Also search-only
+    /// semantics: toc/legend chunks are excluded from results by default;
+    /// `x-vf-chunk-kind` is a filterable key on both faces.
     #[serde(default)]
     pub filter: Option<serde_json::Value>,
     /// Include each hit's stored chunk text (default true).
@@ -411,7 +417,7 @@ impl VfMcp {
 
     /// KNN query with optional pre-filter.
     #[tool(
-        description = "Query the k nearest neighbors of a vector, optionally pre-filtered by metadata (filter runs BEFORE the KNN — full recall). query_vector length must equal the index dimension (see list_indexes); topK 1..=10000 (results page at 100 — pass nextToken back with identical topK/queryVector/filter); filter operators: $eq $ne $gt $gte $lt $lte $startsWith $in $nin $exists $and $or, bare values are implicit $eq. Results are sorted by distance asc, key asc; every hit carries its distance. Errors are {code,message,hint} (Validation / NotFound)."
+        description = "Query the k nearest neighbors of a vector, optionally pre-filtered by metadata (filter runs BEFORE the KNN — full recall). query_vector length must equal the index dimension (see list_indexes); topK 1..=10000 (results page at 100 — pass nextToken back with identical topK/queryVector/filter); filter operators: $eq $ne $gt $gte $lt $lte $startsWith $in $nin $exists $and $or, bare values are implicit $eq. Results are sorted by distance asc, key asc; every hit carries its distance. PROTOCOL semantics: no structure-kind governance (toc/legend rows query like any other) and x-vf-src-name is NOT filterable here — filtering by source is x-vf-src-uri only on this face; the `search` tool translates source names. Errors are {code,message,hint} (Validation / NotFound)."
     )]
     async fn query_vectors(&self, p: Parameters<QueryVectorsParams>) -> CallToolResult {
         match self.call_query_vectors(p.0).await {
@@ -453,9 +459,10 @@ impl VfMcp {
         }
     }
 
-    /// Hybrid file-layer search (M2 T6).
+    /// Hybrid file-layer search (M2 T6; x-vf face semantics — see the
+    /// tool description for the split against query_vectors).
     #[tool(
-        description = "Search an ingest-configured bucket's files: the query text is embedded once per configured embedder, each derived index is queried (topK 1..=1000, optional $-operator filter), and the per-index rankings are merged (rrf). Pass rerank: true to re-score the topK hits with the bucket's cross-encoder (needs rerank = true in vectorfs.toml; text queries, non-keyword mode) — hits come back in rerank order with raw-logit scores. Every hit carries content{text,type}, score, index, key, location{type:'source',key} (the source file to read with get) and metadata. M2: text queries only. Errors are {code,message,hint} (Validation when the bucket lacks an [ingest.<bucket>] section)."
+        description = "Search an ingest-configured bucket's files (the x-vf FACE — one daemon, two semantics): the query text is embedded once per configured embedder, each derived index is queried (topK 1..=1000, optional $-operator filter), and the per-index rankings are merged (rrf). Pass rerank: true to re-score the topK hits with the bucket's cross-encoder (needs rerank = true in vectorfs.toml; text queries, non-keyword mode) — hits come back in rerank order with raw-logit scores. Every hit carries content{text,type}, score, index, key, location{type:'source',key} (the source file to read with get) and metadata. What belongs to THIS face (query_vectors differs on both): (1) filter by source NAME — x-vf-src-name $eq/$in/bare-value conditions are translated server-side to x-vf-src-uri hashes (query_vectors rejects the key outright); (2) structure governance — toc/legend chunks are excluded from results by default (query_vectors returns them like any row). A zero-hit search with a source-name filter carries a `note` about the name matching no indexed source. Errors are {code,message,hint} (Validation when the bucket lacks an [ingest.<bucket>] section)."
     )]
     async fn search(&self, p: Parameters<SearchParams>) -> CallToolResult {
         match self.call_search(p.0).await {
@@ -723,11 +730,18 @@ impl VfMcp {
         )
         .await?;
         let v = response_json(resp).await.map_err(ops::ApiError::internal)?;
-        Ok(json!({
+        // T15: the empty-hit note rides along when the server emitted one
+        // (a translated src-name filter that matched no indexed source) —
+        // dropping it here would hide the typo signal from agents
+        let mut out = json!({
             "schema_version": SCHEMA_VERSION,
             "bucket": p.bucket,
             "hits": v["hits"],
-        }))
+        });
+        if let Some(note) = v.get("note").and_then(serde_json::Value::as_str) {
+            out["note"] = json!(note);
+        }
+        Ok(out)
     }
 
     /// put_source, MCP semantics (decision, aligned with T3's ruling that
@@ -1348,6 +1362,55 @@ mod tests {
         assert!(!hits.is_empty(), "{v}");
         assert_eq!(hits[0]["location"]["key"], "docs/a.txt");
         assert!(hits[0]["content"]["text"].is_string(), "{v}");
+
+        // T15 through the tool face: a src-name filter narrows by NAME
+        // (translated server-side), and a name matching no indexed source
+        // surfaces the note instead of a bare silent empty list
+        let se = vf
+            .search(Parameters(SearchParams {
+                rerank: false,
+                bucket: "docs".into(),
+                text: Some("fox".into()),
+                image_path: None,
+                mode: None,
+                top_k: 5,
+                filter: Some(serde_json::json!({"x-vf-src-name": "docs/a.txt"})),
+                return_text: true,
+            }))
+            .await;
+        let (is_err, v) = text_of(se);
+        assert!(!is_err, "{v}");
+        assert!(
+            v["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|h| h["location"]["key"] == "docs/a.txt"),
+            "{v}"
+        );
+        assert!(v.get("note").is_none(), "{v}");
+        let se = vf
+            .search(Parameters(SearchParams {
+                rerank: false,
+                bucket: "docs".into(),
+                text: Some("fox".into()),
+                image_path: None,
+                mode: None,
+                top_k: 5,
+                filter: Some(serde_json::json!({"x-vf-src-name": "docs/typo.txt"})),
+                return_text: true,
+            }))
+            .await;
+        let (is_err, v) = text_of(se);
+        assert!(!is_err, "{v}");
+        assert_eq!(v["hits"].as_array().unwrap().len(), 0, "{v}");
+        assert!(
+            v["note"]
+                .as_str()
+                .unwrap()
+                .contains("matched no indexed sources"),
+            "{v}"
+        );
 
         // put_source (rw): local file -> object + PENDING marker
         let upload = dir.path().join("upload.txt");

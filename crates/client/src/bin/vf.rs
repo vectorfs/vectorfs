@@ -72,6 +72,9 @@ enum Command {
     /// sources, line keys for pageless ones, never both. NOTE: line
     /// coordinates address the EXTRACTED text (the md extractor strips
     /// heading markers, html drops markup), not the original file's bytes.
+    /// `--source <key>` (repeatable) scopes the query to named source
+    /// FILES — the daemon translates names to x-vf-src-uri (T15), no hash
+    /// digging.
     Search(SearchArgs),
     /// List ingested files / inspect one file's status (the verb forms; the
     /// `vf ls` shorthand covers listing)
@@ -242,6 +245,12 @@ struct SearchArgs {
     /// Allowed values: body, toc, caption, legend.
     #[arg(long = "kind")]
     kinds: Vec<String>,
+
+    /// Restrict the search to one source FILE by its key (T15, repeatable
+    /// for several — they become an $in). No hash digging: the daemon
+    /// translates names to x-vf-src-uri on the Search face
+    #[arg(long = "source")]
+    sources: Vec<String>,
 
     /// Structured output (schema_version'd JSON)
     #[arg(long)]
@@ -529,7 +538,40 @@ struct ConfigInitArgs {
 
 #[tokio::main]
 async fn main() {
-    match Cli::parse().command {
+    // F7 (teachable clap errors): `vf get docs "key"` — two positionals
+    // where the verb takes ONE `bucket/key` path — dies as a bare
+    // "unexpected argument" that never mentions the path form. Intercept
+    // the usage error and append the path-form hint for the key-carrying
+    // verbs (get/cat/rm/chunks share the shape), and only when the
+    // rejected token is a POSITIONAL (a rejected --flag keeps clap's own
+    // error; the hint would be off-target there); every other parse error
+    // takes clap's default rendering/exit untouched.
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            let rendered = e.render().to_string();
+            let positional = matches!(
+                e.get(clap::error::ContextKind::InvalidArg),
+                Some(clap::error::ContextValue::String(s)) if !s.starts_with('-')
+            );
+            let path_verb = ["get", "cat", "rm", "chunks"]
+                .into_iter()
+                .find(|verb| rendered.contains(&format!("vf {verb} ")));
+            if e.kind() == clap::error::ErrorKind::UnknownArgument
+                && positional
+                && let Some(verb) = path_verb
+            {
+                eprintln!("{rendered}");
+                eprintln!(
+                    "note: {verb} takes ONE '<bucket>/<key>' path positional (or a bare key \
+                     with --bucket): `vf {verb} docs/key.txt`"
+                );
+                std::process::exit(e.exit_code());
+            }
+            e.exit()
+        }
+    };
+    match cli.command {
         Command::Put(args) => put_cmd(args).await,
         Command::Search(args) => search_cmd(args).await,
         Command::Sources(args) => match args.command {
@@ -965,6 +1007,14 @@ async fn search_cmd(args: SearchArgs) {
             .fail(args.json, 2),
         },
     };
+    // --source: a SHALLOW wrapper (T15) — the translation's single source
+    // of truth is the SERVER (ADR 0004); the CLI only spells the filter.
+    // Combined with --filter via $and so both compose without key overlap.
+    let filter = match (filter, source_filter_of(&args.sources)) {
+        (f, None) => f,
+        (None, s) => s,
+        (Some(f), Some(s)) => Some(json!({ "$and": [f, s] })),
+    };
     let mut body = json!({
         "bucket": bucket,
         "query": query_member,
@@ -986,19 +1036,29 @@ async fn search_cmd(args: SearchArgs) {
         Err(e) => die(e, conn.endpoint()),
     };
     let hits = v["hits"].as_array().cloned().unwrap_or_default();
+    // T15: the server's empty-hit note (a src-name filter that matched no
+    // indexed source — the typo signal); --json carries it as a member,
+    // the human table reports it on stderr (progress/diagnostics channel)
+    let note = v.get("note").and_then(Value::as_str).map(String::from);
     if args.json {
+        let mut out = json!({
+            "schema_version": SCHEMA_VERSION,
+            "bucket": bucket,
+            "query": query_echo,
+            "topK": args.top_k,
+            "hits": hits,
+        });
+        if let Some(n) = &note {
+            out["note"] = json!(n);
+        }
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "schema_version": SCHEMA_VERSION,
-                "bucket": bucket,
-                "query": query_echo,
-                "topK": args.top_k,
-                "hits": hits,
-            }))
-            .expect("serializes")
+            serde_json::to_string_pretty(&out).expect("serializes")
         );
         return;
+    }
+    if let Some(n) = &note {
+        eprintln!("note: {n}");
     }
     // human table (deterministic: server order is score desc, key asc);
     // image hits have no text channel — the SOURCE column carries the 回源,
@@ -1026,7 +1086,7 @@ async fn search_cmd(args: SearchArgs) {
             h["score"].as_f64().unwrap_or(0.0),
             truncate(h["key"].as_str().unwrap_or(""), 28),
             truncate(h["index"].as_str().unwrap_or(""), 22),
-            truncate(h["location"]["key"].as_str().unwrap_or(""), 24),
+            truncate_source(h["location"]["key"].as_str().unwrap_or(""), 24),
             coord_cell(&h["location"]["coord"]),
             text
         );
@@ -1066,6 +1126,39 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max - 1).collect();
         out.push('…');
         out
+    }
+}
+
+/// The SOURCE column's truncation (T15, replacing head-only `truncate`):
+/// long object keys keep their TAIL and lose their MIDDLE — the file name
+/// and its nearest directories are the identifying part of a path
+/// (`docs/reports/2026/…/radar-vol32.pdf` reads as `docs/re…ol32.pdf`,
+/// never as `docs/reports/202…`). Char-domain, like `truncate`.
+fn truncate_source(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max || max < 3 {
+        // max < 3 cannot hold head + '…' + tail: degrade to head-truncation
+        return truncate(s, max);
+    }
+    // tail-biased: a third of the budget to the head, the rest (minus the
+    // ellipsis) to the tail
+    let head = (max - 1) / 3;
+    let tail = max - 1 - head;
+    let mut out: String = s.chars().take(head).collect();
+    out.push('…');
+    out.extend(s.chars().skip(count - tail));
+    out
+}
+
+/// The repeatable `--source` flags as a filter member (T15): one source
+/// spells the bare-key shorthand `$eq`, several spell `$in` — the server's
+/// name→hash translation (ADR 0004) consumes either; the CLI adds no
+/// logic of its own.
+fn source_filter_of(sources: &[String]) -> Option<Value> {
+    match sources {
+        [] => None,
+        [one] => Some(json!({ "x-vf-src-name": one })),
+        many => Some(json!({ "x-vf-src-name": { "$in": many } })),
     }
 }
 
@@ -2294,6 +2387,46 @@ mod tests {
             next_chunk_key(&sorted, &chunkkey::chunk_key(&hash, "text", 5)),
             None,
             "the last chunk has no continuation"
+        );
+    }
+
+    /// SOURCE-column truncation (T15): tails survive, middles elide — the
+    /// file-name end of a long path stays readable, short keys are
+    /// untouched, and the CJK char-domain discipline holds.
+    #[test]
+    fn source_column_keeps_tail_elides_middle() {
+        // fits: verbatim
+        assert_eq!(truncate_source("docs/fox.txt", 24), "docs/fox.txt");
+        // long path: head + '…' + TAIL (24 = head 7 + '…' + tail 16)
+        let long = "docs/reports/2026/radar/vol32/fox.pdf";
+        let t = truncate_source(long, 24);
+        assert_eq!(t.chars().count(), 24, "{t}");
+        assert!(t.starts_with("docs/re"), "{t}");
+        assert!(t.ends_with("ol32/fox.pdf"), "{t}");
+        assert!(t.contains('…'), "{t}");
+        // the identifying tail is what head-truncation used to lose
+        assert!(!truncate(long, 24).ends_with("fox.pdf"), "self-check");
+        // char-domain: 24 CHARS of CJK, never bytes
+        let cjk: String = "档".repeat(60);
+        assert_eq!(truncate_source(&cjk, 24).chars().count(), 24);
+        // degenerate budget: falls back to head truncation, never panics
+        assert_eq!(truncate_source("abcdef", 2), "a…");
+    }
+
+    /// `--source` flags ⇒ the src-name filter member (T15): one flag is
+    /// the bare-key shorthand, several are `$in` — and nothing else; the
+    /// translation itself is the SERVER's (ADR 0004 single source of
+    /// truth), the client only spells the filter.
+    #[test]
+    fn source_flags_spell_the_src_name_filter() {
+        assert_eq!(source_filter_of(&[]), None);
+        assert_eq!(
+            source_filter_of(&["docs/fox.txt".to_string()]),
+            Some(json!({"x-vf-src-name": "docs/fox.txt"}))
+        );
+        assert_eq!(
+            source_filter_of(&["docs/a.txt".to_string(), "docs/b.txt".to_string()]),
+            Some(json!({"x-vf-src-name": {"$in": ["docs/a.txt", "docs/b.txt"]}}))
         );
     }
 }

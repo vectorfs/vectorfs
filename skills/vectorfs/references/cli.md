@@ -65,20 +65,29 @@ cross-checks the real container).
 | `--rerank` | cross-encoder re-scoring of the merged top-K (needs `[ingest] rerank = true`; semantic/hybrid only — keyword refuses: BM25 order IS that mode's contract) |
 | `--bucket B` | explicit form (XOR the bare-name positional) |
 | `--top-k K` | 1..=1000, default 10 |
+| `--source KEY` | restrict to one source file by key, repeatable for several (T15) — the server translates names to `x-vf-src-uri` hashes, no hash digging |
 | `--filter JSON` | metadata filter, `$`-operator syntax (below); invalid JSON = usage error |
 | `--no-text` | omit chunk text from hits |
 | `--json` | schema-versioned structured output |
 
-Human output columns: `#  SCORE  KEY  INDEX  SOURCE  TEXT` (score 4 decimals;
-TEXT is the first 60 chars of the chunk). Deterministic order: score desc,
+Human output columns: `#  SCORE  KEY  INDEX  SOURCE  COORD  TEXT` (score 4
+decimals; TEXT is the first 60 chars of the chunk; long SOURCE keys keep
+their tail, middle elided). Deterministic order: score desc,
 key asc. Scores are orderings, not calibrated values (different modes/embedders
-are not comparable).
+are not comparable). Result-set governance: `toc` and `legend` chunks are
+EXCLUDED by default (TOC lines are page-repeated perfect matches; legends
+are pathologically short BM25 docs) — `--kind toc` (repeatable; the wire's
+`includeKinds`) admits them back for navigation queries like「哪章在哪页」.
 
 Filter operators (bare value = implicit `$eq`): `$eq $ne $gt $gte $lt $lte
 $startsWith $in $nin $exists $and $or`. Example:
-`--filter '{"kind": {"$eq": "doc"}, "len": {"$gte": 5}}'`. Note: only
-filterable metadata participates — of the file-layer keys that is `x-vf-src-uri`
-only (see protocol.md).
+`--filter '{"kind": {"$eq": "doc"}, "len": {"$gte": 5}}'`. Filterable
+file-layer keys: `x-vf-src-uri` (everywhere) and `x-vf-chunk-kind`; on this
+Search face `x-vf-src-name` also filters with `$eq`/`$in` (server-side
+translated to the src-uri hash — QueryVectors rejects that key; other
+operators on it are refused with a pointer to `x-vf-src-uri`, see
+protocol.md). A zero-hit query whose src-name filter matched no indexed
+source reports it in a `note` (check the key spelling with `vf ls`).
 
 ### `vf chunks <KEY>`
 

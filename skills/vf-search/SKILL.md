@@ -32,6 +32,8 @@ CLI (bucket as a bare positional, XOR `--bucket`):
 | Flag | Meaning |
 |---|---|
 | `--top-k K` | hits to request, 1..=1000 (default 10) |
+| `--source KEY` | restrict to one source file by its key (repeatable = several files) — the server translates names to the `x-vf-src-uri` hash, no digging |
+| `--kind K` | admit an excluded structure kind (repeatable): `toc` and `legend` chunks are out of the default result set; `--kind toc` brings them back (allowed: body, toc, caption, legend) |
 | `--filter JSON` | metadata filter, `$`-operator syntax (below) |
 | `--no-text` | omit chunk text from hits |
 | `--json` | schema-versioned structured output |
@@ -58,13 +60,25 @@ returnText}` — same semantics, camelCase.
 `--filter '{"k": "v"}'` (implicit `$eq`) or with operators:
 `$eq $ne $gt $gte $lt $lte $startsWith $in $nin $exists $and $or`.
 
-Of the file-layer provenance keys only **`x-vf-src-uri`** is filterable.
-Handy pattern: scope a query to one known file by filtering on the
-`x-vf-src-uri` hash taken from an earlier hit's metadata:
+File-layer keys: **`x-vf-src-uri`** (the source's content hash) is
+filterable. On the search face, **`x-vf-src-name`** — the source file's
+key, human-readable — also filters (implicit `$eq`, `$eq`, `$in`; other
+operators are refused with a pointer to `x-vf-src-uri`): the server
+translates names to hashes. Scoping to known files needs no hash digging
+anymore:
 
 ```bash
-vf search "rotation policy" docs --filter '{"x-vf-src-uri": "9f21ab…"}'
+vf search "rotation policy" docs --source docs/report.pdf
+vf search "评估" docs --filter '{"x-vf-src-name": {"$in": ["radar/v31.pdf", "radar/v32.pdf"]}}'
 ```
+
+Structure: `x-vf-chunk-kind` (`body` / `toc` / `caption` / `legend`)
+filters explicitly, and `toc` + `legend` are excluded from results by
+default (TOC lines are perfect lexical matches that霸榜; legend blocks are
+pathologically short) — `--kind` (or `includeKinds` on the wire) admits
+them. A zero-hit search whose src-name filter matched no indexed source
+says so in a `note` — check the key spelling (`vf ls`) before concluding
+the corpus lacks the answer.
 
 ## From hit to full document
 

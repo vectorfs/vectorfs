@@ -384,6 +384,25 @@ fn cli_full_command_smoke() {
         "byte round trip"
     );
 
+    // ---- F7: the two-positional misuse (`vf get docs "key"` — space
+    // where the path form wants a '/') is a clap usage error that now
+    // TEACHES the path form instead of leaving the user at --help ----
+    let o = vf(port, &["get", "docs", "fox.txt"], false);
+    assert_eq!(o.status.code(), Some(2), "stderr:\n{}", err(&o));
+    assert!(
+        err(&o).contains("unexpected argument"),
+        "stderr:\n{}",
+        err(&o)
+    );
+    assert!(
+        err(&o).contains("note: get takes ONE '<bucket>/<key>' path positional"),
+        "stderr:\n{}",
+        err(&o)
+    );
+    // (the legitimate single-positional path form itself is exercised by
+    // the S3-forms smoke below; this fixture's keys carry a docs/ prefix
+    // INSIDE the bucket, so `docs/fox.txt` would split to key fox.txt)
+
     // ---- sources list / status ----
     let o = vf(port, &["sources", "list", "--bucket", "docs"], false);
     assert!(o.status.success(), "stdout:\n{}", out(&o));
@@ -501,6 +520,108 @@ fn cli_full_command_smoke() {
         hits[0]["index"].as_str().unwrap().starts_with("tiny-"),
         "{}",
         out(&o)
+    );
+
+    // ---- T15: --source scopes by NAME — the server translates to the
+    // x-vf-src-uri hash (no hash digging), and a name that matches no
+    // indexed source surfaces the note instead of a silent empty list ----
+    let o = vf(
+        port,
+        &[
+            "search",
+            "quick brown fox",
+            "--bucket",
+            "docs",
+            "--source",
+            "docs/fox.txt",
+            "--json",
+        ],
+        false,
+    );
+    assert!(o.status.success(), "stderr:\n{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    let hits = v["hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "{}", out(&o));
+    assert!(
+        hits.iter().all(|h| h["location"]["key"] == "docs/fox.txt"),
+        "every hit from the named source: {}",
+        out(&o)
+    );
+    assert!(
+        v.get("note").is_none(),
+        "hits present: no note: {}",
+        out(&o)
+    );
+    // repeatable --source ⇒ $in: both sources come back
+    let o = vf(
+        port,
+        &[
+            "search",
+            "quick brown fox",
+            "--bucket",
+            "docs",
+            "--source",
+            "docs/fox.txt",
+            "--source",
+            "docs/sea.txt",
+            "--json",
+        ],
+        false,
+    );
+    assert!(o.status.success(), "stderr:\n{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    let mut seen: Vec<String> = v["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h["location"]["key"].as_str().map(str::to_string))
+        .collect();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen, vec!["docs/fox.txt", "docs/sea.txt"], "{}", out(&o));
+    // a typo'd name: zero hits + the note rides the envelope (and the
+    // human table prints it on stderr)
+    let o = vf(
+        port,
+        &[
+            "search",
+            "quick brown fox",
+            "--bucket",
+            "docs",
+            "--source",
+            "docs/foxx.txt",
+            "--json",
+        ],
+        false,
+    );
+    assert!(o.status.success(), "stderr:\n{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(v["hits"].as_array().unwrap().len(), 0, "{}", out(&o));
+    assert!(
+        v["note"]
+            .as_str()
+            .unwrap()
+            .contains("matched no indexed sources"),
+        "{}",
+        out(&o)
+    );
+    let o = vf(
+        port,
+        &[
+            "search",
+            "quick brown fox",
+            "--bucket",
+            "docs",
+            "--source",
+            "docs/foxx.txt",
+        ],
+        false,
+    );
+    assert!(o.status.success(), "stderr:\n{}", err(&o));
+    assert!(
+        err(&o).contains("matched no indexed sources"),
+        "human mode carries the note on stderr: {}",
+        err(&o)
     );
 
     // ---- rm: 202 DELETING, idempotent ----
