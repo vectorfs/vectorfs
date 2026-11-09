@@ -262,46 +262,73 @@ impl LabelView {
 /// One part's ADDRESSING coordinates, precomputed once in the CHAR domain
 /// the recurrence works in (T13, ADR 0005): the page interval a window
 /// covers (from the extractor's byte-anchored [`super::super::Part::pages`]
-/// table) or, for pageless sources, the line interval (from the `'\n'`
-/// lattice).
+/// table), the line interval (from the `'\n'` lattice), or both.
 ///
-/// The **D-7 fork is decided here, per part**: a part carrying a page-offset
-/// table reports PAGE intervals and never line intervals; a pageless part
-/// reports LINE intervals and never page intervals (无页概念格式 ⇒ 行键) —
-/// one source, one addressing unit, so downstream stamping and `$exists`
-/// filtering never see a mixed vocabulary on one chunk. Page offsets
-/// convert byte→char through the same prefix table as [`LabelView`] (the
-/// extractor anchors in bytes, the recurrence indexes chars); newline
-/// counting needs no conversion at all — `'\n'` is a single-byte char, so
-/// the newline count of any char prefix equals that of its byte prefix
-/// (the char/byte isomorphism the T13 design verified, 无陷阱).
+/// The **D-7 fork is decided here, per part** (refined 2026-11-09, 尾巴裁决
+/// 3): the page/line MUTUAL EXCLUSION is justified only where the part's
+/// lines are extraction PSEUDO-structure — a multi-page part whose `'\n'`
+/// boundaries are the text-layer join's artifact (pdf-text). A part that
+/// carries a page table AND declares its lines REAL structure
+/// ([`Part::real_lines`](super::super::Part::real_lines) — pdf-ocr: each
+/// single-page part's lines are the recognition engine's own explicit
+/// outputs) reports BOTH the page interval and the line interval (页键 +
+/// 行键并存). A pageless part reports LINE intervals only (无页概念格式 ⇒
+/// 行键), `real_lines` or not — there is no page channel to open.
+///
+/// **`$exists` discriminator weakened accordingly** (the adjudication's
+/// documentation duty): a present page key no longer uniquely identifies
+/// a multi-page PDF row — an OCR'd single-page part carries page keys too.
+/// Format discrimination should use modality semantics (the source's
+/// mime/`x-vf-modality`), not page-key presence.
+///
+/// Page offsets convert byte→char through the same prefix table as
+/// [`LabelView`] (the extractor anchors in bytes, the recurrence indexes
+/// chars); newline counting needs no conversion at all — `'\n'` is a
+/// single-byte char, so the newline count of any char prefix equals that
+/// of its byte prefix (the char/byte isomorphism the T13 design verified,
+/// 无陷阱).
 ///
 /// One INCLUSIVE 1-based addressing interval (a page pair or a line pair
 /// — both ends are the unit's numbers, never offsets).
 type Interval = (u32, u32);
 
 pub(super) enum Coords {
-    /// The part carries a page-offset table: `(char index where the page's
-    /// kept text begins, 1-based page number)`, sorted — by char index,
-    /// ties by page number, so the LAST entry at one offset names the
-    /// HIGHEST page (an empty page shares its offset with the successor;
-    /// a window touching that boundary honestly reports the higher page).
+    /// The part carries a page-offset table whose lines are extraction
+    /// pseudo-structure (multi-page pdf-text): `(char index where the
+    /// page's kept text begins, 1-based page number)`, sorted — by char
+    /// index, ties by page number, so the LAST entry at one offset names
+    /// the HIGHEST page (an empty page shares its offset with the
+    /// successor; a window touching that boundary honestly reports the
+    /// higher page). Page keys only (the T13 D-7 fork).
     Paged(Vec<(usize, u32)>),
+    /// The part carries a page-offset table AND declared its lines real
+    /// structure (`real_lines`, 2026-11-09 裁决 3 — pdf-ocr's single-page
+    /// parts): BOTH channels — the page table above plus the `'\n'`
+    /// lattice below, so a window reports its page interval AND its line
+    /// interval (页键 + 行键并存).
+    PagedRealLines(Vec<(usize, u32)>, Vec<usize>),
     /// Pageless part: the char indices of every `'\n'`, ascending.
     Lined(Vec<usize>),
 }
 
 impl Coords {
-    /// Build the table for one part: `pages` empty ⇒ the Lined fork (D-7).
-    pub(super) fn new(text: &str, pages: &[(u32, usize)]) -> Self {
+    /// Build the table for one part: `pages` empty ⇒ the Lined fork (D-7,
+    /// whatever `real_lines` says — no page channel exists); pages present
+    /// ∧ `real_lines` ⇒ the dual channel (裁决 3); pages present ∧
+    /// pseudo-structure lines ⇒ page keys only (the T13 fork).
+    pub(super) fn new(text: &str, pages: &[(u32, usize)], real_lines: bool) -> Self {
+        // the '\n' lattice in the CHAR domain (the recurrence indexes
+        // chars; '\n' is single-byte, so counting is byte/char isomorphic,
+        // but the STORED positions must be char indices)
+        let newlines = || -> Vec<usize> {
+            text.chars()
+                .enumerate()
+                .filter(|&(_, c)| c == '\n')
+                .map(|(i, _)| i)
+                .collect()
+        };
         if pages.is_empty() {
-            let mut newlines = Vec::new();
-            for (i, (_, c)) in text.char_indices().enumerate() {
-                if c == '\n' {
-                    newlines.push(i);
-                }
-            }
-            return Coords::Lined(newlines);
+            return Coords::Lined(newlines());
         }
         // page offsets are BYTES, the recurrence is CHARS — convert through
         // the shared prefix table (floor into the containing char: a
@@ -326,12 +353,17 @@ impl Coords {
             })
             .collect();
         starts.sort_unstable();
-        Coords::Paged(starts)
+        if real_lines {
+            Coords::PagedRealLines(starts, newlines())
+        } else {
+            Coords::Paged(starts)
+        }
     }
 
     /// The window `[s, e)`'s coordinates: `(page?, line?)` — both ends
-    /// INCLUSIVE in the emitted unit, and per the D-7 fork exactly one arm
-    /// is `Some`.
+    /// INCLUSIVE in the emitted unit. Exactly one arm is `Some` on the two
+    /// single-channel forks (paged-pseudo-structure: page only; pageless:
+    /// line only), BOTH on the dual fork (`real_lines`, 裁决 3).
     ///
     /// **Page semantics**: start = the page containing the window's FIRST
     /// char, end = the page containing its LAST char (`e - 1` — a window
@@ -348,22 +380,24 @@ impl Coords {
     /// tests pin both edges).
     pub(super) fn window(&self, s: usize, e: usize) -> (Option<Interval>, Option<Interval>) {
         debug_assert!(e > s, "windows are non-empty by the recurrence");
+        // page of char x: the LAST page whose start ≤ x. A malformed table
+        // whose first entry starts past x degrades to that first page
+        // (saturating idx) — deterministic, never panics; in-tree producers
+        // always open at 0.
+        let page_at = |starts: &[(usize, u32)], x: usize| -> u32 {
+            let idx = starts.partition_point(|&(c, _)| c <= x);
+            starts[idx.saturating_sub(1)].1
+        };
+        let line_at = |newlines: &[usize], x: usize| -> u32 {
+            1 + newlines.partition_point(|&p| p < x) as u32
+        };
         match self {
-            Coords::Paged(starts) => {
-                // page of char x: the LAST page whose start ≤ x. A
-                // malformed table whose first entry starts past x degrades
-                // to that first page (saturating idx) — deterministic,
-                // never panics; in-tree producers always open at 0.
-                let page_at = |x: usize| -> u32 {
-                    let idx = starts.partition_point(|&(c, _)| c <= x);
-                    starts[idx.saturating_sub(1)].1
-                };
-                (Some((page_at(s), page_at(e - 1))), None)
-            }
-            Coords::Lined(newlines) => {
-                let line_at = |x: usize| -> u32 { 1 + newlines.partition_point(|&p| p < x) as u32 };
-                (None, Some((line_at(s), line_at(e))))
-            }
+            Coords::Paged(starts) => (Some((page_at(starts, s), page_at(starts, e - 1))), None),
+            Coords::PagedRealLines(starts, newlines) => (
+                Some((page_at(starts, s), page_at(starts, e - 1))),
+                Some((line_at(newlines, s), line_at(newlines, e))),
+            ),
+            Coords::Lined(newlines) => (None, Some((line_at(newlines, s), line_at(newlines, e)))),
         }
     }
 }
@@ -645,7 +679,7 @@ mod tests {
         // conversion) + a trailing single-char page
         let text = "一二三四五六七"; // chars 0..6, bytes 0..=18
         let pages = [(1u32, 0usize), (2, 6), (3, 12), (4, 18)];
-        let coords = Coords::new(text, &pages);
+        let coords = Coords::new(text, &pages, false);
         // window wholly inside page 1: chars [0, 2)
         assert_eq!(coords.window(0, 2), (Some((1, 1)), None));
         // straddling the 1/2 boundary: chars [1, 3) — HONEST overlap, both
@@ -668,7 +702,7 @@ mod tests {
         // an EMPTY page shares its offset with the successor (a page whose
         // every line was furniture): the HIGHER page owns the shared
         // offset, and any interval reaching it spans the empty page
-        let coords = Coords::new(text, &[(1, 0), (2, 4), (3, 4), (4, 8)]);
+        let coords = Coords::new(text, &[(1, 0), (2, 4), (3, 4), (4, 8)], false);
         assert_eq!(coords.window(2, 4), (Some((1, 1)), None));
         assert_eq!(
             coords.window(3, 5),
@@ -684,11 +718,11 @@ mod tests {
         // past-the-end / mid-glyph offsets clamp and floor (never panic,
         // deterministic): a table whose tail offset is past the text end
         // never wins a window (no char maps to it)
-        let coords = Coords::new(text, &[(1, 0), (2, 999)]);
+        let coords = Coords::new(text, &[(1, 0), (2, 999)], false);
         assert_eq!(coords.window(0, 10), (Some((1, 1)), None));
         // unsorted input with duplicate pages sorts into the same answers
-        let a = Coords::new(text, &[(3, 6), (1, 0), (2, 3)]);
-        let b = Coords::new(text, &[(1, 0), (2, 3), (3, 6)]);
+        let a = Coords::new(text, &[(3, 6), (1, 0), (2, 3)], false);
+        let b = Coords::new(text, &[(1, 0), (2, 3), (3, 6)], false);
         for (s, e) in [(0, 3), (2, 5), (4, 8), (7, 10)] {
             assert_eq!(a.window(s, e), b.window(s, e), "sorting is internal");
         }
@@ -698,7 +732,7 @@ mod tests {
     fn coords_line_intervals_pin_both_newline_boundaries() {
         // chars: a0 b1 \n2 c3 d4 \n5 e6 f7 — three lines
         let text = "ab\ncd\nef";
-        let coords = Coords::new(text, &[]);
+        let coords = Coords::new(text, &[], false);
         // window exactly one line: [3, 5) = "cd" ⇒ (2, 2)
         assert_eq!(coords.window(3, 5), (None, Some((2, 2))));
         // window OPENING right after a '\n' (the s-at-line-start boundary):
@@ -713,13 +747,13 @@ mod tests {
         // whole text: starts line 1, ends at line_at(8) = 3
         assert_eq!(coords.window(0, 8), (None, Some((1, 3))));
         // no newlines at all: every window is line 1
-        let coords = Coords::new("abcdef", &[]);
+        let coords = Coords::new("abcdef", &[], false);
         assert_eq!(coords.window(0, 6), (None, Some((1, 1))));
         // CJK: '\n' counting is char/byte isomorphic — 汉字 are 3 bytes
         // each, the '\n' positions in the CHAR domain are what line_at
         // reads (a window's lines are identical under either anchoring)
         let text = "汉字\n第二行\n第三行";
-        let coords = Coords::new(text, &[]);
+        let coords = Coords::new(text, &[], false);
         assert_eq!(
             coords.window(0, 3),
             (None, Some((1, 2))),
@@ -738,22 +772,61 @@ mod tests {
         assert_eq!(coords.window(0, text.chars().count()), (None, Some((1, 3))));
     }
 
+    /// The D-7 fork's three states, one per part (refined 2026-11-09,
+    /// 裁决 3): a paged part with PSEUDO-structure lines (multi-page
+    /// pdf-text) reports page keys and never line keys; a pageless part
+    /// reports line keys and never page keys (whatever `real_lines` says
+    /// — there is no page channel to open); a paged part that DECLARED its
+    /// lines real structure (pdf-ocr's single-page parts) reports BOTH.
     #[test]
-    fn coords_d7_fork_is_one_channel_per_part() {
-        // a paged part NEVER yields line coordinates, a pageless part never
-        // yields page coordinates — the fork is per part (D-7), whatever
-        // the window shape
-        let paged = Coords::new("page one\n\nmore", &[(1, 0), (2, 10)]);
+    fn coords_d7_fork_three_states_dual_pages_or_lines() {
+        // state 1: pages present, lines are extraction pseudo-structure —
+        // page keys only, whatever the window shape (the T13 fork, held)
+        let paged = Coords::new("page one\n\nmore", &[(1, 0), (2, 10)], false);
         for (s, e) in [(0, 4), (7, 12), (0, 15)] {
             let (page, line) = paged.window(s, e);
             assert!(page.is_some(), "paged part reports pages");
-            assert_eq!(line, None, "paged part reports NO lines (D-7): ({s},{e})");
+            assert_eq!(
+                line, None,
+                "pseudo-structure lines: NO line keys (D-7): ({s},{e})"
+            );
         }
-        let pageless = Coords::new("l1\nl2\nl3", &[]);
-        for (s, e) in [(0, 3), (2, 6), (0, 8)] {
-            let (page, line) = pageless.window(s, e);
-            assert_eq!(page, None, "pageless part reports NO pages (D-7)");
-            assert!(line.is_some(), "pageless part reports lines");
+        // state 2: pageless — line keys only, real_lines irrelevant
+        for real_lines in [false, true] {
+            let pageless = Coords::new("l1\nl2\nl3", &[], real_lines);
+            for (s, e) in [(0, 3), (2, 6), (0, 8)] {
+                let (page, line) = pageless.window(s, e);
+                assert_eq!(page, None, "pageless part reports NO pages (D-7)");
+                assert!(line.is_some(), "pageless part reports lines");
+            }
         }
+        // state 3: pages present AND real_lines — BOTH channels on every
+        // window (页键+行键并存, the pdf-ocr shape: one part IS one page, its
+        // lines the recognition engine's own outputs)
+        let ocr_page = Coords::new("line one\nline two\nline three", &[(7, 0)], true);
+        for (s, e) in [(0, 8), (9, 17), (0, 26)] {
+            let (page, line) = ocr_page.window(s, e);
+            let (p, l) = (page.expect("dual: page key"), line.expect("dual: line key"));
+            assert_eq!(p, (7, 7), "the one-page part's page interval: ({s},{e})");
+            assert!(
+                l.0 >= 1 && l.0 <= l.1 && l.1 <= 3,
+                "sane line interval {l:?}"
+            );
+        }
+        // the line channel keeps the pinned boundary semantics on the dual
+        // fork too: [0,9) = "line one\n" ends IN the break ⇒ interval
+        // (1,2) — carries the line the break OPENS
+        assert_eq!(ocr_page.window(0, 9), (Some((7, 7)), Some((1, 2))));
+        // [9,17) = "line two" ⇒ (2,2); the whole part ⇒ (1,3)
+        assert_eq!(ocr_page.window(9, 17), (Some((7, 7)), Some((2, 2))));
+        assert_eq!(ocr_page.window(0, 26), (Some((7, 7)), Some((1, 3))));
+        // a MULTI-page real_lines part (not a producer today, but the
+        // channel is per WINDOW): straddling pages report both pages AND
+        // the honest line interval — chars a0 b1 \n2 c3 d4 \n5 e6 f7,
+        // page 2 opens at char 4
+        let dual = Coords::new("ab\ncd\nef", &[(1, 0), (2, 4)], true);
+        assert_eq!(dual.window(0, 8), (Some((1, 2)), Some((1, 3))));
+        assert_eq!(dual.window(0, 2), (Some((1, 1)), Some((1, 1))));
+        assert_eq!(dual.window(3, 5), (Some((1, 2)), Some((2, 2))));
     }
 }

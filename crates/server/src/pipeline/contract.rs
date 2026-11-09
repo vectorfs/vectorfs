@@ -366,6 +366,7 @@ pub fn chunker_contract_labels(c: &dyn Chunker, size: usize, overlap: usize) {
         image: None,
         labels,
         pages,
+        real_lines: false,
         furniture_removed: 0,
         section: None,
     };

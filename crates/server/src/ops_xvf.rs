@@ -3037,7 +3037,13 @@ mod tests {
         let b = search(json!({"x-vf-page-start": {"$gte": 99}})).await;
         assert_eq!(b["hits"].as_array().unwrap().len(), 0, "{b}");
 
-        // ---- $exists separates the formats (pdf has page keys, txt not) ----
+        // ---- $exists on the page key: true for THIS corpus's pdf rows
+        // (pdf-text multi-page parts) and false for txt — but per the
+        // 2026-11-09 裁决 3 weakening this is a corpus fact, NOT a format
+        // law: an OCR'd (pdf-ocr) single-page part carries page keys too,
+        // so page-key presence no longer uniquely discriminates multi-page
+        // PDF extraction — format questions belong to modality semantics
+        // (x-vf-modality / the source mime), see chunk::windowing::Coords
         let b = search(json!({"x-vf-page-start": {"$exists": true}})).await;
         let hits = b["hits"].as_array().unwrap();
         assert!(!hits.is_empty(), "{b}");

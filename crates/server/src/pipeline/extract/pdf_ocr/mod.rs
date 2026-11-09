@@ -24,9 +24,12 @@
 //! ([`rec::crop_quad`]) → rec (CRNN/SVTR CTC: 3×48×W, `(v/255−0.5)/0.5`
 //! BGR → [`rec::ctc_greedy_decode`] against the artifact's embedded
 //! dictionary). Every page with surviving lines becomes ONE Text Part,
-//! page order preserved; a page that yields nothing contributes nothing;
-//! a document where NO page yields text is a loud Err (the pdf-text
-//! precedent: silently indexing nothing is worse).
+//! page order preserved — each part a SINGLE page carrying a one-row page
+//! table and the `real_lines` declaration (OCR lines are the recognition
+//! engine's own explicit outputs, real structure ⇒ the D-7-refined DUAL
+//! coordinates: 页键+行键并存, 2026-11-09 尾巴裁决 3); a page that yields
+//! nothing contributes nothing; a document where NO page yields text is a
+//! loud Err (the pdf-text precedent: silently indexing nothing is worse).
 //!
 //! # Model resolution (the embedder discipline, extractor-side)
 //!
@@ -532,12 +535,22 @@ impl Extractor for PdfOcrExtractor {
             if lines.is_empty() {
                 continue; // a page with nothing legible contributes nothing
             }
+            // One single-page part, and the lines are the RECOGNITION
+            // ENGINE's own explicit outputs — real structure, not the
+            // extraction pseudo-structure a text-layer join produces
+            // (2026-11-09 尾巴裁决 3, the D-7 refinement). The part
+            // therefore declares BOTH channels: a one-row page-offset
+            // table (page number, the whole part IS that page — offset 0)
+            // and `real_lines`, which the chunker turns into 页键+行键
+            // 并存 coordinates (chunk::windowing::Coords' dual arm).
+            let page_no = (i + 1) as u32;
             parts.push(Part {
                 modality: Modality::Text,
                 text: lines.join("\n"),
                 image: None,
                 labels: Vec::new(),
-                pages: Vec::new(),
+                pages: vec![(page_no, 0)],
+                real_lines: true,
                 furniture_removed: 0,
                 section: None,
             });
@@ -716,14 +729,64 @@ pub(crate) mod tests {
         assert_eq!(parts[0].modality, Modality::Text);
         assert!(parts[0].image.is_none());
         assert!(!parts[0].text.trim().is_empty(), "fixture rec yields 'B'");
+        // the 2026-11-09 裁决 3 declaration: one single-page part carries a
+        // ONE-ROW page table (its own 1-based page number, offset 0 — the
+        // whole part IS that page) and real_lines = true (OCR lines are the
+        // engine's own outputs, real structure)
+        assert_eq!(parts[0].pages, vec![(1u32, 0usize)], "page 1, whole part");
+        assert!(parts[0].real_lines, "OCR lines are real structure");
         // determinism against the real engines (pdfium + ort + PNG-free
         // render, but the whole path reruns)
         let again = x.extract(HELLO_PDF_MINIMAL, "application/pdf").unwrap();
         assert_eq!(parts, again);
-        // a multi-page document: one Part per page WITH text, page order
+        // a multi-page document: one Part per page WITH text, page order —
+        // and the per-part page numbers follow the page order
         let bytes = crate::pipeline::extract::pdf_inspector::tests::mixed_text_image_pdf();
         let parts = x.extract(&bytes, "application/pdf").unwrap();
         assert_eq!(parts.len(), 2, "both pages carry fixture text");
+        for (i, part) in parts.iter().enumerate() {
+            assert_eq!(
+                part.pages,
+                vec![((i + 1) as u32, 0usize)],
+                "part {i} is exactly page {}",
+                i + 1
+            );
+            assert!(part.real_lines);
+        }
+    }
+
+    /// The chunk-side half of 裁决 3 (no pdf-ocr golden/e2e suite exists —
+    /// this is the e2e-shaped assertion, fixture engines end to part, then
+    /// the REAL chunker over the parts): every window of an OCR'd part
+    /// carries BOTH coordinate keys — the page key (its single page) and
+    /// the line key (the recognition engine's line outputs). A scanned
+    /// corpus is therefore page-addressable AND line-addressable.
+    #[test]
+    fn ocr_parts_chunk_to_dual_coordinates() {
+        use crate::pipeline::Chunker;
+        use crate::pipeline::chunk::token_window::TokenWindowChunker;
+        let x = extractor_or_panic(300);
+        let bytes = crate::pipeline::extract::pdf_inspector::tests::mixed_text_image_pdf();
+        let parts = x.extract(&bytes, "application/pdf").unwrap();
+        assert!(parts.len() >= 2);
+        let c = TokenWindowChunker::new(4, 2).unwrap();
+        let chunks = c.chunk(&parts).unwrap();
+        assert!(!chunks.is_empty(), "fixture text must span windows");
+        let mut pages_seen = std::collections::BTreeSet::new();
+        for ch in &chunks {
+            let (ps, pe) = ch.page.expect("dual: OCR chunks carry the page key");
+            let (ls, le) = ch.line.expect("dual: OCR chunks carry the line key");
+            assert_eq!(ps, pe, "one part is one page — the interval is a point");
+            assert!(
+                ls >= 1 && ls <= le,
+                "sane line interval ({ls},{le}): {ch:?}"
+            );
+            pages_seen.insert(ps);
+        }
+        assert!(
+            pages_seen.len() >= 2,
+            "both fixture pages must surface: {pages_seen:?}"
+        );
     }
 
     #[test]

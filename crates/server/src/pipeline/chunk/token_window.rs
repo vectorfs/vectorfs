@@ -135,9 +135,10 @@ impl Chunker for TokenWindowChunker {
             let ranges =
                 super::windowing::ranges(self.size, self.overlap, chars.len(), &cuts, &forced);
             // T13: the part's addressing table — page offsets (byte→char
-            // converted inside) or the newline lattice, per the D-7 fork —
-            // built once, consulted per window
-            let coords = super::windowing::Coords::new(&part.text, &part.pages);
+            // converted inside), the newline lattice, or BOTH (real_lines,
+            // the 2026-11-09 D-7 refinement), per the fork — built once,
+            // consulted per window
+            let coords = super::windowing::Coords::new(&part.text, &part.pages, part.real_lines);
             for (s, e) in ranges {
                 let (page, line) = coords.window(s, e);
                 out.push(Chunk {
@@ -172,6 +173,7 @@ mod tests {
             image: None,
             labels: Vec::new(),
             pages: Vec::new(),
+            real_lines: false,
             furniture_removed: 0,
             section: None,
         }])
@@ -390,6 +392,7 @@ mod tests {
                 kind: crate::pipeline::ChunkKind::Toc,
             }],
             pages: vec![(1, 0), (2, 24)],
+            real_lines: false,
             furniture_removed: 0,
             section: None,
         };
@@ -485,6 +488,7 @@ mod tests {
             image: None,
             labels: Vec::new(),
             pages: Vec::new(),
+            real_lines: false,
             furniture_removed: 0,
             section: None,
         };
@@ -542,6 +546,7 @@ mod tests {
             image: None,
             labels: Vec::new(),
             pages: Vec::new(),
+            real_lines: false,
             furniture_removed: 0,
             section: Some(4),
         };

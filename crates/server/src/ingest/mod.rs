@@ -157,12 +157,7 @@ use crate::ops::{self, AppState};
 use crate::pipeline::chunk::ChunkerKind;
 use crate::pipeline::config::{ExtractValue, PipelineConfig};
 use crate::pipeline::embed::LoadedEmbedder;
-use crate::pipeline::extract::{
-    ExtractorKind,
-    md::{MdConfig, MdTag},
-    pdf_text::PdfTextConfig,
-    txt::{TxtConfig, TxtTag},
-};
+use crate::pipeline::extract::ExtractorKind;
 use crate::pipeline::normalize::{NormalizeOutcome, normalize};
 use crate::pipeline::{
     Chunk, Chunker, ContentClass, Embedder, Extractor, Fit, Merge, Modality, Part, PipelineError,
@@ -330,8 +325,9 @@ impl BucketPlan {
             ExtractValue::Single(s) => match s.as_str() {
                 // auto stays the built-in mime->kind single-member chain
                 // (M3 ruling pending: whether auto itself becomes a chain
-                // when pdf-ocr lands — see builtin_extractor).
-                "auto" => builtin_extractor(short_key).map(|k| vec![(s.clone(), k)]),
+                // when pdf-ocr lands — see extract::builtin_extractor).
+                "auto" => crate::pipeline::extract::builtin_extractor(short_key)
+                    .map(|k| vec![(s.clone(), k)]),
                 name => self
                     .extractors
                     .get(name)
@@ -430,42 +426,6 @@ fn short_key_of(object_key: &str) -> Option<&'static str> {
         #[cfg(test)]
         "img" => Some("img"),
         _ => crate::pipeline::extract::short_key_for_extension(&ext),
-    }
-}
-
-/// The `auto` mapping's default extractor KIND per short key (kept in lock
-/// step with [`MIME_TO_SHORT_KEY`]). `pdf` deliberately stays `pdf-text`
-/// even though two further PDF kinds (`pdf-inspector`, and `pdf-pages` since
-/// M3-T3) exist: pdfium text extraction is the battle-tested path and `auto`
-/// is an OPINIONATED default — a new kind landing must not silently
-/// re-route every `extract = { default = "auto" }` deployment (image-output
-/// `pdf-pages` doubly so: it would change the pipeline's modality needs).
-/// The `img` family (M3-T4) stays OUT of `auto` for exactly that second
-/// reason: an auto arm would make every existing `auto` deployment start
-/// claiming image files into pipelines whose embedders are text-only. The
-/// M3-T6 text-face families (`docx`, `html`) stay OUT for the behavior-
-/// expansion half of the same ruling: an auto arm would make existing `auto`
-/// deployments START claiming .docx/.html files overnight — text modality
-/// or not, what a pipeline ingests is the operator's declaration. The
-/// M3-T7 CONTAINER families (`epub`, `zip`, `eml`) stay OUT for BOTH
-/// halves at once: an auto arm would make every `auto` deployment start
-/// claiming AND EXPANDING archives overnight — containers re-route
-/// children through the user's chains, so silently adding them is a
-/// behavior expansion with a fan-out the operator never declared.
-/// Deployments that want the classify-first, no-.so engine, the page-image
-/// route, image files, the text face or the containers opt in explicitly
-/// (`extract = { pdf = "pdf-inspector-instance" }`, `pdf =
-/// "pages-instance"`, `img = "image-instance"`, `docx = "…"/`html = "…"`,
-/// `epub = "…"/`zip = "…"/`eml = "…"`).
-/// M2.1 keeps `auto` a single-member chain: whether it should become a
-/// built-in chain (pdf → pdf-inspector → pdf-text, say) is an M3 ruling,
-/// taken when `pdf-ocr` actually exists to chain onto.
-fn builtin_extractor(short_key: &str) -> Option<ExtractorKind> {
-    match short_key {
-        "pdf" => Some(ExtractorKind::PdfText(PdfTextConfig::default())),
-        "md" => Some(ExtractorKind::Md(MdConfig { kind: MdTag::Md })),
-        "txt" => Some(ExtractorKind::Txt(TxtConfig { kind: TxtTag::Txt })),
-        _ => None,
     }
 }
 
@@ -2437,10 +2397,17 @@ struct BatchRow {
 /// `x-vf-modality`, NOT in the non-filterable declaration), and the T13
 /// coordinate keys `x-vf-page-start/end`, `x-vf-line-start/end`,
 /// `x-vf-section` (ADR 0005 — written ONLY when the unit exists, per the
-/// D-7 fork the chunker already resolved: pages present ⇒ page pair and no
-/// line pair, pageless ⇒ line pair, container children ⇒ section; numbers,
-/// so each key evolves an F64 mirror column and is range-filterable
-/// `$gte/$lte` out of the box, and `$exists` separates pdf rows from txt).
+/// D-7 fork the chunker already resolved, refined 2026-11-09 裁决 3:
+/// multi-page parts whose lines are extraction pseudo-structure ⇒ page
+/// pair and NO line pair (pdf-text); single-page parts that declared their
+/// lines real structure ⇒ page pair AND line pair (pdf-ocr, 页键+行键并
+/// 存); pageless ⇒ line pair; container children ⇒ section; numbers, so
+/// each key evolves an F64 mirror column and is range-filterable
+/// `$gte/$lte` out of the box. `$exists` on the page key is WEAKENED as a
+/// format discriminator: an OCR'd single-page part carries page keys too,
+/// so page-key presence no longer uniquely identifies multi-page-PDF rows
+/// — format discrimination belongs to modality semantics
+/// (`x-vf-modality`/the source mime), see `chunk::windowing::Coords`).
 /// Key-count accounting: 5 base + text + kind + at most 4 coordinates
 /// = 11 ≤ 50 (AWS per-vector metadata cap). Per-chunk modality (M3-T1):
 /// both the metadata value and the chunk-key namespace come from the CHUNK,
@@ -5292,9 +5259,11 @@ pub(crate) mod tests {
 
     /// The `auto` mapping's view of the registry (plugin-axis hardening):
     /// every family the mime table declares must resolve under `auto` — a
-    /// table row without a [`builtin_extractor`] arm would silently strand
-    /// every `extract = { default = "auto" }` deployment for that family.
-    /// EXEMPTIONS (deliberate, each with its ruling):
+    /// table row without a
+    /// [`builtin_extractor`](crate::pipeline::extract::builtin_extractor)
+    /// arm would silently strand every `extract = { default = "auto" }`
+    /// deployment for that family. EXEMPTIONS (deliberate, each with its
+    /// ruling):
     /// * `img` (M3-T4): pulling image files into every existing `auto`
     ///   deployment would change their modality needs overnight.
     /// * `docx`/`html` (M3-T6): both kinds are TEXT-modality, but an auto
@@ -5316,7 +5285,7 @@ pub(crate) mod tests {
         for (_mime, key) in crate::pipeline::extract::MIME_TO_SHORT_KEY {
             if matches!(*key, "img" | "docx" | "html" | "epub" | "zip" | "eml") {
                 assert!(
-                    builtin_extractor(key).is_none(),
+                    crate::pipeline::extract::builtin_extractor(key).is_none(),
                     "{key} must stay OUT of auto (the pdf-pages/image ruling, the docx/html \
                      behavior-expansion ruling, the container fan-out ruling): an auto arm \
                      would silently expand what every default = \"auto\" deployment claims"
@@ -5324,7 +5293,7 @@ pub(crate) mod tests {
                 continue;
             }
             assert!(
-                builtin_extractor(key).is_some(),
+                crate::pipeline::extract::builtin_extractor(key).is_some(),
                 "auto has no built-in extractor for family {key} — every MIME_TO_SHORT_KEY \
                  row needs a builtin_extractor arm"
             );

@@ -1211,19 +1211,46 @@ fn canonical_charset(
 
 /// Pipeline fingerprint of one ingest section: first
 /// [`FINGERPRINT_HEX_LEN`] hex chars of `sha256(canonical TOML)` over the
-/// RELEVANT instance configuration — the referenced extractor instances,
-/// the extract ROUTING (M2.1: chain composition AND order; see below), the
-/// chunker, the listed embedder instances, the charset fallback
-/// (M3-T7), and the FTS tokenizer (M3-T9) — all name-keyed and
-/// BTreeMap-normalized so key order and
-/// formatting in the source file do not matter. Query-side (`merge`,
-/// `merge-weights`, since M3-T9 the `fts` switch itself, and since M3-T11
-/// the WHOLE rerank knob — switch AND model reference: a reranker model is
-/// query-side ranking policy, not an index definition the way an embedder
-/// model is, so swapping it must never demand a reindex) and
-/// claim-only fields (`include`, `exclude`, `index-prefix` — v3.1 R5) are
-/// deliberately EXCLUDED: they never change chunk identity, so changing
-/// them must not invalidate completion markers. The same logic puts
+/// RELEVANT instance configuration — the RESOLVED extract routing (M2.1
+/// chain composition AND order; see below), the chunker, the listed
+/// embedder instances, the charset fallback (M3-T7), and the FTS tokenizer
+/// (M3-T9) — BTreeMap-normalized so key order and formatting in the source
+/// file do not matter.
+///
+/// # The extract routes are RESOLVED, not named (2026-11-09 尾巴裁决 2 —
+/// the auto sentinel retirement)
+///
+/// The routes serialize as the chain of extractor CONFIGS each mime family
+/// actually runs ([`resolved_extract_routes`]: the specific entry, else
+/// `default`, with the `"auto"` sentinel expanded through
+/// [`extract::builtin_extractor`](super::extract::builtin_extractor)).
+/// Consequences, each deliberate:
+///
+/// * **auto buckets fingerprint their RESOLVED built-in chain**: the
+///   sentinel string `"auto"` no longer appears anywhere in the digest, so
+///   an upgrade that changes a built-in chain's behavior (the T12
+///   `structure` default, say) now moves the fingerprint of every
+///   `extract = { default = "auto" }` bucket EXACTLY like an explicit
+///   one's — the gate refuses startup and demands an explicit reindex
+///   (no silent mixed deployments of old/new extraction behavior).
+/// * **auto ≡ equal-value explicit**: `pdf = "auto"` and `pdf = "p"`
+///   where `[extractor.p]` is a default-config `pdf-text` derive the SAME
+///   digest (pinned by test) — identical behavior must fingerprint
+///   identically.
+/// * **instance NAMES drop out**: renaming an extractor instance (same
+///   kind, same knobs) no longer moves the digest. Names never transformed
+///   bytes; the values are the chunk identity. (The embedder axis stays
+///   name-keyed: a name there stands for a distinct derived INDEX, not
+///   just a config.)
+///
+/// Query-side (`merge`, `merge-weights`, since M3-T9 the `fts` switch
+/// itself, and since M3-T11 the WHOLE rerank knob — switch AND model
+/// reference: a reranker model is query-side ranking policy, not an index
+/// definition the way an embedder model is, so swapping it must never
+/// demand a reindex) and claim-only fields (`include`, `exclude`,
+/// `index-prefix` — v3.1 R5) are deliberately EXCLUDED: they never change
+/// chunk identity, so changing them must not invalidate completion
+/// markers. The same logic puts
 /// `max_file_size_mb`/`retries`/`scan_interval_secs`/`store_chunk_text`
 /// outside — they gate or observe, never transform. The charset fallback
 /// is the deliberate exception (normalize.rs module docs): it rewrites
@@ -1253,14 +1280,14 @@ pub fn pipeline_fingerprint(
 
     #[derive(serde::Serialize)]
     struct Fp<'a> {
-        extractors: BTreeMap<&'a str, &'a ExtractorKind>,
-        /// mime short key -> ordered chain, in the NORMALIZED ARRAY form:
-        /// the string value `"x"` and the array value `["x"]` are the same
-        /// chain and must derive the same fingerprint (pinned by test),
-        /// while the Vec keeps the serialization order-SENSITIVE —
-        /// `["a","b"]` and `["b","a"]` are different pipelines (a file the
-        /// first member yields on ends up extracted by a different engine).
-        extract_routes: BTreeMap<&'a str, Vec<&'a str>>,
+        /// mime family (or the reserved `default` face) -> the RESOLVED,
+        /// ordered chain of extractor configs (see fn docs: the 2026-11-09
+        /// auto-sentinel retirement — `"auto"` expands to its built-in
+        /// config, instance names drop out, and the Vec keeps the
+        /// serialization order-SENSITIVE: `["a","b"]` and `["b","a"]` are
+        /// different pipelines, a file the first member yields on ends up
+        /// extracted by a different engine).
+        extract_routes: BTreeMap<&'static str, Vec<ExtractorKind>>,
         chunk: &'a ChunkerKind,
         embedders: BTreeMap<&'a str, &'a EmbedderKind>,
         /// The normalize charset fallback, canonical WHATWG name — only
@@ -1275,17 +1302,6 @@ pub fn pipeline_fingerprint(
         fts_tokenizer: FtsTokenizer,
     }
 
-    let mut fp_extractors: BTreeMap<&str, &ExtractorKind> = BTreeMap::new();
-    for instance in used_extractor_instances(&ingest.extract) {
-        if let Some(kind) = extractors.get(instance) {
-            fp_extractors.insert(instance, kind);
-        }
-    }
-    let fp_routes: BTreeMap<&str, Vec<&str>> = ingest
-        .extract
-        .iter()
-        .map(|(mime_key, value)| (mime_key.as_str(), value.chain()))
-        .collect();
     let mut fp_embedders: BTreeMap<&str, &EmbedderKind> = BTreeMap::new();
     for instance in &ingest.embedders {
         if let Some(kind) = embedders.get(instance) {
@@ -1296,8 +1312,7 @@ pub fn pipeline_fingerprint(
     // Total for these plain-data configs (strings/ints only, no floats that
     // could go NaN, no non-string map keys): toml serialization cannot fail.
     let canonical = toml::to_string(&Fp {
-        extractors: fp_extractors,
-        extract_routes: fp_routes,
+        extract_routes: resolved_extract_routes(ingest, extractors),
         chunk: &ingest.chunk,
         embedders: fp_embedders,
         charset_fallback: &ingest.charset_fallback,
@@ -1307,6 +1322,64 @@ pub fn pipeline_fingerprint(
 
     let digest = Sha256::digest(canonical.as_bytes());
     hex_encode(&digest)[..FINGERPRINT_HEX_LEN].to_string()
+}
+
+/// The extract routing table expanded to its RESOLVED, per-family chains —
+/// the FINGERPRINT's view of `extract` (2026-11-09 尾巴裁决 2). For every
+/// mime family [`extract::MIME_TO_SHORT_KEY`] declares: the chain of
+/// extractor CONFIGS a file of that family runs through — the family's
+/// specific entry, else the `default` entry (the same specific-then-
+/// default precedence [`BucketPlan`](crate::ingest)::extractor_chain_for
+/// routes by), with every `"auto"` member expanded through
+/// [`extract::builtin_extractor`] AGAINST THE FAMILY KEY (auto resolves
+/// per content type, never as a blanket). Plus, under the reserved
+/// `"default"` key, the default route's own chain — the face OFF-table
+/// container children ride (a `default = "auto"` resolves to nothing
+/// there, mirroring `child_routes`, because the built-in map is keyed by
+/// family). A family whose chain resolves empty (auto exempting `img`,
+/// `docx`, `html`, the containers — or no entry at all) is NOT a source
+/// of this pipeline and contributes no entry. Instance NAMES are
+/// deliberately absent from the product: chunk identity is the configs.
+fn resolved_extract_routes(
+    ingest: &IngestConfig,
+    extractors: &BTreeMap<String, ExtractorKind>,
+) -> BTreeMap<&'static str, Vec<ExtractorKind>> {
+    let resolve = |value: &ExtractValue, key: &str| -> Vec<ExtractorKind> {
+        value
+            .chain()
+            .into_iter()
+            .filter_map(|member| {
+                if member == "auto" {
+                    super::extract::builtin_extractor(key)
+                } else {
+                    extractors.get(member).cloned()
+                }
+            })
+            .collect()
+    };
+    let mut routes: BTreeMap<&'static str, Vec<ExtractorKind>> = BTreeMap::new();
+    for (_, key) in super::extract::MIME_TO_SHORT_KEY {
+        let Some(value) = ingest
+            .extract
+            .get(*key)
+            .or_else(|| ingest.extract.get("default"))
+        else {
+            continue;
+        };
+        let chain = resolve(value, key);
+        if !chain.is_empty() {
+            routes.insert(key, chain);
+        }
+    }
+    // the off-table face: children whose mime has no family key route
+    // through `default` as-is (auto cannot serve them — keyed by family)
+    if let Some(value) = ingest.extract.get("default") {
+        let chain = resolve(value, "default");
+        if !chain.is_empty() {
+            routes.insert("default", chain);
+        }
+    }
+    routes
 }
 
 /// Lowercase hex (no dependency: 16 bytes in, 32 chars out).
@@ -1884,6 +1957,85 @@ chunk = { kind = "token-window", size = 32, overlap = 8 }
         assert_ne!(single, ab);
     }
 
+    // ---- auto sentinel retirement (2026-11-09 尾巴裁决 2) -------------------
+
+    /// THE self-check the adjudication demanded: an auto route and its
+    /// equal-value EXPLICIT spelling derive the SAME digest — the
+    /// fingerprint serializes the RESOLVED built-in chain, never the
+    /// sentinel string (a digest still carrying the literal `"auto"` — or
+    /// the instance name — could not pass this equality). Both spellings:
+    /// the family-key form (`pdf = "auto"`) and the catch-all form
+    /// (`default = "auto"`, which resolves per family: pdf/md/txt claimed,
+    /// the exempt families contribute no entry under either spelling).
+    #[test]
+    fn fingerprint_auto_route_equals_explicit_equivalent() {
+        // family-key spelling: pdf = "auto" ≡ pdf = <default pdf-text>
+        let auto = "[ingest.ddd]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
+                    extract = { pdf = \"auto\" }\n";
+        let explicit = "[extractor.p]\nkind = \"pdf-text\"\n\n[ingest.ddd]\nchunk = { kind = \
+                        \"token-window\", size = 8, overlap = 2 }\nextract = { pdf = \"p\" }\n";
+        assert_eq!(fp_of(auto), fp_of(explicit), "auto ≡ equal-value explicit");
+        // catch-all spelling: default = "auto" ≡ the three built-in families
+        // routed explicitly (the img/docx/html/epub/zip/eml exemptions make
+        // them non-sources under both spellings — no entry either side)
+        let auto_default = "[ingest.ddd]\nchunk = { kind = \"token-window\", size = 8, overlap = \
+                            2 }\nextract = { default = \"auto\" }\n";
+        let explicit_all = "[extractor.p]\nkind = \"pdf-text\"\n\n[extractor.m]\nkind = \
+                            \"md\"\n\n[extractor.t]\nkind = \"txt\"\n\n[ingest.ddd]\nchunk = { \
+                            kind = \"token-window\", size = 8, overlap = 2 }\nextract = { pdf = \
+                            \"p\", md = \"m\", txt = \"t\" }\n";
+        assert_eq!(
+            fp_of(auto_default),
+            fp_of(explicit_all),
+            "default = \"auto\" ≡ its resolved families routed explicitly"
+        );
+    }
+
+    /// The upgrade-gap closure pin (裁决 2's operative case): the auto
+    /// route's RESOLVED config participates in the digest, so a value
+    /// change in the built-in chain's knobs moves an auto bucket's
+    /// fingerprint exactly like an explicit bucket's — auto ≡
+    /// explicit-at-the-builtin-value, both ≠ the flipped value. Pre-fix
+    /// the auto bucket recorded only the sentinel string: the T12
+    /// `structure` behavior change could not move it (the silent
+    /// mixed-deployment gap this adjudication closes — an upgrade flipping
+    /// the builtin default now refuses startup through the gate and
+    /// demands an explicit reindex, for auto and explicit buckets alike).
+    #[test]
+    fn fingerprint_auto_moves_with_the_builtin_structure_value() {
+        let auto = "[ingest.ddd]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
+                    extract = { pdf = \"auto\" }\n";
+        let explicit_at = |structure_line: &str| {
+            format!(
+                "[extractor.p]\nkind = \"pdf-text\"\n{structure_line}[ingest.ddd]\nchunk = {{ \
+                 kind = \"token-window\", size = 8, overlap = 2 }}\nextract = {{ pdf = \"p\" }}\n"
+            )
+        };
+        // the builtin resolves at the T12 default (structure = true), so
+        // the auto bucket equals an EXPLICIT default bucket — and differs
+        // from the flipped explicit value, the same arrow the explicit
+        // form's own comparison draws
+        let at_default = explicit_at("");
+        let on = explicit_at("structure = true\n");
+        let off = explicit_at("structure = false\n");
+        assert_eq!(fp_of(auto), fp_of(&at_default), "auto ≡ the builtin value");
+        assert_eq!(
+            fp_of(&at_default),
+            fp_of(&on),
+            "explicit default ≡ explicit true (值即规范)"
+        );
+        assert_ne!(
+            fp_of(auto),
+            fp_of(&off),
+            "the RESOLVED structure value participates — auto ≠ flipped"
+        );
+        assert_ne!(
+            fp_of(&on),
+            fp_of(&off),
+            "structure flips the explicit form too"
+        );
+    }
+
     #[test]
     fn fingerprint_chunker_kind_and_knobs_enter_naturally() {
         // M3-T6 (the chunker axis's second kind): the fingerprint serializes
@@ -2410,16 +2562,32 @@ index-prefix = "docs"
         assert_ne!(fp_of(&base), fp_of(&size));
         let overlap = base.replace("overlap = 2", "overlap = 3");
         assert_ne!(fp_of(&base), fp_of(&overlap));
-        // extractor instance config (name same, section content identical
-        // here — so add a DIFFERENT referenced instance instead)
-        let other = "[extractor.a]\nkind = \"txt\"\n\n[extractor.b]\nkind = \"txt\"\n\n\
-                     [ingest.ddd]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
-                     extract = { txt = \"b\" }\n";
-        assert_ne!(fp_of(&base), fp_of(&other));
+        // extractor instance config — TWO directions under the resolved-
+        // routes semantics (2026-11-09 裁决 2: instance NAMES drop out of
+        // the digest, the configs are the chunk identity):
+        // (a) renaming an instance (same kind, same knobs) is NOT a
+        //     behavior change — identical behavior must fingerprint
+        //     identically (the pre-2026-11-09 name-keyed digest forced a
+        //     pointless reindex here);
+        let renamed = "[extractor.a]\nkind = \"txt\"\n\n[extractor.b]\nkind = \"txt\"\n\n\
+                       [ingest.ddd]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
+                       extract = { txt = \"b\" }\n";
+        assert_eq!(fp_of(&base), fp_of(renamed), "a rename changes no chunk");
+        // (b) a genuinely different CONFIG still moves it (pdf-text with
+        //     furniture/TOC structure OFF extracts different bytes)
+        let structure_off = "[extractor.p]\nkind = \"pdf-text\"\nstructure = false\n\n\
+                             [ingest.ddd]\nchunk = { kind = \"token-window\", size = 8, \
+                             overlap = 2 }\nextract = { pdf = \"p\" }\n";
+        let structure_on = structure_off.replace("structure = false\n\n", "");
+        assert_ne!(
+            fp_of(structure_off),
+            fp_of(&structure_on),
+            "structure rewrites chunks — the fingerprint MUST move"
+        );
         // dropping the extractor reference entirely
         let none = "[extractor.a]\nkind = \"txt\"\n\n[ingest.ddd]\nchunk = { kind = \
                     \"token-window\", size = 8, overlap = 2 }\n";
-        assert_ne!(fp_of(&base), fp_of(&none));
+        assert_ne!(fp_of(&base), fp_of(none));
         // M3-T3: the pdf-pages dpi knob enters the fingerprint naturally —
         // it serializes with the instance config (chunk identity: the same
         // page at 150 and 300 dpi is different image bytes), so two

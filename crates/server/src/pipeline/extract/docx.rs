@@ -126,6 +126,7 @@ impl Extractor for DocxExtractor {
             image: None,
             labels: Vec::new(),
             pages: Vec::new(),
+            real_lines: false,
             furniture_removed: 0,
             section: None,
         }])

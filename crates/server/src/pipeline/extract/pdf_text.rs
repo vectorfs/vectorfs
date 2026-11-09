@@ -269,6 +269,10 @@ impl Extractor for PdfTextExtractor {
             image: None,
             labels,
             pages: page_table,
+            // the multi-page part's '\n' lines are the text-layer JOIN's
+            // artifact (伪结构), not structure the engine declared — the
+            // D-7 mutual exclusion keeps holding for this part (裁决 3)
+            real_lines: false,
             furniture_removed,
             section: None,
         }])

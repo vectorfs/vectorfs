@@ -59,12 +59,12 @@ use eml::{EmlConfig, EmlExtractor};
 use epub::{EpubConfig, EpubExtractor};
 use html::{HtmlConfig, HtmlExtractor};
 use image::{ImageConfig, ImageExtractor};
-use md::{MdConfig, MdExtractor};
+use md::{MdConfig, MdExtractor, MdTag};
 use pdf_inspector::{PdfInspectorConfig, PdfInspectorExtractor};
 use pdf_ocr::{PdfOcrConfig, PdfOcrExtractor};
 use pdf_pages::{PdfPagesConfig, PdfPagesExtractor};
 use pdf_text::{PdfTextConfig, PdfTextExtractor};
-use txt::{TxtConfig, TxtExtractor};
+use txt::{TxtConfig, TxtExtractor, TxtTag};
 use zip::{ZipConfig, ZipExtractor};
 
 /// Canonical mime -> config short key, one row per declared mime. ORDER
@@ -143,6 +143,47 @@ pub fn mime_for_short_key(key: &str) -> Option<&'static str> {
         .iter()
         .find(|(_, k)| *k == key)
         .map(|(mime, _)| *mime)
+}
+
+/// The `auto` mapping's default extractor KIND per short key (kept in lock
+/// step with [`MIME_TO_SHORT_KEY`]) — ONE source of truth beside the table,
+/// consumed by BOTH faces that must never drift: the ingest router's
+/// `resolve_chain` (runtime routing) and the pipeline FINGERPRINT
+/// (`config::pipeline_fingerprint` expands every `auto` route through this
+/// arm, the 2026-11-09 adjudication — the auto bucket and an equal-value
+/// explicit bucket must derive the same digest). `pdf` deliberately stays
+/// `pdf-text` even though three further PDF kinds (`pdf-inspector`,
+/// `pdf-pages` since M3-T3, `pdf-ocr` since M3-T10) exist: pdfium text
+/// extraction is the battle-tested path and `auto` is an OPINIONATED
+/// default — a new kind landing must not silently re-route every
+/// `extract = { default = "auto" }` deployment (image-output `pdf-pages`
+/// doubly so: it would change the pipeline's modality needs). The `img`
+/// family (M3-T4) stays OUT of `auto` for exactly that second reason: an
+/// auto arm would make every existing `auto` deployment start claiming
+/// image files into pipelines whose embedders are text-only. The M3-T6
+/// text-face families (`docx`, `html`) stay OUT for the behavior-expansion
+/// half of the same ruling: an auto arm would make existing `auto`
+/// deployments START claiming .docx/.html files overnight — text modality
+/// or not, what a pipeline ingests is the operator's declaration. The
+/// M3-T7 CONTAINER families (`epub`, `zip`, `eml`) stay OUT for BOTH
+/// halves at once: an auto arm would make every `auto` deployment start
+/// claiming AND EXPANDING archives overnight — containers re-route
+/// children through the user's chains, so silently adding them is a
+/// behavior expansion with a fan-out the operator never declared.
+/// Deployments that want the classify-first, no-.so engine, the page-image
+/// route, image files, the text face or the containers opt in explicitly
+/// (`extract = { pdf = "pdf-inspector-instance" }`, `pdf =
+/// "pages-instance"`, `img = "image-instance"`, `docx = "…"/`html = "…"`,
+/// `epub = "…"/`zip = "…"/`eml = "…"`). `auto` stays a single-member
+/// chain: whether it should become a built-in chain (pdf → pdf-inspector →
+/// pdf-text, say) is an unresolved M3+ ruling.
+pub fn builtin_extractor(short_key: &str) -> Option<ExtractorKind> {
+    match short_key {
+        "pdf" => Some(ExtractorKind::PdfText(PdfTextConfig::default())),
+        "md" => Some(ExtractorKind::Md(MdConfig { kind: MdTag::Md })),
+        "txt" => Some(ExtractorKind::Txt(TxtConfig { kind: TxtTag::Txt })),
+        _ => None,
+    }
 }
 
 /// file-name EXTENSION -> short key, the extension-side view of the same

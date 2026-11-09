@@ -319,6 +319,18 @@ pub struct Part {
     /// does NOT consume it in T12's foundation slice — it rides along so
     /// T13's window-coordinate stamping needs no second Part operation.
     pub pages: Vec<(u32, usize)>,
+    /// Extractor DECLARATION channel (2026-11-09 尾巴裁决 3, the D-7
+    /// refinement): this part's `'\n'` lines are REAL structure, not
+    /// extraction pseudo-structure. pdf-text joins a text layer whose line
+    /// boundaries are an artifact of the extraction (伪结构) — such parts
+    /// keep the D-7 mutual exclusion (page table present ⇒ page keys, no
+    /// line keys). pdf-ocr instead emits the recognition engine's own
+    /// explicit line outputs, one single-page part per page (真结构) — it
+    /// sets `real_lines` alongside its page table and the chunker stamps
+    /// BOTH coordinates (页键 + 行键并存, see `chunk::windowing::Coords`).
+    /// Default `false`: every existing producer keeps the T13 fork
+    /// byte-for-byte.
+    pub real_lines: bool,
     /// Furniture-removal audit count (T12): how many lines THIS extractor
     /// dropped as cross-page furniture (headers/footers/copyright straps).
     /// Default 0 — the pre-T12 producers and every non-PDF kind remove
@@ -425,6 +437,7 @@ impl Part {
             image: None,
             labels: Vec::new(),
             pages: Vec::new(),
+            real_lines: false,
             furniture_removed: 0,
             section: None,
         }
@@ -446,6 +459,7 @@ impl Part {
             }),
             labels: Vec::new(),
             pages: Vec::new(),
+            real_lines: false,
             furniture_removed: 0,
             section: None,
         }
@@ -510,20 +524,27 @@ pub struct Chunk {
     /// window straddling a page boundary reports both pages, and the
     /// mandated overlap makes consecutive windows' intervals overlap
     /// HONESTLY (跨窗区间如实重叠, D-7 — no dedup, no shrinking). `Some` iff
-    /// the source part carried a page-offset table ([`Part::pages`], the
-    /// D-7 fork: pages present ⇒ page keys and NO line keys); `None` for
-    /// pageless sources and atomic image chunks.
+    /// the source part carried a page-offset table ([`Part::pages`]); the
+    /// D-7 fork (refined 2026-11-09, 裁决 3) then decides the LINE arm:
+    /// lines are pseudo-structure (multi-page pdf-text parts) ⇒ NO line
+    /// keys, lines are real structure ([`Part::real_lines`], pdf-ocr's
+    /// single-page parts) ⇒ line keys TOO. `None` for pageless sources and
+    /// atomic image chunks.
     pub page: Option<(u32, u32)>,
     /// Content-addressing LINE interval (T13): the inclusive 1-based line
     /// range — `1 + '\n' count before the window's first char` to
     /// `1 + '\n' count before the window's exclusive end` (a window ending
     /// in a '\n' carries that break, so its end is the line the break
     /// OPENS — the boundary semantics `chunk::windowing::Coords` pins).
-    /// The D-7 fork's other arm: `Some` iff the part carried NO page
-    /// table. Line numbers count within the part's own text (container
-    /// children restart at line 1 — never across parts); md-sourced line
-    /// numbers address the EXTRACTED text (the md kind strips heading
-    /// markers), a product-domain caveat the CLI notes.
+    /// The D-7 fork's other arm: `Some` for a pageless part (no page
+    /// concept ⇒ 行键) OR for a paged part that declared its lines real
+    /// structure (`real_lines`, the 2026-11-09 refinement — pdf-ocr's
+    /// 页键+行键并存); `None` only for paged parts whose lines are
+    /// extraction pseudo-structure (multi-page pdf-text) and for atomic
+    /// image chunks. Line numbers count within the part's own text
+    /// (container children restart at line 1 — never across parts);
+    /// md-sourced line numbers address the EXTRACTED text (the md kind
+    /// strips heading markers), a product-domain caveat the CLI notes.
     pub line: Option<(u32, u32)>,
     /// Content-addressing SECTION ordinal (T13): the container-child
     /// position this chunk's part came from (1-based, ingest order),

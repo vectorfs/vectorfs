@@ -143,8 +143,9 @@ impl Chunker for MarkdownChunker {
             // T13 coordinates — identical wiring to token-window (the
             // shared windowing seam is the point: both kinds derive forced
             // endpoints, window kinds AND addressing coordinates from the
-            // same tables, only their cut ORACLE differs)
-            let coords = windowing::Coords::new(&part.text, &part.pages);
+            // same tables, only their cut ORACLE differs); the D-7-refined
+            // dual channel rides the part's real_lines declaration
+            let coords = windowing::Coords::new(&part.text, &part.pages, part.real_lines);
             for (s, e) in ranges {
                 let (page, line) = coords.window(s, e);
                 out.push(Chunk {
@@ -175,6 +176,7 @@ mod tests {
             image: None,
             labels: Vec::new(),
             pages: Vec::new(),
+            real_lines: false,
             furniture_removed: 0,
             section: None,
         }])
@@ -288,6 +290,7 @@ mod tests {
             image: None,
             labels: Vec::new(),
             pages: Vec::new(),
+            real_lines: false,
             furniture_removed: 0,
             section: Some(2),
         };
