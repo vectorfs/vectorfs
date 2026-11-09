@@ -125,6 +125,7 @@ impl Extractor for HtmlExtractor {
             labels: Vec::new(),
             pages: Vec::new(),
             furniture_removed: 0,
+            section: None,
         }])
     }
 }

@@ -916,9 +916,16 @@ fn search_filter(
 ///   fused hit has no single distance);
 /// * `index`/`key` — derived index name + chunk key; attribution is the
 ///   FIRST route (config order) containing the key when several do;
-/// * `location{type:"source", key}` — `key` = the full object key
-///   (`x-vf-src-name`) — the回源 join. `page?` is M3+ (pdf page images);
-/// * `metadata` — the chunk's stored metadata verbatim.
+/// * `location{type:"source", key, coord?}` — `key` = the full object key
+///   (`x-vf-src-name`) — the回源 join; `coord` (T13, D-6/D-7) is the
+///   addressing summary distilled from the stored coordinate keys —
+///   `{page?:{start,end}, line?:{start,end}, section?}`, a member present
+///   only when the chunk carries that unit (pdf ⇒ page, pageless ⇒ line,
+///   container children ⇒ section), `coord` itself omitted when the chunk
+///   carries none. The appendix E.2 `page?` hook this supersedes;
+/// * `metadata` — the chunk's stored metadata verbatim (the protocol face
+///   needs no coord member: QueryVectors returns this same metadata, which
+///   already carries the `x-vf-*` coordinate keys).
 pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Response, ApiError> {
     let input: SearchInput = parse_body(&body)?;
     let handle = require_ingest(&state, &input.bucket)?;
@@ -1336,10 +1343,35 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
                 o["distance"] = json!(distance);
             }
             if let Some(m) = &metadata {
-                o["location"] = json!({
+                let mut location = json!({
                     "type": "source",
                     "key": m.get("x-vf-src-name").cloned().unwrap_or(serde_json::Value::Null),
                 });
+                // T13 coord summary (D-6): distilled from the STORED
+                // coordinate keys, a member only when the chunk carries
+                // that unit; `coord` itself only when any member exists.
+                // Both pair members are read together or not at all (the
+                // stamper always writes start+end in one insert).
+                let interval = |start: &str, end: &str| -> Option<serde_json::Value> {
+                    Some(json!({
+                        "start": m.get(start)?.as_u64()?,
+                        "end": m.get(end)?.as_u64()?,
+                    }))
+                };
+                let mut coord = serde_json::Map::new();
+                if let Some(page) = interval("x-vf-page-start", "x-vf-page-end") {
+                    coord.insert("page".into(), page);
+                }
+                if let Some(line) = interval("x-vf-line-start", "x-vf-line-end") {
+                    coord.insert("line".into(), line);
+                }
+                if let Some(section) = m.get("x-vf-section").and_then(serde_json::Value::as_u64) {
+                    coord.insert("section".into(), json!(section));
+                }
+                if !coord.is_empty() {
+                    location["coord"] = serde_json::Value::Object(coord);
+                }
+                o["location"] = location;
                 o["metadata"] = m.clone();
             }
             o
@@ -2261,6 +2293,220 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
         assert_eq!(b["fieldList"][0]["path"], json!("topK"));
+    }
+
+    /// T13 LINE coordinates end to end on a pageless source (the `nl` 对拍
+    /// spirit): a known-lines txt is ingested through the real worker, and
+    /// every hit's `location.coord.line` (a) matches its stored metadata
+    /// keys, (b) numbers within the file's real line count, and (c) the
+    /// window holding line 3's unique phrase reports an interval CONTAINING
+    /// 3 — what `nl` would number it. Page/section members stay absent
+    /// (D-7: one addressing unit per source).
+    #[tokio::test]
+    async fn search_coord_line_summary_txt() {
+        let f = fixture().await;
+        // five known lines; the needle phrase rides line 3
+        let text = "line one alpha words\n\
+                    line two beta words follow here\n\
+                    line three gamma carries the needle phrase\n\
+                    line four delta words continue on\n\
+                    line five epsilon the closing words\n";
+        put_source_call(&f, "docs", "docs/lines.txt", text.as_bytes().to_vec()).await;
+        drive(&f).await;
+
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"words"},"topK":50}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        assert!(hits.len() >= 2, "32/8 windows over 5 lines: {b}");
+        for h in hits {
+            let coord = &h["location"]["coord"];
+            let (ls, le) = (
+                coord["line"]["start"].as_u64().expect("line.start"),
+                coord["line"]["end"].as_u64().expect("line.end"),
+            );
+            // (a) the summary mirrors the stored metadata verbatim
+            let m = &h["metadata"];
+            assert_eq!(m["x-vf-line-start"].as_u64(), Some(ls), "{h}");
+            assert_eq!(m["x-vf-line-end"].as_u64(), Some(le), "{h}");
+            // (b) within the file's 5 lines — the end may exceed the last
+            // content line by ONE: a window ending in '\n' honestly
+            // includes the line the break OPENS (the pinned end
+            // semantics; the window "…closing words\n" reports (5,6))
+            assert!(1 <= ls && ls <= le && le <= 6, "({ls},{le}): {h}");
+            // (d) the D-7 fork: no page, no section member at all
+            assert!(coord.get("page").is_none(), "{h}");
+            assert!(coord.get("section").is_none(), "{h}");
+            assert!(m.get("x-vf-page-start").is_none(), "{h}");
+        }
+        // (c) the nl 对拍 witness: the needle window covers line 3
+        let holder = hits
+            .iter()
+            .find(|h| {
+                h["content"]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("needle"))
+            })
+            .expect("some hit covers line 3");
+        let (ls, le) = (
+            holder["location"]["coord"]["line"]["start"]
+                .as_u64()
+                .unwrap(),
+            holder["location"]["coord"]["line"]["end"].as_u64().unwrap(),
+        );
+        assert!(
+            ls <= 3 && 3 <= le,
+            "({ls},{le}) must contain line 3: {holder}"
+        );
+    }
+
+    /// The pdf+txt pipeline for the PAGE-coordinate e2e (the real pdfium
+    /// `.so` through the whole worker — the same dependency the golden
+    /// corpus already makes mandatory for this suite).
+    fn pdf_txt_config() -> crate::pipeline::config::PipelineConfig {
+        let text = format!(
+            "[extractor.plain]\nkind = \"txt\"\n\n\
+             [extractor.pdfs]\nkind = \"pdf-text\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = true\n\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ txt = \"plain\", pdf = \"pdfs\" }}\n\
+             chunk = {{ kind = \"token-window\", size = 64, overlap = 16 }}\n\
+             embedders = [\"tiny\"]\nscan_interval_secs = 1\n",
+            fixture_dir().display().to_string()
+        );
+        crate::pipeline::config::load_pipeline_config(&text).unwrap()
+    }
+
+    /// T13 PAGE coordinates end to end (pdfium, real worker) + the range
+    /// and existence FILTERS over them: a 5-page PDF and a txt share one
+    /// index; the pdf hits carry page intervals (no line keys — D-7), the
+    /// txt hits line intervals; `$gte/$lte` narrows to a page window and
+    /// out-of-range is ZERO hits; `$exists` separates the two formats.
+    #[tokio::test]
+    async fn search_coord_page_range_and_exists_filters() {
+        let f = fixture_with(pdf_txt_config()).await;
+        // 5 pages, each unique (no furniture repetition, no TOC shape —
+        // no trailing digit columns), each long enough to straddle windows
+        let esc = |s: &str| {
+            s.replace('\\', "\\\\")
+                .replace('(', "\\(")
+                .replace(')', "\\)")
+        };
+        let pages: Vec<Vec<String>> = (0..5)
+            .map(|i| {
+                vec![
+                    esc(&format!(
+                        "coord header unique words for page {i} of the set"
+                    )),
+                    esc(&format!(
+                        "body prose {i} lorem ipsum dolor sit amet consectetur adipiscing"
+                    )),
+                    esc(&format!(
+                        "closing prose {i} quis nostrud exercitation ullamco"
+                    )),
+                ]
+            })
+            .collect();
+        let pdf_bytes = crate::pipeline::extract::pdf_inspector::tests::build_t12_pdf(pages);
+        put_source_call(&f, "docs", "docs/paper.pdf", pdf_bytes).await;
+        put_source_call(
+            &f,
+            "docs",
+            "docs/plain.txt",
+            b"plain prose words in the text file companion\n".to_vec(),
+        )
+        .await;
+        drive(&f).await;
+        // both sources landed
+        let (st, _, b) = call_json(&f, "/x-vf/GetIngestStatus", json!({"bucket":"docs"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+
+        let search = |filter: serde_json::Value| {
+            let f = &f;
+            async move {
+                let (st, _, b) = call_json(
+                    f,
+                    "/x-vf/Search",
+                    json!({"bucket":"docs","query":{"text":"prose"},"topK":100,"filter":filter}),
+                )
+                .await;
+                assert_eq!(st, StatusCode::OK, "{b}");
+                b
+            }
+        };
+
+        // ---- unfiltered: both formats, each with ITS unit (D-7) ----
+        let b = search(json!({})).await;
+        let hits = b["hits"].as_array().unwrap();
+        assert!(hits.len() >= 3, "{b}");
+        let mut pdf_pages_seen = std::collections::BTreeSet::new();
+        for h in hits {
+            let key = h["location"]["key"].as_str().unwrap();
+            let coord = &h["location"]["coord"];
+            let m = &h["metadata"];
+            if key.ends_with(".pdf") {
+                let (ps, pe) = (
+                    coord["page"]["start"].as_u64().expect("pdf page.start"),
+                    coord["page"]["end"].as_u64().expect("pdf page.end"),
+                );
+                assert_eq!(m["x-vf-page-start"].as_u64(), Some(ps), "{h}");
+                assert_eq!(m["x-vf-page-end"].as_u64(), Some(pe), "{h}");
+                assert!(1 <= ps && ps <= pe && pe <= 5, "({ps},{pe}): {h}");
+                assert!(
+                    coord.get("line").is_none(),
+                    "pdf carries no line keys (D-7): {h}"
+                );
+                assert!(m.get("x-vf-line-start").is_none(), "{h}");
+                pdf_pages_seen.insert(ps);
+            } else {
+                assert!(
+                    coord["line"]["start"].as_u64().is_some(),
+                    "txt carries line keys: {h}"
+                );
+                assert!(coord.get("page").is_none(), "{h}");
+            }
+        }
+        assert!(
+            pdf_pages_seen.len() >= 3,
+            "windows must land on several pages: {pdf_pages_seen:?} in {b}"
+        );
+
+        // ---- $gte/$lte page window: only chunks OPENING on pages 3..4 ----
+        let b = search(json!({"x-vf-page-start": {"$gte": 3, "$lte": 4}})).await;
+        let hits = b["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "{b}");
+        for h in hits {
+            assert!(
+                h["location"]["key"].as_str().unwrap().ends_with(".pdf"),
+                "{h}"
+            );
+            let ps = h["location"]["coord"]["page"]["start"].as_u64().unwrap();
+            assert!((3..=4).contains(&ps), "{h}");
+        }
+        // out-of-range: ZERO hits, not an error, not a silent all
+        let b = search(json!({"x-vf-page-start": {"$gte": 99}})).await;
+        assert_eq!(b["hits"].as_array().unwrap().len(), 0, "{b}");
+
+        // ---- $exists separates the formats (pdf has page keys, txt not) ----
+        let b = search(json!({"x-vf-page-start": {"$exists": true}})).await;
+        let hits = b["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "{b}");
+        assert!(
+            hits.iter()
+                .all(|h| h["location"]["key"].as_str().unwrap().ends_with(".pdf")),
+            "{b}"
+        );
+        let b = search(json!({"x-vf-page-start": {"$exists": false}})).await;
+        let hits = b["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "{b}");
+        assert!(
+            hits.iter()
+                .all(|h| h["location"]["key"].as_str().unwrap().ends_with(".txt")),
+            "{b}"
+        );
     }
 
     /// T12 kind governance over the wire (D-5 + the protocol m3/m5

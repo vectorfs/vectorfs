@@ -243,6 +243,7 @@ impl Extractor for PdfInspectorExtractor {
             labels,
             pages: Vec::new(),
             furniture_removed: 0,
+            section: None,
         }])
     }
 }

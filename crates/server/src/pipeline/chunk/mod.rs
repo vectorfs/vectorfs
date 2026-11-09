@@ -180,6 +180,24 @@ impl Chunker for ChunkerKind {
                         // kind (T12; the modality channel, not ChunkKind,
                         // is what routes image chunks)
                         kind: super::ChunkKind::Body,
+                        // T13 addressing: an atom has no text window, so
+                        // LINE coordinates are None by construction. PAGE
+                        // coordinates would come from the part's page
+                        // table — an atom covers every page its table
+                        // names (a whole-page render names one) — but NO
+                        // image extractor emits the table today (pdf-pages
+                        // renders page images without a Part.pages entry;
+                        // declared limitation, this path stays None until
+                        // one lands). SECTION rides the orchestration
+                        // channel like any text part (a container's image
+                        // child is still a child).
+                        page: part
+                            .pages
+                            .first()
+                            .zip(part.pages.last())
+                            .map(|(f, l)| (f.0, l.0)),
+                        line: None,
+                        section: part.section,
                     });
                     next_index += 1;
                     run_start = i + 1;
@@ -404,6 +422,37 @@ mod tests {
             ChunkerKind::Markdown(_) => unreachable!("kind() builds token-window"),
         };
         assert_eq!(via_axis, direct);
+    }
+
+    /// T13: the image atom's addressing — line None BY CONSTRUCTION (no
+    /// text window), page None while no image extractor emits a page table
+    /// (pdf-pages renders page images without one — declared limitation at
+    /// the bypass), and the section channel riding along like any part's
+    /// (a container's image child is still a child). A hypothetical future
+    /// table names the atom's whole page span.
+    #[test]
+    fn image_atoms_carry_no_text_coordinates_but_keep_their_section() {
+        let k = kind(8, 2);
+        let mut part = png_part("image/png");
+        part.section = Some(3);
+        let out = k.chunk(&[part, Part::text("tail text")]).unwrap();
+        assert_eq!(out[0].modality(), Modality::Image);
+        assert_eq!(out[0].page, None, "no extractor page table today");
+        assert_eq!(out[0].line, None, "an atom has no text window");
+        assert_eq!(out[0].section, Some(3), "orchestration channel rides along");
+        // the text windows after the atom keep their own (pageless) line keys
+        assert_eq!(out[1].page, None);
+        assert_eq!(out[1].line, Some((1, 1)));
+        // and a future page-bearing image part would name its whole span:
+        // one page table entry ⇒ the single page, two ⇒ first..last
+        let mut paged = png_part("image/png");
+        paged.pages = vec![(7, 0)];
+        let out = k.chunk(&[paged]).unwrap();
+        assert_eq!(out[0].page, Some((7, 7)));
+        let mut two = png_part("image/png");
+        two.pages = vec![(2, 0), (3, 0)];
+        let out = k.chunk(&[two]).unwrap();
+        assert_eq!(out[0].page, Some((2, 3)));
     }
 
     #[test]

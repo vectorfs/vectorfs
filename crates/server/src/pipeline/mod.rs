@@ -328,6 +328,17 @@ pub struct Part {
     /// This slice only PRODUCES the count; the ingest-status consumer is
     /// the later T12 slice.
     pub furniture_removed: usize,
+    /// Container-section ordinal (T13, the ORCHESTRATION source of the
+    /// coordinate triad — ADR 0005): the 1-based position of the container
+    /// child this part came from, stamped by the ingest container walk
+    /// ([`crate::ingest`]'s `run_member`) — NOT by any extractor. `None`
+    /// is the ordinary value: leaf documents have no container, and
+    /// extractors never touch the field. Unlike the annotation channels
+    /// above it is a genuine `Option` (absence is the norm for every
+    /// non-child source, not an "empty annotation"), and the stamping
+    /// order rule is documented at the stamping site (an outer container
+    /// stamps last and wins over an inner walk's numbering).
+    pub section: Option<u32>,
 }
 
 /// One structural label over a [`Part`]'s text (T12): a BYTE range plus its
@@ -415,6 +426,7 @@ impl Part {
             labels: Vec::new(),
             pages: Vec::new(),
             furniture_removed: 0,
+            section: None,
         }
     }
 
@@ -435,6 +447,7 @@ impl Part {
             labels: Vec::new(),
             pages: Vec::new(),
             furniture_removed: 0,
+            section: None,
         }
     }
 }
@@ -492,6 +505,31 @@ pub struct Chunk {
     /// byte-compatible in the `Chunk::modality` sense: equality on old
     /// fixtures changes only by the uniformly-added field.
     pub kind: ChunkKind,
+    /// Content-addressing PAGE interval (T13, ADR 0005): the INCLUSIVE
+    /// 1-based page range the window's chars cover, `(start, end)` — a
+    /// window straddling a page boundary reports both pages, and the
+    /// mandated overlap makes consecutive windows' intervals overlap
+    /// HONESTLY (跨窗区间如实重叠, D-7 — no dedup, no shrinking). `Some` iff
+    /// the source part carried a page-offset table ([`Part::pages`], the
+    /// D-7 fork: pages present ⇒ page keys and NO line keys); `None` for
+    /// pageless sources and atomic image chunks.
+    pub page: Option<(u32, u32)>,
+    /// Content-addressing LINE interval (T13): the inclusive 1-based line
+    /// range — `1 + '\n' count before the window's first char` to
+    /// `1 + '\n' count before the window's exclusive end` (a window ending
+    /// in a '\n' carries that break, so its end is the line the break
+    /// OPENS — the boundary semantics `chunk::windowing::Coords` pins).
+    /// The D-7 fork's other arm: `Some` iff the part carried NO page
+    /// table. Line numbers count within the part's own text (container
+    /// children restart at line 1 — never across parts); md-sourced line
+    /// numbers address the EXTRACTED text (the md kind strips heading
+    /// markers), a product-domain caveat the CLI notes.
+    pub line: Option<(u32, u32)>,
+    /// Content-addressing SECTION ordinal (T13): the container-child
+    /// position this chunk's part came from (1-based, ingest order),
+    /// passed through untouched from [`Part::section`] (the orchestration
+    /// source — extractors never set it). `None` for every leaf source.
+    pub section: Option<u32>,
 }
 
 impl Chunk {
@@ -1214,6 +1252,10 @@ mod tests {
             Part::image("image/png", Vec::<u8>::new()).furniture_removed,
             0
         );
+        // T13: the orchestration channel opens None (a leaf source has no
+        // container section; only the ingest walk stamps it)
+        assert_eq!(Part::text("x").section, None);
+        assert_eq!(Part::image("image/png", Vec::<u8>::new()).section, None);
     }
 
     #[test]
@@ -1223,6 +1265,9 @@ mod tests {
             text: "window".to_string(),
             image: None,
             kind: ChunkKind::Body,
+            page: None,
+            line: None,
+            section: None,
         };
         let atomic = Chunk {
             index: 1,
@@ -1232,6 +1277,9 @@ mod tests {
                 mime: "image/png".to_string(),
             }),
             kind: ChunkKind::Body,
+            page: None,
+            line: None,
+            section: None,
         };
         assert_eq!(text_window.modality(), Modality::Text);
         assert_eq!(atomic.modality(), Modality::Image);

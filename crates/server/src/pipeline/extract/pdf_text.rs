@@ -270,6 +270,7 @@ impl Extractor for PdfTextExtractor {
             labels,
             pages: page_table,
             furniture_removed,
+            section: None,
         }])
     }
 }

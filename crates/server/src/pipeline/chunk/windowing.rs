@@ -148,6 +148,22 @@ pub(super) fn ranges(
 // the T12 label view (byte-anchored labels → char-domain recurrence input)
 // ---------------------------------------------------------------------------
 
+/// Byte offset of each char's start (`boundaries[0] = 0` always) — the
+/// byte→char conversion base shared by [`LabelView`] (T12 labels) and
+/// [`Coords`] (T13 page offsets): extractor annotations are BYTE-anchored,
+/// the window recurrence is CHAR-indexed, and the conversion duty is the
+/// chunker's (D-1: "字节锚定，chunker 统一换算 char 域——windowing 的 CJK 防线").
+fn char_boundaries(text: &str) -> Vec<usize> {
+    text.char_indices().map(|(b, _)| b).collect()
+}
+
+/// Char index of the char CONTAINING `byte` (largest boundary ≤ byte), the
+/// floor direction of the conversion. Never panics: `boundaries[0] = 0`
+/// keeps partition_point ≥ 1. Callers clamp to their own char_len.
+fn floor_char(boundaries: &[usize], byte: usize) -> usize {
+    boundaries.partition_point(|&b| b <= byte) - 1
+}
+
 /// One part's structural labels converted ONCE into the CHAR domain the
 /// window recurrence works in (T12). [`LabelSpan`] offsets are BYTE offsets
 /// into `Part::text`; windows are CHAR indices. The conversion duty is the
@@ -180,20 +196,15 @@ impl LabelView {
         }
         // Prefix table: `boundaries[i]` = byte offset where char i starts
         // (boundaries[0] = 0 always). byte→char is then one binary search.
-        let boundaries: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+        let boundaries = char_boundaries(text);
         let char_len = boundaries.len();
-        let floor_char = |byte: usize| -> usize {
-            // char index of the char CONTAINING `byte` (largest boundary
-            // ≤ byte); partition_point ≥ 1 because boundaries[0] = 0.
-            boundaries.partition_point(|&b| b <= byte) - 1
-        };
         let ceil_char = |byte: usize| -> usize {
             // char index of the first char STARTING at/after `byte`
             boundaries.partition_point(|&b| b < byte)
         };
         let mut spans = Vec::with_capacity(labels.len());
         for label in labels {
-            let start = floor_char(label.range.start).min(char_len);
+            let start = floor_char(&boundaries, label.range.start).min(char_len);
             let end = ceil_char(label.range.end).min(char_len);
             if start < end {
                 spans.push((start..end, label.kind));
@@ -241,6 +252,119 @@ impl LabelView {
             }
         }
         agreed.unwrap_or(super::super::ChunkKind::Body)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the T13 coordinate table (page offsets / newline lattice, char domain)
+// ---------------------------------------------------------------------------
+
+/// One part's ADDRESSING coordinates, precomputed once in the CHAR domain
+/// the recurrence works in (T13, ADR 0005): the page interval a window
+/// covers (from the extractor's byte-anchored [`super::super::Part::pages`]
+/// table) or, for pageless sources, the line interval (from the `'\n'`
+/// lattice).
+///
+/// The **D-7 fork is decided here, per part**: a part carrying a page-offset
+/// table reports PAGE intervals and never line intervals; a pageless part
+/// reports LINE intervals and never page intervals (无页概念格式 ⇒ 行键) —
+/// one source, one addressing unit, so downstream stamping and `$exists`
+/// filtering never see a mixed vocabulary on one chunk. Page offsets
+/// convert byte→char through the same prefix table as [`LabelView`] (the
+/// extractor anchors in bytes, the recurrence indexes chars); newline
+/// counting needs no conversion at all — `'\n'` is a single-byte char, so
+/// the newline count of any char prefix equals that of its byte prefix
+/// (the char/byte isomorphism the T13 design verified, 无陷阱).
+///
+/// One INCLUSIVE 1-based addressing interval (a page pair or a line pair
+/// — both ends are the unit's numbers, never offsets).
+type Interval = (u32, u32);
+
+pub(super) enum Coords {
+    /// The part carries a page-offset table: `(char index where the page's
+    /// kept text begins, 1-based page number)`, sorted — by char index,
+    /// ties by page number, so the LAST entry at one offset names the
+    /// HIGHEST page (an empty page shares its offset with the successor;
+    /// a window touching that boundary honestly reports the higher page).
+    Paged(Vec<(usize, u32)>),
+    /// Pageless part: the char indices of every `'\n'`, ascending.
+    Lined(Vec<usize>),
+}
+
+impl Coords {
+    /// Build the table for one part: `pages` empty ⇒ the Lined fork (D-7).
+    pub(super) fn new(text: &str, pages: &[(u32, usize)]) -> Self {
+        if pages.is_empty() {
+            let mut newlines = Vec::new();
+            for (i, (_, c)) in text.char_indices().enumerate() {
+                if c == '\n' {
+                    newlines.push(i);
+                }
+            }
+            return Coords::Lined(newlines);
+        }
+        // page offsets are BYTES, the recurrence is CHARS — convert through
+        // the shared prefix table (floor into the containing char: a
+        // malformed mid-glyph offset degrades to the nearest representable
+        // page start, the LabelView clamping discipline). An offset AT or
+        // PAST the text end clamps to char_len — a position no window char
+        // reaches, so an empty trailing page never wins a window (a
+        // malformed past-the-end table entry is inert, not the owner of the
+        // last char). Then sort so the lookups below can binary-search
+        // (ties keep the higher page last, by the tuple sort).
+        let boundaries = char_boundaries(text);
+        let char_len = boundaries.len();
+        let mut starts: Vec<(usize, u32)> = pages
+            .iter()
+            .map(|&(page, byte)| {
+                let c = if byte >= text.len() {
+                    char_len
+                } else {
+                    floor_char(&boundaries, byte)
+                };
+                (c, page)
+            })
+            .collect();
+        starts.sort_unstable();
+        Coords::Paged(starts)
+    }
+
+    /// The window `[s, e)`'s coordinates: `(page?, line?)` — both ends
+    /// INCLUSIVE in the emitted unit, and per the D-7 fork exactly one arm
+    /// is `Some`.
+    ///
+    /// **Page semantics**: start = the page containing the window's FIRST
+    /// char, end = the page containing its LAST char (`e - 1` — a window
+    /// ending exactly at the next page's opening offset has not read that
+    /// page). A straddling window reports both pages, and the mandated
+    /// overlap makes consecutive windows' intervals overlap HONESTLY
+    /// (跨窗区间如实重叠, D-7 — no dedup).
+    ///
+    /// **Line semantics**: `line_at(x) = 1 + '\n' count strictly before x`.
+    /// Start = `line_at(s)`; END = `line_at(e)` — the exclusive boundary,
+    /// deliberately not `line_at(e-1)`: a window ending in a `'\n'` carries
+    /// that line break, and its interval honestly includes the line the
+    /// break OPENS (the editor-selection convention; the boundary unit
+    /// tests pin both edges).
+    pub(super) fn window(&self, s: usize, e: usize) -> (Option<Interval>, Option<Interval>) {
+        debug_assert!(e > s, "windows are non-empty by the recurrence");
+        match self {
+            Coords::Paged(starts) => {
+                // page of char x: the LAST page whose start ≤ x. A
+                // malformed table whose first entry starts past x degrades
+                // to that first page (saturating idx) — deterministic,
+                // never panics; in-tree producers always open at 0.
+                let page_at = |x: usize| -> u32 {
+                    let idx = starts.partition_point(|&(c, _)| c <= x);
+                    starts[idx.saturating_sub(1)].1
+                };
+                (Some((page_at(s), page_at(e - 1))), None)
+            }
+            Coords::Lined(newlines) => {
+                let line_at = |x: usize| -> u32 { 1 + newlines.partition_point(|&p| p < x) as u32 };
+                (None, Some((line_at(s), line_at(e))))
+            }
+        }
     }
 }
 
@@ -509,5 +633,127 @@ mod tests {
             ChunkKind::Body,
             "nested disagreement"
         );
+    }
+
+    // ---- Coords: the T13 coordinate table (page intervals, line
+    // intervals, the D-7 fork) ----
+
+    #[test]
+    fn coords_page_intervals_cover_windows_exactly() {
+        // 3 CJK-char pages of 2 chars each (3 bytes/char: page offsets are
+        // 0, 6, 12 — byte≠char everywhere except the start, exercising the
+        // conversion) + a trailing single-char page
+        let text = "一二三四五六七"; // chars 0..6, bytes 0..=18
+        let pages = [(1u32, 0usize), (2, 6), (3, 12), (4, 18)];
+        let coords = Coords::new(text, &pages);
+        // window wholly inside page 1: chars [0, 2)
+        assert_eq!(coords.window(0, 2), (Some((1, 1)), None));
+        // straddling the 1/2 boundary: chars [1, 3) — HONEST overlap, both
+        // pages reported (跨窗区间如实重叠)
+        assert_eq!(coords.window(1, 3), (Some((1, 2)), None));
+        // window ending exactly AT page 3's opening (char 4 = its first
+        // char... end-1 = 3, still page 2): [2, 4) covers page 2 only
+        assert_eq!(coords.window(2, 4), (Some((2, 2)), None));
+        // [3, 5) ends at char 4 = page 3's first char ⇒ (2, 3)
+        assert_eq!(coords.window(3, 5), (Some((2, 3)), None));
+        // the tail page: [5, 7) — last char 6 is page 4's only char
+        assert_eq!(coords.window(5, 7), (Some((3, 4)), None));
+        // whole text
+        assert_eq!(coords.window(0, 7), (Some((1, 4)), None));
+    }
+
+    #[test]
+    fn coords_page_table_degeneracies_are_honest_not_panicking() {
+        let text = "abcdefghij"; // ASCII: byte == char
+        // an EMPTY page shares its offset with the successor (a page whose
+        // every line was furniture): the HIGHER page owns the shared
+        // offset, and any interval reaching it spans the empty page
+        let coords = Coords::new(text, &[(1, 0), (2, 4), (3, 4), (4, 8)]);
+        assert_eq!(coords.window(2, 4), (Some((1, 1)), None));
+        assert_eq!(
+            coords.window(3, 5),
+            (Some((1, 3)), None),
+            "reaching the shared offset spans the empty page"
+        );
+        assert_eq!(
+            coords.window(4, 6),
+            (Some((3, 3)), None),
+            "higher page owns the shared offset"
+        );
+        assert_eq!(coords.window(4, 9), (Some((3, 4)), None));
+        // past-the-end / mid-glyph offsets clamp and floor (never panic,
+        // deterministic): a table whose tail offset is past the text end
+        // never wins a window (no char maps to it)
+        let coords = Coords::new(text, &[(1, 0), (2, 999)]);
+        assert_eq!(coords.window(0, 10), (Some((1, 1)), None));
+        // unsorted input with duplicate pages sorts into the same answers
+        let a = Coords::new(text, &[(3, 6), (1, 0), (2, 3)]);
+        let b = Coords::new(text, &[(1, 0), (2, 3), (3, 6)]);
+        for (s, e) in [(0, 3), (2, 5), (4, 8), (7, 10)] {
+            assert_eq!(a.window(s, e), b.window(s, e), "sorting is internal");
+        }
+    }
+
+    #[test]
+    fn coords_line_intervals_pin_both_newline_boundaries() {
+        // chars: a0 b1 \n2 c3 d4 \n5 e6 f7 — three lines
+        let text = "ab\ncd\nef";
+        let coords = Coords::new(text, &[]);
+        // window exactly one line: [3, 5) = "cd" ⇒ (2, 2)
+        assert_eq!(coords.window(3, 5), (None, Some((2, 2))));
+        // window OPENING right after a '\n' (the s-at-line-start boundary):
+        // start counts only the break BEFORE it — line 2, not 3
+        assert_eq!(coords.window(3, 4), (None, Some((2, 2))));
+        // window ENDING in a '\n': [3, 6) = "cd\n" ⇒ end = line_at(6) = 3
+        // — the window carries the break, its interval includes the line
+        // the break OPENS (the pinned end semantics)
+        assert_eq!(coords.window(3, 6), (None, Some((2, 3))));
+        // first window from the very start
+        assert_eq!(coords.window(0, 2), (None, Some((1, 1))));
+        // whole text: starts line 1, ends at line_at(8) = 3
+        assert_eq!(coords.window(0, 8), (None, Some((1, 3))));
+        // no newlines at all: every window is line 1
+        let coords = Coords::new("abcdef", &[]);
+        assert_eq!(coords.window(0, 6), (None, Some((1, 1))));
+        // CJK: '\n' counting is char/byte isomorphic — 汉字 are 3 bytes
+        // each, the '\n' positions in the CHAR domain are what line_at
+        // reads (a window's lines are identical under either anchoring)
+        let text = "汉字\n第二行\n第三行";
+        let coords = Coords::new(text, &[]);
+        assert_eq!(
+            coords.window(0, 3),
+            (None, Some((1, 2))),
+            "ends in the first break"
+        );
+        assert_eq!(
+            coords.window(3, 7),
+            (None, Some((2, 3))),
+            "carries the second break"
+        );
+        assert_eq!(
+            coords.window(3, 6),
+            (None, Some((2, 2))),
+            "inside line 2, no break"
+        );
+        assert_eq!(coords.window(0, text.chars().count()), (None, Some((1, 3))));
+    }
+
+    #[test]
+    fn coords_d7_fork_is_one_channel_per_part() {
+        // a paged part NEVER yields line coordinates, a pageless part never
+        // yields page coordinates — the fork is per part (D-7), whatever
+        // the window shape
+        let paged = Coords::new("page one\n\nmore", &[(1, 0), (2, 10)]);
+        for (s, e) in [(0, 4), (7, 12), (0, 15)] {
+            let (page, line) = paged.window(s, e);
+            assert!(page.is_some(), "paged part reports pages");
+            assert_eq!(line, None, "paged part reports NO lines (D-7): ({s},{e})");
+        }
+        let pageless = Coords::new("l1\nl2\nl3", &[]);
+        for (s, e) in [(0, 3), (2, 6), (0, 8)] {
+            let (page, line) = pageless.window(s, e);
+            assert_eq!(page, None, "pageless part reports NO pages (D-7)");
+            assert!(line.is_some(), "pageless part reports lines");
+        }
     }
 }

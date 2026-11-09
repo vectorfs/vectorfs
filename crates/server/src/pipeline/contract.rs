@@ -355,7 +355,9 @@ pub fn chunker_contract_labels(c: &dyn Chunker, size: usize, overlap: usize) {
             kind: ChunkKind::Caption,
         },
     ];
-    // a realistic page table over the same text — must be inert (T13's)
+    // a realistic page table over the same text — the T13 addressing
+    // input: pages ALIGN with the span edges (a page per segment), so the
+    // fork below exercises pure-page and cross-page windows alike
     let pages = vec![(1u32, 0usize), (2, b1), (3, b2), (4, b3)];
 
     let labeled = Part {
@@ -365,6 +367,7 @@ pub fn chunker_contract_labels(c: &dyn Chunker, size: usize, overlap: usize) {
         labels,
         pages,
         furniture_removed: 0,
+        section: None,
     };
     let chunks = c
         .chunk(std::slice::from_ref(&labeled))
@@ -440,14 +443,28 @@ pub fn chunker_contract_labels(c: &dyn Chunker, size: usize, overlap: usize) {
         "unlabeled windows must stay Body"
     );
 
-    // (4) pages are inert for the chunker: same chunks with them dropped
+    // (4) pages SHAPE nothing but ADDRESS everything (T13): dropping the
+    // page table must not move one window (text/index/kind identical —
+    // the lattice is page-independent), while the D-7 fork flips the
+    // addressing channel (page intervals ⇄ line intervals; the fixture
+    // text has no '\n', so every pageless window is (1, 1))
     let mut no_pages = labeled.clone();
     no_pages.pages = Vec::new();
+    let pageless = c.chunk(&[no_pages]).expect("pages-free chunking");
     assert_eq!(
-        c.chunk(&[no_pages]).expect("pages-free chunking"),
-        chunks,
-        "the page table must not change chunk output (T13's channel)"
+        pageless.len(),
+        chunks.len(),
+        "the page table must not change the window count"
     );
+    for (p, w) in pageless.iter().zip(&chunks) {
+        assert_eq!(p.index, w.index);
+        assert_eq!(p.text, w.text);
+        assert_eq!(p.kind, w.kind);
+        assert_eq!(p.page, None, "no table ⇒ no page keys (D-7)");
+        assert_eq!(p.line, Some((1, 1)));
+        assert!(w.page.is_some(), "table present ⇒ page keys (D-7)");
+        assert_eq!(w.line, None, "table present ⇒ no line keys (D-7)");
+    }
     // (5) determinism on the labeled path
     assert_eq!(c.chunk(&[labeled]).expect("labeled chunking (2nd)"), chunks);
 }
@@ -489,12 +506,18 @@ pub async fn embedder_contract<E: Embedder + ?Sized>(e: &E) {
             text: "first chunk".to_string(),
             image: None,
             kind: ChunkKind::Body,
+            page: None,
+            line: None,
+            section: None,
         },
         super::Chunk {
             index: 1,
             text: "第二个块".to_string(),
             image: None,
             kind: ChunkKind::Body,
+            page: None,
+            line: None,
+            section: None,
         },
     ];
     let docs = e
@@ -579,6 +602,9 @@ pub async fn image_embedder_contract<E: Embedder + ?Sized>(e: &E, png: &[u8]) {
                 mime: "image/png".to_string(),
             }),
             kind: ChunkKind::Body,
+            page: None,
+            line: None,
+            section: None,
         },
         super::Chunk {
             index: 1,
@@ -588,6 +614,9 @@ pub async fn image_embedder_contract<E: Embedder + ?Sized>(e: &E, png: &[u8]) {
                 mime: "image/png".to_string(),
             }),
             kind: ChunkKind::Body,
+            page: None,
+            line: None,
+            section: None,
         },
     ];
     let docs = e

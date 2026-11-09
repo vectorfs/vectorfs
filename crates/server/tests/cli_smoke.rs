@@ -427,6 +427,20 @@ fn cli_full_command_smoke() {
     );
     assert!(o.status.success(), "stdout:\n{}", out(&o));
     assert!(out(&o).contains("docs/fox.txt"), "{}", out(&o));
+    // T13: the table carries the COORD column, and a txt (pageless) corpus
+    // shows LINE cells on its rows (the p/L/§ compact forms; the md-source
+    // product-domain caveat lives in the verb docs)
+    assert!(out(&o).contains("COORD"), "header: {}", out(&o));
+    assert!(
+        out(&o).contains("L1"),
+        "txt hits carry line coords: {}",
+        out(&o)
+    );
+    assert!(
+        !out(&o).contains(" p1 "),
+        "page coords must stay absent for a pageless corpus: {}",
+        out(&o)
+    );
 
     // T12: repeatable --kind passes through to the wire's includeKinds (a
     // txt corpus has no toc chunks - the pin is the flag plumbing + the

@@ -35,8 +35,9 @@
 
 use std::path::PathBuf;
 
+use vectorfs_server::pipeline::chunk::token_window::TokenWindowChunker;
 use vectorfs_server::pipeline::extract::pdf_text::{PdfTextExtractor, locate_library};
-use vectorfs_server::pipeline::{ChunkKind, Extractor, Part};
+use vectorfs_server::pipeline::{ChunkKind, Chunker, Extractor, Part};
 
 fn pdf() -> PdfTextExtractor {
     match locate_library() {
@@ -129,6 +130,88 @@ fn flagship_zero_whole_page_misjudgment_zero_vocabulary_deletion() {
                 assert!(
                     !judged.contains(p),
                     "vol32 p{p}: whole-page TOC misjudgment returned (triple gate regressed)"
+                );
+            }
+            // T13 (标签与坐标互证): vol32's genuine TOC spans all live on
+            // page 2 — and the CHUNKS those spans address carry the page
+            // coordinate. The label says "this is TOC"; the coordinate
+            // independently says "this is page 2" — if either regressed
+            // (span drifting across a page edge, page table mis-anchored),
+            // the mutual pin fails. Two forms:
+            // * every chunk INTERSECTING the span reports a page interval
+            //   CONTAINING 2 (the span's content is addressed to page 2 —
+            //   window shape irrelevant);
+            // * at a window small enough to sit INSIDE the 71-char span,
+            //   pure-toc windows exist and each reports exactly (2, 2).
+            let toc_spans: Vec<&vectorfs_server::pipeline::LabelSpan> = text_part
+                .labels
+                .iter()
+                .filter(|l| l.kind == ChunkKind::Toc)
+                .collect();
+            assert!(
+                !toc_spans.is_empty(),
+                "vol32 must carry its genuine TOC spans (the corpus's measured shape)"
+            );
+            // the span in the CHAR domain (labels are byte-anchored, the
+            // chunk walk below is char-indexed — the test-side twin of the
+            // chunker's own conversion duty)
+            let boundaries: Vec<usize> = text_part.text.char_indices().map(|(b, _)| b).collect();
+            let to_char = |byte: usize| boundaries.partition_point(|&b| b < byte);
+            for span in &toc_spans {
+                assert_eq!(
+                    page_of(&text_part.pages, text_part.text.len(), span.range.start),
+                    2,
+                    "a vol32 Toc span left page 2: {span:?}"
+                );
+                let span_chars = to_char(span.range.start)..to_char(span.range.end);
+                let chunker = TokenWindowChunker::new(512, 64).unwrap();
+                let chunks = chunker
+                    .chunk(std::slice::from_ref(text_part))
+                    .expect("vol32 chunks");
+                let mut pos = 0usize;
+                let mut intersecting = 0usize;
+                for c in &chunks {
+                    let len = c.text.chars().count();
+                    let (s, e) = (pos, pos + len);
+                    if s < span_chars.end && span_chars.start < e {
+                        intersecting += 1;
+                        let (ps, pe) = c.page.expect("paged corpus chunk");
+                        assert!(
+                            ps <= 2 && 2 <= pe,
+                            "a chunk addressing the toc span omits page 2: ({ps},{pe}) {c:?}"
+                        );
+                    }
+                    pos = e - 64;
+                }
+                assert!(
+                    intersecting > 0,
+                    "the toc span must be covered by some window (lossless)"
+                );
+                // the pure form: windows small enough to sit inside the
+                // span judge Toc and carry exactly (2, 2)
+                let small = TokenWindowChunker::new(32, 8).unwrap();
+                let chunks = small
+                    .chunk(std::slice::from_ref(text_part))
+                    .expect("vol32 small-window chunks");
+                let toc_chunks: Vec<_> =
+                    chunks.iter().filter(|c| c.kind == ChunkKind::Toc).collect();
+                assert!(
+                    !toc_chunks.is_empty(),
+                    "a window inside the {}-char span must judge pure toc",
+                    span_chars.len()
+                );
+                for c in &toc_chunks {
+                    assert_eq!(
+                        c.page,
+                        Some((2, 2)),
+                        "a toc-kind window outside page 2: {c:?}"
+                    );
+                }
+                eprintln!(
+                    "vol32: toc span {} chars; {} windows address it (all contain p2); {} pure-toc windows, all (2,2)",
+                    span_chars.len(),
+                    intersecting,
+                    toc_chunks.len()
                 );
             }
         }

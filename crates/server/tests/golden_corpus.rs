@@ -769,6 +769,115 @@ fn golden_t12_structure_false_is_the_pre_t12_join() {
     assert!(parts[0].text.contains(D4_STRAP));
 }
 
+/// T13 page coordinates 对拍 the page table through the REAL engine: every
+/// chunk of the multipage fixture reports exactly the pages its chars
+/// cover — re-derived here over an INDEPENDENT path (the window walk in
+/// byte space: window i starts at window i-1's end minus the overlap, an
+/// ASCII fixture makes char == byte) against the extractor's own
+/// page-offset table. The per-page markers are the human witness (a chunk
+/// whose text lists page p's marker carries p inside its interval), and
+/// both window shapes — inside one page and straddling a boundary — must
+/// occur, with the honest cross-page interval reported.
+#[test]
+fn golden_t13_page_coordinates_match_page_content() {
+    // 12 pages, each: a per-page marker line + a per-page-unique body
+    // (furniture-rule armor — see build_multipage_pdf's doc; nothing
+    // repeats, so the structure path removes nothing and every page
+    // offset is real). Body filler is per-page too, so no whole-window
+    // content can repeat at a shifted offset.
+    const PAGES: usize = 12;
+    let paragraph_for = |i: usize| {
+        format!(
+            "{} with a tail of {} words to fill the window",
+            unique_head(i),
+            "lorem ipsum dolor sit amet"
+        )
+    };
+    let pdf_bytes = build_multipage_pdf(PAGES, paragraph_for);
+    let parts = pdf()
+        .extract(&pdf_bytes, "application/pdf")
+        .expect("fixture must extract");
+    assert_eq!(parts.len(), 1);
+    let part = &parts[0];
+    assert_eq!(part.pages.len(), PAGES);
+    assert_eq!(
+        part.furniture_removed, 0,
+        "fixture self-check: nothing removed"
+    );
+
+    // byte-domain page lookup (the independent direction: the chunker
+    // worked char-domain through the conversion table)
+    let page_of = |byte: usize| -> u32 {
+        let idx = part.pages.partition_point(|&(_, off)| off <= byte) - 1;
+        part.pages[idx].0
+    };
+
+    const SIZE: usize = 64;
+    const OVERLAP: usize = 16;
+    let chunker = TokenWindowChunker::new(SIZE, OVERLAP).unwrap();
+    let chunks = chunker.chunk(std::slice::from_ref(part)).unwrap();
+    assert!(
+        chunks.len() >= PAGES,
+        "{} chunks over 12 pages",
+        chunks.len()
+    );
+
+    // the byte-space window walk: window i covers [pos, pos+len), the next
+    // window starts at end - overlap (the pinned alignment contract)
+    let mut pos = 0usize;
+    let mut starts_seen = 0u32;
+    let mut crossings = 0u32;
+    let mut covered_pages = std::collections::BTreeSet::new();
+    for ch in &chunks {
+        let len = ch.text.len(); // ASCII fixture: bytes == chars
+        let (want_start, want_end) = (page_of(pos), page_of(pos + len - 1));
+        // D-7: the paged part reports page intervals and NO line intervals
+        assert_eq!(
+            ch.page,
+            Some((want_start, want_end)),
+            "chunk {pos}..{}: {ch:?} / pages {:?}",
+            pos + len,
+            part.pages
+        );
+        assert_eq!(ch.line, None, "paged part carries no line keys (D-7)");
+        assert_eq!(ch.section, None);
+        if want_start == want_end {
+            starts_seen += 1;
+        } else {
+            crossings += 1;
+        }
+        // the marker witness: every page marker LISTED in this chunk's text
+        // is inside its interval (markers are per-page unique, both the
+        // page strap and the golden-body head)
+        for p in 1..=PAGES as u32 {
+            let listed = ch.text.contains(&format!("page {p:04} of"))
+                || ch.text.contains(&format!("golden body {p:04}"));
+            if listed {
+                assert!(
+                    want_start <= p && p <= want_end,
+                    "chunk lists page {p} outside ({want_start},{want_end}): {ch:?}"
+                );
+                covered_pages.insert(p);
+            }
+        }
+        pos = pos + len - OVERLAP;
+    }
+    // both window shapes occurred (inside-page AND boundary-straddling —
+    // the honest overlap, not a degenerate all-one-page or all-crossing)
+    assert!(starts_seen > 0, "fixture must produce inside-page windows");
+    assert!(
+        crossings > 0,
+        "fixture must produce boundary-straddling windows"
+    );
+    // and the witness coverage is total: every page's marker landed in some
+    // window whose interval contains it (lossless + coordinates together)
+    assert_eq!(
+        covered_pages.len(),
+        PAGES,
+        "every page marker witnessed: {covered_pages:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // chunker contract re-run through the registered config path (the ingest
 // worker's construction route), on the rewritten text-splitter engine

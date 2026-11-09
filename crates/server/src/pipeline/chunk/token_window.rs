@@ -134,7 +134,12 @@ impl Chunker for TokenWindowChunker {
             let forced = label_view.forced_endpoints();
             let ranges =
                 super::windowing::ranges(self.size, self.overlap, chars.len(), &cuts, &forced);
+            // T13: the part's addressing table — page offsets (byte→char
+            // converted inside) or the newline lattice, per the D-7 fork —
+            // built once, consulted per window
+            let coords = super::windowing::Coords::new(&part.text, &part.pages);
             for (s, e) in ranges {
+                let (page, line) = coords.window(s, e);
                 out.push(Chunk {
                     index,
                     text: chars[s..e].iter().collect(),
@@ -142,6 +147,11 @@ impl Chunker for TokenWindowChunker {
                     // dispatch materializes image chunks; see chunk/mod.rs)
                     image: None,
                     kind: label_view.window_kind(s, e),
+                    page,
+                    line,
+                    // the orchestration channel passes through untouched
+                    // (container-child ordinal, stamped by the ingest walk)
+                    section: part.section,
                 });
                 index += 1;
             }
@@ -163,6 +173,7 @@ mod tests {
             labels: Vec::new(),
             pages: Vec::new(),
             furniture_removed: 0,
+            section: None,
         }])
         .unwrap()
         .into_iter()
@@ -380,6 +391,7 @@ mod tests {
             }],
             pages: vec![(1, 0), (2, 24)],
             furniture_removed: 0,
+            section: None,
         };
         let out = c.chunk(&[part]).unwrap();
         // the invariant battery still holds (forced endpoints never bend it)
@@ -412,7 +424,8 @@ mod tests {
         );
         // kind judgment: a window wholly inside the toc run is Toc; any
         // window crossing an edge (the overlap reach-back) is Body — and
-        // pages ride along inertly (consumed by T13, not this kind)
+        // the page table feeds T13 coordinates: byte 24 = char 8, so page
+        // 2 owns chars 8..12, page 1 owns 0..8
         assert!(
             out.iter()
                 .any(|ch| ch.text.chars().all(|x| x == '目' || x == '录')
@@ -425,5 +438,118 @@ mod tests {
                 && ch.kind == crate::pipeline::ChunkKind::Body),
             "edge-crossing window must arbitrate to Body: {out:?}"
         );
+        // T13 (D-7): the page table is present ⇒ every window carries a
+        // page interval and NO line interval; the byte→char conversion is
+        // exercised by page 2 starting at BYTE 24 = CHAR 8. The expected
+        // interval is re-derived from the char-range walk (start = prev
+        // end - overlap), NOT from the chunk text — windows crossing the
+        // page edge get the honest (1, 2) both-pages interval.
+        let mut spans = Vec::new();
+        let mut start = 0usize;
+        for ch in &out {
+            let len = ch.text.chars().count();
+            spans.push((start, start + len));
+            start = start + len - 2;
+        }
+        let page_at = |x: usize| if x >= 8 { 2u32 } else { 1u32 };
+        for (ch, &(s, e)) in out.iter().zip(&spans) {
+            assert!(ch.page.is_some(), "paged part: {ch:?}");
+            assert_eq!(ch.line, None, "paged part carries no line keys (D-7)");
+            assert_eq!(
+                ch.page,
+                Some((page_at(s), page_at(e - 1))),
+                "window [{s},{e}) = {:?}: interval must cover exactly its chars",
+                ch.text
+            );
+        }
+    }
+
+    /// T13 line coordinates on a pageless part — the `nl` 对拍 spirit: a
+    /// text of KNOWN lines is chunked, and every window's line interval is
+    /// re-derived independently from its char range (1 + '\n' count before
+    /// the start / before the exclusive end). A window whose text includes
+    /// line N's marker phrase must have N inside its interval.
+    #[test]
+    fn line_coordinates_nl_style_on_known_text() {
+        let lines = [
+            "alpha line one has words",
+            "beta line two carries more words here",
+            "gamma line three the marker phrase needle",
+            "delta line four finishes the text",
+        ];
+        let text = lines.join("\n");
+        let c = TokenWindowChunker::new(24, 6).unwrap();
+        let part = Part {
+            modality: Modality::Text,
+            text: text.clone(),
+            image: None,
+            labels: Vec::new(),
+            pages: Vec::new(),
+            furniture_removed: 0,
+            section: None,
+        };
+        let out = c.chunk(&[part]).unwrap();
+        assert!(out.len() >= 3, "fixture must span windows: {out:?}");
+        // independent re-derivation from the char-range walk
+        let chars: Vec<char> = text.chars().collect();
+        let line_at =
+            |x: usize| -> u32 { 1 + chars[..x].iter().filter(|&&c| c == '\n').count() as u32 };
+        let mut start = 0usize;
+        for ch in &out {
+            let len = ch.text.chars().count();
+            let (s, e) = (start, start + len);
+            assert_eq!(ch.line, Some((line_at(s), line_at(e))), "{ch:?} [{s},{e})");
+            assert_eq!(ch.page, None, "pageless part carries no page keys (D-7)");
+            assert_eq!(ch.section, None, "leaf part carries no section");
+            start = e - 6;
+        }
+        // the nl 对拍 witness: the window holding line 3's unique phrase
+        // reports an interval containing 3 (what `nl` would number it)
+        let holder = out
+            .iter()
+            .find(|ch| ch.text.contains("needle"))
+            .expect("some window covers line 3");
+        let (ls, le) = holder.line.expect("lineless pageless chunk");
+        assert!(
+            ls <= 3 && 3 <= le,
+            "line 3 must be inside ({ls},{le}): {holder:?}"
+        );
+        // boundary pin: a window OPENING right after a '\n' starts exactly
+        // on that line (not the next) — line_at counts only breaks BEFORE it
+        let after_break = out.iter().find(|ch| {
+            let off = text.find(&ch.text).unwrap_or(usize::MAX);
+            off > 0 && text[..off].ends_with('\n')
+        });
+        if let Some(ch) = after_break {
+            let (ls, _) = ch.line.unwrap();
+            let breaks_before = text[..text.find(&ch.text).unwrap()]
+                .bytes()
+                .filter(|&b| b == b'\n')
+                .count();
+            assert_eq!(ls, 1 + breaks_before as u32, "{ch:?}");
+        }
+    }
+
+    /// T13: the orchestration channel passes through untouched — a part
+    /// stamped `section = Some(n)` (the ingest container walk's job) lands
+    /// the same ordinal on EVERY window it produces, multi-window or tail.
+    #[test]
+    fn section_passes_through_to_every_window() {
+        let c = TokenWindowChunker::new(8, 2).unwrap();
+        let part = Part {
+            modality: Modality::Text,
+            text: "0123456789abcdefghij".to_string(), // 20 chars -> 3 windows
+            image: None,
+            labels: Vec::new(),
+            pages: Vec::new(),
+            furniture_removed: 0,
+            section: Some(4),
+        };
+        let out = c.chunk(&[part]).unwrap();
+        assert!(out.len() >= 2, "{out:?}");
+        assert!(out.iter().all(|ch| ch.section == Some(4)), "{out:?}");
+        // and a sectionless part stays sectionless
+        let plain = c.chunk(&[Part::text("0123456789abcdefghij")]).unwrap();
+        assert!(plain.iter().all(|ch| ch.section.is_none()));
     }
 }

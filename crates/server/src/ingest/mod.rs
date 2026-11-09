@@ -906,6 +906,16 @@ fn run_member(
     );
     let mut parts: Vec<Part> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    // T13 section ordinal (ADR 0005, the ORCHESTRATION coordinate source):
+    // 1-based, advanced ONLY when a child's parts actually join the
+    // aggregate — the INGEST order, not the enumeration order. A skipped
+    // child (size cap, normalize refusal, no chain) or an exhausted one
+    // holds NO number, so the surviving children's sections stay gapless.
+    // MECHANISM CONSTANT (序号=摄取序), deliberately not config. The stamp
+    // lands after the child's own walk returns, so an OUTER container
+    // stamps LAST and WINS over any inner walk's numbering — a section
+    // names the OUTERMOST container's child.
+    let mut section = 0u32;
     for child in &children {
         let child_display = format!("{display}!{}", child.name);
         // per-child size cap: the SAME max_file_size_mb the object level
@@ -969,7 +979,13 @@ fn run_member(
                 chain,
                 depth + 1,
             ) {
-                Ok(mut child_parts) => parts.append(&mut child_parts),
+                Ok(mut child_parts) => {
+                    section += 1;
+                    for p in child_parts.iter_mut() {
+                        p.section = Some(section);
+                    }
+                    parts.append(&mut child_parts);
+                }
                 Err(reason) => skipped.push(format!("'{}': {reason}", child.name)),
             },
         }
@@ -2418,11 +2434,18 @@ struct BatchRow {
 /// via `store_chunk_text = false`), `x-vf-chunk-kind` (T12: the chunk's
 /// structural kind, ALWAYS explicit — the default `body` is written too, so
 /// filter semantics never hinge on key absence; filterable like
-/// `x-vf-modality`, NOT in the non-filterable declaration). Per-chunk
-/// modality (M3-T1): both the metadata value and the chunk-key namespace
-/// come from the CHUNK, so image atoms land in the `image` namespace
-/// (`{hash}-image-{i}`) with `x-vf-modality = image` — text chunks are
-/// byte-identical to before.
+/// `x-vf-modality`, NOT in the non-filterable declaration), and the T13
+/// coordinate keys `x-vf-page-start/end`, `x-vf-line-start/end`,
+/// `x-vf-section` (ADR 0005 — written ONLY when the unit exists, per the
+/// D-7 fork the chunker already resolved: pages present ⇒ page pair and no
+/// line pair, pageless ⇒ line pair, container children ⇒ section; numbers,
+/// so each key evolves an F64 mirror column and is range-filterable
+/// `$gte/$lte` out of the box, and `$exists` separates pdf rows from txt).
+/// Key-count accounting: 5 base + text + kind + at most 4 coordinates
+/// = 11 ≤ 50 (AWS per-vector metadata cap). Per-chunk modality (M3-T1):
+/// both the metadata value and the chunk-key namespace come from the CHUNK,
+/// so image atoms land in the `image` namespace (`{hash}-image-{i}`) with
+/// `x-vf-modality = image` — text chunks keep the `text` namespace.
 fn build_rows(
     plan: &BucketPlan,
     job: &Job,
@@ -2444,6 +2467,23 @@ fn build_rows(
             // only). The 40KB preflight below covers it for free.
             "x-vf-chunk-kind": chunk.kind.to_string(),
         });
+        // T13 coordinates: only when the unit exists (与 kind 同批, same
+        // 40KB preflight below). Intervals are INCLUSIVE at both ends and
+        // overlap honestly across windows (D-7); page numbers are u32.
+        if let Some((start, end)) = chunk.page {
+            let m = metadata.as_object_mut().expect("object literal");
+            m.insert("x-vf-page-start".into(), serde_json::json!(start));
+            m.insert("x-vf-page-end".into(), serde_json::json!(end));
+        }
+        if let Some((start, end)) = chunk.line {
+            let m = metadata.as_object_mut().expect("object literal");
+            m.insert("x-vf-line-start".into(), serde_json::json!(start));
+            m.insert("x-vf-line-end".into(), serde_json::json!(end));
+        }
+        if let Some(section) = chunk.section {
+            let m = metadata.as_object_mut().expect("object literal");
+            m.insert("x-vf-section".into(), serde_json::json!(section));
+        }
         if plan.store_chunk_text {
             metadata
                 .as_object_mut()
@@ -3381,6 +3421,14 @@ pub(crate) mod tests {
             // T12: the structure kind is ALWAYS stamped (body here — txt
             // chunks carry no structure; the explicit default is the point)
             assert_eq!(meta["x-vf-chunk-kind"], "body");
+            // T13 (D-7): a pageless source carries LINE keys (numbers,
+            // 1-based, start <= end) and no page/section keys — the fork
+            // is per part, stamped by the chunker, written only if present
+            let ls = meta["x-vf-line-start"].as_u64().expect("txt has line keys");
+            let le = meta["x-vf-line-end"].as_u64().expect("txt has line keys");
+            assert!(ls >= 1 && ls <= le, "{meta}");
+            assert!(meta.get("x-vf-page-start").is_none(), "{meta}");
+            assert!(meta.get("x-vf-section").is_none(), "{meta}");
             assert!(meta["x-vf-src-name"].as_str().unwrap().starts_with("docs/"));
             assert_eq!(
                 meta["x-vf-src-uri"].as_str().unwrap().len(),
@@ -4636,6 +4684,9 @@ pub(crate) mod tests {
             text: format!("t{i}"),
             image: None,
             kind: crate::pipeline::ChunkKind::Body,
+            page: None,
+            line: None,
+            section: None,
         };
         let image = |i: u32| Chunk {
             index: i,
@@ -4645,6 +4696,9 @@ pub(crate) mod tests {
                 mime: "image/png".to_string(),
             }),
             kind: crate::pipeline::ChunkKind::Body,
+            page: None,
+            line: None,
+            section: None,
         };
         // the pre-image marker shape, byte-stable: text-only file
         assert_eq!(
@@ -4681,6 +4735,9 @@ pub(crate) mod tests {
             text: format!("t{i}"),
             image: None,
             kind: crate::pipeline::ChunkKind::Body,
+            page: None,
+            line: None,
+            section: None,
         };
         let image = |i: u32| Chunk {
             index: i,
@@ -4690,6 +4747,9 @@ pub(crate) mod tests {
                 mime: "image/png".to_string(),
             }),
             kind: crate::pipeline::ChunkKind::Body,
+            page: None,
+            line: None,
+            section: None,
         };
 
         // text-only chunks: covered (the M2 world — gate silent)
@@ -5612,6 +5672,105 @@ pub(crate) mod tests {
         assert!(
             !got.iter().any(|t| t.contains('#')),
             "the md kind processed the md child: {got:?}"
+        );
+    }
+
+    /// T13 section ordinal (ADR 0005, the orchestration coordinate): the
+    /// children are numbered by INGEST order — a child skipped mid-walk (no
+    /// chain for its mime) holds NO number, so the survivors read 1 and 2
+    /// (gapless), never 1 and 3 (enumeration). The stamp rides EVERY chunk
+    /// of its child, and the container's rows carry line keys beside the
+    /// section (D-7: container children = 行键 + section 叠加).
+    #[tokio::test]
+    async fn container_sections_number_ingested_children_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
+        std::fs::create_dir_all(&docs).unwrap();
+        let payload = b"SECTION-CONTAINER";
+        std::fs::write(docs.join("book.ctn"), payload).unwrap();
+
+        let cfg = ctn_config("txt = \"plain\", ctn = \"ctn\"", "");
+        let (rt, _h, state) = runtime_patched(dir.path(), &cfg, |plan| {
+            plan.extractors.insert(
+                "ctn".to_string(),
+                ExtractorKind::TestContainer(TestContainerSpec::one(
+                    "application/octet-stream",
+                    payload,
+                    vec![
+                        ChildDoc::new(
+                            "ch1/one.txt",
+                            "text/plain",
+                            "first child body alpha beta gamma delta epsilon zeta",
+                        ),
+                        // off-table mime, no default chain in this config:
+                        // SKIPPED mid-walk — must not hold a section number
+                        ChildDoc::new(
+                            "ch1/skip.bin",
+                            "application/x-no-chain-for-this",
+                            "unroutable child bytes",
+                        ),
+                        ChildDoc::new(
+                            "ch2/two.txt",
+                            "text/plain",
+                            "second child body eta theta iota kappa lambda mu",
+                        ),
+                    ],
+                )),
+            );
+        })
+        .await;
+
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        assert_eq!(
+            status_of(&state, "docs", "docs/book.ctn").await.status,
+            SourceStatus::Indexed
+        );
+
+        let plan = &rt.shared.core.buckets["docs"];
+        let rows = state
+            .storage
+            .scan_vectors("docs", &plan.derived["tiny"].index_name, None)
+            .await
+            .unwrap();
+        assert!(!rows.is_empty());
+        let mut sections: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+        for r in &rows {
+            let meta = r.metadata.as_ref().expect("row metadata");
+            let section = meta["x-vf-section"]
+                .as_u64()
+                .expect("container chunks are sectioned");
+            // D-7: txt children are pageless ⇒ line keys beside the section
+            assert!(
+                meta["x-vf-line-start"].as_u64().is_some(),
+                "line keys beside section: {meta}"
+            );
+            assert!(meta.get("x-vf-page-start").is_none(), "{meta}");
+            sections.entry(section).or_default().push(
+                meta["x-vf-chunk-text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+        // gapless ingest-order numbering: sections are exactly {1, 2} —
+        // the skipped middle child never held a number
+        assert_eq!(
+            sections.keys().copied().collect::<Vec<_>>(),
+            vec![1, 2],
+            "ingest order, not enumeration: {sections:?}"
+        );
+        // and each section's chunks are its OWN child's content (the
+        // ordinal is a faithful addressing unit; windows overlap, so the
+        // witness is over the section's joined text)
+        let joined = |s: &u64| sections[s].concat();
+        assert!(
+            joined(&1).contains("first child body") && !joined(&1).contains("second child"),
+            "section 1 = child one: {sections:?}"
+        );
+        assert!(
+            joined(&2).contains("second child body") && !joined(&2).contains("first child"),
+            "section 2 = child two (skip.bin held no number): {sections:?}"
         );
     }
 

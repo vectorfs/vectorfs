@@ -930,6 +930,9 @@ pub(crate) mod tests {
                 text: t.to_string(),
                 image: None,
                 kind: crate::pipeline::ChunkKind::Body,
+                page: None,
+                line: None,
+                section: None,
             })
             .collect();
         let out = e.embed_documents(&docs).await.unwrap();
@@ -988,6 +991,9 @@ pub(crate) mod tests {
                     mime: "image/png".to_string(),
                 }),
                 kind: crate::pipeline::ChunkKind::Body,
+                page: None,
+                line: None,
+                section: None,
             }])
             .await
             .unwrap_err();
@@ -1007,6 +1013,9 @@ pub(crate) mod tests {
                 text: format!("t{i}"),
                 image: None,
                 kind: crate::pipeline::ChunkKind::Body,
+                page: None,
+                line: None,
+                section: None,
             })
             .collect();
         let out = e.embed_documents(&chunks).await.unwrap();
@@ -1034,6 +1043,9 @@ pub(crate) mod tests {
                 text: "x".into(),
                 image: None,
                 kind: crate::pipeline::ChunkKind::Body,
+                page: None,
+                line: None,
+                section: None,
             }])
             .await
             .unwrap();
@@ -1058,6 +1070,9 @@ pub(crate) mod tests {
                 text: "x".into(),
                 image: None,
                 kind: crate::pipeline::ChunkKind::Body,
+                page: None,
+                line: None,
+                section: None,
             }])
             .await
             .unwrap_err();
@@ -1079,6 +1094,9 @@ pub(crate) mod tests {
                 text: "x".into(),
                 image: None,
                 kind: crate::pipeline::ChunkKind::Body,
+                page: None,
+                line: None,
+                section: None,
             }])
             .await
             .unwrap_err();
@@ -1205,6 +1223,9 @@ pub(crate) mod tests {
                 mime: mime.to_string(),
             }),
             kind: crate::pipeline::ChunkKind::Body,
+            page: None,
+            line: None,
+            section: None,
         }
     }
 
@@ -1214,6 +1235,9 @@ pub(crate) mod tests {
             text: text.to_string(),
             image: None,
             kind: crate::pipeline::ChunkKind::Body,
+            page: None,
+            line: None,
+            section: None,
         }
     }
 

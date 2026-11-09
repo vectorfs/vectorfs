@@ -140,12 +140,21 @@ impl Chunker for MarkdownChunker {
             let label_view = windowing::LabelView::new(&part.text, &part.labels);
             let forced = label_view.forced_endpoints();
             let ranges = windowing::ranges(self.size, self.overlap, chars.len(), &cuts, &forced);
+            // T13 coordinates — identical wiring to token-window (the
+            // shared windowing seam is the point: both kinds derive forced
+            // endpoints, window kinds AND addressing coordinates from the
+            // same tables, only their cut ORACLE differs)
+            let coords = windowing::Coords::new(&part.text, &part.pages);
             for (s, e) in ranges {
+                let (page, line) = coords.window(s, e);
                 out.push(Chunk {
                     index,
                     text: chars[s..e].iter().collect(),
                     image: None,
                     kind: label_view.window_kind(s, e),
+                    page,
+                    line,
+                    section: part.section,
                 });
                 index += 1;
             }
@@ -167,6 +176,7 @@ mod tests {
             labels: Vec::new(),
             pages: Vec::new(),
             furniture_removed: 0,
+            section: None,
         }])
         .unwrap()
         .into_iter()
@@ -261,5 +271,63 @@ mod tests {
         assert_eq!(idx, (0..out.len() as u32).collect::<Vec<_>>());
         assert!(c.chunk(&[]).unwrap().is_empty());
         assert!(c.chunk(&[Part::text("")]).unwrap().is_empty());
+    }
+
+    /// T13 coordinates through the second kind (the shared windowing seam:
+    /// markdown windows carry the SAME addressing table token-window uses,
+    /// only the cut oracle differs). A pageless part ⇒ line keys on every
+    /// window, re-derived independently from the char-range walk; the
+    /// section channel passes through untouched.
+    #[test]
+    fn line_coordinates_and_section_through_the_shared_seam() {
+        let text = "# Heading one\nbody text under one\n\n# Heading two\nbody text under two\n";
+        let c = MarkdownChunker::new(24, 6).unwrap();
+        let part = Part {
+            modality: Modality::Text,
+            text: text.to_string(),
+            image: None,
+            labels: Vec::new(),
+            pages: Vec::new(),
+            furniture_removed: 0,
+            section: Some(2),
+        };
+        let out = c.chunk(&[part]).unwrap();
+        assert!(out.len() >= 2, "{out:?}");
+        let chars: Vec<char> = text.chars().collect();
+        let line_at =
+            |x: usize| -> u32 { 1 + chars[..x].iter().filter(|&&c| c == '\n').count() as u32 };
+        let mut start = 0usize;
+        for ch in &out {
+            let len = ch.text.chars().count();
+            let (s, e) = (start, start + len);
+            assert_eq!(ch.line, Some((line_at(s), line_at(e))), "{ch:?} [{s},{e})");
+            assert_eq!(ch.page, None, "pageless part, no page keys (D-7)");
+            assert_eq!(ch.section, Some(2), "orchestration channel passes through");
+            start = e - 6;
+        }
+        // the heading-one body sits on line 2 (line 1 is the heading
+        // itself): a phrase can be TORN across a cut, so the witness is
+        // positional — the window whose char span holds the phrase's first
+        // char must report an interval containing line 2
+        let pos = chars
+            .iter()
+            .position(|&c| c == 'u') // "under one"
+            .expect("fixture carries the phrase");
+        let mut start = 0usize;
+        let mut holder: Option<&Chunk> = None;
+        for ch in &out {
+            let len = ch.text.chars().count();
+            if start <= pos && pos < start + len {
+                holder = Some(ch);
+                break;
+            }
+            start = start + len - 6;
+        }
+        let holder = holder.expect("some window covers the heading-one body");
+        let (ls, le) = holder.line.unwrap();
+        assert!(
+            ls <= 2 && 2 <= le,
+            "({ls},{le}) must contain line 2: {holder:?}"
+        );
     }
 }

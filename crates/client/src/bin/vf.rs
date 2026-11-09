@@ -61,7 +61,13 @@ enum Command {
     /// The one retrieval verb: fan-out + merge + 回源 over the bucket's
     /// embedders. Query = positional TEXT (`vf search "q" docs`) or a local
     /// image file (`vf search --image photo.png docs`, 以图搜图 — exactly one
-    /// of the two). Bucket as a bare positional or via `--bucket`
+    /// of the two). Bucket as a bare positional or via `--bucket`. Hits
+    /// carry content-addressing coordinates (T13): pages (`p18-19`),
+    /// lines (`L405-420`), container sections (`§3`) — shown in the COORD
+    /// column and in --json under location.coord; page keys for paged
+    /// sources, line keys for pageless ones, never both. NOTE: line
+    /// coordinates address the EXTRACTED text (the md extractor strips
+    /// heading markers, html drops markup), not the original file's bytes.
     Search(SearchArgs),
     /// List ingested files / inspect one file's status (the verb forms; the
     /// `vf ls` shorthand covers listing)
@@ -912,10 +918,12 @@ async fn search_cmd(args: SearchArgs) {
         return;
     }
     // human table (deterministic: server order is score desc, key asc);
-    // image hits have no text channel — the SOURCE column carries the 回源
+    // image hits have no text channel — the SOURCE column carries the 回源,
+    // the COORD column the T13 addressing summary (p18-19 / L405-420 / §3,
+    // empty when the hit carries none — see the verb doc for the md caveat)
     let header = format!(
-        "{:<4} {:<9} {:<28} {:<22} {:<24} {}",
-        "#", "SCORE", "KEY", "INDEX", "SOURCE", "TEXT"
+        "{:<4} {:<9} {:<28} {:<22} {:<24} {:<13} {}",
+        "#", "SCORE", "KEY", "INDEX", "SOURCE", "COORD", "TEXT"
     );
     println!("{header}");
     for (i, h) in hits.iter().enumerate() {
@@ -930,15 +938,42 @@ async fn search_cmd(args: SearchArgs) {
             text
         };
         println!(
-            "{:<4} {:<9.4} {:<28} {:<22} {:<24} {}",
+            "{:<4} {:<9.4} {:<28} {:<22} {:<24} {:<13} {}",
             i + 1,
             h["score"].as_f64().unwrap_or(0.0),
             truncate(h["key"].as_str().unwrap_or(""), 28),
             truncate(h["index"].as_str().unwrap_or(""), 22),
             truncate(h["location"]["key"].as_str().unwrap_or(""), 24),
+            coord_cell(&h["location"]["coord"]),
             text
         );
     }
+}
+
+/// The COORD cell from a hit's `location.coord` (T13): each unit in its
+/// compact form — `p18-19` / `p7` (page), `L405-420` / `L12` (line), `§3`
+/// (section) — space-joined when several coexist (a container's txt child
+/// carries line + section). Empty string when the hit carries none.
+fn coord_cell(coord: &serde_json::Value) -> String {
+    let span = |unit: &str, v: &serde_json::Value| -> Option<String> {
+        let (s, e) = (v["start"].as_u64()?, v["end"].as_u64()?);
+        Some(if s == e {
+            format!("{unit}{s}")
+        } else {
+            format!("{unit}{s}-{e}")
+        })
+    };
+    let mut parts = Vec::new();
+    if let Some(p) = span("p", &coord["page"]) {
+        parts.push(p);
+    }
+    if let Some(l) = span("L", &coord["line"]) {
+        parts.push(l);
+    }
+    if let Some(s) = coord["section"].as_u64() {
+        parts.push(format!("§{s}"));
+    }
+    parts.join(" ")
 }
 
 fn truncate(s: &str, max: usize) -> String {
