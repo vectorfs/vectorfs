@@ -27,9 +27,11 @@
 vectorfs API 背后的能力——解析 → 分块 → 嵌入，外加对账与 GC——由**文件层**
 实现（见[下文](#文件层简述)）。
 
-> **状态：预发布（v0.2）。** s3vectors API 面已完备；vectorfs API 交付文本模态
-> MVP（PDF / Markdown / 纯文本）。图片模态、OCR、docx/html 解析器、混合全文
-> 检索 → v0.3（见 [design.md](design.md) §7）。
+> **状态：预发布。** s3vectors API 面已完备；vectorfs API 交付文本 + 图像双模态
+> （PDF 含扫描件 OCR、Markdown、纯文本、docx/html、epub/zip/eml 容器）、混合全文
+> 检索（Lance 原生 FTS 上的 BM25）与重排、结构感知提取（页眉页脚剔除 + 目录/图例
+> 标签）、内容寻址（页/行坐标、grep 式邻域读取）。音频/视频模态 → M4（见
+> [design.md](design.md) §7）。
 
 术语以 [CONTEXT.md](CONTEXT.md) 为准；两张 API 面的命名裁决见
 [ADR 0001](docs/adr/0001-two-layer-api-naming.md)。
@@ -84,9 +86,16 @@ vf search "capacity planning" --bucket docs
 任何标准工具放入的文件（s3 后端上 aws s3 cp 进源桶，file 后端上直接拷贝）都会被
 周期扫描接走（默认 30 秒）——源桶即数据源；删除同样会被对账（chunk 随之 GC）。
 
-`vf` 动词：`put`（`--async`）、`search`、`sources list|status`、`get`、`rm`、
-`reindex`、`status`。一切也都以 vectorfs API 的 8 个操作形式在 wire 上
+`vf` 动词：`put`（`--async`）、`search`（`--mode semantic|keyword|hybrid`、
+`--source`、`--kind`、`--rerank`、坐标范围 `--filter`）、`chunks`（枚举单文件的
+地址空间）、`chunk show`（grep 式按预算读命中邻域）、`sources list|status`、
+`get`、`rm`、`reindex`、`status`。一切也都以 vectorfs API 的操作形式在 wire 上
 （`/x-vf/<Op>`，design.md 附录 E）——同一套 SigV4，同一套错误形状。
+
+结构感知检索开箱即用：页眉页脚进不了 chunk；目录与图例 chunk 保持索引但默认不进
+结果（`--kind toc` 放行——「工具章节在第几页」是合法查询）；每个命中携带地址
+（`p18-19` / `L405-420` / `§3`）——用 `--filter '{"x-vf-page-start":{"$gte":10,"$lte":50}}'`
+收窄范围，再 `vf chunk show <key> --around 3` 读邻域而非整文件。
 
 通过普通 AWS SDK 查询也可以（要求同一嵌入模型——默认 preset 下查询向量必须来自
 `gte-multilingual-base`）：
@@ -95,8 +104,10 @@ vf search "capacity planning" --bucket docs
 client.list_indexes(vectorBucketName="docs")           # -> 派生索引 "text-…"
 client.query_vectors(..., queryVector={"float32": q}, returnMetadata=True)
 # 命中元数据携带溯源键：
-#   x-vf-src-name（文件键）  x-vf-src-uri（短哈希，可过滤）
-#   x-vf-model               x-vf-chunk-text
+#   x-vf-src-name（文件键）    x-vf-src-uri（短哈希，可过滤）
+#   x-vf-model                 x-vf-chunk-text
+#   x-vf-chunk-kind（body/toc/caption/legend，可过滤）
+#   x-vf-page-start/end · x-vf-line-start/end · x-vf-section（数值，可过滤）
 ```
 
 ### 仅协议模式（SDK 模拟器）

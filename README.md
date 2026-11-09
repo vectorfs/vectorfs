@@ -28,9 +28,12 @@ One daemon, two wire contracts. The naming is the map:
 The capability behind the vectorfs API — extract → chunk → embed, with reconciliation
 and GC — is implemented by the **file layer** (see [below](#the-file-layer-in-brief)).
 
-> **Status: pre-release (v0.2).** The s3vectors API face is complete; the vectorfs API
-> ships its text-modality MVP (PDF / Markdown / plain text). Image modality, OCR,
-> docx/html extractors, hybrid full-text search → v0.3 (see [design.md](design.md) §7).
+> **Status: pre-release.** The s3vectors API face is complete; the vectorfs API ships
+> text + image modalities (PDF incl. scanned via OCR, Markdown, plain text, docx/html,
+> epub/zip/eml containers), hybrid full-text search (BM25 over Lance native FTS) with
+> reranking, structure-aware extraction (furniture stripping + TOC/legend labels), and
+> content addressing (page/line coordinates, grep-style neighborhood reads). Audio/video
+> modality → M4 (see [design.md](design.md) §7).
 
 Vocabulary is governed by [CONTEXT.md](CONTEXT.md); the two-face naming decision is
 [ADR 0001](docs/adr/0001-two-layer-api-naming.md).
@@ -90,9 +93,19 @@ backend, plain file copy on the file backend) are picked up by the periodic scan
 (default 30 s) — the source bucket IS the data source; deletions are reconciled
 the same way (chunks GC'd).
 
-`vf` verbs: `put` (`--async`), `search`, `sources list|status`, `get`, `rm`,
-`reindex`, `status`. Everything is also on the wire as the vectorfs API's eight
-operations under `/x-vf/<Op>` (design.md appendix E) — same SigV4, same error shapes.
+`vf` verbs: `put` (`--async`), `search` (`--mode semantic|keyword|hybrid`, `--source`,
+`--kind`, `--rerank`, coordinate-range `--filter`), `chunks` (enumerate one file's
+address space), `chunk show` (grep-style bounded context read around a hit),
+`sources list|status`, `get`, `rm`, `reindex`, `status`. Everything is also on the wire
+as the vectorfs API's operations under `/x-vf/<Op>` (design.md appendix E) — same
+SigV4, same error shapes.
+
+Structure-aware retrieval out of the box: headers/footers never make it into chunks,
+TOC and legend chunks stay indexed but out of default results (`--kind toc` admits
+them — "which page is the tools chapter on" is a legitimate query), and every hit
+carries its address (`p18-19` / `L405-420` / `§3`) — narrow with
+`--filter '{"x-vf-page-start":{"$gte":10,"$lte":50}}'`, then read the neighborhood
+with `vf chunk show <key> --around 3` instead of the whole file.
 
 Querying through a plain AWS SDK works too (same embedding model required — the
 query vector must come from `gte-multilingual-base` for the default preset):
@@ -101,8 +114,10 @@ query vector must come from `gte-multilingual-base` for the default preset):
 client.list_indexes(vectorBucketName="docs")           # -> derived index "text-…"
 client.query_vectors(..., queryVector={"float32": q}, returnMetadata=True)
 # hit metadata carries the provenance keys:
-#   x-vf-src-name (file key)  x-vf-src-uri (short hash, filterable)
-#   x-vf-model                x-vf-chunk-text
+#   x-vf-src-name (file key)   x-vf-src-uri (short hash, filterable)
+#   x-vf-model                 x-vf-chunk-text
+#   x-vf-chunk-kind (body/toc/caption/legend, filterable)
+#   x-vf-page-start/end · x-vf-line-start/end · x-vf-section (filterable numbers)
 ```
 
 ### Unified multimodal embedding (remote, b1)
