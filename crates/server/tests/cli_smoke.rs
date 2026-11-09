@@ -428,9 +428,9 @@ fn cli_full_command_smoke() {
     assert!(o.status.success(), "stdout:\n{}", out(&o));
     assert!(out(&o).contains("docs/fox.txt"), "{}", out(&o));
 
-    // (the tiny fixture embeds only a 16-word vocab — "quick brown fox" is
-    // the discriminative query; the assertion target is the hit SHAPE and
-    // the 回源 location, not the toy model's ranking quality)
+    // T12: repeatable --kind passes through to the wire's includeKinds (a
+    // txt corpus has no toc chunks - the pin is the flag plumbing + the
+    // wire accepting the admitted vocabulary, exit 0)
     let o = vf(
         port,
         &[
@@ -439,7 +439,33 @@ fn cli_full_command_smoke() {
             "--bucket",
             "docs",
             "--top-k",
-            "1",
+            "3",
+            "--kind",
+            "toc",
+            "--kind",
+            "legend",
+        ],
+        false,
+    );
+    assert!(o.status.success(), "stdout:\n{}", out(&o));
+
+    // (the tiny fixture embeds only a 16-word vocab — for OOV terms like
+    // this query several chunks tie at distance 0.0 and the tie breaks by
+    // key ascending, so the ASSERTION TARGET is the hit SHAPE, the 回源
+    // location, and the fox document being PRESENT — never which tied
+    // chunk lands first; T12 note: the always-on kind-exclusion filter
+    // puts every Search on the filtered retrieval path, whose tie paging
+    // is deterministic per query shape but not identical to the unfiltered
+    // one this test was originally pinned against)
+    let o = vf(
+        port,
+        &[
+            "search",
+            "quick brown fox",
+            "--bucket",
+            "docs",
+            "--top-k",
+            "3",
             "--json",
         ],
         false,
@@ -449,7 +475,11 @@ fn cli_full_command_smoke() {
     assert_eq!(v["schema_version"], 1, "{}", out(&o));
     let hits = v["hits"].as_array().unwrap();
     assert!(!hits.is_empty(), "{}", out(&o));
-    assert_eq!(hits[0]["location"]["key"], "docs/fox.txt", "{}", out(&o));
+    assert!(
+        hits.iter().any(|h| h["location"]["key"] == "docs/fox.txt"),
+        "{}",
+        out(&o)
+    );
     assert_eq!(hits[0]["content"]["type"], "TEXT", "{}", out(&o));
     assert!(hits[0]["content"]["text"].is_string(), "{}", out(&o));
     assert!(hits[0]["score"].as_f64().is_some(), "{}", out(&o));

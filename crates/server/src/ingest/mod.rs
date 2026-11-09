@@ -785,6 +785,19 @@ struct RouteNote {
     class: ContentClass,
 }
 
+/// The extract segment's retry cache (T12): the chunks a successful
+/// extraction produced PLUS the per-completion observables that ride the
+/// exact same lifecycle — the routing trace and the furniture audit tally
+/// — set once (retries reuse it), read once at completion. Grouped so the
+/// lifecycle is a type, not a comment.
+struct ExtractCache {
+    chunks: Vec<Chunk>,
+    route_note: Option<RouteNote>,
+    /// The extraction's `furniture_removed` sum (T12 audit, durable into
+    /// the marker at completion).
+    furniture: u32,
+}
+
 // ---------------------------------------------------------------------------
 // M2.1 step 3: container unpacking (children re-enter USER routing)
 // ---------------------------------------------------------------------------
@@ -1806,10 +1819,12 @@ impl IngestRuntime {
         }
 
         // ---- attempts ----
-        let mut cached_chunks: Option<Vec<Chunk>> = None;
-        // routing trace of the (first) successful extract segment — rides
-        // the same lifecycle as cached_chunks: set once, read at completion
-        let mut route_note: Option<RouteNote> = None;
+        // the extract segment's retry cache: set once on the first
+        // successful attempt, reused by every retry — the chunks plus the
+        // per-completion observables that ride the same lifecycle (the
+        // routing trace, T12's furniture tally), so retries never
+        // double-count anything
+        let mut cache: Option<ExtractCache> = None;
         let mut succeeded: BTreeSet<String> = BTreeSet::new();
         let mut last_err = String::new();
         let mut parked: Option<String> = None;
@@ -1817,14 +1832,7 @@ impl IngestRuntime {
         loop {
             attempts += 1;
             match self
-                .try_attempt(
-                    job,
-                    plan,
-                    &bytes,
-                    &mut cached_chunks,
-                    &mut route_note,
-                    &mut succeeded,
-                )
+                .try_attempt(job, plan, &bytes, &mut cache, &mut succeeded)
                 .await
             {
                 Ok(()) => {
@@ -1848,7 +1856,7 @@ impl IngestRuntime {
 
         // per-modality counts ("text" always, "image" only when present —
         // M3-T1; byte-stable with the pre-image marker for text-only files)
-        let chunks_map = Some(chunk_counts(cached_chunks.as_deref()));
+        let chunks_map = Some(chunk_counts(cache.as_ref().map(|c| c.chunks.as_slice())));
         let all_done = succeeded.len() == plan.embedders.len();
         let outcome = if let Some(reason) = parked {
             Outcome::Parked(reason)
@@ -1857,12 +1865,14 @@ impl IngestRuntime {
                 sig,
                 hash,
                 chunks: chunks_map,
+                furniture: cache.as_ref().map(|c| c.furniture),
                 retries: attempts - 1,
                 // progress-line routing note, present only when the probe
                 // actually engaged (multi-member chain + class verdict):
                 // "plain (class=mixed-text-scan)"
-                via: route_note
-                    .take()
+                via: cache
+                    .as_ref()
+                    .and_then(|c| c.route_note.as_ref())
                     .map(|n| format!("{} (class={})", n.winner, n.class)),
             }
         } else if !succeeded.is_empty() {
@@ -1876,6 +1886,7 @@ impl IngestRuntime {
                 sig,
                 hash,
                 chunks: chunks_map,
+                furniture: cache.as_ref().map(|c| c.furniture),
                 reason: format!(
                     "embedder(s) {} failed after {} attempt(s): {last_err}",
                     failed.join(", "),
@@ -1896,13 +1907,12 @@ impl IngestRuntime {
         job: &Job,
         plan: &BucketPlan,
         bytes: &Bytes,
-        cached: &mut Option<Vec<Chunk>>,
-        note: &mut Option<RouteNote>,
+        cache: &mut Option<ExtractCache>,
         succeeded: &mut BTreeSet<String>,
     ) -> Result<(), AttemptErr> {
         // ---- extract + chunk (CPU segment) ----
-        let chunks: &[Chunk] = match cached {
-            Some(c) => c,
+        let chunks: &[Chunk] = match cache {
+            Some(c) => &c.chunks,
             None => {
                 let chain = plan.extractor_chain_for(&job.object_key).ok_or_else(|| {
                     AttemptErr::Parked(format!(
@@ -2031,17 +2041,25 @@ impl IngestRuntime {
                             }
                         })
                         .and_then(|(winner, parts)| {
+                            // T12 audit: the winning member's parts carry
+                            // the extractor's furniture tally — summed
+                            // here (parts die with this segment; the sum
+                            // rides beside the chunks they produced)
+                            let furniture = u32::try_from(
+                                parts.iter().map(|p| p.furniture_removed).sum::<usize>(),
+                            )
+                            .unwrap_or(u32::MAX);
                             chunker
                                 .chunk(&parts)
-                                .map(|chunks| (winner, chunks))
+                                .map(|chunks| (winner, furniture, chunks))
                                 .map_err(|e| AttemptErr::Fail(e.to_string()))
                         })
-                        .map(|(winner, chunks)| {
+                        .map(|(winner, furniture, chunks)| {
                             // the note exists only when routing engaged
                             let traced = class.map(|c| RouteNote { winner, class: c });
                             match traced {
-                                Some(t) => (Some(t), chunks),
-                                None => (None, chunks),
+                                Some(t) => (Some(t), furniture, chunks),
+                                None => (None, furniture, chunks),
                             }
                         })
                 });
@@ -2060,16 +2078,25 @@ impl IngestRuntime {
                         )));
                     }
                 };
-                // joined: Result<Result<(Option<RouteNote>, Vec<Chunk>),
+                // joined: Result<Result<(Option<RouteNote>, u32, Vec<Chunk>),
                 // AttemptErr>, JoinError> (timeout layer already unwrapped)
-                let (traced, chunks): (Option<RouteNote>, Vec<Chunk>) = match joined {
-                    Ok(Ok(v)) => v,
-                    Ok(Err(e)) => return Err(e),
-                    Err(e) => return Err(AttemptErr::Fail(format!("extract task panicked: {e}"))),
-                };
-                *note = traced;
-                *cached = Some(chunks);
-                cached.as_deref().expect("just stored")
+                let (traced, furniture_of_run, chunks): (Option<RouteNote>, u32, Vec<Chunk>) =
+                    match joined {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => return Err(e),
+                        Err(e) => {
+                            return Err(AttemptErr::Fail(format!("extract task panicked: {e}")));
+                        }
+                    };
+                *cache = Some(ExtractCache {
+                    chunks,
+                    route_note: traced,
+                    furniture: furniture_of_run,
+                });
+                cache
+                    .as_ref()
+                    .map(|c| c.chunks.as_slice())
+                    .expect("just stored")
             }
         };
 
@@ -2240,6 +2267,7 @@ impl IngestRuntime {
                 sig,
                 hash,
                 chunks,
+                furniture,
                 retries,
                 via,
             } => {
@@ -2247,6 +2275,7 @@ impl IngestRuntime {
                 m.etag_sig = sig;
                 m.content_hash = hash;
                 m.chunks = chunks;
+                m.furniture_removed = furniture;
                 m.retries = retries;
                 m.retries_exhausted = false;
                 m.status_reason = None;
@@ -2278,12 +2307,14 @@ impl IngestRuntime {
                 sig,
                 hash,
                 chunks,
+                furniture,
                 reason,
             } => {
                 m.status = SourceStatus::PartiallyIndexed;
                 m.etag_sig = sig;
                 m.content_hash = hash;
                 m.chunks = chunks;
+                m.furniture_removed = furniture;
                 m.retries_exhausted = true; // the retry budget IS spent
                 m.status_reason = Some(reason.clone());
                 m.engines = engines_now;
@@ -2296,6 +2327,7 @@ impl IngestRuntime {
                 m.status_reason = Some(reason.clone());
                 m.chunks = None;
                 m.engines = None;
+                m.furniture_removed = None;
                 eprintln!("ingest: {} -> FAILED ({reason})", job.object_key);
             }
             Outcome::Parked(reason) => {
@@ -2304,6 +2336,7 @@ impl IngestRuntime {
                 m.status_reason = Some(reason.clone());
                 m.chunks = None;
                 m.engines = None;
+                m.furniture_removed = None;
                 eprintln!("ingest: {} -> FAILED/parked ({reason})", job.object_key);
             }
         }
@@ -2347,6 +2380,8 @@ enum Outcome {
         sig: String,
         hash: String,
         chunks: Option<BTreeMap<String, u32>>,
+        /// The extraction's furniture tally (T12 audit, per-source durable).
+        furniture: Option<u32>,
         retries: u32,
         /// Routing trace for the progress line — `"{winner} (class={c})"`,
         /// present only when the probe engaged (M2.1 step 2). NOT marker
@@ -2358,6 +2393,9 @@ enum Outcome {
         sig: String,
         hash: String,
         chunks: Option<BTreeMap<String, u32>>,
+        /// Same as [`Outcome::Indexed`]'s: a partial completion still ran
+        /// the extraction whose tally this is.
+        furniture: Option<u32>,
         reason: String,
     },
     Failed(String),
@@ -2377,10 +2415,14 @@ struct BatchRow {
 /// Chunk metadata (§5.10.1 complete key set): `x-vf-src-uri` (key hash,
 /// filterable, the GC join key), `x-vf-src-name` (full key, non-filterable),
 /// `x-vf-modality`, `x-vf-model`, `x-vf-chunk-text` (default on, droppable
-/// via `store_chunk_text = false`). Per-chunk modality (M3-T1): both the
-/// metadata value and the chunk-key namespace come from the CHUNK, so image
-/// atoms land in the `image` namespace (`{hash}-image-{i}`) with
-/// `x-vf-modality = image` — text chunks are byte-identical to before.
+/// via `store_chunk_text = false`), `x-vf-chunk-kind` (T12: the chunk's
+/// structural kind, ALWAYS explicit — the default `body` is written too, so
+/// filter semantics never hinge on key absence; filterable like
+/// `x-vf-modality`, NOT in the non-filterable declaration). Per-chunk
+/// modality (M3-T1): both the metadata value and the chunk-key namespace
+/// come from the CHUNK, so image atoms land in the `image` namespace
+/// (`{hash}-image-{i}`) with `x-vf-modality = image` — text chunks are
+/// byte-identical to before.
 fn build_rows(
     plan: &BucketPlan,
     job: &Job,
@@ -2397,6 +2439,10 @@ fn build_rows(
             "x-vf-src-name": job.object_key,
             "x-vf-modality": modality.to_string(),
             "x-vf-model": spec.model,
+            // T12 structure kind: ALWAYS explicit (body included — 显式 >
+            // 缺席, the filter's NULL story stays the LEGACY-row story
+            // only). The 40KB preflight below covers it for free.
+            "x-vf-chunk-kind": chunk.kind.to_string(),
         });
         if plan.store_chunk_text {
             metadata
@@ -3001,6 +3047,7 @@ async fn reindex_bucket_quiesced(
             updated_at: now.clone(),
             chunks: None,
             engines: None,
+            furniture_removed: None,
         };
         state
             .storage
@@ -3331,6 +3378,9 @@ pub(crate) mod tests {
         for hit in vectors {
             let meta = &hit["metadata"];
             assert_eq!(meta["x-vf-modality"], "text");
+            // T12: the structure kind is ALWAYS stamped (body here — txt
+            // chunks carry no structure; the explicit default is the point)
+            assert_eq!(meta["x-vf-chunk-kind"], "body");
             assert!(meta["x-vf-src-name"].as_str().unwrap().starts_with("docs/"));
             assert_eq!(
                 meta["x-vf-src-uri"].as_str().unwrap().len(),
@@ -3838,6 +3888,7 @@ pub(crate) mod tests {
             updated_at: "t".into(),
             chunks: Some(BTreeMap::from([("text".to_string(), 1)])),
             engines: None,
+            furniture_removed: None,
         };
         state
             .storage

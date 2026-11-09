@@ -144,6 +144,15 @@ struct SearchInput {
     /// serve startup), a TEXT query (the cross-encoder reads the pair) and
     /// a non-keyword mode. Default absent/false = the pre-T11 behavior.
     rerank: Option<bool>,
+    /// Structure kinds to ADMIT beyond the default visibility (T12, D-5):
+    /// Search excludes `toc` and `legend` chunks by default (F2/F4
+    /// governance — TOC lines are perfect BM25 matches and霸榜; legends
+    /// amplify pathologically short docs); listing a kind here放行s it
+    /// (e.g. `includeKinds: ["toc"]` for the navigation query「哪章在哪页」).
+    /// Values are validated against the closed `x-vf-chunk-kind`
+    /// vocabulary (`body|toc|caption|legend`) — unknown kinds are
+    /// ValidationExceptions, never silent no-matches.
+    include_kinds: Option<Vec<String>>,
 }
 
 /// The parsed `searchMode` (see [`SearchInput::search_mode`]).
@@ -343,6 +352,11 @@ fn source_status_json(
     if let Some(chunks) = chunks_json(&m.chunks) {
         o["chunks"] = json!(chunks);
     }
+    // T12 audit: the extraction's furniture tally (Some(0) = extracted,
+    // removed nothing; absent = no completing extraction / pre-T12 marker)
+    if let Some(n) = m.furniture_removed {
+        o["furnitureRemoved"] = json!(n);
+    }
     o
 }
 
@@ -363,6 +377,7 @@ fn pending_marker(key: &str, sig: &str, fingerprint: &str) -> SourceMarker {
         updated_at: crate::ingest::marker::now_rfc3339(),
         chunks: None,
         engines: None,
+        furniture_removed: None,
     }
 }
 
@@ -766,6 +781,81 @@ fn decode_image_query(img: &SearchImageInput) -> Result<(Vec<u8>, String), ApiEr
     Ok((bytes, sniffed))
 }
 
+/// The kinds Search excludes unless [`SearchInput::include_kinds`] admits
+/// them (T12, D-5): TOC lines are page-repeated perfect lexical matches
+/// (F2's霸榜) and legend blocks are pathologically short BM25 docs — both
+/// stay INDEXED and retrievable, just out of the DEFAULT result set (the
+/// superset parameter放行s them; ranking policy, never chunk identity, so
+/// this list lives on the query face and touches no fingerprint).
+const SEARCH_DEFAULT_EXCLUDED_KINDS: [&str; 2] = ["toc", "legend"];
+
+/// Compile the Search filter: the user's `$`-operator filter, conjoined
+/// with the default kind exclusion unless `include_kinds` admits every
+/// excluded kind (T12).
+///
+/// **Negative-form predicate (the m3 trap)**: the exclusion compiles to
+/// `x-vf-chunk-kind $nin [...]`, whose semantics on BOTH execution paths
+/// treat a MISSING key as matching — memory `eval_cond` (`!stored
+/// .is_some_and(..)`) and SQL pushdown (`col IS NULL OR col NOT IN ..`).
+/// A bare `!=`/`NOT IN` would let SQL three-valued logic drop every
+/// NULL row — which is exactly the LEGACY pre-T12 population; 存量 null 行
+/// 默认可见 is pinned by test.
+///
+/// `include_kinds` values are validated against the closed kind
+/// vocabulary — an unknown kind is a field-addressable ValidationException
+/// (the m5 discipline), never a silent no-match.
+fn search_filter(
+    user: &Option<serde_json::Value>,
+    include_kinds: &Option<Vec<String>>,
+) -> Result<Option<crate::filter::Filter>, ApiError> {
+    // validate + resolve the admitted set first (unknown kinds fail loud
+    // even when the exclusion would end up empty — a typo'd kind name must
+    // not silently pass as "no-op")
+    let mut admitted: Vec<&str> = Vec::new();
+    if let Some(kinds) = include_kinds {
+        for k in kinds {
+            if crate::pipeline::ChunkKind::parse(k).is_none() {
+                return Err(ApiError::validation_field(
+                    "includeKinds",
+                    format!(
+                        "unknown includeKinds entry {k:?} (allowed kinds: body, toc, caption, \
+                         legend — the x-vf-chunk-kind vocabulary)"
+                    ),
+                ));
+            }
+            admitted.push(k.as_str());
+        }
+    }
+    let excluded: Vec<&str> = SEARCH_DEFAULT_EXCLUDED_KINDS
+        .into_iter()
+        .filter(|k| !admitted.contains(k))
+        .collect();
+    // everything admitted: no injection, the user filter stands alone
+    // (byte-identical compile + error path of the pre-T12 behavior)
+    if excluded.is_empty() {
+        return match user {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(f) => Ok(Some(
+                crate::filter::Filter::compile(f)
+                    .map_err(|e| ApiError::validation_field("filter", e.0))?,
+            )),
+        };
+    }
+    // conjoin at the JSON level ($and composes with any user grammar):
+    // `user AND kind $nin excluded` — one compiled filter both routes run
+    let injection = serde_json::json!({
+        "x-vf-chunk-kind": { "$nin": excluded },
+    });
+    let combined = match user {
+        None | Some(serde_json::Value::Null) => injection,
+        Some(f) => serde_json::json!({ "$and": [f, injection] }),
+    };
+    Ok(Some(
+        crate::filter::Filter::compile(&combined)
+            .map_err(|e| ApiError::validation_field("filter", e.0))?,
+    ))
+}
+
 /// `POST /x-vf/Search` (appendix E.2) — the flagship superset op: embed the
 /// query once per QUERY-MODALITY-matching embedder, query each derived index
 /// (topK, `$`-short-name filter, pre-filter pushdown — the same
@@ -976,13 +1066,11 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
 
     // filter: `$` short-name syntax, same compile + non-filterable rejection
     // as QueryVectors (appendix E.5: the two official grammars stay as-is).
-    let compiled = match &input.filter {
-        None | Some(serde_json::Value::Null) => None,
-        Some(f) => Some(
-            crate::filter::Filter::compile(f)
-                .map_err(|e| ApiError::validation_field("filter", e.0))?,
-        ),
-    };
+    // T12 kind governance composes INTO the same compiled filter (see
+    // [`search_filter`]): one filter object is what BOTH routes consume —
+    // the semantic routes' pushdown and the lexical kernel's pre/post
+    // filter — so the default exclusion covers every searchMode at once.
+    let compiled = search_filter(&input.filter, &input.include_kinds)?;
 
     let names = shared.embedder_names(&input.bucket).unwrap_or_default();
     if names.is_empty() {
@@ -1344,8 +1432,14 @@ pub async fn get_ingest_status(
         ]);
         let mut pending_count = 0u64;
         let mut done = 0usize; // reindex progress: terminal markers
+        // T12 audit aggregate: furniture lines removed across the bucket's
+        // DURABLE markers (not the process-lifetime stats block — this
+        // survives restarts like the markers it sums; Some(0) sources
+        // contribute 0, pre-T12/failed markers contribute nothing)
+        let mut furniture_lines: u64 = 0;
         for m in &markers {
             *counts.entry(m.status.as_str()).or_insert(0) += 1;
+            furniture_lines += m.furniture_removed.unwrap_or(0) as u64;
             match m.status {
                 SourceStatus::Pending | SourceStatus::InProgress => pending_count += 1,
                 SourceStatus::Indexed | SourceStatus::PartiallyIndexed | SourceStatus::Failed => {
@@ -1372,6 +1466,9 @@ pub async fn get_ingest_status(
             "bucket": bucket,
             "counts": counts,
             "pendingCount": pending_count,
+            // T12 audit (durable): furniture lines this bucket's
+            // extractions removed — 静默行为变可审计行为
+            "furnitureLinesRemoved": furniture_lines,
             // KB IngestionJobStatistics field names (appendix E.2/E.5):
             // process-lifetime cumulative counters (reset on restart).
             "stats": {
@@ -2164,6 +2261,313 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
         assert_eq!(b["fieldList"][0]["path"], json!("topK"));
+    }
+
+    /// T12 kind governance over the wire (D-5 + the protocol m3/m5
+    /// duties): three populations share one index — a stamped `body` row,
+    /// a stamped `toc` row, and a LEGACY row with NO kind key (the pre-T12
+    /// population) — and the faces must treat them as:
+    ///
+    /// * **Search default**: toc hidden, body AND the legacy NULL row
+    ///   visible — the negative-form predicate is the whole point (a bare
+    ///   `!=` would let SQL three-valued logic drop every null row);
+    /// * **includeKinds**: the superset放行 — the navigation query
+    ///   (「哪章在哪页」) reaches the toc chunk;
+    /// * **unknown kinds**: field-addressable ValidationException (m5),
+    ///   never a silent no-match;
+    /// * **QueryVectors (protocol)**: NO implicit exclusion — unfiltered
+    ///   returns the toc row, and the kind key filters explicitly.
+    #[tokio::test]
+    async fn search_kind_governance_null_rows_and_include_kinds() {
+        // fts ON (superset of the plain fixture): the kind exclusion must
+        // hold on the LEXIAL arm too — one injected filter, every route
+        let f = fixture_with(tiny_fts_config(false)).await;
+        // one real ingest so the derived index exists (dim + mirror
+        // columns materialize through the normal path)
+        put_source_call(
+            &f,
+            "docs",
+            "docs/fox.txt",
+            b"the quick brown fox jumps over the lazy dog".to_vec(),
+        )
+        .await;
+        drive(&f).await;
+        let (st, _, status) =
+            call_json(&f, "/x-vf/GetIngestStatus", json!({"bucket":"docs"})).await;
+        assert_eq!(st, StatusCode::OK, "{status}");
+        let ix = &status["buckets"][0]["derivedIndexes"][0];
+        let index = ix["index"].as_str().unwrap().to_string();
+        let dim = ix["dim"].as_u64().unwrap() as usize;
+
+        // the three populations, written through the PROTOCOL face (the
+        // exact rows a mixed pre/post-T12 index holds)
+        // every row carries chunk TEXT with the query term so the LEXICAL
+        // arm can match them too (the kind governance must hold on both
+        // routes; a textless row is invisible to BM25 by construction)
+        let row = |key: &str, extra: serde_json::Value| {
+            let mut meta = json!({"x-vf-chunk-text": "the fox governance fixture row"});
+            if let (serde_json::Value::Object(dst), serde_json::Value::Object(src)) =
+                (&mut meta, extra)
+            {
+                for (k, v) in src {
+                    dst.insert(k, v);
+                }
+            }
+            json!({
+                "key": key,
+                "data": { "float32": vec![0.5f32; dim] },
+                "metadata": meta,
+            })
+        };
+        let body = serde_json::json!({
+            "vectorBucketName": "docs",
+            "indexName": index,
+            "vectors": [
+                row("kind-body-row", json!({"x-vf-chunk-kind": "body"})),
+                row("kind-toc-row", json!({"x-vf-chunk-kind": "toc"})),
+                row("legacy-null-row", json!({"legacy": true})),
+            ],
+        });
+        let resp = crate::ops::put_vectors(
+            State(f.state.as_ref().clone()),
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .expect("put rows");
+        let _ = resp;
+
+        let keys_of = |b: &serde_json::Value| -> Vec<String> {
+            b["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["key"].as_str().unwrap_or("").to_string())
+                .collect()
+        };
+
+        // ---- Search default: toc hidden, body + the LEGACY NULL row
+        // visible (m3: 存量 null 行默认可见) ----
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":50}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let keys = keys_of(&b);
+        assert!(
+            keys.contains(&"legacy-null-row".to_string()),
+            "the pre-T12 null-kind row must stay visible: {keys:?}"
+        );
+        assert!(keys.contains(&"kind-body-row".to_string()), "{keys:?}");
+        assert!(
+            !keys.contains(&"kind-toc-row".to_string()),
+            "toc is excluded from the default result set: {keys:?}"
+        );
+        // attribution stays visible on the admitted rows (kind in metadata)
+        assert!(
+            b["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["key"] == json!("kind-body-row")
+                    && h["metadata"]["x-vf-chunk-kind"] == json!("body")),
+            "{b}"
+        );
+
+        // ---- the LEXICAL arm carries the same exclusion (the injection
+        // composes into the ONE filter both routes run): keyword mode ----
+        for mode in ["keyword", "hybrid"] {
+            let (st, _, b) = call_json(
+                &f,
+                "/x-vf/Search",
+                json!({"bucket":"docs","query":{"text":"fox"},"topK":50,
+                       "searchMode": mode}),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{mode}: {b}");
+            let keys = keys_of(&b);
+            assert!(
+                keys.contains(&"legacy-null-row".to_string()),
+                "{mode}: null row visible: {keys:?}"
+            );
+            assert!(
+                !keys.contains(&"kind-toc-row".to_string()),
+                "{mode}: toc excluded: {keys:?}"
+            );
+            // ...and includeKinds放行s on the lexical arm as well
+            let (st, _, b) = call_json(
+                &f,
+                "/x-vf/Search",
+                json!({"bucket":"docs","query":{"text":"fox"},"topK":50,
+                       "searchMode": mode, "includeKinds":["toc"]}),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{mode}: {b}");
+            assert!(
+                keys_of(&b).contains(&"kind-toc-row".to_string()),
+                "{mode}: includeKinds admits toc: {:?}",
+                keys_of(&b)
+            );
+        }
+
+        // ---- includeKinds放行: the navigation query reaches the toc chunk ----
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":50,
+                   "includeKinds":["toc"]}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let keys = keys_of(&b);
+        assert!(
+            keys.contains(&"kind-toc-row".to_string()),
+            "includeKinds admits the toc row: {keys:?}"
+        );
+        assert!(keys.contains(&"legacy-null-row".to_string()), "{keys:?}");
+        // admitting BOTH excluded kinds empties the injection entirely (the
+        // user filter path stands alone, byte-identical)
+        let (st, _, b2) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":50,
+                   "includeKinds":["toc","legend"]}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b2}");
+        assert_eq!(
+            keys_of(&b2),
+            keys,
+            "both admitted == toc-only admitted here"
+        );
+        // the kind exclusion composes WITH a user filter (AND semantics)
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":50,
+                   "filter":{"legacy":{"$eq":true}}}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let keys = keys_of(&b);
+        assert_eq!(keys, vec!["legacy-null-row".to_string()], "{keys:?}");
+
+        // ---- unknown kinds: field-addressable 400 (m5), not a silent
+        // no-match ----
+        let (st, h, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":5,
+                   "includeKinds":["header"]}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(errortype(&h), Some("ValidationException"));
+        assert!(
+            b["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown includeKinds entry"),
+            "{b}"
+        );
+        assert_eq!(b["fieldList"][0]["path"], json!("includeKinds"), "{b}");
+
+        // ---- protocol face (QueryVectors): NO implicit exclusion — the
+        // toc row is unfiltered-visible AND explicitly filterable ----
+        let qbody = serde_json::json!({
+            "vectorBucketName": "docs",
+            "indexName": index,
+            "queryVector": {"float32": vec![0.5f64; dim]},
+            "topK": 100,
+            "returnMetadata": true,
+        });
+        let resp = crate::ops::query_vectors(
+            State(f.state.as_ref().clone()),
+            Bytes::from(serde_json::to_vec(&qbody).unwrap()),
+        )
+        .await
+        .expect("query ok");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let qkeys: Vec<&str> = v["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["key"].as_str().unwrap())
+            .collect();
+        assert!(
+            qkeys.contains(&"kind-toc-row"),
+            "QueryVectors never implicitly excludes: {qkeys:?}"
+        );
+        // ...and the kind key is a first-class filterable on the protocol
+        // face (explicit user behavior)
+        let mut filtered = qbody.clone();
+        filtered["filter"] = json!({"x-vf-chunk-kind": {"$eq": "toc"}});
+        let resp = crate::ops::query_vectors(
+            State(f.state.as_ref().clone()),
+            Bytes::from(serde_json::to_vec(&filtered).unwrap()),
+        )
+        .await
+        .expect("query ok");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let got: Vec<&str> = v["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(got, vec!["kind-toc-row"], "explicit kind filter: {got:?}");
+    }
+
+    /// tiny-embedder pipeline with the PDF route (structure detection ON —
+    /// the T12 adjudicated default): the extractor's furniture tally must
+    /// flow to the durable marker, the per-source wire row, and the
+    /// per-bucket GetIngestStatus aggregate (slice 2's audit channel
+    /// consumed).
+    #[tokio::test]
+    async fn ingest_furniture_tally_flows_to_marker_and_status() {
+        let text = format!(
+            "[extractor.pdf]\nkind = \"pdf-text\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = true\n\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ pdf = \"pdf\" }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"tiny\"]\nscan_interval_secs = 1\n",
+            fixture_dir().display().to_string()
+        );
+        let f = fixture_with(load_pipeline_config(&text).unwrap()).await;
+        // 4 pages, every page head the same strap: the furniture gate
+        // (100% of pages, substance gates pass) removes 4 lines
+        let pages: Vec<Vec<String>> = (0..4usize)
+            .map(|i| {
+                vec![
+                    "copyright 2026 vectorfs radar".to_string(),
+                    format!("unique prose {i} for the page"),
+                    format!("second prose {i} line here"),
+                ]
+            })
+            .collect();
+        let pdf_bytes = crate::pipeline::extract::pdf_inspector::tests::build_t12_pdf(pages);
+        put_source_call(&f, "docs", "docs/radar.pdf", pdf_bytes).await;
+        drive(&f).await;
+        let m = marker_of(&f, "docs/radar.pdf").await.expect("marker");
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
+        assert_eq!(m.furniture_removed, Some(4), "the strap left every page");
+
+        // per-source wire row (ListSources / vf ls's FURN column source)
+        let (st, _, b) = call_json(&f, "/x-vf/ListSources", json!({"bucket":"docs"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["sources"][0]["furnitureRemoved"], json!(4), "{b}");
+
+        // per-bucket durable aggregate (GetIngestStatus / vf status)
+        let (st, _, b) = call_json(&f, "/x-vf/GetIngestStatus", json!({"bucket":"docs"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["buckets"][0]["furnitureLinesRemoved"], json!(4), "{b}");
     }
 
     /// M3-T4 以图搜图 over the wire, in-process: the image FILE extractor +

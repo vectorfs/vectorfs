@@ -348,6 +348,16 @@ pub struct SourceMarker {
     /// markers (never warned on) or a non-completing outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engines: Option<BTreeMap<String, String>>,
+    /// Furniture lines THIS source's extraction removed (T12 audit, slice
+    /// 2's channel consumed): summed over the winning extractor's parts at
+    /// completion. `Some(0)` = extraction ran and removed nothing (honest
+    /// "checked, clean"); `None` = no completing extraction this marker
+    /// (pre-T12 markers, FAILED/parked) — the two stay distinguishable so
+    /// the GetIngestStatus aggregate never guesses. Durable per source;
+    /// status sums it (the `stats` block's process-lifetime counters are a
+    /// different reset semantics and deliberately not used for this).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub furniture_removed: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -3988,6 +3998,7 @@ mod tests {
             updated_at: "2026-11-05T00:00:00.000Z".into(),
             chunks: Some(BTreeMap::from([("text".to_string(), 3)])),
             engines: None,
+            furniture_removed: None,
         }
     }
 

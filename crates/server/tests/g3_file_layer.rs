@@ -770,6 +770,7 @@ async fn gc_scope_is_exactly_the_held_lock_set() {
                 updated_at: "t0".into(),
                 chunks: Some(BTreeMap::from([("text".to_string(), 1)])),
                 engines: None,
+                furniture_removed: None,
             },
         )
         .await

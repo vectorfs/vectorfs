@@ -312,6 +312,7 @@ pub fn plan_present(
             updated_at: now.to_string(),
             chunks: None,
             engines: None,
+            furniture_removed: None,
         });
     };
     // any present sighting resets the N-strike counter (R5): a stale count
@@ -448,6 +449,7 @@ mod tests {
             updated_at: "t0".into(),
             chunks: None,
             engines: None,
+            furniture_removed: None,
         }
     }
 

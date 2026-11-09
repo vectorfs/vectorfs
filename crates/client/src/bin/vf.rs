@@ -216,6 +216,14 @@ struct SearchArgs {
     #[arg(long)]
     rerank: bool,
 
+    /// Structure kinds to ADMIT into the results (T12, repeatable):
+    /// search excludes toc/legend chunks by default (TOC lines are
+    /// page-repeated perfect lexical matches and霸榜 the default ranking);
+    /// `--kind toc` 放行s them — the navigation query「哪章在哪页」.
+    /// Allowed values: body, toc, caption, legend.
+    #[arg(long = "kind")]
+    kinds: Vec<String>,
+
     /// Structured output (schema_version'd JSON)
     #[arg(long)]
     json: bool,
@@ -879,6 +887,11 @@ async fn search_cmd(args: SearchArgs) {
     if let Some(f) = filter {
         body["filter"] = f;
     }
+    if !args.kinds.is_empty() {
+        // repeatable --kind ⇒ the wire's includeKinds array (the server
+        // validates the closed vocabulary; unknown kinds die loud)
+        body["includeKinds"] = json!(args.kinds);
+    }
     let v = match conn.call_json("Search", &body).await {
         Ok(v) => v,
         Err(e) => die(e, conn.endpoint()),
@@ -997,8 +1010,8 @@ async fn list_sources(
         return;
     }
     let header = format!(
-        "{:<40} {:<20} {:<8} {:<10} {}",
-        "KEY", "STATUS", "CHUNKS", "SIZE", "UPDATED"
+        "{:<40} {:<20} {:<8} {:<6} {:<10} {}",
+        "KEY", "STATUS", "CHUNKS", "FURN", "SIZE", "UPDATED"
     );
     println!("{header}");
     for s in &rows {
@@ -1008,11 +1021,17 @@ async fn list_sources(
             .as_array()
             .map(|cs| cs.iter().filter_map(|c| c["count"].as_u64()).sum::<u64>())
             .unwrap_or(0);
+        // T12 audit column: furniture lines this source's extraction
+        // removed ("-" = no completing extraction / pre-T12 marker)
+        let furniture = s["furnitureRemoved"]
+            .as_u64()
+            .map_or("-".into(), |n| n.to_string());
         println!(
-            "{:<40} {:<20} {:<8} {:<10} {}",
+            "{:<40} {:<20} {:<8} {:<6} {:<10} {}",
             truncate(s["key"].as_str().unwrap_or(""), 40),
             s["status"].as_str().unwrap_or(""),
             chunks,
+            furniture,
             s["size"]
                 .as_u64()
                 .map(human_bytes)
@@ -1356,6 +1375,15 @@ async fn status_cmd(args: StatusArgs) {
         );
         if let Some(at) = b["lastScanAt"].as_str() {
             println!("    lastScan : {at}");
+        }
+        // T12 audit (durable, summed over the markers — a different reset
+        // semantics than the process-lifetime stats below): printed only
+        // when anything was removed; the --json face always carries it
+        if b["furnitureLinesRemoved"].as_u64().is_some_and(|n| n > 0) {
+            println!(
+                "    furniture: {} lines removed",
+                b["furnitureLinesRemoved"]
+            );
         }
         let s = &b["stats"];
         if s.is_object() {

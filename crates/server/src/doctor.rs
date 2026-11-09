@@ -1165,6 +1165,7 @@ mod tests {
                     updated_at: "t".into(),
                     chunks: None,
                     engines: None,
+                    furniture_removed: None,
                 },
             )
             .await

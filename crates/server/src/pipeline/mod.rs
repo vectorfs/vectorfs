@@ -177,6 +177,24 @@ impl std::fmt::Display for ChunkKind {
     }
 }
 
+impl ChunkKind {
+    /// The inverse of `Display` (the `x-vf-chunk-kind` value grammar): the
+    /// closed four-word vocabulary, or `None` for anything else. The
+    /// `/x-vf/Search` face validates its `includeKinds` superset parameter
+    /// through here (T12: an unknown kind must fail loud with a
+    /// field-addressable error, never silently match nothing — the m5
+    /// path discipline).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "body" => Some(ChunkKind::Body),
+            "toc" => Some(ChunkKind::Toc),
+            "caption" => Some(ChunkKind::Caption),
+            "legend" => Some(ChunkKind::Legend),
+            _ => None,
+        }
+    }
+}
+
 /// Content CLASS of one source's bytes (M2.1 step 2: probe → affinity →
 /// route): what the bytes ARE, family-agnostic — the same vocabulary serves
 /// the pdf family today and the image family in M3.
@@ -1245,6 +1263,13 @@ mod tests {
                 assert_eq!(a == b, i == j);
             }
         }
+        // Display/parse round-trip: the x-vf-chunk-kind value grammar is
+        // closed in BOTH directions (includeKinds validates through parse)
+        for (k, s) in all {
+            assert_eq!(ChunkKind::parse(s), Some(k), "{s}");
+        }
+        assert_eq!(ChunkKind::parse("header"), None);
+        assert_eq!(ChunkKind::parse(""), None);
         // LabelSpan carries its kind by value (Copy) alongside the byte range
         let span = LabelSpan {
             range: 0..3,
