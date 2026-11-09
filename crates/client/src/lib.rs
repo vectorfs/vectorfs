@@ -316,10 +316,23 @@ impl Connection {
         op: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, CallError> {
-        let path = format!("/x-vf/{op}");
+        self.call_json_path(&format!("/x-vf/{op}"), body).await
+    }
+
+    /// The plain-path form of [`Connection::call_json`] for the AWS data
+    /// plane (`/ListVectors`, `/GetVectors`, … — no `/x-vf/` prefix). The
+    /// T14 addressing verbs are the client's first consumers of the data
+    /// plane: `vf chunks` enumerates a source's key interval with
+    /// ListVectors, `vf chunk show` point-looks-up the neighborhood window
+    /// with GetVectors. Same gate, same rest-json error protocol.
+    pub async fn call_json_path(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, CallError> {
         let (_, _, bytes) = self
             .call(
-                &path,
+                path,
                 serde_json::to_vec(body).expect("serializes"),
                 &[],
                 "application/json",

@@ -18,7 +18,10 @@
 //! failures, zero interaction, idempotent verbs, deterministic output.
 //!
 //! Verbs (附录E.4): put / search / sources list|status / get / rm / reindex /
-//! status — plus `mcp`, the stdio MCP server that exposes the same verbs to
+//! status — plus the T14 content-addressing pair `chunks` (a source's chunk
+//! address space: ListVectors + client prefix filter + early-exit) and
+//! `chunk show` (bounded neighborhood read, grep -C semantics) — and `mcp`,
+//! the stdio MCP server that exposes the same verbs to
 //! agents (client/src/mcp.rs). API fields are camelCase, flags kebab-case,
 //! one to one (`--top-k` -> topK, `--max-results` -> maxResults).
 //! `vf search` takes its query as positional TEXT (M2) or `--image <file>`
@@ -30,6 +33,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 use vectorfs_client::{self as client, CallError, Connection};
+use vectorfs_common::chunkkey;
 use vectorfs_common::report::{Failure, SCHEMA_VERSION, human_bytes};
 
 fn version_str() -> &'static str {
@@ -79,6 +83,15 @@ enum Command {
     /// Print a source file's bytes to stdout (the `get` stdout form, S3-CLI
     /// convention): `vf cat docs/hello.pdf`
     Cat(CatArgs),
+    /// List one source's CHUNK address space (T14, ADR 0005): the
+    /// `{hash}-{modality}-{i}` keys are the vector world's line numbers.
+    /// S3-CLI-style path: `vf chunks docs/hello.pdf`. Table: I (modality-i)
+    /// / KIND / COORD / TEXT preview — the I column plus the printed hash
+    /// prefix compose the chunk keys `vf chunk show` takes
+    Chunks(ChunksArgs),
+    /// The content-addressed read family (T14): `vf chunk show` reads a
+    /// chunk and its REAL enumerated neighbors, bounded (grep -C semantics)
+    Chunk(ChunkArgs),
     /// Delete a source file (object + async chunk GC). S3-CLI-style path:
     /// `vf rm docs/sample.md`; `--bucket` + bare key remains the explicit
     /// form
@@ -346,6 +359,72 @@ struct CatArgs {
     bucket: Option<String>,
 }
 
+/// `vf chunks <bucket/key>` — one source's chunk address space (T14).
+#[derive(Args, Debug)]
+struct ChunksArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
+    /// Source as `bucket/key` (S3-CLI style path) or a bare key alongside
+    /// `--bucket`
+    key: Option<String>,
+
+    /// Vector bucket (explicit form; mutually exclusive with the path
+    /// positional)
+    #[arg(long)]
+    bucket: Option<String>,
+
+    /// Structured output (schema_version'd JSON)
+    #[arg(long)]
+    json: bool,
+}
+
+/// `vf chunk …` — the content-addressed read family (T14).
+#[derive(Args, Debug)]
+struct ChunkArgs {
+    #[command(subcommand)]
+    command: ChunkCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ChunkCommand {
+    /// Bounded neighborhood read of one chunk (grep -C semantics): the
+    /// anchor plus its REAL enumerated neighbors, each clipped to --chars
+    /// with a continuation marker. Reads the INDEXED view (the chunk text
+    /// the pipeline stored — same source as search hits), never the raw
+    /// file
+    Show(ChunkShowArgs),
+}
+
+#[derive(Args, Debug)]
+struct ChunkShowArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
+    /// Vector bucket (bare name — the chunk key is its own address, there
+    /// is no object key to path-split)
+    bucket: String,
+
+    /// Chunk key `{16hex}-{modality}-{i}` (from `vf chunks`)
+    chunk_key: String,
+
+    /// Neighborhood radius in address-space order, 0..=20 (0 = the anchor
+    /// alone; the 1+2N ≤ 41-key window fits ONE GetVectors call under its
+    /// 100-key cap) [default: 2]
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(0..=20))]
+    around: u64,
+
+    /// Chars shown per chunk; 0 = the FULL text of ONE chunk (requires
+    /// --around 0 — a whole unbounded neighborhood would silently break the
+    /// never-over-LLM-context promise) [default: 400]
+    #[arg(long, default_value_t = 400)]
+    chars: u64,
+
+    /// Structured output (schema_version'd JSON)
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Args, Debug)]
 struct RmArgs {
     #[command(flatten)]
@@ -459,6 +538,10 @@ async fn main() {
         },
         Command::Get(args) => get_cmd(args).await,
         Command::Cat(args) => cat_cmd(args).await,
+        Command::Chunks(args) => chunks_cmd(args).await,
+        Command::Chunk(args) => match args.command {
+            ChunkCommand::Show(a) => chunk_show_cmd(a).await,
+        },
         Command::Rm(args) => rm_cmd(args).await,
         Command::Ls(args) => ls_cmd(args).await,
         Command::Reindex(args) => reindex_cmd(args).await,
@@ -1196,6 +1279,566 @@ async fn sources_status_cmd(args: SourcesStatusArgs) {
 }
 
 // ---------------------------------------------------------------------------
+// content addressing (T14, ADR 0005): vf chunks / vf chunk show
+//
+// The `{hash}-{modality}-{i}` chunk keys are a CONTRACT — the vector
+// world's line numbers: ordered, enumerable, neighborhood-addressable.
+// Both verbs ride the AWS data plane through the same signed Connection
+// (`/ListVectors`, `/GetVectors` — the client's first data-plane
+// consumers); the shape judgment is the ONE shared implementation in
+// vectorfs-common::chunkkey (sigv4 同源一套 precedent, T14 sink).
+// ---------------------------------------------------------------------------
+
+/// The half-open lexical interval of ONE source's chunk keys:
+/// [`{hash}-`, `{hash}.`). `'-' + 1 = '.'` and no byte sits between them,
+/// so a key starts with `{hash}-` IFF `lower <= key < upper` — the interval
+/// IS the prefix set, which is what makes page-level early-exit sound.
+fn chunk_prefix_bounds(hash: &str) -> (String, String) {
+    (format!("{hash}-"), format!("{hash}."))
+}
+
+/// Filter ONE key-ascending ListVectors page against the source's key
+/// interval: the matched entries, and whether enumeration may STOP.
+/// ListVectors walks an index in key order, so the FIRST key at/past
+/// `upper` proves every later key — the rest of this page and every next
+/// page — lies beyond the source: stop requesting pages (the scan costs
+/// O(the source's key interval), never O(the whole index)).
+fn scan_chunk_page<'a>(
+    page: &'a [(String, Value)],
+    lower: &str,
+    upper: &str,
+) -> (Vec<&'a (String, Value)>, bool) {
+    let mut matched = Vec::new();
+    for entry in page {
+        if entry.0.as_str() >= upper {
+            return (matched, true);
+        }
+        if entry.0.starts_with(lower) {
+            matched.push(entry);
+        }
+    }
+    (matched, false)
+}
+
+/// Address-space order: NUMERIC i (the chunker assigns ONE global index
+/// per source — text windows and image atoms share the sequence, so a
+/// mixed-modality source's keys INTERLEAVE in document order:
+/// `text-0, text-1, image-2, text-3`). The enumeration returns keys in
+/// lexical order, which is neither numeric (`-text-10` sorts before
+/// `-text-2`) nor interleaved (`image-*` sorts before `text-*` wholesale)
+/// — sort on the parsed ordinal. The modality tiebreak only total-orders
+/// the impossible-tie case. Foreign keys that matched the hash interval
+/// but do not carry the chunk-key shape (pure-protocol rows parked in the
+/// same interval) are dropped here: they are not address-space members.
+fn order_chunk_entries(entries: &mut Vec<(String, Value)>) {
+    entries.retain(|(k, _)| chunkkey::parse_chunk_key(k).is_some());
+    entries.sort_by_key(|(k, _)| {
+        let p = chunkkey::parse_chunk_key(k).expect("retained above");
+        (p.index, p.modality.to_string())
+    });
+}
+
+/// The `--around` window, taken from the REAL enumerated order (**枚举
+/// 优先**, ADR 0005): neighbors are whatever keys actually sit beside the
+/// anchor after enumeration — cross-modal neighbors are returned AS-IS,
+/// never skipped and never guessed. (A guessing scheme — the anchor's key
+/// with i±1 — systematically misses real neighbors in mixed-modality
+/// sources, where the text/image i counters interleave in document order;
+/// that failure mode is exactly what enumeration-first exists to prevent.)
+fn chunk_window<'a>(sorted: &'a [String], anchor: &str, around: usize) -> Option<&'a [String]> {
+    let pos = sorted.iter().position(|k| k == anchor)?;
+    let lo = pos.saturating_sub(around);
+    let hi = (pos + around + 1).min(sorted.len());
+    Some(&sorted[lo..hi])
+}
+
+/// The next key after `key` in address-space order (the truncation
+/// marker's continuation pointer — the window an agent opens next).
+fn next_chunk_key<'a>(sorted: &'a [String], key: &str) -> Option<&'a str> {
+    let pos = sorted.iter().position(|k| k == key)?;
+    sorted.get(pos + 1).map(String::as_str)
+}
+
+/// Bounded body: the first `chars` CHARS of the text (char discipline — a
+/// CJK glyph is never halved) plus a truncation flag. `chars == 0` = full
+/// text; the caller has already enforced the `--chars 0` × `--around > 0`
+/// mutex (chunk size is a pipeline config with no upper bound — 41 × full
+/// text would silently break the never-over-LLM-context promise).
+fn bound_chunk_text(text: &str, chars: u64) -> (String, bool) {
+    if chars == 0 || text.chars().count() as u64 <= chars {
+        return (text.to_string(), false);
+    }
+    (text.chars().take(chars as usize).collect(), true)
+}
+
+/// The coord summary from a vector's metadata (the same `{page?, line?,
+/// section?}` shape `vf search --json` reports under hit.location.coord —
+/// T13): only the units that exist, mirroring the stamped
+/// `x-vf-page-start/end` / `x-vf-line-start/end` / `x-vf-section` keys.
+fn coord_obj(metadata: &Value) -> Value {
+    let span = |start_key: &str, end_key: &str| -> Option<Value> {
+        Some(json!({
+            "start": metadata[start_key].as_u64()?,
+            "end": metadata[end_key].as_u64()?,
+        }))
+    };
+    let mut o = json!({});
+    if let Some(p) = span("x-vf-page-start", "x-vf-page-end") {
+        o["page"] = p;
+    }
+    if let Some(l) = span("x-vf-line-start", "x-vf-line-end") {
+        o["line"] = l;
+    }
+    if let Some(s) = metadata["x-vf-section"].as_u64() {
+        o["section"] = json!(s);
+    }
+    o
+}
+
+/// The bucket's derived indexes from GetIngestStatus: `(indexName,
+/// embedder)` pairs in config order. Every derived index mirrors the same
+/// chunk identity, and the UNION across them is the complete address space
+/// — each embedder only holds the modalities its doc side accepts (a
+/// text-only embedder's index has no image chunks however image-rich the
+/// source is), so a single-index read would under-report mixed sources.
+async fn derived_indexes(
+    conn: &Connection,
+    bucket: &str,
+) -> Result<Vec<(String, String)>, Failure> {
+    let v = match conn
+        .call_json("GetIngestStatus", &json!({ "bucket": bucket }))
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return Err(e.to_failure(conn.endpoint())),
+    };
+    let Some(entry) = v["buckets"].as_array().and_then(|a| a.first()) else {
+        return Err(Failure::new(
+            "NotFound",
+            format!("bucket '{bucket}' is not an ingest bucket on this daemon"),
+            "list the daemon's ingest buckets with: vf ls",
+        ));
+    };
+    let indexes: Vec<(String, String)> = entry["derivedIndexes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|ix| {
+            Some((
+                ix["index"].as_str()?.to_string(),
+                ix["embedder"].as_str().unwrap_or("?").to_string(),
+            ))
+        })
+        .collect();
+    if indexes.is_empty() {
+        return Err(Failure::new(
+            "NotFound",
+            format!("bucket '{bucket}' reports no derived indexes"),
+            "an ingest bucket needs at least one embedder in its [ingest.{bucket}] section",
+        ));
+    }
+    Ok(indexes)
+}
+
+/// ONE derived index's contribution to the source's address space:
+/// ListVectors pages (maxResults 1000, the protocol face's page shape)
+/// filtered against the hash interval with early-exit. A NotFoundException
+/// means the index exists in the plan but not on disk yet (nothing has
+/// written to it) — an empty contribution, not an error.
+async fn enumerate_index_chunks(
+    conn: &Connection,
+    bucket: &str,
+    index: &str,
+    hash: &str,
+) -> Result<Vec<(String, Value)>, CallError> {
+    let (lower, upper) = chunk_prefix_bounds(hash);
+    let mut out: Vec<(String, Value)> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut body = json!({
+            "vectorBucketName": bucket,
+            "indexName": index,
+            "maxResults": 1000,
+            "returnMetadata": true,
+        });
+        if let Some(t) = &token {
+            body["nextToken"] = json!(t);
+        }
+        let v = match conn.call_json_path("/ListVectors", &body).await {
+            Ok(v) => v,
+            Err(CallError::Http { shape, .. }) if shape == "NotFoundException" => {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
+        let page: Vec<(String, Value)> = v["vectors"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| {
+                (
+                    e["key"].as_str().unwrap_or_default().to_string(),
+                    e.get("metadata").cloned().unwrap_or(Value::Null),
+                )
+            })
+            .collect();
+        let (matched, stop) = scan_chunk_page(&page, &lower, &upper);
+        out.extend(matched.into_iter().cloned());
+        if stop {
+            break;
+        }
+        token = v["nextToken"].as_str().map(str::to_string);
+        if token.is_none() {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// The source's COMPLETE address space: the union of every derived index's
+/// enumeration (first index wins on the rare same-key overlap — the chunk
+/// identity is the key, only the model metadata differs), sorted into
+/// address-space order. Takes the key HASH (both callers already hold it —
+/// `vf chunks` from the object key, `chunk show` from the anchor key).
+async fn enumerate_source_chunks(
+    conn: &Connection,
+    bucket: &str,
+    indexes: &[(String, String)],
+    hash: &str,
+    json_out: bool,
+) -> Vec<(String, Value)> {
+    let mut merged = std::collections::HashMap::<String, Value>::new();
+    for (index, _) in indexes {
+        for (k, m) in match enumerate_index_chunks(conn, bucket, index, hash).await {
+            Ok(entries) => entries,
+            Err(e) => die(e, conn.endpoint()),
+        } {
+            merged.entry(k).or_insert(m);
+        }
+        if !json_out {
+            eprintln!("vf: enumerated {}/{}", bucket, index);
+        }
+    }
+    let mut entries: Vec<(String, Value)> = merged.into_iter().collect();
+    order_chunk_entries(&mut entries);
+    entries
+}
+
+/// `vf chunks <bucket/key>` — the address-space listing: what `vf search`
+/// can address, in the order the address space defines it.
+async fn chunks_cmd(args: ChunksArgs) {
+    let (bucket, key) = resolve_key_target(args.key.as_deref(), args.bucket.as_deref(), "chunks");
+    let conn = args
+        .common
+        .connect()
+        .unwrap_or_else(|f| f.fail(args.json, 2));
+    // the source must exist (a 404 here names the real problem — an
+    // unuploaded key — instead of a silently empty address space)
+    let src = match conn
+        .call_json("GetSource", &json!({"bucket": bucket, "key": key}))
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => die(e, conn.endpoint()),
+    };
+    let indexes = match derived_indexes(&conn, &bucket).await {
+        Ok(ix) => ix,
+        Err(f) => f.fail(args.json, 1),
+    };
+    let hash = chunkkey::object_key_hash(&key);
+    let entries = enumerate_source_chunks(&conn, &bucket, &indexes, &hash, args.json).await;
+    if entries.is_empty() {
+        let status = src["status"].as_str().unwrap_or("?");
+        eprintln!(
+            "vf: no chunks for {key} (source status: {status}) — indexing may still be in flight"
+        );
+    }
+    // store_chunk_text = false shows up as no text anywhere; say it once on
+    // stderr, both output modes (the listing is still useful — the address
+    // space exists — but the read verb will refuse)
+    if entries
+        .iter()
+        .all(|(_, m)| m["x-vf-chunk-text"].as_str().is_none())
+    {
+        eprintln!(
+            "vf: no chunk text stored for this source (store_chunk_text = false on the daemon) — \
+             `vf chunk show` will refuse to read these chunks"
+        );
+    }
+
+    if args.json {
+        let chunks: Vec<Value> = entries
+            .iter()
+            .map(|(k, m)| {
+                let p = chunkkey::parse_chunk_key(k).expect("ordered entries parse");
+                json!({
+                    "key": k,
+                    "modality": p.modality,
+                    "i": p.index,
+                    "kind": m["x-vf-chunk-kind"].as_str(),
+                    "coord": coord_obj(m),
+                    // PREVIEW only (60 chars, the search table's discipline) —
+                    // the read verb is `vf chunk show`; a full-text dump of a
+                    // big source's address space would bury the listing
+                    "text": m["x-vf-chunk-text"].as_str().map(|t| {
+                        t.replace(['\n', '\r', '\t'], " ").chars().take(60).collect::<String>()
+                    }),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema_version": SCHEMA_VERSION,
+                "bucket": bucket,
+                "key": key,
+                "hash": hash,
+                "indexes": indexes.iter().map(|(ix, _)| ix).collect::<Vec<_>>(),
+                "count": chunks.len(),
+                "chunks": chunks,
+            }))
+            .expect("serializes")
+        );
+        return;
+    }
+
+    // human table (deterministic: address-space order (modality, numeric i))
+    println!(
+        "{key} {hash}- · {} chunks · index {}",
+        entries.len(),
+        indexes
+            .iter()
+            .map(|(ix, _)| ix.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if entries.is_empty() {
+        return;
+    }
+    let header = format!("{:<12} {:<8} {:<13} {}", "I", "KIND", "COORD", "TEXT");
+    println!("{header}");
+    for (k, m) in &entries {
+        let p = chunkkey::parse_chunk_key(k).expect("ordered entries parse");
+        let kind = m["x-vf-chunk-kind"].as_str().unwrap_or("-");
+        let coord = coord_cell(&coord_obj(m));
+        let text = m["x-vf-chunk-text"]
+            .as_str()
+            .map(|t| t.replace(['\n', '\r', '\t'], " "))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:<12} {:<8} {:<13} {}",
+            format!("{}-{}", p.modality, p.index),
+            kind,
+            coord,
+            text.chars().take(60).collect::<String>()
+        );
+    }
+}
+
+/// `vf chunk show <bucket> <chunk-key>` — the bounded neighborhood read.
+async fn chunk_show_cmd(args: ChunkShowArgs) {
+    // USAGE gates first (exit 2, before any wire traffic): the key shape and
+    // the size-boundedness mutex
+    let parts = chunkkey::parse_chunk_key(&args.chunk_key).unwrap_or_else(|| {
+        Failure::new(
+            "USAGE",
+            format!("'{}' is not a chunk key", args.chunk_key),
+            "chunk keys are {16-hex-object-hash}-{modality}-{i}, e.g. \
+             0123456789abcdef-text-3 — list them with: vf chunks <bucket>/<key>",
+        )
+        .fail(args.json, 2)
+    });
+    if args.bucket.contains('/') {
+        Failure::new(
+            "USAGE",
+            format!("'{}' is not a bare bucket name", args.bucket),
+            "'vf chunk show' takes the BUCKET and the CHUNK KEY as two positionals: vf chunk \
+             show docs 0123456789abcdef-text-3",
+        )
+        .fail(args.json, 2);
+    }
+    if args.chars == 0 && args.around > 0 {
+        Failure::new(
+            "USAGE",
+            "--chars 0 (full text) cannot be combined with --around > 0",
+            "chunk size is a pipeline config with NO upper bound — a whole neighborhood in full \
+             text would break the bounded-read promise; read ONE chunk in full with \
+             '--chars 0 --around 0', or keep --chars > 0 for a bounded neighborhood",
+        )
+        .fail(args.json, 2);
+    }
+
+    let conn = args
+        .common
+        .connect()
+        .unwrap_or_else(|f| f.fail(args.json, 2));
+    let indexes = match derived_indexes(&conn, &args.bucket).await {
+        Ok(ix) => ix,
+        Err(f) => f.fail(args.json, 1),
+    };
+
+    // 枚举优先: the neighborhood is defined by the REAL key order of the
+    // source's address space (same enumeration `vf chunks` renders), never
+    // by guessing i±1 keys around the anchor
+    let entries =
+        enumerate_source_chunks(&conn, &args.bucket, &indexes, parts.hash, args.json).await;
+    let sorted: Vec<String> = entries.iter().map(|(k, _)| k.clone()).collect();
+    let Some(window) = chunk_window(&sorted, &args.chunk_key, args.around as usize) else {
+        Failure::new(
+            "NotFound",
+            format!(
+                "chunk '{}' is not in bucket '{}''s address space",
+                args.chunk_key, args.bucket
+            ),
+            "the key may be stale (source re-indexed) or mistyped — the address space is \
+             per source file: vf chunks <bucket>/<object-key> lists the live keys",
+        )
+        .fail(args.json, 1);
+    };
+    if !args.json {
+        eprintln!(
+            "vf: {} chunks in the address space; window {} ..= {}",
+            sorted.len(),
+            window.first().map(String::as_str).unwrap_or("?"),
+            window.last().map(String::as_str).unwrap_or("?")
+        );
+    }
+
+    // one batched point-lookup per derived index (≤ 41 keys ≤ GetVectors'
+    // 100-key cap); first index containing a key wins (the key IS the
+    // chunk identity; only model metadata can differ)
+    let mut by_key = std::collections::HashMap::<String, Value>::new();
+    for (index, _) in &indexes {
+        let body = json!({
+            "vectorBucketName": args.bucket,
+            "indexName": index,
+            "keys": window,
+            "returnMetadata": true,
+            "returnData": false,
+        });
+        let v = match conn.call_json_path("/GetVectors", &body).await {
+            Ok(v) => v,
+            Err(CallError::Http { shape, .. }) if shape == "NotFoundException" => continue,
+            Err(e) => die(e, conn.endpoint()),
+        };
+        for vec_entry in v["vectors"].as_array().cloned().unwrap_or_default() {
+            if let Some(k) = vec_entry["key"].as_str() {
+                by_key
+                    .entry(k.to_string())
+                    .or_insert_with(|| vec_entry["metadata"].clone());
+            }
+        }
+    }
+
+    // fail loud on store_chunk_text = false: enumerABLE but not readABLE is
+    // a config state, and a silent empty body would misreport it as "the
+    // chunk has no content" (the never-silent-empty ruling, ADR 0005)
+    let mut blocks: Vec<(String, Value)> = Vec::with_capacity(window.len());
+    for key in window {
+        let Some(meta) = by_key.get(key) else {
+            Failure::new(
+                "NotFound",
+                format!("chunk '{key}' vanished between enumeration and read"),
+                "the source may have been re-indexed concurrently; retry",
+            )
+            .fail(args.json, 1);
+        };
+        if meta["x-vf-chunk-text"].as_str().is_none() {
+            Failure::new(
+                "NO_CHUNK_TEXT",
+                format!(
+                    "chunk '{key}' carries no 'x-vf-chunk-text' metadata — this index stores no \
+                     chunk text"
+                ),
+                "the daemon's vectorfs.toml sets store_chunk_text = false for this bucket: the \
+                 address space is enumerable (vf chunks) but chunks are not readable; re-index \
+                 with the default store_chunk_text = true to enable bounded reads",
+            )
+            .fail(args.json, 1);
+        }
+        blocks.push((key.clone(), meta.clone()));
+    }
+
+    if args.json {
+        let blocks_json: Vec<Value> = blocks
+            .iter()
+            .map(|(k, m)| {
+                let p = chunkkey::parse_chunk_key(k).expect("window keys parse");
+                let text = m["x-vf-chunk-text"].as_str().unwrap_or("");
+                let (bounded, truncated) = bound_chunk_text(text, args.chars);
+                json!({
+                    "key": k,
+                    "modality": p.modality,
+                    "i": p.index,
+                    "anchor": k.as_str() == args.chunk_key,
+                    "kind": m["x-vf-chunk-kind"].as_str(),
+                    "coord": coord_obj(m),
+                    "model": m["x-vf-model"].as_str(),
+                    // the text AS SHOWN (bounded); the full text only ever
+                    // arrives via --chars 0 --around 0, by explicit ask
+                    "text": bounded,
+                    "truncated": truncated,
+                    "next": if truncated { next_chunk_key(&sorted, k) } else { None },
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema_version": SCHEMA_VERSION,
+                "bucket": args.bucket,
+                "key": args.chunk_key,
+                "around": args.around,
+                "chars": args.chars,
+                "blocks": blocks_json,
+            }))
+            .expect("serializes")
+        );
+        return;
+    }
+
+    for (n, (key, meta)) in blocks.iter().enumerate() {
+        let p = chunkkey::parse_chunk_key(key).expect("window keys parse");
+        let coord = coord_cell(&coord_obj(meta));
+        let mut head = format!(
+            "── {key}  kind={}",
+            meta["x-vf-chunk-kind"].as_str().unwrap_or("-")
+        );
+        if !coord.is_empty() {
+            head.push_str(&format!("  coord={coord}"));
+        }
+        head.push_str(&format!(
+            "  model={}",
+            meta["x-vf-model"].as_str().unwrap_or("-")
+        ));
+        if key.as_str() == args.chunk_key {
+            head.push_str("  ← anchor");
+        }
+        println!("{head}");
+        let text = meta["x-vf-chunk-text"].as_str().unwrap_or("");
+        if p.modality == "image" && text.is_empty() {
+            // cross-modal neighbors are shown as-is; an image chunk has no
+            // text channel — say that instead of printing nothing
+            println!("〔image chunk — no text channel〕");
+        } else {
+            let (bounded, truncated) = bound_chunk_text(text, args.chars);
+            println!("{bounded}");
+            if truncated {
+                match next_chunk_key(&sorted, key) {
+                    Some(next) => println!("…[truncated, next: {next}]"),
+                    None => println!("…[truncated]"),
+                }
+            }
+        }
+        if n + 1 < blocks.len() {
+            println!();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // get / cat / rm / reindex / status
 // ---------------------------------------------------------------------------
 
@@ -1473,5 +2116,184 @@ async fn mcp_cmd(args: McpArgs) {
             "check the endpoint (vf status) and that stdin/stdout are a pipe pair",
         )
         .fail(false, 2),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tests: the T14 addressing primitives (pure logic — the enumeration /
+// windowing / bounding decisions, no I/O; the daemon-facing halves live in
+// crates/server/tests/cli_smoke.rs against the real binaries)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(keys: &[&str]) -> Vec<(String, Value)> {
+        keys.iter().map(|k| (k.to_string(), Value::Null)).collect()
+    }
+
+    /// The interval IS the prefix set: `lower <= k < upper` iff k starts
+    /// with `{hash}-` — the property early-exit's correctness rests on.
+    #[test]
+    fn prefix_bounds_are_exactly_the_prefix_set() {
+        let hash = "0123456789abcdef";
+        let (lower, upper) = chunk_prefix_bounds(hash);
+        assert_eq!(lower, "0123456789abcdef-");
+        assert_eq!(upper, "0123456789abcdef.");
+        for k in ["0123456789abcdef-text-0", "0123456789abcdef-image-9"] {
+            assert!(
+                k.starts_with(&lower) && k >= lower.as_str() && k < upper.as_str(),
+                "{k}"
+            );
+        }
+        for k in [
+            "0123456789abcdee-text-0", // hash below
+            "0123456789abcdef",        // bare hash, no dash
+            "0123456789abcdef.",       // the upper bound itself
+            "0123456789abcdef0-x-1",   // longer hash
+        ] {
+            assert!(!(k.starts_with(&lower) && k < upper.as_str()), "{k}");
+        }
+    }
+
+    /// Page scanning: keys before the interval pass by, keys inside match,
+    /// and the FIRST key at/past the upper bound stops the whole scan (no
+    /// later page can contain a match — keys arrive ascending).
+    #[test]
+    fn page_scan_matches_and_early_exits() {
+        let hash = "0123456789abcdef";
+        let (lower, upper) = chunk_prefix_bounds(hash);
+        // keys entirely below the interval: no match, no stop
+        let below = page(&["0000000000000001-text-0", "0123456789abcdee-image-0"]);
+        let (m, stop) = scan_chunk_page(&below, &lower, &upper);
+        assert!(m.is_empty() && !stop, "m={m:?} stop={stop}");
+        // interval keys mixed with nothing past the end: matched, keep paging
+        let inside = page(&["0123456789abcdef-image-0", "0123456789abcdef-text-2"]);
+        let (m, stop) = scan_chunk_page(&inside, &lower, &upper);
+        assert_eq!(m.len(), 2);
+        assert!(!stop, "no key reached the upper bound");
+        // first key past the interval stops the scan even mid-page
+        let mut mixed = page(&["0123456789abcdef-text-0", "0123456789abcdef."]);
+        mixed.push(("0123456789abcdef-text-99".into(), Value::Null));
+        let (m, stop) = scan_chunk_page(&mixed, &lower, &upper);
+        assert_eq!(m.len(), 1);
+        assert!(
+            stop,
+            "the first key at/past the upper bound ends enumeration"
+        );
+        // a page that OPENS past the interval stops at its first key
+        let past = page(&["zzzzzzzzzzzzzzzz-text-0"]);
+        let (_, stop) = scan_chunk_page(&past, &lower, &upper);
+        assert!(stop);
+    }
+
+    /// Address-space order is the NUMERIC global i (document order): mixed
+    /// modalities INTERLEAVE (`text-0, text-1, image-2, text-3` — the
+    /// chunker's one counter serves text windows and image atoms alike),
+    /// `-text-2` sorts before `-text-10` (lexical order inverts them), and
+    /// foreign keys in the interval are not address-space members.
+    #[test]
+    fn entries_order_numerically_with_interleaved_modalities() {
+        let hash = chunkkey::object_key_hash("docs/mixed.zip");
+        let mut entries = page(&[
+            &chunkkey::chunk_key(&hash, "text", 10),
+            &chunkkey::chunk_key(&hash, "text", 3),
+            &chunkkey::chunk_key(&hash, "image", 2),
+            &chunkkey::chunk_key(&hash, "text", 0),
+            &chunkkey::chunk_key(&hash, "text", 1),
+            // a pure-protocol row parked inside the interval: same hash
+            // prefix, not the chunk-key shape
+            &format!("{hash}-custom"),
+        ]);
+        order_chunk_entries(&mut entries);
+        let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                format!("{hash}-text-0").as_str(),
+                format!("{hash}-text-1").as_str(),
+                format!("{hash}-image-2").as_str(), // the interleave, kept
+                format!("{hash}-text-3").as_str(),
+                format!("{hash}-text-10").as_str(), // numeric: 3 < 10
+            ],
+            "i numeric (3 before 10), modalities interleaved, foreign row dropped"
+        );
+    }
+
+    /// 枚举优先 (the adjudicated property): the window is cut from the REAL
+    /// enumerated order — cross-modal neighbors are returned AS-IS, and the
+    /// window never contains keys that are not in the enumeration (a
+    /// guessing scheme — anchor key with i±1 of the same modality — would
+    /// fabricate or miss the interleaved image neighbor here).
+    #[test]
+    fn window_is_cut_from_the_real_enumeration() {
+        let hash = chunkkey::object_key_hash("docs/mixed.zip");
+        let sorted: Vec<String> = [
+            chunkkey::chunk_key(&hash, "text", 0),
+            chunkkey::chunk_key(&hash, "text", 1),
+            chunkkey::chunk_key(&hash, "image", 2),
+            chunkkey::chunk_key(&hash, "text", 3),
+        ]
+        .into_iter()
+        .collect();
+        // the interleave: image-2's neighbors are text-1 and text-3 —
+        // returned as-is, not skipped, not guessed into image-1/image-3
+        let w = chunk_window(&sorted, &chunkkey::chunk_key(&hash, "image", 2), 1).unwrap();
+        assert_eq!(
+            w,
+            [
+                chunkkey::chunk_key(&hash, "text", 1),
+                chunkkey::chunk_key(&hash, "image", 2),
+                chunkkey::chunk_key(&hash, "text", 3),
+            ]
+        );
+        // head/tail clamping: the window never runs past the enumeration
+        let w = chunk_window(&sorted, &chunkkey::chunk_key(&hash, "text", 0), 2).unwrap();
+        assert_eq!(w.len(), 3, "clamped at the head: {w:?}");
+        let w = chunk_window(&sorted, &chunkkey::chunk_key(&hash, "text", 3), 5).unwrap();
+        assert_eq!(
+            w.len(),
+            4,
+            "clamped at the tail: the whole 4-key space {w:?}"
+        );
+        // --around 0: the anchor alone
+        let w = chunk_window(&sorted, &chunkkey::chunk_key(&hash, "text", 1), 0).unwrap();
+        assert_eq!(w, [chunkkey::chunk_key(&hash, "text", 1)]);
+        // absent anchor: None (the caller's NotFound)
+        assert!(chunk_window(&sorted, &format!("{hash}-text-999"), 1).is_none());
+    }
+
+    /// Bounded text: exact fit emits no marker, char (never byte) clipping,
+    /// and the continuation pointer names the NEXT key in real order.
+    #[test]
+    fn bounded_text_clips_by_char_and_points_forward() {
+        let hash = chunkkey::object_key_hash("docs/a.txt");
+        let sorted: Vec<String> = [
+            chunkkey::chunk_key(&hash, "text", 4),
+            chunkkey::chunk_key(&hash, "text", 5),
+        ]
+        .into_iter()
+        .collect();
+        // exact fit / chars = 0 (full) / short text: never truncated
+        for chars in [0u64, 5, 500] {
+            let (t, trunc) = bound_chunk_text("héllo", chars);
+            assert_eq!(t, "héllo");
+            assert!(!trunc, "chars={chars}");
+        }
+        // char discipline: 6 CHARS of CJK, never 6 bytes
+        let (t, trunc) = bound_chunk_text("中文段落内容很长", 3);
+        assert_eq!(t, "中文段");
+        assert!(trunc);
+        // the marker's continuation: the next key in the enumeration
+        assert_eq!(
+            next_chunk_key(&sorted, &chunkkey::chunk_key(&hash, "text", 4)),
+            Some(chunkkey::chunk_key(&hash, "text", 5).as_str())
+        );
+        assert_eq!(
+            next_chunk_key(&sorted, &chunkkey::chunk_key(&hash, "text", 5)),
+            None,
+            "the last chunk has no continuation"
+        );
     }
 }

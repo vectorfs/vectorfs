@@ -1206,3 +1206,652 @@ fn cli_image_search_smoke() {
 
     daemon.dump_log_tail("end of image smoke (informational)");
 }
+
+// ---------------------------------------------------------------------------
+// T14 content addressing: `vf chunks` / `vf chunk show` over the REAL daemon
+// + REAL vf — pagination (a >1000-chunk source walks multiple ListVectors
+// pages), the client hash-interval filter + early-exit, NUMERIC i ordering,
+// the bounded neighborhood read (window / truncation marker / USAGE gates /
+// fail-loud store_chunk_text), and the mixed-modality (txt+jpg zip) union
+// enumeration with cross-modal neighbors returned as-is.
+// ---------------------------------------------------------------------------
+
+/// The T14 smoke's config: the plain docs bucket PLUS a `notext` bucket with
+/// store_chunk_text = false (the fail-loud fixture — its address space is
+/// enumerable but not readable).
+fn chunk_config_toml(data_dir: &Path) -> String {
+    format!(
+        r#"version = 1
+region = "us-east-1"
+account_id = "000000000000"
+access_key_id = "{AK}"
+secret_access_key = "{SK}"
+models_dir = "{models}"
+
+[extractor.plain]
+kind = "txt"
+
+[embedder.tiny]
+kind = "ort"
+model = "tiny-fixture"
+path = "{fixture}"
+offline = true
+
+[ingest.docs]
+include = ["docs/**"]
+extract = {{ txt = "plain" }}
+chunk = {{ kind = "token-window", size = 32, overlap = 8 }}
+embedders = ["tiny"]
+scan_interval_secs = 1
+
+[ingest.notext]
+include = ["notext/**"]
+extract = {{ txt = "plain" }}
+chunk = {{ kind = "token-window", size = 32, overlap = 8 }}
+embedders = ["tiny"]
+store_chunk_text = false
+scan_interval_secs = 1
+"#,
+        models = data_dir.join(".vectorfs/models").display(),
+        fixture = fixture_dir().display(),
+    )
+}
+
+/// Poll `vf sources status` to INDEXED for an arbitrary bucket (the shared
+/// wait_vf_indexed helper is docs-hardcoded).
+fn wait_vf_indexed_in(port: u16, bucket: &str, key: &str, deadline: Instant) {
+    while Instant::now() < deadline {
+        let o = vf(port, &["sources", "status", key, "--bucket", bucket], false);
+        if out(&o).contains("status               : INDEXED") {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    panic!("{key} did not reach INDEXED in {bucket}");
+}
+
+#[test]
+fn cli_chunk_addressing_smoke() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let work = tmp.path().join("work");
+    let data_dir = work.join("data");
+    std::fs::create_dir_all(data_dir.join(".vectorfs")).unwrap();
+    std::fs::write(
+        data_dir.join(".vectorfs/vectorfs.toml"),
+        chunk_config_toml(&data_dir),
+    )
+    .unwrap();
+
+    // the PAGINATION source: token-window 32/8 strides ~24 chars, so ~40k
+    // chars make ~1600 chunks — beyond the client's 1000/page ListVectors
+    // request, the multi-page walk is exercised for real
+    let mut big = String::new();
+    for n in 0..700 {
+        big.push_str(&format!(
+            "the counting sentence number {n} carries plenty of ordinary words and ends here "
+        ));
+    }
+    assert!(big.chars().count() > 39_000, "self-check: ~40k chars");
+    let big_path = work.join("big.txt");
+    std::fs::write(&big_path, &big).unwrap();
+    // a SECOND source in the same bucket/index: the hash-interval filter
+    // must keep its chunks out of big.txt's enumeration
+    let fox = work.join("fox.txt");
+    std::fs::write(&fox, "the quick brown fox jumps over the lazy dog").unwrap();
+    // the fail-loud fixture source (notext bucket)
+    let small = work.join("small.txt");
+    std::fs::write(&small, "a modest paragraph of text for the no-text bucket").unwrap();
+
+    let port = free_port();
+    let daemon = Daemon::spawn(&data_dir, port, "chunk-serve.log");
+    wait_healthy(port, Instant::now() + Duration::from_secs(60));
+
+    for (path, key, bucket) in [
+        (&big_path, "docs/big.txt", "docs"),
+        (&fox, "docs/fox.txt", "docs"),
+        (&small, "notext/small.txt", "notext"),
+    ] {
+        let o = vf(
+            port,
+            &[
+                "put",
+                path.to_str().unwrap(),
+                "--bucket",
+                bucket,
+                "--key",
+                key,
+                "--timeout",
+                "300",
+            ],
+            false,
+        );
+        assert!(
+            o.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            out(&o),
+            err(&o)
+        );
+        wait_vf_indexed_in(port, bucket, key, Instant::now() + Duration::from_secs(300));
+    }
+
+    // ---- vf chunks: pagination + hash-interval filter + NUMERIC order ----
+    // (the scoped bucket stores keys WITH the docs/ prefix — the flag form
+    // addresses the full key verbatim, exactly like the get/cat contract)
+    let o = vf(
+        port,
+        &["chunks", "docs/big.txt", "--bucket", "docs", "--json"],
+        false,
+    );
+    assert!(
+        o.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        out(&o),
+        err(&o)
+    );
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(v["schema_version"], 1, "{}", out(&o));
+    let hash = v["hash"].as_str().unwrap().to_string();
+    let chunks = v["chunks"].as_array().cloned().unwrap();
+    assert!(
+        chunks.len() > 1000,
+        "{} chunks — the >1000/page walk must paginate, got {}",
+        chunks.len(),
+        chunks.len()
+    );
+    // every key sits inside the source's hash interval (the fox.txt source
+    // shares the index — its keys must be filtered OUT client-side)
+    for c in &chunks {
+        let k = c["key"].as_str().unwrap();
+        assert!(k.starts_with(&format!("{hash}-")), "{k} outside {hash}-");
+    }
+    // the count agrees with the marker's own accounting (sources status)
+    let o = vf(
+        port,
+        &[
+            "sources",
+            "status",
+            "docs/big.txt",
+            "--bucket",
+            "docs",
+            "--json",
+        ],
+        false,
+    );
+    let sv: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    let marker_chunks: u64 = sv["source"]["chunks"]
+        .as_array()
+        .map(|cs| cs.iter().filter_map(|c| c["count"].as_u64()).sum())
+        .unwrap_or(0);
+    assert_eq!(
+        chunks.len() as u64,
+        marker_chunks,
+        "enumeration count == marker count (hash filter lost or duplicated chunks)"
+    );
+    // NUMERIC i order + the 序号契约 (contiguous, gap-free, monotonic): the
+    // text modality must enumerate 0..N-1 in numeric order — lexical order
+    // would put text-10 right after text-1
+    let is: Vec<u64> = chunks.iter().map(|c| c["i"].as_u64().unwrap()).collect();
+    for (n, i) in is.iter().enumerate() {
+        assert_eq!(
+            *i, n as u64,
+            "i must be 0..N-1 in numeric order (gap/dup at {n})"
+        );
+    }
+
+    // human table: the preamble carries the hash prefix (with it, the I
+    // column composes the keys `vf chunk show` takes), rows show KIND /
+    // COORD (a txt corpus is pageless ⇒ LINE coords) / TEXT preview
+    let o = vf(port, &["chunks", "docs/big.txt", "--bucket", "docs"], false);
+    assert!(o.status.success(), "stdout:\n{}", out(&o));
+    let table = out(&o);
+    assert!(table.contains(&format!("{hash}-")), "{}", table);
+    assert!(
+        table.lines().count() > 100,
+        "the whole address space is listed: {} rows",
+        table.lines().count()
+    );
+    let header = table.lines().nth(1).unwrap_or_default();
+    assert!(
+        header.contains("I") && header.contains("KIND"),
+        "header: {header}"
+    );
+    assert!(table.contains("text-0"), "{}", header);
+    assert!(table.contains("body"), "kind column: {header}");
+    assert!(table.contains("L1"), "txt rows carry line coords: {header}");
+    // numeric-vs-lexical in the RENDERED table: text-10 must come after
+    // text-9 (lexical order would print text-10 before text-2)
+    let p9 = table.find("text-9").expect("text-9 row");
+    let p10 = table.find("text-10").expect("text-10 row");
+    assert!(
+        p9 < p10,
+        "numeric order in the table: text-9 before text-10"
+    );
+    let p2 = table.find("text-2").expect("text-2 row");
+    assert!(
+        p2 < p10,
+        "numeric order in the table: text-2 before text-10"
+    );
+
+    // ---- vf chunk show: the bounded neighborhood read ----
+    let anchor = format!("{hash}-text-5");
+    // default --around 2: 5 blocks, anchor marked, headers carry the
+    // metadata summary (kind / coord / model)
+    let o = vf(port, &["chunk", "show", "docs", &anchor], false);
+    assert!(
+        o.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        out(&o),
+        err(&o)
+    );
+    let shown = out(&o);
+    assert!(shown.contains(&format!("── {anchor}")), "{}", shown);
+    assert_eq!(shown.matches("← anchor").count(), 1, "{}", shown);
+    for k in 3..=7 {
+        assert!(shown.contains(&format!("{hash}-text-{k}")), "{}", shown);
+    }
+    assert!(
+        !shown.contains(&format!("{hash}-text-2")),
+        "outside the window: {}",
+        shown
+    );
+    assert!(
+        !shown.contains(&format!("{hash}-text-8")),
+        "outside the window: {}",
+        shown
+    );
+    assert!(shown.contains("kind=body"), "{}", shown);
+    assert!(shown.contains("model=tiny-fixture"), "{}", shown);
+    assert!(
+        shown.contains("coord=L"),
+        "txt coords in block headers: {}",
+        shown
+    );
+    // no truncation at the default 400 chars (chunks here are ~32 chars)
+    assert!(!shown.contains("[truncated"), "{}", shown);
+
+    // --around 0: the anchor alone
+    let o = vf(
+        port,
+        &["chunk", "show", "docs", &anchor, "--around", "0"],
+        false,
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let shown = out(&o);
+    assert!(shown.contains(&format!("── {anchor}")), "{}", shown);
+    assert!(!shown.contains(&format!("{hash}-text-4")), "{}", shown);
+    assert!(!shown.contains(&format!("{hash}-text-6")), "{}", shown);
+
+    // --chars 20: every block truncates, each marker pointing at the NEXT
+    // key in address-space order — the LAST window block (text-7) points
+    // PAST the window (text-8): the continuation window entry
+    let o = vf(
+        port,
+        &["chunk", "show", "docs", &anchor, "--chars", "20"],
+        false,
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let shown = out(&o);
+    assert!(
+        shown.contains(&format!("…[truncated, next: {hash}-text-4]")),
+        "first truncated block points forward: {}",
+        shown
+    );
+    assert!(
+        shown.contains(&format!("…[truncated, next: {hash}-text-8]")),
+        "the window's last block points PAST the window: {}",
+        shown
+    );
+    assert!(
+        !shown.contains(&format!("…[truncated, next: {hash}-text-7]")),
+        "a block's continuation is the NEXT key, never itself: {}",
+        shown
+    );
+
+    // --chars 0 --around 0: the one legal full-text form — no marker
+    let o = vf(
+        port,
+        &[
+            "chunk", "show", "docs", &anchor, "--chars", "0", "--around", "0",
+        ],
+        false,
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!out(&o).contains("[truncated"), "{}", out(&o));
+
+    // ---- the USAGE gates (exit 2) ----
+    // --chars 0 with a neighborhood: the bounded-read mutex (chunk size is
+    // an unbounded pipeline config; 41x full text would break the promise)
+    let o = vf(
+        port,
+        &["chunk", "show", "docs", &anchor, "--chars", "0"],
+        false,
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(err(&o).contains("--chars 0"), "{}", err(&o));
+    // --around beyond the 20 cap (41-key window <= GetVectors' 100 keys)
+    let o = vf(
+        port,
+        &["chunk", "show", "docs", &anchor, "--around", "21"],
+        false,
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    // not a chunk key
+    let o = vf(port, &["chunk", "show", "docs", "not-a-chunk-key"], false);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(err(&o).contains("is not a chunk key"), "{}", err(&o));
+    // bucket/key path confusion: chunk show takes TWO positionals
+    let o = vf(port, &["chunk", "show", "docs/fox.txt", &anchor], false);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(err(&o).contains("bare bucket name"), "{}", err(&o));
+
+    // ---- the NotFound faces (exit 1) ----
+    // a well-shaped key that is not in the address space
+    let o = vf(
+        port,
+        &["chunk", "show", "docs", &format!("{hash}-text-99999")],
+        false,
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(err(&o).contains("not in bucket"), "{}", err(&o));
+    // an unuploaded source key names the real problem (GetSource 404),
+    // not a silently empty address space
+    let o = vf(port, &["chunks", "nope.txt", "--bucket", "docs"], false);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(err(&o).contains("NotFound"), "{}", err(&o));
+
+    // ---- store_chunk_text = false: enumerable but NOT readable ----
+    // the listing works (the address space exists) with a stderr note
+    let o = vf(
+        port,
+        &["chunks", "notext/small.txt", "--bucket", "notext", "--json"],
+        false,
+    );
+    assert!(
+        o.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        out(&o),
+        err(&o)
+    );
+    assert!(err(&o).contains("store_chunk_text"), "{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    let notext_chunks = v["chunks"].as_array().cloned().unwrap();
+    assert!(!notext_chunks.is_empty(), "{}", out(&o));
+    assert!(
+        notext_chunks.iter().all(|c| c["text"].is_null()),
+        "no text previews: {}",
+        out(&o)
+    );
+    // the read FAILS LOUD, pointing at the config
+    let notext_key = notext_chunks[0]["key"].as_str().unwrap().to_string();
+    let o = vf(port, &["chunk", "show", "notext", &notext_key], false);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "stdout:\n{}\nstderr:\n{}",
+        out(&o),
+        err(&o)
+    );
+    assert!(err(&o).contains("NO_CHUNK_TEXT"), "{}", err(&o));
+    assert!(err(&o).contains("store_chunk_text"), "{}", err(&o));
+
+    daemon.dump_log_tail("end of chunk smoke (informational)");
+}
+
+/// The mixed-modality config (T14): zip container + txt and image child
+/// chains, TWO embedders — tiny (text doc side) and clip/siglip2 (image doc
+/// side). The source's chunks therefore SPLIT ACROSS TWO derived indexes
+/// (text-* in tiny's, image-* in clip's): the union enumeration is the only
+/// way the address space is complete.
+fn mixed_config_toml(data_dir: &Path) -> String {
+    format!(
+        r#"version = 1
+region = "us-east-1"
+account_id = "000000000000"
+access_key_id = "{AK}"
+secret_access_key = "{SK}"
+models_dir = "{models}"
+
+[extractor.plain]
+kind = "txt"
+
+[extractor.zipper]
+kind = "zip"
+
+[extractor.imgs]
+kind = "image"
+
+[embedder.tiny]
+kind = "ort"
+model = "tiny-fixture"
+path = "{tiny}"
+offline = true
+
+[embedder.clip]
+kind = "siglip2"
+model = "tiny-siglip2"
+path = "{clip}"
+offline = true
+
+[ingest.docs]
+include = ["docs/**"]
+extract = {{ zip = "zipper", txt = "plain", img = "imgs" }}
+chunk = {{ kind = "token-window", size = 32, overlap = 8 }}
+embedders = ["tiny", "clip"]
+scan_interval_secs = 1
+"#,
+        models = data_dir.join(".vectorfs/models").display(),
+        tiny = fixture_dir().display(),
+        clip = siglip2_fixture_dir().display(),
+    )
+}
+
+/// The T14 interleave e2e: a txt+png zip container source indexes as
+/// INTERLEAVED text/image chunks (the vector world's mixed document), the
+/// two modalities land in TWO different derived indexes, and:
+/// * `vf chunks` enumerates the UNION across both indexes (complete address
+///   space — a single-index read would miss half of it);
+/// * `vf chunk show --around` at the modality seam returns the CROSS-MODAL
+///   neighbor as-is (枚举优先: neighbors are the real enumerated keys, not
+///   guessed i±1 keys).
+#[test]
+fn cli_mixed_modality_chunks_smoke() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let work = tmp.path().join("work");
+    let data_dir = work.join("data");
+    std::fs::create_dir_all(data_dir.join(".vectorfs")).unwrap();
+    std::fs::write(
+        data_dir.join(".vectorfs/vectorfs.toml"),
+        mixed_config_toml(&data_dir),
+    )
+    .unwrap();
+
+    // the mixed source: one txt child (several text chunks) + one png child
+    // (one image atom), zipped in test with the same crate the extractor
+    // reads (the extract/zip.rs discipline — no committed binary blobs)
+    let mut text_child = String::new();
+    for n in 0..10 {
+        text_child.push_str(&format!(
+            "chapter paragraph {n} with several plain words inside it "
+        ));
+    }
+    let mut zip_buf = std::io::Cursor::new(Vec::new());
+    {
+        use std::io::Write as _;
+        let mut zip = zip::ZipWriter::new(&mut zip_buf);
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        zip.start_file("chapter.txt", opts).unwrap();
+        zip.write_all(text_child.as_bytes()).unwrap();
+        zip.start_file("figure.png", opts).unwrap();
+        zip.write_all(RED_PNG).unwrap();
+        zip.finish().unwrap();
+    }
+    let mixed = work.join("mixed.zip");
+    std::fs::write(&mixed, zip_buf.into_inner()).unwrap();
+
+    let port = free_port();
+    let daemon = Daemon::spawn(&data_dir, port, "mixed-serve.log");
+    wait_healthy(port, Instant::now() + Duration::from_secs(60));
+
+    let o = vf(
+        port,
+        &[
+            "put",
+            mixed.to_str().unwrap(),
+            "--bucket",
+            "docs",
+            "--key",
+            "docs/mixed.zip",
+            "--timeout",
+            "300",
+        ],
+        false,
+    );
+    assert!(
+        o.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        out(&o),
+        err(&o)
+    );
+    wait_vf_indexed_in(
+        port,
+        "docs",
+        "docs/mixed.zip",
+        Instant::now() + Duration::from_secs(300),
+    );
+
+    // ---- the UNION enumeration: both modalities, both indexes ----
+    let o = vf(
+        port,
+        &["chunks", "docs/mixed.zip", "--bucket", "docs", "--json"],
+        false,
+    );
+    assert!(
+        o.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        out(&o),
+        err(&o)
+    );
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    let hash = v["hash"].as_str().unwrap().to_string();
+    let chunks = v["chunks"].as_array().cloned().unwrap();
+    let modalities: Vec<&str> = chunks
+        .iter()
+        .map(|c| c["modality"].as_str().unwrap_or("?"))
+        .collect();
+    assert!(
+        modalities.contains(&"image"),
+        "the image half lives in clip's index — the union must carry it: {:?}",
+        modalities
+    );
+    assert!(
+        modalities.contains(&"text"),
+        "the text half lives in tiny's index: {:?}",
+        modalities
+    );
+    // the count agrees with the marker's cross-modality accounting
+    let o = vf(
+        port,
+        &[
+            "sources",
+            "status",
+            "docs/mixed.zip",
+            "--bucket",
+            "docs",
+            "--json",
+        ],
+        false,
+    );
+    let sv: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    let marker_chunks: u64 = sv["source"]["chunks"]
+        .as_array()
+        .map(|cs| cs.iter().filter_map(|c| c["count"].as_u64()).sum())
+        .unwrap_or(0);
+    assert_eq!(
+        chunks.len() as u64,
+        marker_chunks,
+        "union count == marker count (a single-index enumeration under-counts)"
+    );
+    // address-space order: the NUMERIC global i — the chunker assigns ONE
+    // index sequence per source (text windows and image atoms share it), so
+    // the enumeration must be 0..N-1 gap-free in document order: the txt
+    // child's windows first, the png child's atom LAST (zip order)
+    let mut seen: Vec<(String, u64)> = Vec::new();
+    for c in &chunks {
+        seen.push((
+            c["modality"].as_str().unwrap_or("?").to_string(),
+            c["i"].as_u64().unwrap(),
+        ));
+    }
+    for (n, (_, i)) in seen.iter().enumerate() {
+        assert_eq!(
+            *i, n as u64,
+            "the global i must be 0..N-1 in order: {seen:?}"
+        );
+    }
+    let last_i = seen.len() as u64 - 1;
+    assert_eq!(
+        seen.last().map(|(m, _)| m.as_str()),
+        Some("image"),
+        "the png child is the LAST chunk (zip order preserved): {seen:?}"
+    );
+    let last_text_i = last_i - 1;
+
+    // ---- 枚举优先 at the interleave: the LAST text chunk's AFTER neighbor
+    // in the real enumeration is the IMAGE atom — returned AS-IS, not
+    // skipped, not guessed into another text key ----
+    let last_text = format!("{hash}-text-{last_text_i}");
+    let o = vf(
+        port,
+        &["chunk", "show", "docs", &last_text, "--around", "1"],
+        false,
+    );
+    assert!(
+        o.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        out(&o),
+        err(&o)
+    );
+    let shown = out(&o);
+    let image_key = format!("{hash}-image-{last_i}");
+    assert!(
+        shown.contains(&format!("── {image_key}")),
+        "the cross-modal AFTER neighbor is shown as-is: {}",
+        shown
+    );
+    assert!(
+        shown.contains("〔image chunk — no text channel〕"),
+        "the image block says what it is instead of an empty body: {}",
+        shown
+    );
+    assert!(shown.contains("← anchor"), "{}", shown);
+    // exactly three blocks: [text-{last-2}, text-{last-1}=anchor, image-{last}]
+    assert_eq!(
+        shown.matches("── ").count(),
+        3,
+        "window = anchor + 1 before + 1 after: {}",
+        shown
+    );
+
+    // anchoring ON the image atom: its BEFORE neighbor crosses back into
+    // text (and the window clamps at the tail — nothing after it)
+    let o = vf(
+        port,
+        &["chunk", "show", "docs", &image_key, "--around", "1"],
+        false,
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let shown = out(&o);
+    assert!(
+        shown.contains(&format!("── {last_text}")),
+        "the cross-modal BEFORE neighbor: {}",
+        shown
+    );
+    assert_eq!(
+        shown.matches("── ").count(),
+        2,
+        "clamped at the tail (nothing exists after the last chunk): {}",
+        shown
+    );
+
+    daemon.dump_log_tail("end of mixed-modality smoke (informational)");
+}

@@ -80,6 +80,39 @@ $startsWith $in $nin $exists $and $or`. Example:
 filterable metadata participates — of the file-layer keys that is `x-vf-src-uri`
 only (see protocol.md).
 
+### `vf chunks <KEY>`
+
+List one source's CHUNK address space (T14, ADR 0005): the
+`{hash}-{modality}-{i}` keys are the vector world's line numbers — ordered
+(document order, one global `i` per source: text windows and image atoms
+share the sequence), enumerable, neighborhood-addressable. `vf chunks
+docs/hello.pdf` (S3-CLI path form) or `docs/hello.pdf --bucket docs`.
+
+Table: `I  KIND  COORD  TEXT` — I is `{modality}-{i}` (compose the full key
+with the hash prefix printed above the table), KIND the `x-vf-chunk-kind`,
+COORD the T13 summary (`p18-19` / `L405-420` / `§3`), TEXT a 60-char
+preview. `--json`. The read verb for the bodies is `vf chunk show`.
+
+### `vf chunk show <BUCKET> <CHUNK-KEY>`
+
+Bounded neighborhood read (grep -C semantics): the anchor chunk plus its
+`--around N` real enumerated neighbors — cross-modal neighbors (a jpg page
+between text chunks) are returned as-is, never skipped. Reads the INDEXED
+view (the stored `x-vf-chunk-text`, same source as search hits), not the
+raw file.
+
+| Flag | Meaning |
+|---|---|
+| `--around N` | neighborhood radius, 0..=20, default 2 (0 = anchor alone; the ≤41-key window fits one GetVectors call) |
+| `--chars B` | chars shown per chunk, default 400; truncated blocks end with `…[truncated, next: <chunk-key>]` — the key to open next |
+| `--json` | schema-versioned structured output (blocks with key/kind/coord/model/text/truncated/next) |
+
+`--chars 0` (full text of ONE chunk) requires `--around 0` — a full-text
+neighborhood has no size bound (USAGE error otherwise). If the index was
+built with `store_chunk_text = false`, the listing still works but this
+verb FAILS LOUD (`NO_CHUNK_TEXT`) pointing at that config — never a silent
+empty body.
+
 ### `vf ls [PATH]`
 
 No argument: list the ingest buckets (`INDEXED=  PARTIAL=  PENDING=  FAILED=`

@@ -662,6 +662,8 @@ AWS 面 21 op 不受影响——文件层经它们写入（公理 2 §5.10.0）�
 | `sources status <key> --bucket <b>` | 单文件状态（statusReason / 失败详情可见） |
 | `get <bucket>/<key>` 或 `<key> --bucket <b>` `[--out <f>]` | 下载原文件（回源；等价于直接 GetObject） |
 | `cat <bucket>/<key>` | get 的 stdout 直出形态（S3-CLI 惯用） |
+| `chunks <bucket>/<key>` 或 `<key> --bucket <b>` | T14 寻址枚举：单源 chunk 地址空间全景（`{hash}-{modality}-{i}` 升格为契约，ADR 0005）——ListVectors 分页 + 客户端哈希区间过滤 + early-exit（成本 O(哈希区间)），按数值 i 序输出（I/KIND/COORD/TEXT 列；多 embedder 桶跨派生 index 并集） |
+| `chunk show <b> <chunk-key> [--around N≤20] [--chars B]` | T14 有界邻域读（grep -C 语义）：邻域取自真实枚举序（枚举优先，跨模态邻居如实返回不跳过）；`--chars 0`（全文）须配 `--around 0`（USAGE 互斥）；截断带 `…[truncated, next: <chunk-key>]` 续窗标记；`store_chunk_text = false` 的索引枚举可见但读取响亮拒绝（NO_CHUNK_TEXT） |
 | `rm <bucket>/<key>` 或 `<key> --bucket <b>` | 删对象 + GC（与 S3 直接删除等价的便捷包装） |
 | `reindex [<b>] 或 --bucket <b>` | 触发显式重嵌（daemon 内执行） |
 | `status` | `/health` + GetIngestStatus 汇总 |

@@ -11,52 +11,13 @@ use sha2::{Digest, Sha256};
 
 use crate::store::{SourceMarker, SourceStatus};
 
-/// Hex chars of sha256(object key) used as the marker FILE name base and as
-/// `x-vf-src-uri` / chunk-key prefix.
-///
-/// 16 hex = 64 bits. Birthday-collision odds for N sources are ~N²/2^65:
-/// even a million sources give ~2.7e-8 — and a collision would need TWO
-/// colliding keys ALIVE in the same bucket to misbehave (the marker of one
-/// would shadow the other). File-name safety was the other constraint: hex
-/// needs no escaping on every object-store backend.
-pub const KEY_HASH_HEX_LEN: usize = 16;
-
-/// Marker/chunk key base: first [`KEY_HASH_HEX_LEN`] hex of sha256(key).
-pub fn object_key_hash(object_key: &str) -> String {
-    let digest = Sha256::digest(object_key.as_bytes());
-    hex(&digest)[..KEY_HASH_HEX_LEN].to_string()
-}
-
-/// Chunk key (§5.10.1): `{keyHash16}-{modality}-{index}` — short, stable, and
-/// containing the OBJECT key hash so two same-content files never stomp each
-/// other's chunks (they are two Sources).
-pub fn chunk_key(key_hash: &str, modality: &str, index: u32) -> String {
-    format!("{key_hash}-{modality}-{index}")
-}
-
-/// Does `key` carry the DERIVED chunk-key shape `{16hex}-{modality}-{seq}`?
-/// GC 判据 layer 2 (§5.10.5 anti-false-delete): the reaper only considers
-/// vectors whose key parses as (exactly three `-`-free segments) a 16-hex
-/// object-key hash, an alphanumeric modality token ("text" in M2; "image" /
-/// "audio" later), and an all-digit ordinal. Keys minted by [`chunk_key`]
-/// always satisfy this; a pure-protocol user's key must be shaped EXACTLY
-/// like ours to be eligible at all — and even then layers 1 (managed-index
-/// stamp) and 3 (`x-vf-src-uri` joins a vanished object) still gate the
-/// delete. 裸前缀删除 is what this function exists to prevent.
-pub fn is_chunk_key(key: &str) -> bool {
-    let mut parts = key.split('-');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(hash), Some(modality), Some(seq), None) => {
-            hash.len() == KEY_HASH_HEX_LEN
-                && hash.bytes().all(|b| b.is_ascii_hexdigit())
-                && !modality.is_empty()
-                && modality.bytes().all(|b| b.is_ascii_alphanumeric())
-                && !seq.is_empty()
-                && seq.bytes().all(|b| b.is_ascii_digit())
-        }
-        _ => false,
-    }
-}
+// The chunk-key family (`object_key_hash` / `chunk_key` / `is_chunk_key`,
+// `KEY_HASH_HEX_LEN`) sank into vectorfs-common (T14, ADR 0005): the client's
+// addressing verbs (`vf chunks` prefix enumeration, `vf chunk show --around`)
+// need the SAME shape judgment, and sigv4 is the standing precedent for
+// one-source shared wire logic. Re-exported so this crate's historical
+// `marker::…` call sites keep working — one implementation, two binaries.
+pub use vectorfs_common::chunkkey::{KEY_HASH_HEX_LEN, chunk_key, is_chunk_key, object_key_hash};
 
 fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -462,43 +423,9 @@ mod tests {
     const SIG: &str = "size=10;mtime_ns=1";
     const SIG2: &str = "size=11;mtime_ns=2";
 
-    #[test]
-    fn key_hash_is_stable_short_hex() {
-        let h = object_key_hash("docs/hello.txt");
-        assert_eq!(h.len(), KEY_HASH_HEX_LEN);
-        assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_eq!(h, object_key_hash("docs/hello.txt"));
-        assert_ne!(h, object_key_hash("docs/hello.md"));
-        // chunk keys are the same base + modality + ordinal
-        assert_eq!(chunk_key(&h, "text", 0), format!("{h}-text-0"));
-        assert_eq!(chunk_key(&h, "text", 12), format!("{h}-text-12"));
-    }
-
-    #[test]
-    fn chunk_key_shape_recognition() {
-        let h = object_key_hash("docs/hello.txt");
-        // ours always match, any modality token / ordinal width
-        for k in [
-            chunk_key(&h, "text", 0),
-            chunk_key(&h, "image", 12345),
-            chunk_key(&h, "audio", 7),
-        ] {
-            assert!(is_chunk_key(&k), "{k}");
-        }
-        // lookalikes that must NOT pass (GC 判据 layer 2)
-        assert!(!is_chunk_key("custom-key-1"), "user-shaped key");
-        assert!(!is_chunk_key(&format!("{}-text-0", &h[..15])), "short hash");
-        assert!(!is_chunk_key(&format!("{h}-text-1x")), "ordinal not digits");
-        assert!(!is_chunk_key(&format!("{h}-te-xt-1")), "extra segment");
-        assert!(!is_chunk_key(&format!("{h}--1")), "empty modality");
-        assert!(!is_chunk_key(&format!("{h}-text-")), "empty ordinal");
-        assert!(
-            !is_chunk_key(&format!("{}-text-1", "z".repeat(16))),
-            "hash not hex"
-        );
-        assert!(!is_chunk_key("k1"), "plain protocol key");
-        assert!(!is_chunk_key(""), "empty");
-    }
+    // (the key-family tests — hash stability, chunk-key shape recognition —
+    // moved to vectorfs-common's chunkkey module with the implementation,
+    // T14 sink; this module keeps the migration-edge tests below)
 
     #[test]
     fn scan_edges_no_marker_is_new_pending() {
