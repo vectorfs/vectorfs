@@ -1,8 +1,13 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # 超集面源名过滤：服务端 name→hash 翻译，协议面语义不动
+
+**已执行**（T15，2026-11-09，9172ecd）：编译前 JSON 层翻译（`$eq`/shorthand/`$in` + 递归
+`$and/$or`），不可译算子 400 path=filter；QueryVectors non-filterable 拒绝同 filter 显式钉住
+不回归；空命中 note + constraints 触顶回指用户所写名字；CLI `--source`。`vf chunk show` 归属
+ADR 0005（T14 交付）。
 
 > **修订（2026-11-07）**：`vf chunk show` 的规格归属移入 ADR 0005（内容寻址组，T14）——本 ADR
 > 收窄为源名过滤（F5）+ riders（F7/F9/文档义务）；新 400 错误的 fieldList path 归属（filter/

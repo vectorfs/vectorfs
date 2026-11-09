@@ -1,5 +1,12 @@
 # 使用摩擦 backlog（2026-11-06）
 
+> **闭环注记（2026-11-09）**：九项摩擦全部交付——F1 由 M3-T9（并行会话）关闭；F2–F9 经
+> 方案套件（`docs/design/2026-11-retrieval-quality-solution.md`，T12–T15 六提交）关闭：
+> c1d63c7/d82a339/961c4cb（T12 结构标签，F2/F3/F4）、d0abe5d（T13 坐标，F8）、
+> efebebc（T14 寻址动词，F6）、9172ecd（T15 工效，F5/F7/F9）。三个小尾巴留裁决：
+> structure 默认值（已按 true 实施）、auto 哨兵指纹缺口修法、pdf-ocr 页表一行修。
+> 以下为原始记录（含 F2 实体指认的审查纠偏），存档不回改。
+
 > 来源：一次真实 dogfooding 会话——用 `vf search`/`vf get` 回答「ThoughtWorks 技术雷达 vol 28–32 中
 > Vibe Coding 的变化」（语料：5 期中文版雷达 PDF，`docs` 桶，INDEXED=6）。每条摩擦附会话级实证。
 > 定位：**摩擦 → 机制归宿映射**。多数摩擦在 design.md 已有规划归宿（M3 T8 `$textMatch`+tantivy、
