@@ -169,7 +169,7 @@ impl ProxyAwareConnector {
     #[cfg(test)]
     pub(crate) fn proxied(authority: http::uri::Authority, exclusions: Vec<String>) -> Self {
         Self {
-            http: HttpConnector::new(),
+            http: direct_connector(),
             proxy: Some((authority, exclusions)),
         }
     }
@@ -208,10 +208,27 @@ impl ProxyAwareConnector {
                 (authority, exclusions)
             });
         Self {
-            http: HttpConnector::new(),
+            http: direct_connector(),
             proxy,
         }
     }
+}
+
+/// The inner transport dial. Scheme enforcement is OFF: hyper-rustls forwards
+/// the ORIGINAL destination URI — https scheme included — to the connector it
+/// wraps (its own built-in HttpConnector gets `enforce_http(false)` for
+/// exactly this reason: "HttpConnector won't enforce scheme, but
+/// HttpsConnector will", connector/builder.rs). With the default
+/// `enforce_http(true)` every DIRECT https request died at connect with
+/// "invalid URL, scheme is not http" — model prefetch / openai egress failed
+/// at connect while curl reached the same endpoint. Scheme gating is already
+/// the HttpsConnector layer's job (unsupported schemes are rejected there);
+/// this layer dials host:port and defers the default port (443/80) to
+/// HttpConnector's own scheme handling.
+fn direct_connector() -> HttpConnector {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    http
 }
 
 /// curl's NO_PROXY semantics, subset: exact host match, dot-suffix match
@@ -388,6 +405,36 @@ mod tests {
             get.starts_with("GET /data.bin "),
             "tunneled request {get:?}"
         );
+    }
+
+    /// REGRESSION (the 2026-11-09 deployment blocker): a DIRECT https
+    /// destination must dial. hyper-rustls hands this connector the ORIGINAL
+    /// https-scheme URI, so with the old default `enforce_http(true)` every
+    /// direct https request died at connect ("invalid URL, scheme is not
+    /// http") while curl reached the same endpoint. Only the transport dial
+    /// is under test here — the listener is plain TCP and no TLS wrap
+    /// happens; a completed handshake IS the assertion.
+    #[tokio::test]
+    async fn connector_dials_https_scheme_uri_direct() {
+        use tower_service::Service;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // a completed TCP accept is the whole assertion; drop the stream after
+        let accept = tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+        });
+
+        let mut connector = ProxyAwareConnector::from_env();
+        std::future::poll_fn(|cx| connector.poll_ready(cx))
+            .await
+            .unwrap();
+        let uri: http::Uri = format!("https://127.0.0.1:{}/x.bin", port).parse().unwrap();
+        let stream = connector.call(uri).await.expect("direct https dial");
+        drop(stream);
+        accept.await.unwrap();
     }
 
     #[test]
