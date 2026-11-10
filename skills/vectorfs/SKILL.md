@@ -81,7 +81,7 @@ Docker instead: `docker compose -f deploy/docker-compose.yml up`.
 | Verb | One-liner |
 |---|---|
 | `vf put <files…> <bucket>[/prefix]/` | upload, wait for INDEXED (`--async` returns at 202) |
-| `vf search <text> <bucket>` | semantic search (`--top-k` `--filter` `--json` `--no-text`) |
+| `vf search <text> <bucket>` | search (`--mode hybrid` recommended; `--top-k` `--filter` `--rerank` `--per-source` `--json` `--no-text`) |
 | `vf ls [bucket[/prefix]]` | list ingest buckets / a bucket's sources |
 | `vf sources list --bucket B` | ingest markers, auto-paginated |
 | `vf sources status <key> --bucket B` | one file's status + failure reason |

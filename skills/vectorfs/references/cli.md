@@ -61,8 +61,10 @@ cross-checks the real container).
 | Flag | Meaning |
 |---|---|
 | `--image PATH` | image query (XOR the text positional; bucket stays positional) |
-| `--mode M` | `semantic` (default) \| `keyword` (BM25 lexical — needs `[ingest] fts = true` + `vectorfs optimize`; exact terms/proper nouns, the semantic blind spot) \| `hybrid` (both, merged) |
+| `--mode M` | `semantic` (default) \| `keyword` (BM25 lexical — needs `[ingest] fts = true` + `vectorfs optimize`; exact terms/proper nouns, the semantic blind spot) \| `hybrid` (**recommended** — both arms fused; exact terms / proper nouns / error codes are keyword/hybrid's strength and a pure-semantic blind spot, per the recall-quality research) |
 | `--rerank` | cross-encoder re-scoring of the merged top-K (needs `[ingest] rerank = true`; semantic/hybrid only — keyword refuses: BM25 order IS that mode's contract) |
+| `--rerank-depth N` | rerank candidate depth (R3a): re-score the first N merged candidates, still return `--top-k`. 1..=200 and ≥ top-k, needs `--rerank`; default = top-k (no change). CPU budget: the cross-encoder scores ~148 ms/pair on CPU — depth 20 ≈ 3 s, depth 50 ≈ 7.4 s (linear in depth) |
+| `--per-source N` | per-source quota (R4): at most N hits per source file, applied to the merged ranking before top-K truncation (rank order kept). 1..=100, 0/absent = off. If the quota thins the set below top-k, fewer hits come back — skipped same-source hits are NOT backfilled (backfill would defeat the quota) |
 | `--bucket B` | explicit form (XOR the bare-name positional) |
 | `--top-k K` | 1..=1000, default 10 |
 | `--source KEY` | restrict to one source file by key, repeatable for several (T15) — the server translates names to `x-vf-src-uri` hashes, no hash digging |

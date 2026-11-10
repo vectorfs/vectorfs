@@ -31,6 +31,10 @@ CLI (bucket as a bare positional, XOR `--bucket`):
 
 | Flag | Meaning |
 |---|---|
+| `--mode M` | `semantic` (default) \| `keyword` (pure BM25) \| `hybrid` (**recommended** — both arms fused; needs the bucket's `fts = true`, which the `text-rag` preset ships) |
+| `--rerank` | cross-encoder re-scoring of the merged top-K (needs `[ingest] rerank = true`; semantic/hybrid only — keyword refuses) |
+| `--rerank-depth N` | rerank candidate depth: re-score the first N merged candidates, still return `--top-k` (1..=200, ≥ top-k, needs `--rerank`, default = top-k). CPU budget: ~148 ms/pair on CPU — depth 20 ≈ 3 s, depth 50 ≈ 7.4 s |
+| `--per-source N` | per-source quota: at most N hits per source file in the merged order, before top-K truncation (1..=100, default off). Fewer than top-k hits come back when the quota thins the set — no backfill |
 | `--top-k K` | hits to request, 1..=1000 (default 10) |
 | `--source KEY` | restrict to one source file by its key (repeatable = several files) — the server translates names to the `x-vf-src-uri` hash, no digging |
 | `--kind K` | admit an excluded structure kind (repeatable): `toc` and `legend` chunks are out of the default result set; `--kind toc` brings them back (allowed: body, toc, caption, legend) |
@@ -43,6 +47,11 @@ returnText}` — same semantics, camelCase.
 
 ## Query crafting
 
+- **Prefer `--mode hybrid`** (the recommended everyday mode): exact terms,
+  proper nouns, and error codes are keyword/hybrid's strength and a
+  pure-semantic blind spot — measured evidence, not taste. Pure `semantic`
+  shines for paraphrase/meaning queries; pure `keyword` when you want BM25's
+  exact-term contract untouched.
 - **Query the meaning, not keywords**: the query is *embedded*, so a full
   natural-language sentence ("how do we plan capacity for next quarter")
   usually beats a keyword list ("capacity planning").
@@ -50,7 +59,8 @@ returnText}` — same semantics, camelCase.
   multilingual — a Chinese query finds English documents and vice versa.
 - **Recall then dedupe**: fetch more (`--top-k 20`) and dedupe by
   `SOURCE`/`location.key` — several chunks of one file are adjacent hits, not
-  distinct answers.
+  distinct answers. `--per-source 2` enforces the spread server-side when one
+  fat document crowds the head (fewer hits return, honestly).
 - Order is deterministic: score desc, then key asc. Score is a merged
   (fan-out + merge) score — higher is better; treat it as a ranking, not a
   probability.

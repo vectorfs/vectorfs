@@ -51,7 +51,11 @@ pub enum Preset {
     #[default]
     Dev,
     /// gte text pipeline: pdf/md/txt extractors + token-window + ort
-    /// embedder; init prefetches the model.
+    /// embedder; init prefetches the model. Ships `fts = true` (R3c:
+    /// hybrid is the recommended everyday mode — the §7 CONFIG default
+    /// stays off, the preset opts in; existing deployments' files are
+    /// never touched, and `fts` itself stays outside the fingerprint so
+    /// this is availability, not migration).
     TextRag,
     /// Offline text pipeline: local `path` embedder, no network, model
     /// supplied by the operator.
@@ -154,10 +158,13 @@ extract = {{ pdf = \"pdf\", md = \"md\", default = \"t\" }}
 chunk = {{ kind = \"token-window\", size = 512, overlap = 64 }}
 embedders = [\"text\"]
 merge = \"rrf\"
-# Lexical search (exact-term/BM25 via `vf search --mode keyword|hybrid`) is
-# OFF by default (M3 superset content, §7). To enable (then run
-# `vectorfs optimize` to build the FTS index):
-#   fts = true
+# Lexical search is ON in this preset (R3c: hybrid is the recommended
+# everyday mode — exact terms / proper nouns / error codes are
+# keyword/hybrid's strength and a pure-semantic blind spot). The §7 config
+# default stays OFF; presets opt in. Run `vectorfs optimize` to build the
+# FTS index (until then keyword/hybrid fall back to a flat BM25 scan —
+# correct, slower at scale):
+fts = true
 #   # fts-tokenizer = \"icu\"    # default: dictionary zh/en word segmentation
 #   # fts-tokenizer = \"ngram\"  # 2,2 bigram: best CJK recall, but Latin words
 #   #                         # are bigrammed too (substring matches fire)
@@ -409,6 +416,10 @@ mod tests {
             "whole bucket"
         );
         assert_eq!(ingest.embedders, ["text"]);
+        // R3c: the preset ships the lexical face ON (hybrid is the
+        // recommended everyday mode); the §7 CONFIG default stays false —
+        // this asserts the template, not the default
+        assert!(ingest.fts, "text-rag materializes fts = true");
         // online + empty cache: OK — load-time prefetch is allowed (§5.10.4)
         cfg.validate_model_availability(dir.path()).unwrap();
         // no --models-dir passed: the top-level key must NOT be written
@@ -436,6 +447,15 @@ mod tests {
         // and the fingerprinted instances are exactly the referenced ones
         // (pdf/md/t all named in `extract`, embedder `text`)
         assert!(t1.contains("embedders = [\"text\"]"));
+        // R3c non-migration pin: `fts` stays OUTSIDE the fingerprint — the
+        // preset's `fts = true` materializes availability, never a reindex
+        // demand (strip the line and the digest is unchanged)
+        let stripped = t1.replace("fts = true\n", "");
+        let f3 = load_pipeline_config(&stripped)
+            .unwrap()
+            .fingerprint("docs")
+            .unwrap();
+        assert_eq!(f1, f3, "fts must not move the pipeline fingerprint");
     }
 
     #[test]

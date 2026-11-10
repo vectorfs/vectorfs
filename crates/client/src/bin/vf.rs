@@ -238,6 +238,22 @@ struct SearchArgs {
     #[arg(long)]
     rerank: bool,
 
+    /// Rerank candidate DEPTH (R3a): re-score the first N merged
+    /// candidates, still return --top-k. Default = --top-k (zero change).
+    /// 1..=200 and >= --top-k; needs --rerank. CPU honesty: the
+    /// cross-encoder scores ~148 ms/pair on CPU — depth 20 ≈ 3 s,
+    /// depth 50 ≈ 7.4 s (linear in the depth).
+    #[arg(long)]
+    rerank_depth: Option<i64>,
+
+    /// Per-source quota (R4): at most N hits per source file in the final
+    /// order, applied to the merged ranking before top-K truncation
+    /// (walked in rank order; skipped same-source hits are NOT backfilled
+    /// — fewer than top-k come back when the quota thins the set).
+    /// 1..=100; 0/absent = off.
+    #[arg(long)]
+    per_source: Option<i64>,
+
     /// Structure kinds to ADMIT into the results (T12, repeatable):
     /// search excludes toc/legend chunks by default (TOC lines are
     /// page-repeated perfect lexical matches and霸榜 the default ranking);
@@ -1030,6 +1046,14 @@ async fn search_cmd(args: SearchArgs) {
         // repeatable --kind ⇒ the wire's includeKinds array (the server
         // validates the closed vocabulary; unknown kinds die loud)
         body["includeKinds"] = json!(args.kinds);
+    }
+    // R3a/R4: emitted only when spelled — absent = the server default
+    // (rerankDepth = topK, perSource off), old invocations byte-unchanged
+    if let Some(d) = args.rerank_depth {
+        body["rerankDepth"] = json!(d);
+    }
+    if let Some(n) = args.per_source {
+        body["perSource"] = json!(n);
     }
     let v = match conn.call_json("Search", &body).await {
         Ok(v) => v,

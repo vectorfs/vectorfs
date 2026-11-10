@@ -46,7 +46,7 @@ Same SigV4, same error model; camelCase fields ↔ kebab-case CLI flags;
 | `GetSourceData` | bucket, key → the original byte stream |
 | `ListSources` | bucket, `status?`, `maxResults` 1–1000 (default 500), `nextToken` → sources[] |
 | `DeleteSource` | bucket, key → 202 `{status: "DELETING"}` (async chunk GC) |
-| `Search` | bucket, `query{text}`, `topK` 1–1000, `filter?`, `returnText?` → hits[] (below) — the flagship op: fan-out + merge + source attribution |
+| `Search` | bucket, `query{text}`, `topK` 1–1000, `filter?`, `returnText?`, `searchMode?` (semantic default \| keyword \| hybrid — recommended), `rerank?`, `rerankDepth?` (1..=200, ≥ topK; default = topK), `perSource?` (0..=100, 0 = off) → hits[] (below) — the flagship op: fan-out + merge (+ per-source quota) + optional cross-encoder rerank + source attribution |
 | `Reindex` | bucket → 202 `{jobId}`; progress via GetIngestStatus |
 | `GetIngestStatus` | bucket? → status counts + scan statistics + reindex progress |
 

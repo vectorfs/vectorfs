@@ -283,6 +283,11 @@ pub(crate) struct BucketPlan {
     /// tokenizer. Query-availability like `merge` — never chunk identity.
     pub(crate) fts: bool,
     pub(crate) fts_tokenizer: crate::pipeline::config::FtsTokenizer,
+    /// Fusion over-fetch multiplier (R3b): how many × topK each retrieval
+    /// arm of `/x-vf/Search` fetches before the merge (1 = the pre-R3b
+    /// behavior). Query-side retrieval policy like `merge` — never chunk
+    /// identity, outside the pipeline fingerprint.
+    pub(crate) fusion_overfetch: u32,
     /// The normalize charset entry's fallback (M3-T7), resolved ONCE at
     /// load from the config's canonical name (config.rs validated the
     /// label at parse) and threaded to BOTH normalize call sites — the
@@ -1111,6 +1116,7 @@ impl IngestCore {
                     store_chunk_text: icfg.store_chunk_text,
                     fts: icfg.fts,
                     fts_tokenizer: icfg.fts_tokenizer,
+                    fusion_overfetch: icfg.fusion_overfetch,
                     charset_fallback: encoding_rs::Encoding::for_label(
                         icfg.charset_fallback.as_bytes(),
                     )
@@ -2745,6 +2751,14 @@ impl IngestShared {
     /// what `vectorfs optimize` builds the FTS index with (M3-T9).
     pub fn fts_tokenizer_of(&self, bucket: &str) -> Option<crate::pipeline::config::FtsTokenizer> {
         self.core.buckets.get(bucket).map(|p| p.fts_tokenizer)
+    }
+
+    /// The bucket's fusion over-fetch multiplier (R3b): 1 = each retrieval
+    /// arm of `/x-vf/Search` fetches exactly topK (the pre-R3b behavior).
+    /// Query-side retrieval policy like `merge` — never chunk identity,
+    /// outside the pipeline fingerprint.
+    pub fn fusion_overfetch_of(&self, bucket: &str) -> Option<u32> {
+        self.core.buckets.get(bucket).map(|p| p.fusion_overfetch)
     }
 
     /// Derived-index specs of one bucket, config embedder order.

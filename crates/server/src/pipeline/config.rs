@@ -205,6 +205,16 @@ struct IngestRaw {
     /// the pipeline fingerprint (see [`pipeline_fingerprint`]).
     #[serde(default)]
     rerank: Option<toml::Value>,
+    /// Fusion over-fetch multiplier (R3b, recall-quality first batch):
+    /// each retrieval arm of `/x-vf/Search` fetches `min(topK × this, 1000)`
+    /// candidates before the merge (which truncates back to topK — or to
+    /// `max(topK, rerankDepth)` when the request carries one). TOML key
+    /// kebab-case like `index-prefix`. 1..=10, default 1 = the arms fetch
+    /// exactly topK (the pre-R3b behavior). Query-side retrieval policy —
+    /// never chunk identity, EXCLUDED from the pipeline fingerprint (the
+    /// `merge`/`merge-weights` precedent).
+    #[serde(rename = "fusion-overfetch", default = "default_fusion_overfetch")]
+    fusion_overfetch: u32,
 }
 
 fn default_scan_interval_secs() -> usize {
@@ -227,6 +237,9 @@ fn default_charset_fallback() -> String {
 }
 fn default_fts_tokenizer() -> String {
     "icu".to_string()
+}
+fn default_fusion_overfetch() -> u32 {
+    1
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +622,12 @@ pub struct IngestConfig {
     /// demanding a reindex would be demanding re-embedding for zero
     /// difference, the exact outcome the merge-weights ruling refuses).
     pub rerank: Option<super::rerank::RerankerKind>,
+    /// Fusion over-fetch multiplier (R3b): 1..=10, default 1 (= the arms
+    /// fetch exactly topK, the pre-R3b behavior). Query-side retrieval
+    /// policy like `merge`/`merge-weights` — it changes how DEEP the
+    /// candidate pool behind a ranking is fetched, never chunk identity,
+    /// so it stays OUT of the pipeline fingerprint.
+    pub fusion_overfetch: u32,
 }
 
 impl PipelineConfig {
@@ -708,6 +727,7 @@ fn unknown_field_parts(message: &str) -> Option<(&str, String)> {
 ///   consistent with it (`weighted` requires weights; weights on `rrf` are a
 ///   dead knob and refused; every weight is positive, finite, and names a
 ///   listed embedder instance);
+/// * `fusion-overfetch` is in 1..=10 (R3b; 1 = the default, no over-fetch);
 ///
 /// Parsing is side-effect free by contract: no network, no .so load, no
 /// credential reads — `pipelines check` must run on an air-gapped box
@@ -1033,6 +1053,7 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
                 fts: rawi.fts,
                 fts_tokenizer,
                 rerank,
+                fusion_overfetch: rawi.fusion_overfetch,
             },
         );
     }
@@ -1099,6 +1120,17 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
         if icfg.extract_timeout_secs == 0 {
             return Err(PipelineError::config(
                 format!("[{section}]: extract_timeout_secs must be > 0"),
+                line,
+            ));
+        }
+        if !(1..=10).contains(&icfg.fusion_overfetch) {
+            return Err(PipelineError::config(
+                format!(
+                    "[{section}]: fusion-overfetch must be between 1 and 10 (the multiplier on \
+                     topK each retrieval arm of `/x-vf/Search` fetches before the merge; 1 = no \
+                     over-fetch), got {}",
+                    icfg.fusion_overfetch
+                ),
                 line,
             ));
         }
@@ -1244,10 +1276,11 @@ fn canonical_charset(
 ///   just a config.)
 ///
 /// Query-side (`merge`, `merge-weights`, since M3-T9 the `fts` switch
-/// itself, and since M3-T11 the WHOLE rerank knob — switch AND model
+/// itself, since M3-T11 the WHOLE rerank knob — switch AND model
 /// reference: a reranker model is query-side ranking policy, not an index
 /// definition the way an embedder model is, so swapping it must never
-/// demand a reindex) and claim-only fields (`include`, `exclude`,
+/// demand a reindex — and since R3b `fusion-overfetch`: retrieval depth
+/// policy, same reasoning) and claim-only fields (`include`, `exclude`,
 /// `index-prefix` — v3.1 R5) are deliberately EXCLUDED: they never change
 /// chunk identity, so changing them must not invalidate completion
 /// markers. The same logic puts
@@ -1510,7 +1543,7 @@ index-prefix = "docs"
                 "[ingest.d]: unknown field 'chunkder' (allowed: include, exclude, extract, \
                  chunk, embedders, merge, merge-weights, index-prefix, scan_interval_secs, \
                  max_file_size_mb, retries, extract_timeout_secs, store_chunk_text, \
-                 charset_fallback, fts, fts-tokenizer, rerank)"
+                 charset_fallback, fts, fts-tokenizer, rerank, fusion-overfetch)"
             ),
             "{msg}"
         );
@@ -1759,6 +1792,44 @@ chunk = { kind = "token-window", size = 32, overlap = 8 }
             fp(&other_model),
             "the model reference elides — ranking policy, not chunk identity"
         );
+    }
+
+    // ---- fusion-overfetch (R3b, recall-quality first batch) ------------------
+
+    #[test]
+    fn fusion_overfetch_parses_with_default_one_and_range_gated() {
+        // absent = 1 (the arms fetch exactly topK — the pre-R3b behavior)
+        let cfg = parse(FP_CFG).unwrap();
+        assert_eq!(cfg.ingest["docs"].fusion_overfetch, 1);
+        // explicit 1 (spelled out) and the whole legal band
+        for v in [1u32, 2, 5, 10] {
+            let cfg = parse(&format!("{FP_CFG}fusion-overfetch = {v}\n")).unwrap();
+            assert_eq!(cfg.ingest["docs"].fusion_overfetch, v);
+        }
+        // out-of-band values die at the section line that carries them
+        for v in [0u32, 11] {
+            let err = parse(&format!("{FP_CFG}fusion-overfetch = {v}\n")).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("fusion-overfetch must be between 1 and 10"),
+                "{v}: {msg}"
+            );
+            assert!(msg.contains(&format!("got {v}")), "{v}: {msg}");
+            assert!(msg.contains("at line"), "{v}: {msg}");
+        }
+    }
+
+    /// THE fingerprint pin for the over-fetch axis: retrieval depth policy,
+    /// never chunk identity — any multiplier fingerprints identically to the
+    /// bare config (the merge/rerank ruling extended to depth).
+    #[test]
+    fn fusion_overfetch_never_enters_the_fingerprint() {
+        let base = parse(FP_CFG).unwrap();
+        let deep = parse(&format!("{FP_CFG}fusion-overfetch = 5\n")).unwrap();
+        let deepest = parse(&format!("{FP_CFG}fusion-overfetch = 10\n")).unwrap();
+        let fp = |c: &PipelineConfig| c.fingerprint("docs").unwrap();
+        assert_eq!(fp(&base), fp(&deep), "depth policy, not chunk identity");
+        assert_eq!(fp(&deep), fp(&deepest), "every multiplier elides");
     }
 
     #[test]

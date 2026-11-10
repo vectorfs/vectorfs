@@ -69,6 +69,16 @@ filters; `store_chunk_text = false` to not store chunk text in metadata).
 Validate with `vectorfs pipelines check` (exit 0 valid / 1 validation failure
 with TOML line numbers / 2 usage).
 
+Query-side `[ingest.<bucket>]` knobs (ranking/retrieval policy — they never
+change chunk identity, so they do NOT trip the fingerprint gate):
+`fts` (lexical face switch), `rerank` (cross-encoder availability),
+`fusion-overfetch = N` (1..=10, default 1 — each retrieval arm of Search
+fetches `min(max(topK, rerankDepth) × N, 1000)` candidates before the merge;
+deeper pools give the rrf fusion and a deep rerank more to work with. The
+`text-rag` preset ships `fts = true` — hybrid is the recommended everyday
+mode). Exception: `fts-tokenizer` DOES trip the gate (it changes how the
+FTS index tokenizes — 换分词 = reindex).
+
 **Fingerprint gate**: changing extractor/chunker/embedder config makes serve
 refuse startup until an explicit re-embed — `vectorfs serve --reindex`.
 

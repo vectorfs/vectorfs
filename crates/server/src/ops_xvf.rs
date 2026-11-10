@@ -144,6 +144,26 @@ struct SearchInput {
     /// serve startup), a TEXT query (the cross-encoder reads the pair) and
     /// a non-keyword mode. Default absent/false = the pre-T11 behavior.
     rerank: Option<bool>,
+    /// Rerank candidate DEPTH (R3a, decoupled from the return depth): the
+    /// cross-encoder re-scores the first `rerankDepth` merged candidates and
+    /// the response still returns `topK`. Absent = topK (the pre-R3a
+    /// behavior, old clients zero-change). 1..=200, and >= topK (rerank
+    /// must re-score at least what would be returned); a depth without
+    /// `rerank: true` is a dead knob and refused. CPU honesty: the
+    /// cross-encoder scores ~148 ms/pair on CPU (research/2026-11-m3-bench
+    /// §2) — depth 20 ≈ 3 s, depth 50 ≈ 7.4 s; the latency is linear in
+    /// the depth.
+    rerank_depth: Option<i64>,
+    /// Per-source quota (R4, grouping): after the merge order settles and
+    /// BEFORE any truncation, at most `perSource` hits per source file
+    /// (`x-vf-src-uri`) survive — walked in fusion-rank order, bucket-full
+    /// entries skipped (保序). 1..=100; absent/0 = off (the pre-R4
+    /// behavior). If the quota leaves fewer than topK hits, fewer are
+    /// returned — skipped same-source hits are NOT backfilled (backfilling
+    /// would defeat the quota). Applies before a rerankDepth truncation
+    /// too: the cross-encoder sees the quota'd candidate set (a same-source
+    /// crowd must not eat the re-scoring budget).
+    per_source: Option<i64>,
     /// Structure kinds to ADMIT beyond the default visibility (T12, D-5):
     /// Search excludes `toc` and `legend` chunks by default (F2/F4
     /// governance — TOC lines are perfect BM25 matches and霸榜; legends
@@ -998,6 +1018,23 @@ fn json_type_name(v: &serde_json::Value) -> &'static str {
     }
 }
 
+/// The source-grouping key of one merged hit (R4): the stored
+/// `x-vf-src-uri` from the attribution map's metadata — the same hash the
+/// GC joins on and the src-name translation targets. `None` when the hit
+/// carries no source hash (not reachable for file-layer chunks; callers
+/// treat such a hit as its own bucket so the quota never bites malformed
+/// metadata).
+fn src_uri_of<'a>(
+    attribution: &'a HashMap<String, (String, Option<f64>, Option<serde_json::Value>)>,
+    key: &str,
+) -> Option<&'a str> {
+    attribution
+        .get(key)
+        .and_then(|(_, _, m)| m.as_ref())
+        .and_then(|m| m.get("x-vf-src-uri"))
+        .and_then(serde_json::Value::as_str)
+}
+
 /// Compile the Search filter: the user's `$`-operator filter, conjoined
 /// with the default kind exclusion unless `include_kinds` admits every
 /// excluded kind (T12).
@@ -1156,6 +1193,24 @@ fn compile_filter(
 /// ranking IS its semantics); hits come back in rerank order with the
 /// score field carrying the RAW cross-encoder logit, and `distance` is
 /// omitted (the order no longer derives from it).
+///
+/// `rerankDepth` (R3a, recall-quality first batch): decouples the re-scoring
+/// depth from the return depth — the cross-encoder scores the first
+/// `rerankDepth` merged candidates, topK still come back. Absent = topK
+/// (zero behavior change); 1..=200 and >= topK, both enforced loudly; a
+/// depth without `rerank: true` is a dead knob and refused. The arms fetch
+/// `min(max(topK, rerankDepth) × fusion-overfetch, 1000)` so the depth has
+/// a fusion output deep enough to re-score at the default multiplier; the
+/// bucket's `fusion-overfetch` (R3b) composes on top for still-deeper
+/// pools.
+/// CPU honesty: ~148 ms/pair (research/2026-11-m3-bench.md §2) — depth 20
+/// ≈ 3 s, depth 50 ≈ 7.4 s.
+///
+/// `perSource` (R4): per-source quota on the merged order, applied BEFORE
+/// any truncation (rerank included — the cross-encoder sees the quota'd
+/// candidate set). At most N hits per `x-vf-src-uri` survive, walked in
+/// fusion order; fewer than topK are returned when the quota thins the
+/// set (no backfill — backfilling would defeat the quota). Absent/0 = off.
 ///
 /// Hit shape, field by field (appendix E.2):
 /// * `content{text?, type: "TEXT"|"IMAGE"}` — `type` follows the CHUNK's
@@ -1336,6 +1391,53 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
             ));
         }
     };
+
+    // rerankDepth (R3a): decouple the re-scoring depth from the return
+    // depth. Absent = topK (zero behavior change); explicit values must be
+    // usable — a depth without rerank is a dead knob and a depth below topK
+    // would SHRINK the result set (both die loud, the fts-tokenizer-on-
+    // fts-off discipline: bad values die at the field that carries them).
+    let rerank_depth = match input.rerank_depth {
+        None => top_k,
+        Some(d) if (1..=200).contains(&d) => d as usize,
+        Some(d) => {
+            return Err(ApiError::validation_field(
+                "rerankDepth",
+                format!("rerankDepth must be between 1 and 200, got {d}"),
+            ));
+        }
+    };
+    if input.rerank_depth.is_some() {
+        if !reranking {
+            return Err(ApiError::validation_field(
+                "rerankDepth",
+                "rerankDepth is set but rerank is not true — the depth only sizes the \
+                 cross-encoder's candidate set; pass rerank: true or drop rerankDepth",
+            ));
+        }
+        if rerank_depth < top_k {
+            return Err(ApiError::validation_field(
+                "rerankDepth",
+                format!(
+                    "rerankDepth must be >= topK (rerank re-scores at least what would be \
+                     returned), got rerankDepth {rerank_depth} < topK {top_k}"
+                ),
+            ));
+        }
+    }
+
+    // perSource (R4): the per-source quota. Absent/0 = off (zero behavior
+    // change); 1..=100 = at most N hits per source file in the final order.
+    let per_source = match input.per_source {
+        None | Some(0) => None,
+        Some(n) if (1..=100).contains(&n) => Some(n as usize),
+        Some(n) => {
+            return Err(ApiError::validation_field(
+                "perSource",
+                format!("perSource must be between 0 and 100 (0 = off), got {n}"),
+            ));
+        }
+    };
     let return_text = input.return_text.unwrap_or(true);
 
     // filter: `$` short-name syntax, same compile + non-filterable rejection
@@ -1367,6 +1469,22 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
     // M3-T9: hybrid appends the BM25 list of the SAME route after its
     // semantic list — one route contributes two lists (both named by the
     // embedder instance, so merge-weights weigh a route's both arms alike).
+    //
+    // R3b fusion over-fetch: each ARM fetches min(max(topK, rerankDepth) ×
+    // the bucket's `fusion-overfetch`, 1000) candidates instead of topK —
+    // a deeper candidate pool behind the same merge (a rank-15-both-arms
+    // chunk can now out-fuse a rank-1-one-arm one). The `max(topK,
+    // rerankDepth)` base is the R3a linkage: a rerankDepth deeper than
+    // topK must have a fusion output deep enough to re-score, even at the
+    // default multiplier. The merge truncates back below; multiplier 1
+    // (the config default) makes fetch_k == max(topK, rerankDepth) — the
+    // exact pre-R3b behavior for every depth-less request. A single-list
+    // result is order-identical either way (a deeper fetch only APPENDS to
+    // a list whose ranking is already total), so the knob bites fused
+    // faces only.
+    let fetch_k = (rerank_depth.max(top_k)
+        * shared.fusion_overfetch_of(&input.bucket).unwrap_or(1) as usize)
+        .min(1000);
     let lexical = crate::lexical::kernel();
     let query_text = match &query {
         Query::Text(t) => Some(t.as_str()),
@@ -1446,7 +1564,7 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
                     meta.dimension,
                     &meta.distance_metric,
                     &qvec,
-                    top_k,
+                    fetch_k,
                     compiled.as_ref(),
                     QueryRoute::Pushdown,
                     None,
@@ -1484,7 +1602,7 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
                     &input.bucket,
                     &spec.index_name,
                     text,
-                    top_k,
+                    fetch_k,
                     compiled.as_ref(),
                 )
                 .await?;
@@ -1533,16 +1651,46 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
             merge_hitlists_weighted(&named, weights)
         }
     };
-    merged.truncate(top_k); // fusions can exceed topK across route unions
+    // ---- R4 per-source quota: merge order settled, truncation NOT yet —
+    // the quota walks the FULL merged ranking in fusion order and keeps at
+    // most `perSource` entries per source file (bucket-full entries are
+    // skipped, order preserved). Deliberately BEFORE any truncation (a
+    // same-source crowd must not eat the rerank budget either) and with NO
+    // backfill: if the quota leaves fewer than topK hits, fewer are
+    // returned — refilling the gaps with the skipped same-source hits would
+    // defeat the quota's whole point (the textbook-794-chunks crowding
+    // shape, research/2026-11-recall-quality-optimization.md R4).
+    if let Some(n) = per_source {
+        let mut per_src: HashMap<String, usize> = HashMap::new();
+        merged.retain(|h| {
+            // the grouping key is the attribution map's source hash (the
+            // same `x-vf-src-uri` the GC joins on); a hit without one (not
+            // possible for file-layer chunks, but honestly) is its own
+            // bucket — the quota never bites malformed metadata
+            let key = src_uri_of(&attribution, &h.key)
+                .unwrap_or(h.key.as_str())
+                .to_string();
+            let count = per_src.entry(key).or_insert(0);
+            if *count >= n {
+                false
+            } else {
+                *count += 1;
+                true
+            }
+        });
+    }
+    merged.truncate(rerank_depth.max(top_k)); // fusions can exceed topK across route unions; R3a: a rerankDepth deeper than topK widens the re-scoring pool
 
-    // ---- rerank (M3-T11): merge → rerank → 回源 (§5.10.3 data flow). The
-    // candidates are the truncated topK (the request's own candidate-set
-    // semantics — rerank re-scores what would be returned); each carries
-    // its stored x-vf-chunk-text (empty for image chunks / text-less
-    // buckets — scored, never dropped). The reranker's output replaces the
-    // merged order AND the scores (raw cross-encoder logits, monotone in
+    // ---- rerank (M3-T11 + R3a depth): merge → quota → truncate(depth) →
+    // rerank → truncate(topK) → 回源 (§5.10.3 data flow). The candidates
+    // are the (quota'd) merged head — topK of them by default, or
+    // rerankDepth when the request decouples the depths (each carries its
+    // stored x-vf-chunk-text, empty for image chunks / text-less buckets —
+    // scored, never dropped). The reranker's output replaces the merged
+    // order AND the scores (raw cross-encoder logits, monotone in
     // relevance); `distance` stops being emitted below because the order
-    // no longer derives from it.
+    // no longer derives from it. When depth > topK the re-scored tail is
+    // truncated away here — the response still returns topK.
     if let Some(reranker) = reranker {
         let query_text = match &query {
             Query::Text(t) => t.as_str(),
@@ -1570,6 +1718,10 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
                     input.bucket
                 ))
             })?;
+        // R3a: the depths are decoupled on the WAY IN only — re-score
+        // rerankDepth candidates, still RETURN topK (a no-op at the
+        // default depth == topK).
+        merged.truncate(top_k);
     }
 
     let hits: Vec<serde_json::Value> = merged
@@ -4073,6 +4225,664 @@ mod tests {
             assert!(ok, "hybrid rerank not totally ordered: {b}");
         }
         assert!(hits.iter().all(|h| h.get("distance").is_none()), "{b}");
+    }
+
+    // ---------------- Search rerankDepth / perSource / fusion-overfetch
+    // (recall-quality first batch: R3a + R4 + R3b, research/2026-11-recall-
+    // quality-optimization.md §3) ----------------
+
+    /// R3a: the re-scoring depth decouples from the return depth. The
+    /// validation face first (bounds, dead knob, depth < topK — all
+    /// field-addressable ValidationExceptions, keyword's rerank refusal
+    /// untouched), then the behavior: the exact-logit corpus above — with
+    /// topK=1 and NO depth the cross-encoder re-scores exactly the merged
+    /// head (one candidate, itself); with rerankDepth=4 it re-scores all
+    /// four docs and the max-logit doc (b, 103) takes the single returned
+    /// slot even though it was NOT the semantic head. Default absent =
+    /// depth topK = the pre-R3a behavior (byte-identical).
+    #[tokio::test]
+    async fn search_rerank_depth_decouples_candidate_and_return_depth() {
+        // fts on: the keyword-refusal arm below needs the lexical face
+        let f = fixture_with(tiny_rerank_config("fts = true\n")).await;
+        for (key, body) in [
+            ("docs/a.txt", b"the fox".to_vec()),
+            ("docs/b.txt", b"fox embeds the quick fox".to_vec()),
+            ("docs/c1.txt", b"contract probe chunk".to_vec()),
+            ("docs/c2.txt", b"contract probe chunk".to_vec()),
+        ] {
+            put_source_call(&f, "docs", key, body).await;
+        }
+        drive(&f).await;
+
+        // ---- validation face ----
+        // bounds: 0 and 201 are outside 1..=200 (rerank: true so the
+        // dead-knob arm cannot fire first)
+        for bad in [0i64, 201] {
+            let (st, _, b) = call_json(
+                &f,
+                "/x-vf/Search",
+                json!({"bucket":"docs","query":{"text":"hello vectorfs"},"topK":5,
+                       "rerank":true,"rerankDepth":bad}),
+            )
+            .await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}: {b}");
+            assert_eq!(
+                b["fieldList"][0]["path"],
+                json!("rerankDepth"),
+                "{bad}: {b}"
+            );
+            assert!(
+                b["message"].as_str().unwrap().contains("between 1 and 200"),
+                "{bad}: {b}"
+            );
+        }
+        // dead knob: a depth without rerank is refused (the fts-tokenizer
+        // discipline — never a silently-ignored value)
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"hello vectorfs"},"topK":5,
+                   "rerankDepth":5}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["fieldList"][0]["path"], json!("rerankDepth"), "{b}");
+        assert!(
+            b["message"]
+                .as_str()
+                .unwrap()
+                .contains("rerank is not true"),
+            "{b}"
+        );
+        // depth < topK would SHRINK the result set — refused
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"hello vectorfs"},"topK":10,
+                   "rerank":true,"rerankDepth":5}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["fieldList"][0]["path"], json!("rerankDepth"), "{b}");
+        assert!(
+            b["message"].as_str().unwrap().contains("must be >= topK"),
+            "{b}"
+        );
+        // keyword still refuses rerank itself, depth or no depth
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":5,
+                   "searchMode":"keyword","rerank":true,"rerankDepth":5}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert!(
+            b["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not apply to searchMode"),
+            "{b}"
+        );
+
+        // ---- behavior ----
+        // the semantic head first (rerank OFF): whoever leads the merged
+        // order is what a depth-less topK=1 re-scores
+        let (_, _, plain) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"hello vectorfs"},"topK":4}),
+        )
+        .await;
+        let semantic_head = plain["hits"][0]["key"].as_str().unwrap().to_string();
+        let b_hash = crate::ingest::marker::object_key_hash("docs/b.txt");
+        let b_key = plain["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["key"].as_str().unwrap())
+            .find(|k| k.starts_with(&b_hash))
+            .expect("docs/b.txt has a hit")
+            .to_string();
+        assert_ne!(
+            semantic_head, b_key,
+            "precondition: the max-logit doc is not the semantic head — tune the corpus"
+        );
+
+        // topK=1, NO depth: the one candidate is the merged head itself
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"hello vectorfs"},"topK":1,
+                   "rerank":true}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["hits"].as_array().unwrap().len(), 1, "{b}");
+        assert_eq!(b["hits"][0]["key"].as_str().unwrap(), semantic_head, "{b}");
+
+        // topK=1, rerankDepth=4: all four candidates re-scored, b's 103
+        // logit takes the single returned slot — the return depth stays 1
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"hello vectorfs"},"topK":1,
+                   "rerank":true,"rerankDepth":4}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["hits"].as_array().unwrap().len(), 1, "{b}");
+        assert_eq!(b["hits"][0]["key"].as_str().unwrap(), b_key, "{b}");
+        assert_eq!(b["hits"][0]["score"].as_f64().unwrap(), 103.0, "{b}");
+
+        // topK=2, rerankDepth=4: four re-scored, TWO returned (b first)
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"hello vectorfs"},"topK":2,
+                   "rerank":true,"rerankDepth":4}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["hits"].as_array().unwrap().len(), 2, "{b}");
+        assert_eq!(b["hits"][0]["key"].as_str().unwrap(), b_key, "{b}");
+    }
+
+    /// R4: the per-source quota (grouping). A fat multi-chunk document
+    /// crowds the merged top-10 (the textbook-794-chunks shape); `perSource`
+    /// caps every source's share — walked in fusion order (the survivors
+    /// are a SUBSEQUENCE of the unquota'd order), counts respected at 1
+    /// and 2, and a quota that thins the set returns FEWER than topK
+    /// honestly (no backfill of the skipped same-source hits). Absent and
+    /// explicit 0 are byte-identical (the default = off).
+    #[tokio::test]
+    async fn search_per_source_quota_groups_merged_order() {
+        let f = fixture_with(tiny_fts_config(false)).await;
+        // the fat doc: ~5 windows, every one carries "fox" — near-duplicate
+        // chunks cluster in embedding space and crowd the top-10 (kept
+        // small enough that ALL chunks fit one top-10 fetch, so the quota's
+        // diversity math is over the whole corpus)
+        let fat = ["the fox network signal route "; 4].concat();
+        put_source_call(&f, "docs", "docs/fat.txt", fat.into_bytes()).await;
+        for (i, body) in [
+            (1, b"the fox rides alone tonight".to_vec()),
+            (2, b"a fox sleeps under the bridge".to_vec()),
+            (3, b"fox watchers report movement".to_vec()),
+        ] {
+            put_source_call(&f, "docs", &format!("docs/s{i}.txt"), body).await;
+        }
+        drive(&f).await;
+
+        let quotaless = |per_source: Option<i64>| {
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":10,
+                   "perSource": per_source})
+        };
+        let (st, _, base) = call_json(&f, "/x-vf/Search", quotaless(None)).await;
+        assert_eq!(st, StatusCode::OK, "{base}");
+        let src = |h: &serde_json::Value| h["location"]["key"].as_str().unwrap().to_string();
+        let hits = base["hits"].as_array().unwrap();
+        // precondition: the fat doc really crowds (>= 3 of its chunks in
+        // the top-10 — otherwise this corpus no longer exercises R4)
+        let fat_count = hits.iter().filter(|h| src(h) == "docs/fat.txt").count();
+        assert!(fat_count >= 3, "crowding precondition: {base}");
+
+        // ---- perSource = 1: every source at most once, survivors keep
+        // the fusion order (a subsequence of the quotaless ranking) ----
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":10,"perSource":1}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        let mut per_src: std::collections::BTreeMap<String, usize> = Default::default();
+        for h in hits {
+            *per_src.entry(src(h)).or_insert(0) += 1;
+        }
+        assert!(
+            per_src.values().all(|c| c <= &1),
+            "perSource=1 caps every source: {per_src:?} — {b}"
+        );
+        assert_eq!(per_src.get("docs/fat.txt"), Some(&1), "{b}");
+        assert!(hits.len() >= 3, "cross-source diversity: {b}");
+        // order preservation: each survivor's position in the quotaless
+        // baseline strictly increases
+        let base_order: Vec<String> = base["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["key"].as_str().unwrap().to_string())
+            .collect();
+        let mut prev: Option<usize> = None;
+        for h in hits {
+            let key = h["key"].as_str().unwrap();
+            let pos = base_order
+                .iter()
+                .position(|k| k == key)
+                .expect("survivors come from the quotaless ranking");
+            assert!(
+                prev.is_none_or(|p| p < pos),
+                "quota keeps fusion order: {key} at {pos} after {prev:?}"
+            );
+            prev = Some(pos);
+        }
+
+        // ---- perSource = 2 ----
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":10,"perSource":2}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let mut per_src: std::collections::BTreeMap<String, usize> = Default::default();
+        for h in b["hits"].as_array().unwrap() {
+            *per_src.entry(src(h)).or_insert(0) += 1;
+        }
+        assert!(
+            per_src.values().all(|c| c <= &2),
+            "perSource=2 caps every source: {per_src:?} — {b}"
+        );
+        assert_eq!(per_src.get("docs/fat.txt"), Some(&2), "{b}");
+
+        // ---- honest shortfall: only TWO sources match this query —
+        // perSource=1 returns 2 hits, NOT 10 (the skipped fat chunks are
+        // never backfilled) ----
+        put_source_call(
+            &f,
+            "docs",
+            "docs/lone.txt",
+            b"a fox and nothing else".to_vec(),
+        )
+        .await;
+        drive(&f).await;
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":10,
+                   "filter":{"x-vf-src-name":{"$in":["docs/fat.txt","docs/lone.txt"]}},
+                   "perSource":1}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2, "two sources x quota 1, no backfill: {b}");
+        assert_eq!(src(&hits[0]), "docs/fat.txt", "{b}");
+        assert_eq!(src(&hits[1]), "docs/lone.txt", "{b}");
+
+        // ---- validation: 101 is outside 1..=100 ----
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":5,"perSource":101}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["fieldList"][0]["path"], json!("perSource"), "{b}");
+        assert!(
+            b["message"].as_str().unwrap().contains("between 0 and 100"),
+            "{b}"
+        );
+
+        // ---- default = off: absent and explicit 0 byte-identical ----
+        let (_, _, zero) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":10,"perSource":0}),
+        )
+        .await;
+        // (the baseline above predates docs/lone.txt — recompute it)
+        let (_, _, base2) = call_json(&f, "/x-vf/Search", quotaless(None)).await;
+        assert_eq!(
+            serde_json::to_string(&base2).unwrap(),
+            serde_json::to_string(&zero).unwrap(),
+            "perSource 0 == absent (off)"
+        );
+    }
+
+    /// R4 × rerank ordering: the quota runs BEFORE the rerankDepth
+    /// truncation, so the cross-encoder re-scores the QUOTA'D candidate
+    /// set. Observable: with perSource=1 the surviving chunk of the fat
+    /// source is the one the FUSION admitted (its rank-first chunk), not
+    /// the one the reranker would have crowned — pin both orders at
+    /// runtime and assert they disagree (precondition), then that the
+    /// quota's choice wins.
+    #[tokio::test]
+    async fn search_per_source_quota_runs_before_rerank() {
+        let f = fixture_with(tiny_rerank_config("fts = true\n")).await;
+        // the fat source: the FIRST window carries the fixture vocab's
+        // LOW-id words ("contract probe chunk" — the exact-logit corpus's
+        // 51-scorers) and the later windows carry the HIGH-id phrase
+        // ("fox embeds the quick fox" — the 103-scorer), so the fusion
+        // order (semantic all-tie → key asc → text-0) and the rerank order
+        // (logit sums → the later windows) genuinely disagree
+        let fat = format!(
+            "{}{}",
+            "contract probe chunk ",
+            " fox embeds the quick fox fox embeds the quick fox fox embeds the quick fox"
+        );
+        put_source_call(&f, "docs", "docs/fat.txt", fat.into_bytes()).await;
+        put_source_call(
+            &f,
+            "docs",
+            "docs/b.txt",
+            b"the quick brown fox jumps over the lazy dog".to_vec(),
+        )
+        .await;
+        put_source_call(
+            &f,
+            "docs",
+            "docs/c.txt",
+            b"whales and dolphins swim in the deep blue ocean".to_vec(),
+        )
+        .await;
+        drive(&f).await;
+
+        // fusion order (rerank OFF): the fat source's rank-first chunk
+        let (_, _, plain) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":10}),
+        )
+        .await;
+        let fusion_first = plain["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["location"]["key"] == json!("docs/fat.txt"))
+            .map(|h| h["key"].as_str().unwrap().to_string())
+            .expect("the fat source has hits");
+
+        // rerank order (quota OFF): the fat chunk the cross-encoder ranks
+        // first — computed through the SAME loaded reranker the wire uses
+        let reranker = f.handle.shared().reranker_of("docs").unwrap();
+        let fat_chunks: Vec<crate::pipeline::RerankCandidate> = plain["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|h| h["location"]["key"] == json!("docs/fat.txt"))
+            .map(|h| {
+                let text = h["content"]["text"].as_str().unwrap_or("");
+                crate::pipeline::RerankCandidate {
+                    key: h["key"].as_str().unwrap().to_string(),
+                    text: text.to_string(),
+                }
+            })
+            .collect();
+        assert!(fat_chunks.len() >= 2, "the fat source is multi-chunk");
+        let reranked = reranker.rerank("fox", &fat_chunks).await.unwrap();
+        let rerank_first = reranked[0].key.clone();
+        assert!(
+            fat_chunks.iter().any(|c| c.key == fusion_first),
+            "both orders over the same chunk set"
+        );
+        assert_ne!(
+            fusion_first, rerank_first,
+            "precondition: fusion-first != rerank-first — tune the corpus"
+        );
+
+        // rerank + perSource=1: exactly ONE fat chunk survives, and it is
+        // the fusion-admitted one — had the quota run AFTER the rerank,
+        // the survivor would be the reranker's pick instead
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"fox"},"topK":10,
+                   "rerank":true,"perSource":1}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let fat_hits: Vec<&serde_json::Value> = b["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|h| h["location"]["key"] == json!("docs/fat.txt"))
+            .collect();
+        assert_eq!(fat_hits.len(), 1, "quota: one fat chunk — {b}");
+        assert_eq!(
+            fat_hits[0]["key"].as_str().unwrap(),
+            fusion_first,
+            "the fusion-admitted chunk survives the rerank, not the reranker's pick: {b}"
+        );
+        // b/c still there (the quota thins, the companions ride along)
+        assert_eq!(b["hits"].as_array().unwrap().len(), 3, "{b}");
+    }
+
+    /// tiny fts pipeline + an extra splice line for the ingest section
+    /// (fusion-overfetch tests, R3b).
+    fn tiny_fts_extra_config(extra: &str) -> crate::pipeline::config::PipelineConfig {
+        let text = format!(
+            "[extractor.plain]\nkind = \"txt\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = true\n\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ txt = \"plain\" }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"tiny\"]\nscan_interval_secs = 1\nfts = true\n{extra}",
+            fixture_dir().display().to_string()
+        );
+        load_pipeline_config(&text).unwrap()
+    }
+
+    /// R3b: `fusion-overfetch` widens every retrieval arm (fetch
+    /// min(max(topK, rerankDepth) × mult, 1000) instead of topK). The
+    /// deep case is asserted EXACTLY against an independent oracle (both
+    /// arms engine-direct at the deep fetch, rrf-fused) — safe to pin
+    /// because the deep fetch covers the whole corpus, so neither arm is
+    /// ever cut at a tie boundary (the tiny embedder is CLS-constant:
+    /// every distance ties at 0, and the ENGINE's pick among tied rows at
+    /// a limit cut is not stable across calls — a shallow exact-order
+    /// oracle would be flaky by construction, so the shallow side is
+    /// asserted through the mechanism instead: a doc whose BM25 rank sits
+    /// beyond the shallow cut can only carry its second rrf contribution
+    /// when the arm fetched deep enough). A single-arm keyword query is
+    /// byte-identical under any multiplier (a deeper fetch only appends
+    /// to a list whose ranking is already total).
+    #[tokio::test]
+    async fn search_fusion_overfetch_widens_the_arms_and_changes_the_fusion() {
+        // the corpus: four single-chunk docs (each ≤ one 32-char window),
+        // matching the query term with DISTINCT multiplicity — BM25 ranks
+        // them strictly (no ties, a deterministic arm at any cut) while
+        // the degenerate semantic arm ties everything at distance 0 (its
+        // full-fetch order is chunk-key asc, equally deterministic)
+        let corpus: Vec<(String, String)> = (1..=4)
+            .map(|i| {
+                (
+                    format!("docs/p{i}.txt"),
+                    format!("{}{}", "alpha ".repeat(i), "tail"),
+                )
+            })
+            .collect();
+        let query = "alpha";
+        let top_k = 3usize;
+
+        // the deep oracle: both arms engine-direct at a fetch that covers
+        // the whole corpus, fused with the same rrf the wire uses
+        async fn deep_oracle(f: &Fixture, query: &str, fetch: usize, top_k: usize) -> HitList {
+            let spec = f
+                .handle
+                .shared()
+                .derived_specs("docs")
+                .unwrap()
+                .pop()
+                .unwrap();
+            let loaded = f.handle.shared().embedder("tiny").unwrap();
+            let qv = loaded
+                .embed_query(&Query::Text(query.to_string()))
+                .await
+                .unwrap();
+            let sem = f
+                .state
+                .storage
+                .query_vectors(
+                    "docs",
+                    &spec.index_name,
+                    spec.dim as i32,
+                    "cosine",
+                    &qv,
+                    fetch,
+                    None,
+                    crate::store::QueryRoute::Pushdown,
+                    None,
+                )
+                .await
+                .unwrap();
+            let bm = crate::lexical::kernel()
+                .search(
+                    &f.state.storage,
+                    "docs",
+                    &spec.index_name,
+                    query,
+                    fetch,
+                    None,
+                )
+                .await
+                .unwrap();
+            let sem_list: HitList = sem
+                .hits
+                .iter()
+                .map(|h| crate::pipeline::Hit {
+                    key: h.key.clone(),
+                    score: 1.0 / (1.0 + h.distance as f64),
+                })
+                .collect();
+            let bm_list: HitList = bm
+                .iter()
+                .map(|h| crate::pipeline::Hit {
+                    key: h.key.clone(),
+                    score: h.score,
+                })
+                .collect();
+            let mut fused = merge_hitlists(Merge::Rrf, &[sem_list, bm_list]);
+            fused.truncate(top_k);
+            fused
+        }
+
+        // ---- the BM25 order, through the wire's own keyword face (full
+        // depth: topK = corpus size, no cut, strictly ordered scores) ----
+        let f1 = fixture_with(tiny_fts_extra_config("")).await;
+        for (key, body) in &corpus {
+            put_source_call(&f1, "docs", key.as_str(), body.clone().into_bytes()).await;
+        }
+        drive(&f1).await;
+        let (st, _, b) = call_json(
+            &f1,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":query},"topK":8,
+                   "searchMode":"keyword"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let bm_order: Vec<String> = b["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["key"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(bm_order.len(), 4, "{b}");
+        // strict BM25 scores: no adjacent tie (the arm is deterministic
+        // at any fetch cut)
+        for w in b["hits"].as_array().unwrap().windows(2) {
+            assert!(
+                w[0]["score"].as_f64().unwrap() > w[1]["score"].as_f64().unwrap(),
+                "strict bm25 order: {b}"
+            );
+        }
+
+        // ---- multiplier 3: fetch == 9 >= corpus — exact oracle equality
+        // (both arms full-depth, deterministic) ----
+        let f3 = fixture_with(tiny_fts_extra_config("fusion-overfetch = 3\n")).await;
+        for (key, body) in &corpus {
+            put_source_call(&f3, "docs", key.as_str(), body.clone().into_bytes()).await;
+        }
+        drive(&f3).await;
+        let oracle = deep_oracle(&f3, query, top_k * 3, top_k).await;
+        let (st, _, deep) = call_json(
+            &f3,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":query},"topK":top_k,
+                   "searchMode":"hybrid"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{deep}");
+        let deep_keys: Vec<&str> = deep["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["key"].as_str().unwrap())
+            .collect();
+        let oracle_keys: Vec<&str> = oracle.iter().map(|h| h.key.as_str()).collect();
+        assert_eq!(deep_keys, oracle_keys, "deep fetch == oracle: {deep}");
+
+        // ---- the knob's bite (mechanism-level, robust to the semantic
+        // arm's unstable tie-pick): find a deep-head doc whose BM25 rank
+        // is BEYOND the shallow fetch cut ----
+        let deep_late_bm: Vec<&str> = deep_keys
+            .iter()
+            .filter(|k| bm_order.iter().position(|b| b == *k).unwrap() >= top_k)
+            .copied()
+            .collect();
+        assert!(
+            !deep_late_bm.is_empty(),
+            "precondition: the deep head contains a doc whose bm25 rank is beyond the \
+             shallow cut — tune the doc names (keys order the tied semantic arm): \
+             bm={bm_order:?} deep={deep_keys:?}"
+        );
+        let late = deep_late_bm[0];
+        let late_deep_score = deep["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["key"].as_str().unwrap() == late)
+            .unwrap()["score"]
+            .as_f64()
+            .unwrap();
+
+        // shallow (default multiplier): the bm arm cut at topK=3 CANNOT
+        // contribute to `late` — if it appears at all it is the semantic
+        // pick alone (a single rrf term, strictly less than the deep
+        // two-term sum); absent-or-cheaper is the honest observable
+        let (st, _, shallow) = call_json(
+            &f1,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":query},"topK":top_k,
+                   "searchMode":"hybrid"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{shallow}");
+        let shallow_hit = shallow["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["key"].as_str().unwrap() == late);
+        let shallow_late_score = shallow_hit.map(|h| h["score"].as_f64().unwrap());
+        assert!(
+            shallow_late_score.is_none_or(|s| s < late_deep_score),
+            "the bm arm fetched deep in the deep case only: late {late} shallow \
+             {shallow_late_score:?} deep {late_deep_score} — {shallow}"
+        );
+
+        // ---- single-arm keyword: the multiplier changes nothing (a
+        // deeper fetch only APPENDS; truncate(topK) restores the prefix) —
+        // the zero-surprise property for non-fused faces ----
+        let (_, _, kw_shallow) = call_json(
+            &f1,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":query},"topK":3,
+                   "searchMode":"keyword"}),
+        )
+        .await;
+        let (_, _, kw_deep) = call_json(
+            &f3,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":query},"topK":3,
+                   "searchMode":"keyword"}),
+        )
+        .await;
+        assert_eq!(
+            serde_json::to_string(&kw_shallow).unwrap(),
+            serde_json::to_string(&kw_deep).unwrap(),
+            "single-arm faces are multiplier-blind: {kw_shallow} vs {kw_deep}"
+        );
     }
 
     // ---------------- Search searchMode (M3-T9) ----------------
