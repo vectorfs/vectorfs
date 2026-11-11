@@ -18,6 +18,18 @@
 //! bypass for free, and the global chunk-index sequence (text windows and
 //! image atoms share ONE counter across all parts) is assigned in one
 //! place.
+//!
+//! # The context-header axis entry (R2 CCH, recall roadmap)
+//!
+//! The ingest worker enters through [`ChunkerKind::chunk_source`], the
+//! SOURCE-aware form of the same walk: when the chunker's
+//! `context-header = "toc-path"` knob is on, every TEXT window carries a
+//! heading-path [`Chunk::embed_prefix`] (filename stem > document title >
+//! nearest preceding TOC chapter for the window's start page —
+//! [`windowing::context_header`]) computed from the part's TOC-derived
+//! `sections` map. The prefix feeds the EMBEDDING INPUT ONLY (see
+//! [`Chunk::embed_prefix`]'s hard boundary); the plain trait path and the
+//! knob's default `none` never emit one.
 
 pub mod markdown;
 pub mod token_window;
@@ -49,6 +61,63 @@ pub enum ChunkerKind {
     Markdown(MarkdownChunker),
 }
 
+/// The `context-header` knob's closed vocabulary (R2 CCH, recall roadmap):
+/// whether the chunker stamps each window's embedding input with a
+/// heading-path prefix (`文件名（去扩展）> 文档标题（可得则用）> 章节路径` —
+/// [`windowing::context_header`]). Config form is the chunk table's
+/// `context-header = "toc-path" | "none"` (kebab-case like every ingest
+/// knob).
+///
+/// **This knob is chunk-identity-relevant and ENTERS the pipeline
+/// fingerprint** (the `structure` knob precedent): turning it on changes
+/// the EMBEDDING INPUT, hence the vectors, hence every chunk's identity in
+/// the index — enabling it must demand the explicit re-embed of a
+/// fingerprint flip. The default `none` keeps pre-R2 fingerprints
+/// byte-stable (elided at the default, the charset three-state rule).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ContextHeader {
+    /// No prefix — every chunk embeds its text alone (the pre-R2 path,
+    /// byte-identical).
+    #[default]
+    #[serde(rename = "none")]
+    None,
+    /// Prefix from the TOC-derived chapter map: filename stem + document
+    /// title (first-line heuristic, when short enough) + the nearest
+    /// preceding TOC entry for the window's start page. Parts without a
+    /// map (non-PDF sources, `structure = false`) degrade to
+    /// filename-only prefixes.
+    #[serde(rename = "toc-path")]
+    TocPath,
+}
+
+impl ContextHeader {
+    /// `true` at the default — the fingerprint elides the field there (the
+    /// charset/fts-tokenizer three-state precedent: identical behavior
+    /// must fingerprint identically, and enabling the header genuinely
+    /// moves it).
+    pub(crate) fn is_none(&self) -> bool {
+        matches!(self, ContextHeader::None)
+    }
+}
+
+/// The per-SOURCE chunking context the ingest worker hands the axis
+/// (R2 CCH): the source identity the header's filename component needs.
+/// Plain borrowed data; the kinds read it, never own it.
+///
+/// v1 carries the STEM only. The adjudication's optional document-title
+/// component (首行或卷号行，可得则用) is DELIBERATELY NOT implemented:
+/// pdfium's `.all()` text exposes no font-size/layout signal, and the
+/// first-line heuristic measures as noise on the evidence corpora (the
+/// D-4 fixture's first kept line is a 2-char ring word; a txt source's
+/// first line is usually prose) — not obtainable without layout, so not
+/// attempted (如实声明).
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkCtx<'a> {
+    /// The source's FILE NAME without extension (e.g. `vol32` for
+    /// `radar/vol32.pdf`) — the header's always-present first component.
+    pub source_stem: &'a str,
+}
+
 impl ChunkerKind {
     /// Two-stage config parse. `section` is the config path for error
     /// context — chunkers are configured INLINE in an ingest section, so it
@@ -71,6 +140,7 @@ impl ChunkerKind {
                 // window sanity is STARTUP validation (§5.10.3), reported at
                 // the config line that carries the bad numbers
                 TokenWindowChunker::new(cfg.size, cfg.overlap)
+                    .map(|c| c.with_context_header(cfg.context_header))
                     .map(ChunkerKind::TokenWindow)
                     .map_err(|m| PipelineError::config(format!("[{section}]: {m}"), line))
             }
@@ -82,6 +152,7 @@ impl ChunkerKind {
                 // same window sanity, same startup discipline (the shared
                 // recurrence depends on 0 < overlap < size)
                 MarkdownChunker::new(cfg.size, cfg.overlap)
+                    .map(|c| c.with_context_header(cfg.context_header))
                     .map(ChunkerKind::Markdown)
                     .map_err(|m| PipelineError::config(format!("[{section}]: {m}"), line))
             }
@@ -97,8 +168,8 @@ impl ChunkerKind {
 
     /// The kind's REGISTRY label — the `kind = "…"` config string, one per
     /// variant, exhaustively matched so a new kind MUST land here (the
-    /// compiler walks it; [`KIND_LABELS`] and the parity test then force the
-    /// table views to agree). Unlike [`Self::describe`] this is knob-free.
+    /// compiler walks it; [`KIND_LABELS`] and the parity test then force
+    /// the table views to agree). Unlike [`Self::describe`] this is knob-free.
     pub fn kind_label(&self) -> &'static str {
         match self {
             ChunkerKind::TokenWindow(_) => "token-window",
@@ -110,21 +181,49 @@ impl ChunkerKind {
     pub fn describe(&self) -> String {
         match self {
             ChunkerKind::TokenWindow(c) => {
-                format!("token-window(size={}, overlap={})", c.size, c.overlap)
+                let mut s = format!("token-window(size={}, overlap={})", c.size, c.overlap);
+                if c.context_header == ContextHeader::TocPath {
+                    s.push_str(", context-header=toc-path");
+                }
+                s
             }
             ChunkerKind::Markdown(c) => {
-                format!("markdown(size={}, overlap={})", c.size, c.overlap)
+                let mut s = format!("markdown(size={}, overlap={})", c.size, c.overlap);
+                if c.context_header == ContextHeader::TocPath {
+                    s.push_str(", context-header=toc-path");
+                }
+                s
             }
         }
     }
-}
 
-/// Dispatch: the enum IS the chunker — and the enum layer is where the
-/// §5.10.2 modality split happens (see module docs). The text-run walking
-/// and the image bypass below are AXIS mechanism shared by every kind;
-/// each kind only ever sees a maximal run of Text parts.
-impl Chunker for ChunkerKind {
-    fn chunk(&self, parts: &[Part]) -> Result<Vec<Chunk>, PipelineError> {
+    /// The SOURCE-aware chunking entry (R2 CCH): the ingest worker's path.
+    /// Like the trait's [`Chunker::chunk`] (same modality split, same
+    /// global index sequence) but carrying the source identity the
+    /// `context-header = "toc-path"` mode needs: when the mode is on and a
+    /// stem is given, every TEXT window is stamped with its
+    /// [`Chunk::embed_prefix`]; otherwise (mode off, or no source — the
+    /// plain trait path and the contract doubles) no prefix ever
+    /// materializes — the header's FIRST component is the filename, a
+    /// prefix without it would be a different identity than production
+    /// ever sees.
+    ///
+    pub fn chunk_source(
+        &self,
+        parts: &[Part],
+        source_stem: Option<&str>,
+    ) -> Result<Vec<Chunk>, PipelineError> {
+        let ctx = source_stem.map(|stem| ChunkCtx { source_stem: stem });
+        self.dispatch(parts, ctx.as_ref())
+    }
+
+    /// The shared modality-split walk (the axis mechanism, parameterized
+    /// by the optional context — `None` is the plain trait path).
+    fn dispatch(
+        &self,
+        parts: &[Part],
+        ctx: Option<&ChunkCtx<'_>>,
+    ) -> Result<Vec<Chunk>, PipelineError> {
         // Walk the parts in order, chunking each maximal run of TEXT parts
         // through the kind (a sub-slice, so a text-only input is ONE call —
         // byte-identical to calling the kind directly) and materializing
@@ -134,8 +233,8 @@ impl Chunker for ChunkerKind {
         // kind numbers its own output.
         let chunk_text_run = |run: &[Part]| -> Result<Vec<Chunk>, PipelineError> {
             match self {
-                ChunkerKind::TokenWindow(c) => c.chunk(run),
-                ChunkerKind::Markdown(c) => c.chunk(run),
+                ChunkerKind::TokenWindow(c) => c.chunk_run(run, ctx),
+                ChunkerKind::Markdown(c) => c.chunk_run(run, ctx),
             }
         };
         let mut out: Vec<Chunk> = Vec::new();
@@ -198,6 +297,8 @@ impl Chunker for ChunkerKind {
                             .map(|(f, l)| (f.0, l.0)),
                         line: None,
                         section: part.section,
+                        // an image atom has no text to prefix (R2 CCH)
+                        embed_prefix: None,
                     });
                     next_index += 1;
                     run_start = i + 1;
@@ -206,6 +307,17 @@ impl Chunker for ChunkerKind {
         }
         flush_text_run(&parts[run_start..], &mut out, &mut next_index)?;
         Ok(out)
+    }
+}
+
+/// Dispatch: the enum IS the chunker — and the enum layer is where the
+/// §5.10.2 modality split happens (see module docs). The plain trait path
+/// is the context-FREE form of the shared walk (no source identity ⇒ no
+/// context header ever — see [`ChunkerKind::chunk_source`]); the ingest
+/// worker enters through the source-aware path.
+impl Chunker for ChunkerKind {
+    fn chunk(&self, parts: &[Part]) -> Result<Vec<Chunk>, PipelineError> {
+        self.dispatch(parts, None)
     }
 }
 
@@ -490,5 +602,205 @@ mod tests {
         assert!(msg.contains("image/jpeg"), "{msg}");
         // the real 1x1 PNG passes its canonical mime
         assert!(k.chunk(&[Part::image("image/png", TINY_PNG)]).is_ok());
+    }
+
+    // ---- R2 CCH: the context-header axis (chunk_source + the knob) ----
+
+    fn cch_kind(kind: &str, header: &str) -> ChunkerKind {
+        let raw: toml::Value = toml::from_str(&format!(
+            "kind = \"{kind}\"\nsize = 8\noverlap = 2\ncontext-header = \"{header}\""
+        ))
+        .unwrap();
+        ChunkerKind::from_config("t", &raw, None).unwrap()
+    }
+
+    /// A paged part with a chapter map (the pdf-text structure shape): two
+    /// "pages" of body text plus the (page, title) entries a TOC judgment
+    /// would have produced. Returns (part, expected page->title lookup).
+    fn paged_part_with_map() -> Part {
+        // 2 pages x 20 chars (ASCII: byte == char); page 2 opens at char 20
+        let mut p = Part::text("aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbb");
+        p.pages = vec![(1, 0), (2, 20)];
+        p.sections = vec![
+            (1, "序章".to_string()),
+            (2, "第二章 方法".to_string()),
+            (5, "附录".to_string()),
+        ];
+        p
+    }
+
+    #[test]
+    fn context_header_knob_parses_describes_and_fingerprints() {
+        // parse: both values, both kinds; unknown value is loud with the menu
+        for kind in ["token-window", "markdown"] {
+            let on = cch_kind(kind, "toc-path");
+            let off = cch_kind(kind, "none");
+            assert!(
+                matches!(on, ChunkerKind::TokenWindow(c) if c.context_header == ContextHeader::TocPath)
+                    || matches!(on, ChunkerKind::Markdown(c) if c.context_header == ContextHeader::TocPath)
+            );
+            assert!(format!("{off:?}").contains("None"));
+            // describe shows the knob ONLY when it departs from the default
+            assert!(
+                on.describe().contains("context-header=toc-path"),
+                "{}",
+                on.describe()
+            );
+            assert!(
+                !off.describe().contains("context-header"),
+                "{}",
+                off.describe()
+            );
+        }
+        let raw: toml::Value = toml::from_str(
+            "kind = \"token-window\"\nsize = 8\noverlap = 2\ncontext-header = \"heading-path\"",
+        )
+        .unwrap();
+        let err = ChunkerKind::from_config("ingest.d.chunk", &raw, Some(6)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown variant `heading-path`, expected `none` or `toc-path`"),
+            "{msg}"
+        );
+        assert!(msg.contains("[ingest.d.chunk]"), "{msg}");
+        assert!(msg.contains("at line 6"), "{msg}");
+        // fingerprint: the knob serializes elided at the default (pre-R2
+        // fingerprints byte-stable) and PRESENT when on (改嵌入输入 = 改块身份
+        // = 入指纹 — enabling demands the reindex of a fingerprint flip)
+        let plain: toml::Value =
+            toml::from_str("kind = \"token-window\"\nsize = 8\noverlap = 2").unwrap();
+        let explicit_none = cch_kind("token-window", "none");
+        let on = cch_kind("token-window", "toc-path");
+        assert_eq!(
+            toml::to_string(&plain_serde(&explicit_none)).unwrap(),
+            toml::to_string(&plain_serde(&cch_kind_from(&plain))).unwrap(),
+            "absent and explicit-none serialize identically (elided at the default)"
+        );
+        assert!(
+            toml::to_string(&plain_serde(&on))
+                .unwrap()
+                .contains("context-header = \"toc-path\""),
+            "the on-mode serializes into the fingerprint form"
+        );
+        assert_ne!(
+            toml::to_string(&plain_serde(&on)).unwrap(),
+            toml::to_string(&plain_serde(&explicit_none)).unwrap()
+        );
+        // a non-string value is serde's typed refusal (loud, section- and
+        // line-attributed through the shared stage-2 shaper — the axis rule)
+        let raw: toml::Value =
+            toml::from_str("kind = \"markdown\"\nsize = 8\noverlap = 2\ncontext-header = 42")
+                .unwrap();
+        let err = ChunkerKind::from_config("ingest.d.chunk", &raw, Some(2)).unwrap_err();
+        assert!(err.to_string().contains("[ingest.d.chunk]"), "{}", err);
+        assert!(err.to_string().contains("at line 2"), "{}", err);
+    }
+
+    /// helper: serialize the INNER config (the fingerprint's view of a kind)
+    fn plain_serde(k: &ChunkerKind) -> toml::Value {
+        match k {
+            ChunkerKind::TokenWindow(c) => {
+                toml::Value::try_from(token_window::TokenWindowConfig::from(c)).unwrap()
+            }
+            ChunkerKind::Markdown(c) => {
+                toml::Value::try_from(markdown::MarkdownConfig::from(c)).unwrap()
+            }
+        }
+    }
+
+    fn cch_kind_from(raw: &toml::Value) -> ChunkerKind {
+        ChunkerKind::from_config("t", raw, None).unwrap()
+    }
+
+    /// The SOURCE-AWARE entry stamps prefixes; the plain trait path never
+    /// does; mode none never does; the image atom never does (no text
+    /// window). Every prefix's shape is pinned against the map: windows on
+    /// page 1 carry 序章, page 2 carries 第二章 方法 (the nearest PRECEDING
+    /// entry — 附录 targets page 5 and is future), and the composition is
+    /// stem > title > chapter.
+    #[test]
+    fn chunk_source_stamps_prefixes_by_nearest_preceding_chapter() {
+        let on = cch_kind("token-window", "toc-path");
+        let part = paged_part_with_map();
+        // window size 8 over 40 chars -> windows live inside one page each
+        // except the straddlers; assert per-window by the page the window
+        // STARTS on (the adjudicated lookup key)
+        let chunks = on
+            .chunk_source(std::slice::from_ref(&part), Some("golden-radar"))
+            .unwrap();
+        assert!(chunks.iter().all(|c| c.embed_prefix.is_some()));
+        for c in &chunks {
+            let prefix = c.embed_prefix.as_ref().unwrap();
+            let page = c.page.unwrap().0;
+            let chapter = if page == 1 {
+                "序章"
+            } else {
+                "第二章 方法"
+            };
+            assert_eq!(prefix, &format!("golden-radar > {chapter}"), "{c:?}");
+        }
+        // mode none through the SAME source-aware entry: byte-old path
+        let off = cch_kind("token-window", "none");
+        let plain = off
+            .chunk_source(&[paged_part_with_map()], Some("golden-radar"))
+            .unwrap();
+        assert!(plain.iter().all(|c| c.embed_prefix.is_none()), "{plain:?}");
+        // mode ON through the PLAIN trait path: no prefix either (the
+        // header's first component is the filename — a prefix without it
+        // would be an identity production never sees)
+        let trait_path = on.chunk(&[paged_part_with_map()]).unwrap();
+        assert!(
+            trait_path.iter().all(|c| c.embed_prefix.is_none()),
+            "{trait_path:?}"
+        );
+        // and chunk_source with NO stem on mode on: still none
+        let no_stem = on.chunk_source(&[paged_part_with_map()], None).unwrap();
+        assert!(no_stem.iter().all(|c| c.embed_prefix.is_none()));
+        // the image atom: prefix-free whatever the mode (mixed parts, the
+        // atom between two text runs)
+        let k = cch_kind("token-window", "toc-path");
+        let mut atom = png_part("image/png");
+        atom.section = None;
+        let out = k
+            .chunk_source(&[paged_part_with_map(), atom], Some("s"))
+            .unwrap();
+        assert!(
+            out.iter()
+                .any(|c| c.image.is_some() && c.embed_prefix.is_none())
+        );
+    }
+
+    /// The map-less degradation, pinned: a part with NO sections (txt/md
+    /// sources, structure=false) gets FILENAME-ONLY prefixes on mode on —
+    /// the adjudicated non-PDF shape — and the straddling-window rule keys
+    /// on the START page only (a window whose first char is on page 1
+    /// carries page 1's chapter even when it reaches into page 2).
+    #[test]
+    fn mapless_parts_degrade_to_filename_only() {
+        let on = cch_kind("token-window", "toc-path");
+        let chunks = on
+            .chunk_source(&[Part::text("plain prose here")], Some("notes"))
+            .unwrap();
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.embed_prefix.as_deref() == Some("notes"))
+        );
+        // start-page rule: page 1's first chapter covers a window that
+        // opens on page 1 even if the recurrence ends it on page 2
+        let k = cch_kind("token-window", "toc-path");
+        let mut p = Part::text("aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbb");
+        p.pages = vec![(1, 0), (2, 20)];
+        p.sections = vec![(1, "一章".to_string()), (2, "二章".to_string())];
+        let chunks = k.chunk_source(&[p], Some("doc")).unwrap();
+        for c in &chunks {
+            let start_page = c.page.unwrap().0;
+            let chapter = if start_page == 1 { "一章" } else { "二章" };
+            assert_eq!(
+                c.embed_prefix.as_deref(),
+                Some(format!("doc > {chapter}").as_str()),
+                "{c:?}"
+            );
+        }
     }
 }

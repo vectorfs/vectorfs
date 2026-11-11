@@ -127,6 +127,7 @@ impl Extractor for HtmlExtractor {
             real_lines: false,
             furniture_removed: 0,
             section: None,
+            sections: Vec::new(),
         }])
     }
 }

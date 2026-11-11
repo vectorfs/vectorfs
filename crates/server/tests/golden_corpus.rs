@@ -740,6 +740,18 @@ fn golden_t12_structure_labels_furniture_and_toc() {
     assert!(part.text.contains("gadget alpha 12"), "prices stay");
     assert!(part.text.contains("widget echo 5999"), "sorted prices stay");
 
+    // ---- R2 CCH: the SAME judged hits upgraded into the chapter map —
+    // exactly the D4_TOC_ENTRIES table, titles verbatim, targets intact
+    // (the judged price pages contribute nothing — their gates rejected)
+    assert_eq!(
+        part.sections,
+        D4_TOC_ENTRIES
+            .iter()
+            .map(|&(t, n)| (n, t.to_string()))
+            .collect::<Vec<_>>(),
+        "the section map is the TOC hits, upgraded"
+    );
+
     // ---- determinism with the annotated product in the equality ----
     let again = x.extract(&pdf_bytes, "application/pdf").unwrap();
     assert_eq!(parts, again);
@@ -767,6 +779,111 @@ fn golden_t12_structure_false_is_the_pre_t12_join() {
     assert_eq!(parts[0].furniture_removed, 0);
     // ...and the strap IS in the raw product (no removal on this path)
     assert!(parts[0].text.contains(D4_STRAP));
+}
+
+/// R2 CCH end to end against the REAL pdfium: a cover page, a TITLELESS
+/// TOC page (the flagship radar shape), and body pages the entries point
+/// into — the extractor derives the chapter map, the chunker's
+/// `context-header = "toc-path"` mode stamps each window's prefix from
+/// the window's START page, and the two hard invariants hold: the window
+/// TEXT is the original (reconstruction exact) and mode `none`/the plain
+/// path stamp nothing.
+#[test]
+fn golden_r2_cch_sections_and_prefixes() {
+    // 10 pages: p1 cover, p2 titleless TOC (entries -> 3/5/8), p3-10 body
+    // ASCII stand-ins (the D-4 discipline: a Helvetica-only synthetic PDF
+    // cannot draw CJK — the flagship gate exercises the real CJK corpus)
+    const ENTRIES: [(&str, u32); 3] = [("adopt ring", 3), ("trial ring", 5), ("assess ring", 8)];
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    pages.push(vec![
+        "golden radar volume 32".to_string(),
+        "cover prose line unique".to_string(),
+    ]);
+    pages.push(ENTRIES.iter().map(|(t, n)| format!("{t} {n}")).collect());
+    for p in 3..=10 {
+        pages.push(vec![
+            format!("body page {p} marker line"),
+            format!("body page {p} second prose line for the window budget"),
+            format!("body page {p} third prose line to fill"),
+        ]);
+    }
+    let pdf_bytes = build_multipage_pdf_lines(&pages);
+    let parts = pdf()
+        .extract(&pdf_bytes, "application/pdf")
+        .expect("R2 fixture must extract");
+    assert_eq!(parts.len(), 1);
+    let part = &parts[0];
+
+    // the chapter map: judged entries only, appearance order
+    assert_eq!(
+        part.sections,
+        vec![
+            (3u32, "adopt ring".to_string()),
+            (5, "trial ring".to_string()),
+            (8, "assess ring".to_string()),
+        ],
+        "the real engine's judged TOC upgrades into the map"
+    );
+
+    // chunk with the mode ON through the SOURCE-aware entry
+    let raw: toml::Value = toml::from_str(
+        "kind = \"token-window\"\nsize = 48\noverlap = 8\ncontext-header = \"toc-path\"",
+    )
+    .unwrap();
+    let chunker =
+        vectorfs_server::pipeline::chunk::ChunkerKind::from_config("g", &raw, None).unwrap();
+    let chunks = chunker
+        .chunk_source(std::slice::from_ref(part), Some("golden"))
+        .expect("chunk with header");
+    assert!(chunks.len() > 3, "fixture must span windows: {:?}", chunks);
+
+    let nearest = |page: u32| -> Option<&'static str> {
+        // the independent re-derivation: the last entry targeting at/below
+        ENTRIES.iter().rfind(|(_, n)| *n <= page).map(|(t, _)| *t)
+    };
+    for c in &chunks {
+        let (start, _end) = c.page.expect("paged fixture");
+        let want = match nearest(start) {
+            Some(chapter) => format!("golden > {chapter}"),
+            None => "golden".to_string(), // pre-first-entry pages (cover/TOC)
+        };
+        assert_eq!(
+            c.embed_prefix.as_deref(),
+            Some(want.as_str()),
+            "window starting p{start}: {c:?}"
+        );
+        // the text channel is the ORIGINAL window — a slice of the part
+        assert!(part.text.contains(c.text.as_str()), "{c:?}");
+    }
+    // the cover/TOC windows carry the filename-only degradation (no entry
+    // targets page <= 2), and body windows carry chapters — both shapes
+    // occurred on this fixture
+    assert!(
+        chunks
+            .iter()
+            .any(|c| c.embed_prefix.as_deref() == Some("golden")),
+        "the pre-first-entry degradation must occur (cover/TOC windows)"
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|c| c.embed_prefix.as_deref() == Some("golden > adopt ring")),
+        "chapter prefixes must occur"
+    );
+
+    // mode none through the SAME entry: no prefix, byte-old texts
+    let raw_none: toml::Value =
+        toml::from_str("kind = \"token-window\"\nsize = 48\noverlap = 8").unwrap();
+    let plain =
+        vectorfs_server::pipeline::chunk::ChunkerKind::from_config("g", &raw_none, None).unwrap();
+    let off = plain
+        .chunk_source(std::slice::from_ref(part), Some("golden"))
+        .unwrap();
+    assert_eq!(off.len(), chunks.len());
+    for (a, b) in chunks.iter().zip(&off) {
+        assert_eq!(a.text, b.text, "the mode changes no window byte");
+        assert!(b.embed_prefix.is_none());
+    }
 }
 
 /// T13 page coordinates 对拍 the page table through the REAL engine: every

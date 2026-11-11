@@ -160,7 +160,7 @@ use crate::pipeline::embed::LoadedEmbedder;
 use crate::pipeline::extract::ExtractorKind;
 use crate::pipeline::normalize::{NormalizeOutcome, normalize};
 use crate::pipeline::{
-    Chunk, Chunker, ContentClass, Embedder, Extractor, Fit, Merge, Modality, Part, PipelineError,
+    Chunk, ContentClass, Embedder, Extractor, Fit, Merge, Modality, Part, PipelineError,
 };
 use crate::store::{SourceMarker, SourceStatus, Storage};
 
@@ -447,6 +447,20 @@ pub(crate) fn mime_for(object_key: &str) -> &'static str {
     short_key_of(object_key)
         .and_then(crate::pipeline::extract::mime_for_short_key)
         .unwrap_or("application/octet-stream")
+}
+
+/// The source's FILE NAME without extension (R2 CCH: the context header's
+/// always-present first component — `radar/vol32.pdf` ⇒ `vol32`,
+/// `notes.md` ⇒ `notes`). The final path segment minus its final
+/// extension; a dotfile (`.gitignore`) keeps its whole name (its dot is
+/// not an extension), a stemless key degrades to the raw segment.
+fn source_stem_of(object_key: &str) -> String {
+    let file = object_key.rsplit('/').next().unwrap_or(object_key);
+    std::path::Path::new(file)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| file.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1910,6 +1924,15 @@ impl IngestRuntime {
                     ))
                 })?;
                 let chunker = plan.chunker.clone();
+                // R2 CCH: the source's file-name stem (radar/vol32.pdf ⇒
+                // "vol32") — the context-header's always-present first
+                // component. Computed OUTSIDE the blocking segment (plain
+                // string surgery, no reason to hold the closure borrow).
+                // v1 declaration: container children chunk under the OUTER
+                // key's stem (a zip's children share the archive's name —
+                // per-child names would need a part-channel that does not
+                // exist).
+                let source_stem = source_stem_of(&job.object_key);
                 // the PRE-normalize state: the scan-time mime guess (which
                 // already sees through compression wrappers) and the raw
                 // bytes. The blocking segment normalizes this FIRST and
@@ -2038,8 +2061,14 @@ impl IngestRuntime {
                                 parts.iter().map(|p| p.furniture_removed).sum::<usize>(),
                             )
                             .unwrap_or(u32::MAX);
+                            // the SOURCE-aware chunk entry (R2 CCH): when
+                            // the chunk axis runs context-header =
+                            // "toc-path", windows carry their heading-path
+                            // embed_prefix; mode none (the default) is the
+                            // pre-R2 byte path — chunk_source degrades to
+                            // it with a None stem
                             chunker
-                                .chunk(&parts)
+                                .chunk_source(&parts, Some(source_stem.as_str()))
                                 .map(|chunks| (winner, furniture, chunks))
                                 .map_err(|e| AttemptErr::Fail(e.to_string()))
                         })
@@ -4674,6 +4703,82 @@ pub(crate) mod tests {
         assert!(!has_extracted_content(&[Part::text(" \n\t ")]));
     }
 
+    /// R2 CCH's storage-side boundary, unit-pinned: a chunk carrying an
+    /// `embed_prefix` stores the ORIGINAL text in `x-vf-chunk-text` (the
+    /// column the FTS index mirrors — BM25 and R1's df statistics read
+    /// original text by construction), and the prefix appears NOWHERE in
+    /// the written metadata. The embed-side composition is pinned in
+    /// pipeline::embed's tests; this is the store/FTS third of the
+    /// three-assertion boundary.
+    #[test]
+    fn build_rows_stores_original_text_when_prefix_present() {
+        let plan = BucketPlan {
+            fingerprint: "fp".to_string(),
+            claim: ClaimFilter::default(),
+            extract: BTreeMap::new(),
+            extractors: BTreeMap::new(),
+            chunker: crate::pipeline::chunk::ChunkerKind::from_config(
+                "t",
+                &toml::from_str("kind = \"token-window\"\nsize = 8\noverlap = 2").unwrap(),
+                None,
+            )
+            .unwrap(),
+            embedders: Vec::new(),
+            derived: BTreeMap::new(),
+            merge: Merge::Rrf,
+            merge_weights: BTreeMap::new(),
+            rerank: None,
+            max_file_size_bytes: 1 << 20,
+            retries: 0,
+            extract_timeout: std::time::Duration::from_secs(9),
+            store_chunk_text: true,
+            fts: true,
+            fts_tokenizer: crate::pipeline::config::FtsTokenizer::Icu,
+            fusion_overfetch: 1,
+            anchor_gating: true,
+            charset_fallback: encoding_rs::GBK,
+            scan_interval_secs: 30,
+        };
+        let job = Job {
+            vb: "docs".to_string(),
+            object_key: "radar/vol32.pdf".to_string(),
+            key_hash: marker::object_key_hash("radar/vol32.pdf"),
+        };
+        let spec = domain::DerivedSpec {
+            index_name: "t-abcdefgh".to_string(),
+            key: "0".repeat(64),
+            embedder: "tiny".to_string(),
+            model: "tiny-fixture".to_string(),
+            dim: 8,
+        };
+        let chunks = vec![Chunk {
+            index: 0,
+            text: "自满于 AI 生成的代码".to_string(),
+            image: None,
+            kind: crate::pipeline::ChunkKind::Body,
+            page: Some((18, 19)),
+            line: None,
+            section: None,
+            embed_prefix: Some("vol32 > 试验".to_string()),
+        }];
+        let vectors = vec![vec![0.5f32; 8]];
+        let rows = match build_rows(&plan, &job, &spec, &chunks, &vectors) {
+            Ok(r) => r,
+            Err(AttemptErr::Fail(m)) | Err(AttemptErr::Parked(m)) => panic!("rows: {m}"),
+        };
+        assert_eq!(rows.len(), 1);
+        let meta = rows[0].metadata.as_object().expect("object");
+        assert_eq!(
+            meta.get("x-vf-chunk-text").and_then(|t| t.as_str()),
+            Some("自满于 AI 生成的代码"),
+            "the STORED text is the original — never prefixed"
+        );
+        assert!(
+            !meta.values().any(|v| v.as_str() == Some("vol32 > 试验")),
+            "the prefix appears nowhere in the metadata: {meta:?}"
+        );
+    }
+
     #[test]
     fn chunk_counts_per_modality_text_always_image_only_when_present() {
         let text = |i: u32| Chunk {
@@ -4684,6 +4789,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            embed_prefix: None,
         };
         let image = |i: u32| Chunk {
             index: i,
@@ -4696,6 +4802,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            embed_prefix: None,
         };
         // the pre-image marker shape, byte-stable: text-only file
         assert_eq!(
@@ -4735,6 +4842,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            embed_prefix: None,
         };
         let image = |i: u32| Chunk {
             index: i,
@@ -4747,6 +4855,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            embed_prefix: None,
         };
 
         // text-only chunks: covered (the M2 world — gate silent)
@@ -5651,7 +5760,7 @@ pub(crate) mod tests {
             )
             .unwrap(),
         );
-        let expected: Vec<String> = Chunker::chunk(&plan.chunker, &expected_parts)
+        let expected: Vec<String> = crate::pipeline::Chunker::chunk(&plan.chunker, &expected_parts)
             .unwrap()
             .into_iter()
             .map(|c| c.text)

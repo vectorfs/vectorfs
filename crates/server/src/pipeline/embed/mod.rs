@@ -84,6 +84,23 @@ pub(crate) fn text_chunk_refusal(chunk: &Chunk) -> PipelineError {
     ))
 }
 
+/// The text one chunk's EMBEDDING INPUT (R2 CCH): the heading-path prefix,
+/// a newline, then the chunk's ORIGINAL text — or the text alone when no
+/// prefix was stamped. This is the ONE composition site of the R2 hard
+/// boundary: every text embedder kind feeds its model exactly this, while
+/// [`Chunk::text`], the stored `x-vf-chunk-text` and the FTS index's text
+/// column stay the original everywhere else. The lexical arm's separation
+/// is load-bearing, not incidental: R1's anchor gating reads df statistics
+/// off the FTS index, and a chapter title repeated into every chunk of
+/// its chapter would inflate exactly the postings counts that ceiling is
+/// calibrated against — the prefix must never reach BM25.
+pub(crate) fn embed_input(c: &Chunk) -> String {
+    match &c.embed_prefix {
+        Some(prefix) => format!("{prefix}\n{}", c.text),
+        None => c.text.clone(),
+    }
+}
+
 /// The available-kind list embedded in unknown-kind errors.
 pub const EMBEDDER_KINDS: &str = "ort, openai, siglip2";
 
@@ -387,6 +404,38 @@ impl serde::Serialize for EmbedderKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R2 CCH: the ONE composition site — the embedding input is prefix +
+    /// "\n" + text when a prefix was stamped, the text alone otherwise.
+    /// Everything else in the system (storage, FTS, returned text) reads
+    /// `Chunk::text` directly and never sees the prefix.
+    #[test]
+    fn embed_input_composes_prefix_newline_text() {
+        let plain = super::Chunk {
+            index: 0,
+            text: "正文块".to_string(),
+            image: None,
+            kind: crate::pipeline::ChunkKind::Body,
+            page: None,
+            line: None,
+            section: None,
+            embed_prefix: None,
+        };
+        assert_eq!(embed_input(&plain), "正文块");
+        let prefixed = super::Chunk {
+            embed_prefix: Some("vol32 > 试验".to_string()),
+            text: plain.text.clone(),
+            ..plain.clone()
+        };
+        assert_eq!(embed_input(&prefixed), "vol32 > 试验\n正文块");
+        // empty prefix never occurs (the chunker stamps None, not ""), but
+        // the composition stays total if one ever did
+        let empty = super::Chunk {
+            embed_prefix: Some(String::new()),
+            ..plain.clone()
+        };
+        assert_eq!(embed_input(&empty), "\n正文块");
+    }
 
     #[test]
     fn from_config_parses_both_kinds() {

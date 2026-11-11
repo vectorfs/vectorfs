@@ -79,6 +79,27 @@ deeper pools give the rrf fusion and a deep rerank more to work with. The
 mode). Exception: `fts-tokenizer` DOES trip the gate (it changes how the
 FTS index tokenizes — 换分词 = reindex).
 
+Index-side chunk-table knob: `context-header = "toc-path" | "none"`
+(default `none`) inside `chunk = { … }` (R2 CCH, recall-quality roadmap).
+`toc-path` prefixes each chunk's EMBEDDING INPUT with its heading path —
+`文件名（去扩展）> 章节路径` — where the chapter comes from the PDF's
+TOC-derived section map (the nearest preceding TOC entry for the chunk's
+start page; non-PDF sources and TOC-less documents degrade to
+filename-only). Two rules are load-bearing:
+
+- **改嵌入输入 = 改块身份 = reindex**: enabling the knob changes every
+  vector, so it ENTERS the pipeline fingerprint and the gate demands an
+  explicit re-embed (`vectorfs serve --reindex` after flipping it; the
+  default `none` keeps pre-R2 fingerprints byte-stable — flipping to
+  `toc-path` triggers the same full-re-embed window as R2 prescribes).
+- **The prefix never reaches storage or the lexical face**: stored/returned
+  `x-vf-chunk-text`, the FTS index and BM25 all read the ORIGINAL chunk
+  text. The separation protects R1's anchor-gating df statistics — a
+  chapter title repeated into every chunk of its chapter would inflate
+  exactly the postings counts the anchor ceiling is calibrated against.
+  The reranker reads the stored original too (prefixing its input is out
+  of v1's scope — the query face cannot reconstruct the prefix anyway).
+
 **Fingerprint gate**: changing extractor/chunker/embedder config makes serve
 refuse startup until an explicit re-embed — `vectorfs serve --reindex`.
 
@@ -88,7 +109,10 @@ refuse startup until an explicit re-embed — `vectorfs serve --reindex`.
   `pdf-inspector`; scanned PDFs fail loud with an OCR-needed reason), md, txt.
   gzip files are decompressed in place during normalize. Image/OCR/docx/html
   → v0.3.
-- Chunker: token-window (512 / overlap 64), char-counted, CJK-safe.
+- Chunker: token-window (512 / overlap 64), char-counted, CJK-safe. Opt-in
+  heading-path embedding prefix via `chunk.context-header = "toc-path"`
+  (R2 CCH — see the knob notes above; embedding input only, never stored
+  text).
 - Default model `gte-multilingual-base` (768-dim). Query vectors must come
   from the same model — including raw `query_vectors` calls via an SDK.
 - Periodic scan of source buckets: default 30 s; deletions reconciled (chunk

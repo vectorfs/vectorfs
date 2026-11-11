@@ -288,11 +288,13 @@ pub enum Fit {
 /// channels plus one audit counter, all anchored to `text` and all empty/0
 /// for every pre-T12 producer/consumer: [`Part::labels`] (structural
 /// spans), [`Part::pages`] (the page-offset table T13 shares), and
-/// [`Part::furniture_removed`]. They are PLAIN Vecs/ints, not Options, for
-/// the same reason `image` is additive-but-explicit: an absent annotation
-/// and an empty annotation mean the same thing here, and one-line
-/// `Vec::new()`/`0` literals keep every existing construction site honest
-/// about the new channels.
+/// [`Part::furniture_removed`]. R2 (recall roadmap CCH) adds a third
+/// annotation channel of the same additive shape: [`Part::sections`] (the
+/// TOC-derived chapter map the context-header axis consumes). They are
+/// PLAIN Vecs/ints, not Options, for the same reason `image` is
+/// additive-but-explicit: an absent annotation and an empty annotation
+/// mean the same thing here, and one-line `Vec::new()`/`0` literals keep
+/// every existing construction site honest about the new channels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Part {
     pub modality: Modality,
@@ -351,6 +353,19 @@ pub struct Part {
     /// order rule is documented at the stamping site (an outer container
     /// stamps last and wins over an inner walk's numbering).
     pub section: Option<u32>,
+    /// CHAPTER-SECTION map (R2 CCH, recall roadmap): `(target page, entry
+    /// title)` pairs in TOC-appearance order — the document-level section
+    /// map the pdfium structure path derives from its TOC judgment (the
+    /// judge's hits upgraded from "label these lines" to "name the
+    /// chapters", the PageIndex/docling「TOC 被消费而非被索引」precedent).
+    /// NOT to be confused with [`Part::section`] (the container-child
+    /// ORDINAL, an orchestration coordinate): this channel is PROSE
+    /// TITLES keyed by page. Empty = no TOC-derived map (every producer
+    /// except the pdf-text structure path) — the context-header axis then
+    /// degrades to filename-only prefixes for this part. Consumed by the
+    /// chunker axis only when `context-header = "toc-path"`; like the
+    /// other annotation channels it never changes the text channel.
+    pub sections: Vec<(u32, String)>,
 }
 
 /// One structural label over a [`Part`]'s text (T12): a BYTE range plus its
@@ -440,6 +455,7 @@ impl Part {
             real_lines: false,
             furniture_removed: 0,
             section: None,
+            sections: Vec::new(),
         }
     }
 
@@ -462,6 +478,7 @@ impl Part {
             real_lines: false,
             furniture_removed: 0,
             section: None,
+            sections: Vec::new(),
         }
     }
 }
@@ -551,6 +568,23 @@ pub struct Chunk {
     /// passed through untouched from [`Part::section`] (the orchestration
     /// source — extractors never set it). `None` for every leaf source.
     pub section: Option<u32>,
+    /// Embedding-input heading-path prefix (R2 CCH, recall roadmap):
+    /// `文件名（去扩展）> 文档标题（可得则用）> 章节路径（按窗起始页查
+    /// TOC 章节地图）` — the structured-context prefix the chunker stamps
+    /// when the pipeline's chunk axis runs `context-header = "toc-path"`.
+    ///
+    /// **THE HARD BOUNDARY (metadata-replacement thinking, inverted)**:
+    /// this prefix joins the chunk's identity ONLY through the EMBEDDING
+    /// input ([`embed_input`]'s composition site is the embed axis) —
+    /// [`Chunk::text`], the stored/returned `x-vf-chunk-text`, and the FTS
+    /// index's text column are the ORIGINAL text, always. vectorfs returns
+    /// source text by construction, so no query-time replacement exists or
+    /// is needed; and the lexical arm (R1's df statistics, BM25 postings)
+    /// must never see prefix tokens — a heading repeated in every chunk of
+    /// a chapter would inflate its df and blur the anchor ceiling.
+    /// `None` = no prefix (the default `context-header = "none"` path,
+    /// every pre-R2 chunk, and atomic image chunks — no text to prefix).
+    pub embed_prefix: Option<String>,
 }
 
 impl Chunk {
@@ -1277,6 +1311,14 @@ mod tests {
         // container section; only the ingest walk stamps it)
         assert_eq!(Part::text("x").section, None);
         assert_eq!(Part::image("image/png", Vec::<u8>::new()).section, None);
+        // R2 CCH: the chapter-map channel opens EMPTY (no TOC-derived map —
+        // the context-header axis degrades to filename-only for this part)
+        assert!(Part::text("x").sections.is_empty());
+        assert!(
+            Part::image("image/png", Vec::<u8>::new())
+                .sections
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1289,6 +1331,7 @@ mod tests {
             page: None,
             line: None,
             section: None,
+            embed_prefix: None,
         };
         let atomic = Chunk {
             index: 1,
@@ -1301,6 +1344,7 @@ mod tests {
             page: None,
             line: None,
             section: None,
+            embed_prefix: None,
         };
         assert_eq!(text_window.modality(), Modality::Text);
         assert_eq!(atomic.modality(), Modality::Image);

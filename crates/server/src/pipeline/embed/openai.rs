@@ -647,7 +647,12 @@ impl Embedder for OpenAiEmbedder {
                         Some((img.bytes.as_ref(), img.mime.as_str())),
                         None,
                     )?,
-                    None => self.messages_body(&self.doc_system, None, Some(&c.text))?,
+                    // R2 CCH: text members embed the composed prefix + text
+                    // (the one composition site — embed::embed_input)
+                    None => {
+                        let input = super::embed_input(c);
+                        self.messages_body(&self.doc_system, None, Some(&input))?
+                    }
                 };
                 out.push(self.post_message(&body).await?);
             }
@@ -658,7 +663,8 @@ impl Embedder for OpenAiEmbedder {
         }
         let mut out = Vec::with_capacity(chunks.len());
         for batch in chunks.chunks(POOL_SIZE) {
-            let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
+            // R2 CCH: the legacy batch wire carries the composed inputs too
+            let texts: Vec<String> = batch.iter().map(super::embed_input).collect();
             out.extend(self.post_batch(&texts).await?);
         }
         Ok(out)
@@ -933,6 +939,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                embed_prefix: None,
             })
             .collect();
         let out = e.embed_documents(&docs).await.unwrap();
@@ -994,6 +1001,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                embed_prefix: None,
             }])
             .await
             .unwrap_err();
@@ -1016,6 +1024,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                embed_prefix: None,
             })
             .collect();
         let out = e.embed_documents(&chunks).await.unwrap();
@@ -1046,6 +1055,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                embed_prefix: None,
             }])
             .await
             .unwrap();
@@ -1073,6 +1083,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                embed_prefix: None,
             }])
             .await
             .unwrap_err();
@@ -1097,6 +1108,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                embed_prefix: None,
             }])
             .await
             .unwrap_err();
@@ -1226,6 +1238,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            embed_prefix: None,
         }
     }
 
@@ -1238,6 +1251,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            embed_prefix: None,
         }
     }
 
@@ -1273,6 +1287,67 @@ pub(crate) mod tests {
             seen[1].raw,
             serde_json::to_vec(&json!({"model": "embedding-fake", "input": ["qq"]})).unwrap(),
             "byte-for-byte legacy wire on the query route"
+        );
+    }
+
+    /// R2 CCH on the WIRE: the composed input (prefix + "\n" + text) is
+    /// what the provider receives — the legacy batch wire carries it in
+    /// `input`, the multimodal messages dialect carries it as the user
+    /// message's text member. `Chunk::text` itself is untouched (the
+    /// storage/FTS side never sees the prefix — pinned at the ingest and
+    /// store layers; this is the embed-side third of that boundary).
+    #[tokio::test]
+    async fn embed_documents_wire_carries_the_composed_prefix_input() {
+        let (base, fake) = fake_openai().await;
+        let prefixed = |i: u32, prefix: &str, text: &str| Chunk {
+            index: i,
+            text: text.to_string(),
+            image: None,
+            kind: crate::pipeline::ChunkKind::Body,
+            page: None,
+            line: None,
+            section: None,
+            embed_prefix: Some(prefix.to_string()),
+        };
+        // legacy batch: input = ["vol32 > 试验\n正文一", "notes\n正文二"]
+        let e = OpenAiEmbedder::new(&fake_config(base)).unwrap();
+        e.embed_documents(&[
+            prefixed(0, "vol32 > 试验", "正文一"),
+            prefixed(1, "notes", "正文二"),
+        ])
+        .await
+        .unwrap();
+        {
+            let seen = fake.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(
+                seen[0].input,
+                vec![
+                    "vol32 > 试验\n正文一".to_string(),
+                    "notes\n正文二".to_string()
+                ],
+                "the batch wire carries prefix + newline + text"
+            );
+        }
+        // multimodal messages: the TEXT member is the composed input
+        let (base, fake) = fake_openai().await;
+        let cfg = fake_multimodal_config(base, None, None);
+        let e = OpenAiEmbedder::new(&cfg).unwrap();
+        e.embed_documents(&[prefixed(0, "vol32 > 评估", "正文")])
+            .await
+            .unwrap();
+        let seen = fake.seen.lock().unwrap();
+        let user_text = seen[0].body["messages"]
+            .as_array()
+            .and_then(|m| m.iter().find(|m| m["role"] == "user"))
+            .and_then(|m| m["content"].as_array())
+            .and_then(|c| c.first())
+            .and_then(|c| c["text"].as_str());
+        assert_eq!(
+            user_text,
+            Some("vol32 > 评估\n正文"),
+            "the messages dialect carries the composed input too: {}",
+            seen[0].body
         );
     }
 

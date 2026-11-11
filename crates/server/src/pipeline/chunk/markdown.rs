@@ -44,7 +44,7 @@
 //! text carries.
 
 use super::windowing;
-use super::{Chunk, Chunker, Part, PipelineError};
+use super::{Chunk, ChunkCtx, Chunker, ContextHeader, Part, PipelineError};
 use text_splitter::MarkdownSplitter;
 
 /// Runtime instance: the window knobs (same shape as token-window — `size`
@@ -53,16 +53,27 @@ use text_splitter::MarkdownSplitter;
 pub struct MarkdownChunker {
     pub size: usize,
     pub overlap: usize,
+    /// R2 CCH mode (the `context-header` knob) — same semantics as
+    /// token-window's field (prefixes only through the source-aware path).
+    pub context_header: ContextHeader,
 }
 
 /// Per-kind config struct (`deny_unknown_fields`; the typed `kind` tag is
-/// the allowed-list source and part of the fingerprint).
+/// the allowed-list source and part of the fingerprint). The R2
+/// `context-header` knob fingerprints elided-at-default, exactly as
+/// token-window's (the shared axis rule).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MarkdownConfig {
     pub kind: MarkdownTag,
     pub size: usize,
     pub overlap: usize,
+    #[serde(
+        rename = "context-header",
+        default,
+        skip_serializing_if = "ContextHeader::is_none"
+    )]
+    pub context_header: ContextHeader,
 }
 
 /// Literal tag: only deserializes from `"markdown"`.
@@ -78,6 +89,7 @@ impl From<&MarkdownChunker> for MarkdownConfig {
             kind: MarkdownTag::Markdown,
             size: c.size,
             overlap: c.overlap,
+            context_header: c.context_header,
         }
     }
 }
@@ -86,6 +98,7 @@ impl MarkdownChunker {
     /// Programmatic constructor with the same startup validation as
     /// token-window (`0 < overlap < size` — a window with no forward
     /// stride would loop forever; the shared recurrence depends on it).
+    /// The context-header mode defaults to `none` (the pre-R2 behavior).
     pub fn new(size: usize, overlap: usize) -> Result<Self, PipelineError> {
         if size < 1 {
             return Err(PipelineError::config(
@@ -102,7 +115,17 @@ impl MarkdownChunker {
                 None,
             ));
         }
-        Ok(MarkdownChunker { size, overlap })
+        Ok(MarkdownChunker {
+            size,
+            overlap,
+            context_header: ContextHeader::None,
+        })
+    }
+
+    /// R2 CCH builder: set the context-header mode (the config path's arm).
+    pub fn with_context_header(mut self, mode: ContextHeader) -> Self {
+        self.context_header = mode;
+        self
     }
 
     /// Semantic cut candidates for one part's text: the CHAR indices where
@@ -115,10 +138,17 @@ impl MarkdownChunker {
             .map(|c| c.char_offset + c.chunk.chars().count())
             .collect()
     }
-}
 
-impl Chunker for MarkdownChunker {
-    fn chunk(&self, parts: &[Part]) -> Result<Vec<Chunk>, PipelineError> {
+    /// The context-parameterized chunk run — identical wiring to
+    /// token-window (the shared windowing seam is the point: both kinds
+    /// derive forced endpoints, window kinds, addressing coordinates AND
+    /// the R2 context header from the same tables, only their cut ORACLE
+    /// differs).
+    pub(super) fn chunk_run(
+        &self,
+        parts: &[Part],
+        ctx: Option<&ChunkCtx<'_>>,
+    ) -> Result<Vec<Chunk>, PipelineError> {
         let mut out = Vec::new();
         let mut index: u32 = 0;
         for part in parts {
@@ -148,6 +178,17 @@ impl Chunker for MarkdownChunker {
             let coords = windowing::Coords::new(&part.text, &part.pages, part.real_lines);
             for (s, e) in ranges {
                 let (page, line) = coords.window(s, e);
+                // R2 CCH — identical wiring to token-window (the shared
+                // seam; the chapter component keys on the window's start
+                // page)
+                let embed_prefix = ctx.and_then(|ctx| {
+                    windowing::context_header(
+                        self.context_header,
+                        ctx,
+                        &part.sections,
+                        page.map(|(start, _)| start),
+                    )
+                });
                 out.push(Chunk {
                     index,
                     text: chars[s..e].iter().collect(),
@@ -156,11 +197,18 @@ impl Chunker for MarkdownChunker {
                     page,
                     line,
                     section: part.section,
+                    embed_prefix,
                 });
                 index += 1;
             }
         }
         Ok(out)
+    }
+}
+
+impl Chunker for MarkdownChunker {
+    fn chunk(&self, parts: &[Part]) -> Result<Vec<Chunk>, PipelineError> {
+        self.chunk_run(parts, None)
     }
 }
 
@@ -179,6 +227,7 @@ mod tests {
             real_lines: false,
             furniture_removed: 0,
             section: None,
+            sections: Vec::new(),
         }])
         .unwrap()
         .into_iter()
@@ -280,6 +329,35 @@ mod tests {
     /// only the cut oracle differs). A pageless part ⇒ line keys on every
     /// window, re-derived independently from the char-range walk; the
     /// section channel passes through untouched.
+    /// R2 CCH through the second kind (the shared windowing seam: both
+    /// kinds derive the context header from the same tables, only their
+    /// cut ORACLE differs). A pageless part with NO map ⇒ filename-only
+    /// prefixes (the adjudicated non-PDF degradation); mode off ⇒ none.
+    #[test]
+    fn context_header_through_the_shared_seam() {
+        use crate::pipeline::chunk::ChunkCtx;
+        let c = MarkdownChunker::new(24, 6)
+            .unwrap()
+            .with_context_header(crate::pipeline::chunk::ContextHeader::TocPath);
+        let text = "# Heading one\nbody text under one\n\n# Heading two\nbody text under two\n";
+        let part = Part::text(text);
+        let ctx = ChunkCtx {
+            source_stem: "notes",
+        };
+        let out = c
+            .chunk_run(std::slice::from_ref(&part), Some(&ctx))
+            .unwrap();
+        assert!(out.len() >= 2, "{out:?}");
+        for ch in &out {
+            assert_eq!(ch.embed_prefix.as_deref(), Some("notes"), "{ch:?}");
+            assert!(text.contains(ch.text.as_str()), "text untouched: {ch:?}");
+        }
+        // mode off: the plain pre-R2 product
+        let off = MarkdownChunker::new(24, 6).unwrap();
+        let plain = off.chunk(&[Part::text(text)]).unwrap();
+        assert!(plain.iter().all(|c| c.embed_prefix.is_none()));
+    }
+
     #[test]
     fn line_coordinates_and_section_through_the_shared_seam() {
         let text = "# Heading one\nbody text under one\n\n# Heading two\nbody text under two\n";
@@ -293,6 +371,7 @@ mod tests {
             real_lines: false,
             furniture_removed: 0,
             section: Some(2),
+            sections: Vec::new(),
         };
         let out = c.chunk(&[part]).unwrap();
         assert!(out.len() >= 2, "{out:?}");

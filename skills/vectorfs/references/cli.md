@@ -188,6 +188,27 @@ Delete a source: object deleted, chunks GC'd asynchronously. stdout
 Explicit full re-embed of a bucket (after pipeline config changes). stdout is
 the jobId only. Progress: `vf status` / `vf sources list`.
 
+#### Context header (R2 CCH, embedding-input chapter context, default off)
+
+`chunk = { …, context-header = "toc-path" }` in vectorfs.toml prefixes each
+chunk's **embedding input** with its heading path — `文件名（去扩展）>
+章节路径`, the chapter being the nearest preceding TOC entry for the
+chunk's start page (from the PDF extractor's TOC judgment; txt/md and
+TOC-less documents get filename-only). Index-side context for retrieval:
+TOC-diffusion chunks and body chunks stop sharing the same structure-word
+cloud in embedding space.
+
+- **Migration**: 改嵌入输入 = 改块身份 — the knob trips the fingerprint
+  gate; after flipping it run `vectorfs serve --reindex` (or `vf reindex`)
+  for the full re-embed. Default `none` keeps old fingerprints and old
+  vectors byte-stable.
+- **Boundary**: the prefix feeds the embedder ONLY. Stored/returned chunk
+  text (`vf chunk show`, search hits), the FTS index and BM25 all read the
+  ORIGINAL text — deliberately, so R1's anchor-gating df statistics stay
+  unpolluted (a chapter title repeated into every chunk of its chapter
+  would inflate exactly the postings counts the anchor ceiling is
+  calibrated against).
+
 ### `vf status`
 
 `/health` + GetIngestStatus summary: engines, per-bucket counts/stats/

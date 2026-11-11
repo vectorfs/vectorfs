@@ -129,6 +129,7 @@ impl Extractor for DocxExtractor {
             real_lines: false,
             furniture_removed: 0,
             section: None,
+            sections: Vec::new(),
         }])
     }
 }

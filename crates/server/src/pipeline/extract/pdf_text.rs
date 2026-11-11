@@ -244,8 +244,10 @@ impl Extractor for PdfTextExtractor {
         // furniture removal needs the WHOLE page set (cross-page
         // evidence), the page-offset table needs the join. The knob-off
         // path is the pre-T12 byte-exact join (raw `\r\n` separators,
-        // empty annotation channels).
-        let (text, labels, page_table, furniture_removed) = if self.structure {
+        // empty annotation channels). R2 CCH: the structure path also
+        // derives the chapter map (TOC hits → sections); the knob-off
+        // path stays map-less like every other empty channel.
+        let (text, labels, page_table, furniture_removed, sections) = if self.structure {
             let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
             let assembled = super::structure::assemble(&refs);
             (
@@ -253,9 +255,10 @@ impl Extractor for PdfTextExtractor {
                 assembled.labels,
                 assembled.pages,
                 assembled.furniture_removed,
+                assembled.sections,
             )
         } else {
-            (texts.join("\n\n"), Vec::new(), Vec::new(), 0)
+            (texts.join("\n\n"), Vec::new(), Vec::new(), 0, Vec::new())
         };
         if text.trim().is_empty() {
             return Err(PipelineError::extract(
@@ -275,6 +278,7 @@ impl Extractor for PdfTextExtractor {
             real_lines: false,
             furniture_removed,
             section: None,
+            sections,
         }])
     }
 }

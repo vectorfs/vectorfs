@@ -124,6 +124,40 @@ fn flagship_zero_whole_page_misjudgment_zero_vocabulary_deletion() {
         );
         any_toc_labeled |= !judged.is_empty();
 
+        // R2 CCH (旗舰门 addition): the judged TOC hits must ALSO have
+        // upgraded into the chapter map (`Part::sections`). The MEASURED
+        // vol32 shape (this gate's own run): p2's ten entries top out in
+        // the four QUADRANT names — 技术平台工具语言和框架 — so a chunk in
+        // the Vibe Coding pages (p18-19) maps to 技术 (p12): exactly the
+        // context the research doc's R2 example prescribed. Every target
+        // inside the document, titles non-empty, quadrants present.
+        if vol == 32 {
+            assert!(
+                !text_part.sections.is_empty(),
+                "vol32: the judged TOC produced no section map (the R2 upgrade lost the hits)"
+            );
+            let page_count = text_part.pages.len() as u32;
+            for (target, title) in &text_part.sections {
+                assert!(
+                    *target >= 1 && *target <= page_count,
+                    "vol32: section entry ({target}, {title:?}) points outside the {page_count}-page document"
+                );
+                assert!(!title.trim().is_empty(), "vol32: empty section title");
+            }
+            for quadrant in ["技术", "平台", "工具", "语言和框架"] {
+                assert!(
+                    text_part.sections.iter().any(|(_, t)| t.contains(quadrant)),
+                    "vol32: quadrant {quadrant:?} missing from the section titles: {:?}",
+                    text_part.sections
+                );
+            }
+            eprintln!(
+                "vol32 section map ({} entries): {:?}",
+                text_part.sections.len(),
+                text_part.sections
+            );
+        }
+
         // (2) vol32's false-positive pages must be clean
         if vol == 32 {
             for p in VOL32_FP_PAGES {

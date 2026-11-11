@@ -595,7 +595,10 @@ impl Embedder for OrtEmbedder {
         if let Some(c) = chunks.iter().find(|c| c.image.is_some()) {
             return Err(super::image_chunk_refusal(c));
         }
-        let texts = chunks.iter().map(|c| c.text.clone()).collect();
+        // R2 CCH: the embedding input is the composed prefix + text (the
+        // one composition site — see embed::embed_input); everything
+        // stored or returned stays the original chunk text
+        let texts = chunks.iter().map(super::embed_input).collect();
         self.embed_texts(texts).await
     }
 
@@ -710,6 +713,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                embed_prefix: None,
             },
             Chunk {
                 index: 1,
@@ -719,6 +723,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                embed_prefix: None,
             },
         ];
         let docs = e.embed_documents(&chunks).await.unwrap();
@@ -928,6 +933,7 @@ pub(crate) mod tests {
                     page: None,
                     line: None,
                     section: None,
+                    embed_prefix: None,
                 },
                 Chunk {
                     index: 1,
@@ -937,6 +943,7 @@ pub(crate) mod tests {
                     page: None,
                     line: None,
                     section: None,
+                    embed_prefix: None,
                 },
             ])
             .await

@@ -1557,6 +1557,39 @@ index-prefix = "docs"
         assert!(msg.contains("at line 1"), "{msg}");
     }
 
+    /// R2 CCH fingerprint three-state (the chunk-table `context-header`
+    /// knob): absent ≡ explicit `none` (pre-R2 fingerprints byte-stable —
+    /// the charset/fts-tokenizer elision rule), while `"toc-path"` GENUINELY
+    /// moves the digest — changing the embedding input changes chunk
+    /// identity, so opting in must demand the explicit re-embed of a
+    /// fingerprint flip (the `structure` knob precedent).
+    #[test]
+    fn context_header_knob_fingerprint_three_state() {
+        let base = "[extractor.p]\nkind = \"txt\"\n\n[ingest.docs]\nextract = { txt = \"p\" }\nchunk = { kind = \"token-window\", size = 512, overlap = 64{extra} }\nembedders = []\n";
+        let absent = parse(&base.replace("{extra}", "")).unwrap();
+        let explicit_none = parse(&base.replace("{extra}", ", context-header = \"none\"")).unwrap();
+        let toc_path = parse(&base.replace("{extra}", ", context-header = \"toc-path\"")).unwrap();
+        let fp_absent = absent.fingerprint("docs").unwrap();
+        assert_eq!(
+            explicit_none.fingerprint("docs").unwrap(),
+            fp_absent,
+            "absent and explicit-none fingerprint identically (elided at the default)"
+        );
+        assert_ne!(
+            toc_path.fingerprint("docs").unwrap(),
+            fp_absent,
+            "toc-path must move the fingerprint (改嵌入输入 = 改块身份 = reindex)"
+        );
+        // the knob is on the CHUNK axis: an unknown value dies at the
+        // chunker's stage-2 shaper with the section + line
+        let err = parse(&base.replace("{extra}", ", context-header = \"auto\"")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown variant `auto`, expected `none` or `toc-path`"),
+            "{msg}"
+        );
+    }
+
     #[test]
     fn unknown_ingest_field() {
         let err =

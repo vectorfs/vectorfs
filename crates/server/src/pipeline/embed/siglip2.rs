@@ -816,6 +816,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            embed_prefix: None,
         };
         let chunks = vec![mk([255, 255, 255]), mk([0, 0, 0])];
         let docs = e.embed_documents(&chunks).await.unwrap();
@@ -847,6 +848,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            embed_prefix: None,
         };
         let red = e.embed_documents(&[wide]).await.unwrap();
         // red channel = +1.0, green/blue = −1.0 → channel means [1, −1, −1]
@@ -915,6 +917,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                embed_prefix: None,
             }])
             .await
             .unwrap_err();
@@ -1002,6 +1005,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            embed_prefix: None,
         };
         let batch: Vec<_> = (0..5).map(mk).collect();
         let split = e.embed_documents(&batch).await.unwrap();

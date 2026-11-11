@@ -28,7 +28,7 @@
 //! the exact char overlap — the contract semantics are unchanged, the
 //! boundaries are just less likely to tear a sentence in half.
 
-use super::{Chunk, Chunker, Part, PipelineError};
+use super::{Chunk, ChunkCtx, Chunker, ContextHeader, Part, PipelineError};
 use text_splitter::TextSplitter;
 
 /// Runtime instance.
@@ -36,16 +36,31 @@ use text_splitter::TextSplitter;
 pub struct TokenWindowChunker {
     pub size: usize,
     pub overlap: usize,
+    /// R2 CCH mode (the `context-header` knob): prefixes only ever
+    /// materialize through the SOURCE-aware path
+    /// (`ChunkerKind::chunk_source`) — the plain trait path stays
+    /// prefix-free whatever this field says.
+    pub context_header: ContextHeader,
 }
 
 /// Per-kind config struct (`deny_unknown_fields`; the typed `kind` tag is
-/// the allowed-list source and part of the fingerprint).
+/// the allowed-list source and part of the fingerprint). The R2
+/// `context-header` knob is chunk-identity-relevant (it changes the
+/// EMBEDDING INPUT) so it fingerprints — but ELIDED at the default `none`
+/// (the charset three-state rule: pre-R2 configs keep byte-stable
+/// fingerprints while opting in genuinely moves the digest).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TokenWindowConfig {
     pub kind: TokenWindowTag,
     pub size: usize,
     pub overlap: usize,
+    #[serde(
+        rename = "context-header",
+        default,
+        skip_serializing_if = "ContextHeader::is_none"
+    )]
+    pub context_header: ContextHeader,
 }
 
 /// Literal tag: only deserializes from `"token-window"`.
@@ -61,6 +76,7 @@ impl From<&TokenWindowChunker> for TokenWindowConfig {
             kind: TokenWindowTag::TokenWindow,
             size: c.size,
             overlap: c.overlap,
+            context_header: c.context_header,
         }
     }
 }
@@ -70,6 +86,8 @@ impl TokenWindowChunker {
     /// config path (`0 < overlap < size`, `size >= 2` implied — a window
     /// with no forward stride would loop forever, one that never overlaps is
     /// legal but almost never intended, so both are loud config errors).
+    /// The context-header mode defaults to `none` (the pre-R2 behavior);
+    /// the config path sets it through [`Self::with_context_header`].
     pub fn new(size: usize, overlap: usize) -> Result<Self, PipelineError> {
         if size < 1 {
             return Err(PipelineError::config(
@@ -86,7 +104,17 @@ impl TokenWindowChunker {
                 None,
             ));
         }
-        Ok(TokenWindowChunker { size, overlap })
+        Ok(TokenWindowChunker {
+            size,
+            overlap,
+            context_header: ContextHeader::None,
+        })
+    }
+
+    /// R2 CCH builder: set the context-header mode (the config path's arm).
+    pub fn with_context_header(mut self, mode: ContextHeader) -> Self {
+        self.context_header = mode;
+        self
     }
 
     /// Semantic cut candidates for one part's text: the CHAR indices where
@@ -100,10 +128,18 @@ impl TokenWindowChunker {
             .map(|c| c.char_offset + c.chunk.chars().count())
             .collect()
     }
-}
 
-impl Chunker for TokenWindowChunker {
-    fn chunk(&self, parts: &[Part]) -> Result<Vec<Chunk>, PipelineError> {
+    /// The context-parameterized chunk run (the shared windowing seam the
+    /// axis dispatch calls): `ctx` present + mode on ⇒ every window carries
+    /// its [`Chunk::embed_prefix`] (computed by
+    /// [`windowing::context_header`](super::windowing::context_header));
+    /// `None` ctx or mode off ⇒ the pre-R2 byte path, `embed_prefix: None`
+    /// everywhere.
+    pub(super) fn chunk_run(
+        &self,
+        parts: &[Part],
+        ctx: Option<&ChunkCtx<'_>>,
+    ) -> Result<Vec<Chunk>, PipelineError> {
         let mut out = Vec::new();
         let mut index: u32 = 0;
         for part in parts {
@@ -141,6 +177,18 @@ impl Chunker for TokenWindowChunker {
             let coords = super::windowing::Coords::new(&part.text, &part.pages, part.real_lines);
             for (s, e) in ranges {
                 let (page, line) = coords.window(s, e);
+                // R2 CCH: the window's context header — the chapter
+                // component keys on the window's START page (页区间的起始
+                // 页), so a straddling window names the chapter its first
+                // char lives in
+                let embed_prefix = ctx.and_then(|ctx| {
+                    super::windowing::context_header(
+                        self.context_header,
+                        ctx,
+                        &part.sections,
+                        page.map(|(start, _)| start),
+                    )
+                });
                 out.push(Chunk {
                     index,
                     text: chars[s..e].iter().collect(),
@@ -153,11 +201,18 @@ impl Chunker for TokenWindowChunker {
                     // the orchestration channel passes through untouched
                     // (container-child ordinal, stamped by the ingest walk)
                     section: part.section,
+                    embed_prefix,
                 });
                 index += 1;
             }
         }
         Ok(out)
+    }
+}
+
+impl Chunker for TokenWindowChunker {
+    fn chunk(&self, parts: &[Part]) -> Result<Vec<Chunk>, PipelineError> {
+        self.chunk_run(parts, None)
     }
 }
 
@@ -176,6 +231,7 @@ mod tests {
             real_lines: false,
             furniture_removed: 0,
             section: None,
+            sections: Vec::new(),
         }])
         .unwrap()
         .into_iter()
@@ -395,6 +451,7 @@ mod tests {
             real_lines: false,
             furniture_removed: 0,
             section: None,
+            sections: Vec::new(),
         };
         let out = c.chunk(&[part]).unwrap();
         // the invariant battery still holds (forced endpoints never bend it)
@@ -491,6 +548,7 @@ mod tests {
             real_lines: false,
             furniture_removed: 0,
             section: None,
+            sections: Vec::new(),
         };
         let out = c.chunk(&[part]).unwrap();
         assert!(out.len() >= 3, "fixture must span windows: {out:?}");
@@ -537,6 +595,104 @@ mod tests {
     /// T13: the orchestration channel passes through untouched — a part
     /// stamped `section = Some(n)` (the ingest container walk's job) lands
     /// the same ordinal on EVERY window it produces, multi-window or tail.
+    /// R2 CCH through the kind's own seam: a part with a chapter map and a
+    /// CJK-heavy text — every window carries its prefix (stem > nearest
+    /// preceding chapter by the window's START page), the window TEXT is
+    /// untouched (reconstruction still exact — the prefix never leaks into
+    /// `Chunk::text`), and the composed embed input is prefix + "\n" +
+    /// text (`embed::embed_input`, the one composition site).
+    #[test]
+    fn context_header_prefixes_windows_and_never_touches_text() {
+        use crate::pipeline::embed::embed_input;
+        let c = TokenWindowChunker::new(6, 2)
+            .unwrap()
+            .with_context_header(crate::pipeline::chunk::ContextHeader::TocPath);
+        // 12 CJK chars = 2 pages of 6; entries: page 1 一章, page 2 二章
+        let text = "正文一页内容第二页内容";
+        let mut part = Part {
+            modality: Modality::Text,
+            text: text.to_string(),
+            image: None,
+            labels: Vec::new(),
+            pages: vec![(1, 0), (2, 18)], // 6 CJK chars = 18 bytes
+            real_lines: false,
+            furniture_removed: 0,
+            section: None,
+            sections: vec![(1, "一章".to_string()), (2, "二章".to_string())],
+        };
+        part.pages = vec![(1, 0), (2, 18)];
+        let ctx = crate::pipeline::chunk::ChunkCtx {
+            source_stem: "雷达卷",
+        };
+        let out = c
+            .chunk_run(std::slice::from_ref(&part), Some(&ctx))
+            .unwrap();
+        assert!(!out.is_empty(), "{out:?}");
+        for ch in &out {
+            let want_chapter = if ch.page.unwrap().0 == 1 {
+                "一章"
+            } else {
+                "二章"
+            };
+            let want = format!("雷达卷 > {want_chapter}");
+            assert_eq!(ch.embed_prefix.as_deref(), Some(want.as_str()), "{ch:?}");
+            // THE hard boundary at the kind seam: text is the ORIGINAL
+            // window (a slice of the part text, nothing prepended)
+            assert!(text.contains(ch.text.as_str()), "{ch:?}");
+            // and the embed input composition is prefix + "\n" + text
+            let input = embed_input(ch);
+            assert_eq!(
+                input,
+                format!("{}\n{}", ch.embed_prefix.as_ref().unwrap(), ch.text)
+            );
+        }
+        // reconstruction across the windows is still exact (the prefix
+        // changed no bytes of the window texts)
+        let windows: Vec<&str> = out.iter().map(|c| c.text.as_str()).collect();
+        let mut recon = String::new();
+        for (i, w) in windows.iter().enumerate() {
+            if i == 0 {
+                recon.push_str(w);
+            } else {
+                recon.extend(w.chars().skip(2));
+            }
+        }
+        assert_eq!(&recon, text);
+    }
+
+    /// The additive red line, byte-pinned: `context-header = "none"`
+    /// (explicit or absent) is the pre-R2 chunk list EXACTLY — the full
+    /// Chunk equality, new `embed_prefix: None` field included.
+    #[test]
+    fn context_header_none_is_the_pre_r2_path_byte_for_byte() {
+        let plain = TokenWindowChunker::new(8, 2).unwrap();
+        let raw: toml::Value =
+            toml::from_str("kind = \"token-window\"\nsize = 8\noverlap = 2").unwrap();
+        let unconfigured = super::super::ChunkerKind::from_config("t", &raw, None).unwrap();
+        let raw_none: toml::Value = toml::from_str(
+            "kind = \"token-window\"\nsize = 8\noverlap = 2\ncontext-header = \"none\"",
+        )
+        .unwrap();
+        let explicit_none = super::super::ChunkerKind::from_config("t", &raw_none, None).unwrap();
+        let parts = vec![Part::text("0123456789abcdefghij")];
+        let via_plain = plain.chunk(&parts).unwrap();
+        let via_default = match &unconfigured {
+            super::super::ChunkerKind::TokenWindow(c) => c.chunk(&parts).unwrap(),
+            _ => unreachable!(),
+        };
+        let via_explicit = match &explicit_none {
+            super::super::ChunkerKind::TokenWindow(c) => c.chunk(&parts).unwrap(),
+            _ => unreachable!(),
+        };
+        // and the SOURCE-aware entry on mode none is identical too (the
+        // ingest path with the knob off)
+        let via_source = unconfigured.chunk_source(&parts, Some("stem")).unwrap();
+        assert_eq!(via_plain, via_default);
+        assert_eq!(via_plain, via_explicit);
+        assert_eq!(via_plain, via_source);
+        assert!(via_plain.iter().all(|c| c.embed_prefix.is_none()));
+    }
+
     #[test]
     fn section_passes_through_to_every_window() {
         let c = TokenWindowChunker::new(8, 2).unwrap();
@@ -549,6 +705,7 @@ mod tests {
             real_lines: false,
             furniture_removed: 0,
             section: Some(4),
+            sections: Vec::new(),
         };
         let out = c.chunk(&[part]).unwrap();
         assert!(out.len() >= 2, "{out:?}");

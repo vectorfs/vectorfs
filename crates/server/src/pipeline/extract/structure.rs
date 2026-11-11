@@ -98,6 +98,20 @@
 //! honestly rather than re-hardening the gate that the live corpus just
 //! falsified.
 //!
+//! # The chapter map (R2 CCH, 2026-11-11)
+//!
+//! The judged hits are also consumed, not merely labeled: [`assemble`]
+//! upgrades them into `Assembled::sections` — `(target page, entry title)`
+//! pairs in TOC-appearance order, the document-level SECTION MAP the
+//! chunker's `context-header = "toc-path"` axis reads to prefix each
+//! chunk's embedding input with its chapter context (「TOC 被消费而非被
+//! 索引」, the PageIndex/docling precedent — the map rides the Part as an
+//! annotation channel and never touches the text). Only the pdfium path
+//! produces it: the page table it presupposes exists there alone
+//! (pdf-inspector's markdown flavor is pageless — its TOC RUNS label fine
+//! but cannot ground a page-keyed map; v1 derives the map from TOC alone,
+//! honestly declared).
+//!
 //! # Honest scope (v1 declarations)
 //!
 //! * 卷末索引 (end-of-volume indexes without page columns) — v1 不治, v1.1
@@ -173,6 +187,16 @@ fn is_leader_char(c: char) -> bool {
 /// * `评估×22页` — glued unit counts (no trailing digit run at all);
 /// * `12` — a bare page number with no title side.
 pub(in crate::pipeline::extract) fn toc_entry_page(line: &str) -> Option<u32> {
+    toc_entry(line).map(|(_, page)| page)
+}
+
+/// The R2 CCH upgrade of [`toc_entry_page`]: the same strict predicate,
+/// returning BOTH halves of the entry — `(title, page)` — because the
+/// section map (below) consumes the TITLE side, not just the column. The
+/// title is the line minus its trailing leaders and digit run, trimmed of
+/// leading leaders (indentation is not part of a chapter's name);
+/// non-empty by the predicate itself.
+pub(in crate::pipeline::extract) fn toc_entry(line: &str) -> Option<(&str, u32)> {
     let trimmed = line.trim_end();
     // the trailing ASCII-digit run
     let digits = trimmed
@@ -199,7 +223,7 @@ pub(in crate::pipeline::extract) fn toc_entry_page(line: &str) -> Option<u32> {
     if title.is_empty() || title.ends_with(|c: char| c.is_ascii_digit()) {
         return None;
     }
-    Some(num)
+    Some((title.trim_start_matches(is_leader_char), num))
 }
 
 /// The furniture normalization key: trim, strip ONE leading and ONE
@@ -258,6 +282,14 @@ pub(in crate::pipeline::extract) struct Assembled {
     /// Audit count of REMOVED furniture lines (the ingest-status channel;
     /// this slice produces it, slice 3 consumes it).
     pub furniture_removed: usize,
+    /// CHAPTER-SECTION map (R2 CCH): `(target page, entry title)` pairs in
+    /// TOC-appearance order — the TOC judgment's hits upgraded from line
+    /// labels into a document-level map (页码 → 最近前序条目标题 at lookup
+    /// time; the per-page column monotonicity the gate already proved is
+    /// what makes "nearest preceding entry" well-defined). Empty when no
+    /// page judged TOC — the context-header axis then degrades to
+    /// filename-only prefixes for this document.
+    pub sections: Vec<(u32, String)>,
 }
 
 /// The pdfium page loop's structure-aware assembly (T12): normalize each
@@ -277,11 +309,26 @@ pub(in crate::pipeline::extract) fn assemble(raw_pages: &[&str]) -> Assembled {
     let lines: Vec<Vec<&str>> = normalized.iter().map(|p| p.split('\n').collect()).collect();
     let fates = furniture_fates(&lines);
     // per-page TOC judgment over the KEPT lines (furniture is invisible to
-    // the gate: D-1's 页内家具同行剔除 — a removed strap cannot vote)
-    let toc_hits: Vec<Vec<usize>> = lines
+    // the gate: D-1's 页内家具同行剔除 — a removed strap cannot vote). Each
+    // hit carries its TARGET page (the R2 upgrade: the hits feed the
+    // section map, which needs the column, not just the line indices)
+    let toc_hits: Vec<Vec<(usize, u32)>> = lines
         .iter()
         .zip(&fates)
         .map(|(page, fates)| judge_toc_page(page, fates, lines.len() as u32).unwrap_or_default())
+        .collect();
+    // the document-level CHAPTER map (R2 CCH): every judged entry in
+    // appearance order — (target page, title) — the raw material the
+    // chunker's nearest-preceding lookup consumes (monotonic within each
+    // judged page by the gate; appearance order across pages)
+    let sections: Vec<(u32, String)> = lines
+        .iter()
+        .zip(&toc_hits)
+        .flat_map(|(page, hits)| {
+            hits.iter().filter_map(|&(l, target)| {
+                toc_entry(page[l]).map(|(title, _)| (target, title.to_string()))
+            })
+        })
         .collect();
 
     let mut text = String::new();
@@ -319,7 +366,7 @@ pub(in crate::pipeline::extract) fn assemble(raw_pages: &[&str]) -> Assembled {
                     kind: ChunkKind::Caption,
                 });
             }
-            if toc_hits[p].contains(&l) {
+            if toc_hits[p].iter().any(|&(i, _)| i == l) {
                 run = match run {
                     // contiguous by ORIGINAL line index: extend through
                     // the '\n' just pushed (it lies inside the span)
@@ -350,6 +397,7 @@ pub(in crate::pipeline::extract) fn assemble(raw_pages: &[&str]) -> Assembled {
         labels,
         pages,
         furniture_removed,
+        sections,
     }
 }
 
@@ -430,9 +478,15 @@ fn furniture_fates(pages: &[Vec<&str>]) -> Vec<Vec<LineFate>> {
 /// non-decreasing, and the column's maximum within the document's page
 /// count (range plausibility, the demoted title gate's successor — see
 /// the module docs for the falsification record and the declared narrow
-/// residual). Returns the hit line indices (line-level spans, never
-/// whole-page bytes) when the page is judged TOC; `None` = 放行不判.
-fn judge_toc_page(lines: &[&str], fates: &[LineFate], total_pages: u32) -> Option<Vec<usize>> {
+/// residual). Returns the hits as `(line index, target page)` pairs
+/// (line-level spans, never whole-page bytes; the target pages ride along
+/// since R2 — the section map consumes them) when the page is judged TOC;
+/// `None` = 放行不判.
+fn judge_toc_page(
+    lines: &[&str],
+    fates: &[LineFate],
+    total_pages: u32,
+) -> Option<Vec<(usize, u32)>> {
     let mut content = 0usize;
     let mut hits: Vec<(usize, u32)> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
@@ -443,7 +497,7 @@ fn judge_toc_page(lines: &[&str], fates: &[LineFate], total_pages: u32) -> Optio
             continue; // blank lines vote in neither the ratio nor the gate
         }
         content += 1;
-        if let Some(n) = toc_entry_page(line) {
+        if let Some((_, n)) = toc_entry(line) {
             hits.push((i, n));
         }
     }
@@ -462,7 +516,7 @@ fn judge_toc_page(lines: &[&str], fates: &[LineFate], total_pages: u32) -> Optio
     if hits.iter().any(|&(_, n)| n > total_pages) {
         return None;
     }
-    Some(hits.into_iter().map(|(i, _)| i).collect())
+    Some(hits)
 }
 
 // ---------------------------------------------------------------------------
@@ -680,6 +734,29 @@ mod tests {
         assert_eq!(toc_entry_page("gadget alpha 5999"), Some(5999));
     }
 
+    /// The R2 title side (the section map's material): leaders, the page
+    /// number, and leading indentation drop; the chapter's NAME survives
+    /// verbatim, CJK included.
+    #[test]
+    fn toc_entry_returns_the_title_side_for_the_section_map() {
+        assert_eq!(
+            toc_entry("第一章 检索质量方案 12"),
+            Some(("第一章 检索质量方案", 12))
+        );
+        assert_eq!(
+            toc_entry("第一章 绪论 .................... 1"),
+            Some(("第一章 绪论", 1))
+        );
+        assert_eq!(toc_entry("第二章 方法 …… 12"), Some(("第二章 方法", 12)));
+        // indentation is not part of a chapter's name
+        assert_eq!(toc_entry("    1.1 研究背景 8"), Some(("1.1 研究背景", 8)));
+        assert_eq!(
+            toc_entry("Methods and Materials 3"),
+            Some(("Methods and Materials", 3))
+        );
+        assert_eq!(toc_entry("12"), None);
+    }
+
     // ---- the per-page TOC gate, v2 (D-1 门 v2) ----
 
     #[test]
@@ -704,7 +781,18 @@ mod tests {
         let fates = all_keep(radar.len());
         assert_eq!(
             judge_toc_page(&radar, &fates, TOTAL),
-            Some(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+            Some(vec![
+                (0, 3),
+                (1, 4),
+                (2, 5),
+                (3, 6),
+                (4, 7),
+                (5, 10),
+                (6, 18),
+                (7, 27),
+                (8, 34),
+                (9, 39)
+            ])
         );
         // a titled TOC judges identically — the title line is INERT under
         // v2 (present ⇒ diagnostic value only, never a requirement)
@@ -718,15 +806,21 @@ mod tests {
         let fates = all_keep(titled.len());
         assert_eq!(
             judge_toc_page(&titled, &fates, TOTAL),
-            Some(vec![1, 2, 3, 4])
+            Some(vec![(1, 1), (2, 3), (3, 3), (4, 7)])
         );
         let titled = ["TABLE OF CONTENTS", "introduction 1", "methods 3"];
         let fates = all_keep(titled.len());
-        assert_eq!(judge_toc_page(&titled, &fates, TOTAL), Some(vec![1, 2]));
+        assert_eq!(
+            judge_toc_page(&titled, &fates, TOTAL),
+            Some(vec![(1, 1), (2, 3)])
+        );
         // equal page numbers stay legal (non-DECREASING, not increasing)
         let flat = ["one 3", "two 3", "three 3"];
         let fates = all_keep(flat.len());
-        assert_eq!(judge_toc_page(&flat, &fates, TOTAL), Some(vec![0, 1, 2]));
+        assert_eq!(
+            judge_toc_page(&flat, &fates, TOTAL),
+            Some(vec![(0, 3), (1, 3), (2, 3)])
+        );
         // non-monotonic column (一览页/计数页): rejected — the flagship's
         // naive-predicate false positives all carry unordered columns
         let overview = ["评估 22", "试验 20", "暂缓 11", "采纳 9"];
@@ -757,12 +851,15 @@ mod tests {
         let fates = all_keep(with_blanks.len());
         assert_eq!(
             judge_toc_page(&with_blanks, &fates, TOTAL),
-            Some(vec![1, 3])
+            Some(vec![(1, 1), (3, 2)])
         );
         // removed furniture is invisible: the strap does not vote
         let with_strap = ["© 2026 vectorfs", "第一章 绪论 1", "第二章 方法 2"];
         let fates = vec![LineFate::Remove, LineFate::Keep, LineFate::Keep];
-        assert_eq!(judge_toc_page(&with_strap, &fates, TOTAL), Some(vec![1, 2]));
+        assert_eq!(
+            judge_toc_page(&with_strap, &fates, TOTAL),
+            Some(vec![(1, 1), (2, 2)])
+        );
     }
 
     /// The v2 DECLARED NARROW RESIDUAL, pinned honestly: a page whose
@@ -781,7 +878,7 @@ mod tests {
         // indistinguishable from this shape at the line level)
         assert_eq!(
             judge_toc_page(&ranked_small, &fates, 46),
-            Some(vec![0, 1, 2])
+            Some(vec![(0, 3), (1, 8), (2, 21)])
         );
         // the SAME lines in a 2-page document: the bound tightens and the
         // residual disappears — the range gate scales with the document
@@ -948,11 +1045,78 @@ mod tests {
         );
         // CJK byte anchoring: span offsets sit on char boundaries (the
         // slice above already proves it — no panic, exact text)
+        // R2 CCH: the SAME hits upgraded into the chapter map — target
+        // pages from the column, titles from the title side (leaders and
+        // the page number gone, CJK preserved verbatim)
+        assert_eq!(
+            a.sections,
+            vec![
+                (1u32, "第一章 绪论".to_string()),
+                (2, "第二章 方法".to_string()),
+                (3, "第三章 结果".to_string()),
+            ]
+        );
         // determinism: same inputs, same product
         let again = assemble(&[toc_page.as_str(), body1.as_str(), body2.as_str()]);
         assert_eq!(again.text, a.text);
         assert_eq!(again.labels, a.labels);
         assert_eq!(again.pages, a.pages);
+        assert_eq!(again.sections, a.sections);
+    }
+
+    // ---- R2 CCH: the chapter map (TOC hits → 页码→标题) ----
+
+    /// The section map's build rules, pinned: entries accumulate in
+    /// APPEARANCE order across every judged page (a TOC split over two
+    /// pages keeps its listing order); titles drop leaders/indent/page
+    /// numbers (`绪论 .................... 12` ⇒ `绪论`); repeated target
+    /// pages are legal; a no-TOC document maps to EMPTY (the
+    /// filename-only degradation the context-header axis takes).
+    #[test]
+    fn section_map_accumulates_judged_entries_in_appearance_order() {
+        // a two-page TOC continuation + a body page, entries pointing
+        // inside the 5-page document (the v2 range gate's bound)
+        let toc1 = page(&[
+            "目录上篇",
+            "绪论 .................... 1",
+            "    1.1 研究背景 2", // indentation is not part of the title
+        ]);
+        let toc2 = page(&[
+            "目录下篇", // a non-hit line: ratio still ≥50% (2/3)
+            "第二章 方法 2",
+            "附录 5",
+        ]);
+        // body pages carry per-page-unique lines (a repeated line on ≥20%
+        // of pages would be furniture — irrelevant to the map, but the
+        // fixture stays honest about the whole assembly)
+        let bodies: Vec<String> = (3..=5)
+            .map(|p| page(&[&format!("正文第 {p} 页一行")]))
+            .collect();
+        let body_refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
+        let a = assemble(&[
+            toc1.as_str(),
+            toc2.as_str(),
+            body_refs[0],
+            body_refs[1],
+            body_refs[2],
+        ]);
+        assert_eq!(
+            a.sections,
+            vec![
+                (1u32, "绪论".to_string()),
+                (2, "1.1 研究背景".to_string()),
+                (2, "第二章 方法".to_string()), // repeated target: legal
+                (5, "附录".to_string()),
+            ],
+            "appearance order across judged pages; leaders/indent stripped"
+        );
+        // a document with NO judged TOC page: empty map, the degradation
+        let mut pages = Vec::new();
+        for i in 0..4 {
+            pages.push(page(&[&format!("正文第 {} 行", i + 1)]));
+        }
+        let refs: Vec<&str> = pages.iter().map(String::as_str).collect();
+        assert!(assemble(&refs).sections.is_empty());
     }
 
     #[test]

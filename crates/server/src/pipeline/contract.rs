@@ -369,6 +369,7 @@ pub fn chunker_contract_labels(c: &dyn Chunker, size: usize, overlap: usize) {
         real_lines: false,
         furniture_removed: 0,
         section: None,
+        sections: Vec::new(),
     };
     let chunks = c
         .chunk(std::slice::from_ref(&labeled))
@@ -510,6 +511,7 @@ pub async fn embedder_contract<E: Embedder + ?Sized>(e: &E) {
             page: None,
             line: None,
             section: None,
+            embed_prefix: None,
         },
         super::Chunk {
             index: 1,
@@ -519,6 +521,7 @@ pub async fn embedder_contract<E: Embedder + ?Sized>(e: &E) {
             page: None,
             line: None,
             section: None,
+            embed_prefix: None,
         },
     ];
     let docs = e
@@ -606,6 +609,7 @@ pub async fn image_embedder_contract<E: Embedder + ?Sized>(e: &E, png: &[u8]) {
             page: None,
             line: None,
             section: None,
+            embed_prefix: None,
         },
         super::Chunk {
             index: 1,
@@ -618,6 +622,7 @@ pub async fn image_embedder_contract<E: Embedder + ?Sized>(e: &E, png: &[u8]) {
             page: None,
             line: None,
             section: None,
+            embed_prefix: None,
         },
     ];
     let docs = e

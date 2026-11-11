@@ -245,6 +245,7 @@ impl Extractor for PdfInspectorExtractor {
             real_lines: false,
             furniture_removed: 0,
             section: None,
+            sections: Vec::new(),
         }])
     }
 }

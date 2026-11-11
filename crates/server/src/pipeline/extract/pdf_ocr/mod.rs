@@ -553,6 +553,7 @@ impl Extractor for PdfOcrExtractor {
                 real_lines: true,
                 furniture_removed: 0,
                 section: None,
+                sections: Vec::new(),
             });
         }
         if parts.is_empty() {

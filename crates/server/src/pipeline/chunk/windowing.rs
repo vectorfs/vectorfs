@@ -89,6 +89,48 @@
 //! * **budget**: `end ≤ candidate ≤ s + size`, and the tail rule emits
 //!   `(s, char_len)` only when `char_len - s ≤ size`.
 
+/// The R2 CCH context header of one window (the axis's one prefix rule,
+/// shared by both kinds — only their cut ORACLE differs): the
+/// heading-path prefix that joins the chunk's EMBEDDING INPUT when the
+/// chunker's `context-header = "toc-path"` mode is on.
+///
+/// Components, joined `" > "`:
+///
+/// 1. the source FILE NAME STEM (always — the non-PDF sources' only
+///    component; `ChunkerKind::chunk_source` passes it);
+/// 2. the CHAPTER PATH: the NEAREST PRECEDING TOC entry for the window's
+///    START page — the last map entry (appearance order) whose target
+///    page ≤ the window's start page. A v1 declaration: the path is the
+///    FLAT nearest entry, not a reconstructed hierarchy (TOC lines carry
+///    no reliable depth signal; indent analysis is out of scope), and
+///    windows before the first entry's page — the TOC pages themselves,
+///    typically — carry no chapter component at all. The adjudication's
+///    optional document-title component is v1-NOT-IMPLEMENTED (see
+///    `ChunkCtx`'s declaration: no layout signal ⇒ not obtainable).
+///
+/// `None` when the mode is off (the pre-R2 path — no prefix ever
+/// materializes). The product is the ONLY string the embed axis may
+/// prepend; it never touches the chunk's text (the R2 hard boundary).
+pub(super) fn context_header(
+    mode: super::ContextHeader,
+    ctx: &super::ChunkCtx<'_>,
+    sections: &[(u32, String)],
+    start_page: Option<u32>,
+) -> Option<String> {
+    if mode == super::ContextHeader::None {
+        return None;
+    }
+    let mut components: Vec<&str> = vec![ctx.source_stem];
+    if let Some(page) = start_page {
+        // nearest preceding entry: the LAST in-appearance entry whose
+        // target page is at/below the window's start page
+        if let Some((_, title)) = sections.iter().rfind(|(tp, _)| *tp <= page) {
+            components.push(title);
+        }
+    }
+    Some(components.join(" > "))
+}
+
 /// Char-index ranges of the exact-overlap windows over a `char_len`-long
 /// text, preferring `cuts` (ascending CHAR indices — the oracle's chunk
 /// ends) inside the budget and never ending a window past a `forced`
