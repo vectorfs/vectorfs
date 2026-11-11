@@ -186,7 +186,26 @@ Delete a source: object deleted, chunks GC'd asynchronously. stdout
 ### `vf reindex [BUCKET]`
 
 Explicit full re-embed of a bucket (after pipeline config changes). stdout is
-the jobId only. Progress: `vf status` / `vf sources list`.
+the jobId only. Progress: `vf status` / `vf sources list` / `vf jobs`.
+
+### `vf jobs [BUCKET]`
+
+Live ingest progress (the daemon's InFlight register, GetIngestStatus
+`inFlight`): one row per file a worker is processing RIGHT NOW. Bare bucket
+positional scopes it (`ls`-shaped); no argument aggregates every ingest
+bucket (aggregate mode adds a BUCKET column). `--json`.
+
+Table: `KEY  STAGE  ELAPSED  DETAIL` — STAGE is the coarse pipeline stage
+(`unpacking` → `extracting` → `chunking` → `embedding` ↔ `writing`, the last
+two alternating per ~500-chunk sub-batch), ELAPSED counts from the current
+attempt's start (retries re-stamp it), DETAIL carries the counters the
+stages own: `children 812/1551` (a container walk), `chunks 3400/20168`
+(embed interleave), `batch 12/41` (ops-layer commits). Empty state: one
+`no in-flight jobs` line. Register semantics: process-memory on the daemon —
+a restart empties it because the attempts restart too (the durable truth
+stays the markers); `batchesTotal` is the `ceil(chunks/500)` plan and the
+19 MiB byte budget can subdivide a sub-batch's put (advisory, not
+accounting).
 
 #### Context header (R2 CCH, embedding-input chapter context, default off)
 

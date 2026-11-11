@@ -5,9 +5,9 @@
 //!
 //!   put (foreground wait to INDEXED, and --async), get (byte round-trip),
 //!   sources list / sources status, search (hit + location 回源), rm (202
-//!   DELETING), reindex (jobId), status (/health + GetIngestStatus) — plus
-//!   the FAILED exit-1 path (non-UTF-8 source) and the no-credentials
-//!   structured error.
+//!   DELETING), reindex (jobId), jobs (the InFlight live-progress table),
+//!   status (/health + GetIngestStatus) — plus the FAILED exit-1 path
+//!   (non-UTF-8 source) and the no-credentials structured error.
 //!
 //! Hermetic: committed tiny-embedder fixture + repo-local libonnxruntime
 //! (VF_ORT_PATH), tmp data root, free TCP port; no network beyond loopback.
@@ -1975,4 +1975,160 @@ fn cli_mixed_modality_chunks_smoke() {
     );
 
     daemon.dump_log_tail("end of mixed-modality smoke (informational)");
+}
+
+// ---------------------------------------------------------------------------
+// vf jobs (the InFlight register: live per-job ingest progress)
+// ---------------------------------------------------------------------------
+
+/// `vf jobs` end to end against the real daemon: the DETERMINISTIC face is
+/// the envelope + empty state (`no in-flight jobs`, --json count 0, exit 0,
+/// both bucket-scoped and aggregate); the mid-flight table is sampled
+/// OPPORTUNISTICALLY — a big multi-sub-batch source is `put --async`'d and
+/// `vf jobs --json` polled while the worker grinds. The deterministic
+/// mid-flight semantics (chunksDone advancing per sub-batch, terminal
+/// clear) are pinned by the in-process tests (ingest mod + ops_xvf); this
+/// smoke adds the real binaries, the signed wire and the human table.
+#[test]
+fn cli_jobs_live_progress_and_empty_state() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let work = tmp.path().join("work");
+    let data_dir = work.join("data");
+    std::fs::create_dir_all(data_dir.join(".vectorfs")).unwrap();
+    std::fs::write(
+        data_dir.join(".vectorfs/vectorfs.toml"),
+        config_toml(&data_dir),
+    )
+    .unwrap();
+
+    // ~52 KB of text over the 32-char/8-overlap window ⇒ ~2.1k chunks ⇒
+    // 5 sub-batches: the job runs for seconds, widening the sampling window
+    let novel = work.join("novel.txt");
+    std::fs::write(&novel, "word ".repeat(10_500)).unwrap();
+
+    let port = free_port();
+    let daemon = Daemon::spawn(&data_dir, port, "serve-jobs.log");
+    wait_healthy(port, Instant::now() + Duration::from_secs(60));
+
+    // ---- the empty state BEFORE any upload (deterministic) ----
+    let o = vf(port, &["jobs"], false);
+    assert!(
+        o.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        out(&o),
+        err(&o)
+    );
+    assert_eq!(out(&o), "no in-flight jobs\n");
+    let o = vf(port, &["jobs", "--json"], false);
+    assert!(o.status.success(), "stderr:\n{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(v["schema_version"], 1);
+    assert_eq!(v["count"], 0);
+    assert_eq!(v["jobs"].as_array().map(Vec::len), Some(0));
+
+    // ---- upload --async and sample the live table (opportunistic) ----
+    let o = vf(
+        port,
+        &[
+            "put",
+            novel.to_str().unwrap(),
+            "--bucket",
+            "docs",
+            "--key",
+            "docs/novel.txt",
+            "--async",
+        ],
+        false,
+    );
+    assert!(
+        o.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        out(&o),
+        err(&o)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut caught: Option<serde_json::Value> = None;
+    while Instant::now() < deadline {
+        let o = vf(port, &["jobs", "--json"], false);
+        if !o.status.success() {
+            continue; // transient mid-poll failures are retried until deadline
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&out(&o)) else {
+            continue;
+        };
+        if v["count"].as_u64().unwrap_or(0) >= 1 {
+            caught = v["jobs"][0].clone().into();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    if let Some(j) = &caught {
+        assert_eq!(j["bucket"].as_str(), Some("docs"), "{j}");
+        assert_eq!(j["key"].as_str(), Some("docs/novel.txt"), "{j}");
+        let stage = j["stage"].as_str().unwrap_or_default();
+        assert!(
+            [
+                "unpacking",
+                "extracting",
+                "chunking",
+                "embedding",
+                "writing"
+            ]
+            .contains(&stage),
+            "{j}"
+        );
+        if let (Some(d), Some(t)) = (j["chunksDone"].as_u64(), j["chunksTotal"].as_u64()) {
+            assert!(d <= t, "{j}");
+        }
+        // the HUMAN table while still in flight: header + one data row (if
+        // the job is STILL running — a re-check through --json gates the row
+        // assert so the smoke cannot flake on a fast finisher)
+        let o = vf(port, &["jobs", "docs"], false);
+        assert!(
+            o.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            out(&o),
+            err(&o)
+        );
+        let table = out(&o);
+        assert!(table.contains("KEY") && table.contains("STAGE"), "{table}");
+        assert!(
+            table.contains("ELAPSED") && table.contains("DETAIL"),
+            "{table}"
+        );
+        let o = vf(port, &["jobs", "--json"], false);
+        let still: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+        if still["count"].as_u64().unwrap_or(0) >= 1 {
+            assert!(
+                table.contains("docs/novel.txt"),
+                "the live row renders: {table}"
+            );
+            assert!(
+                table.contains(stage) || still["jobs"][0]["stage"] != j["stage"],
+                "stage cell renders (or advanced between the two reads): {table}"
+            );
+        }
+    } else {
+        eprintln!(
+            "vf-jobs smoke: the job finished before a live sample landed \
+                   (the deterministic mid-flight semantics live in the in-process tests)"
+        );
+    }
+
+    // ---- terminal: the register is empty in EVERY form (deterministic) ----
+    wait_vf_indexed(
+        port,
+        "docs/novel.txt",
+        Instant::now() + Duration::from_secs(120),
+    );
+    let o = vf(port, &["jobs"], false);
+    assert!(o.status.success(), "stderr:\n{}", err(&o));
+    assert_eq!(out(&o), "no in-flight jobs\n");
+    let o = vf(port, &["jobs", "docs", "--json"], false);
+    assert!(o.status.success(), "stderr:\n{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(v["count"], 0);
+
+    daemon.dump_log_tail("end of vf jobs smoke (informational)");
 }

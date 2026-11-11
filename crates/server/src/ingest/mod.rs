@@ -182,6 +182,18 @@ pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(8);
 const BATCH_MAX_ROWS: usize = 500;
 const BATCH_BUDGET_BYTES: usize = 19 * 1024 * 1024;
 
+/// Serial sub-batch size for the embed→write interleave (2026-11-11 摄取
+/// 进度可见性): chunks flow through the embedder in `min(500, remaining)`
+/// slices, each slice embedded → row-built → committed before the next
+/// starts, so InFlight progress (`chunksDone`) advances ~500 at a time
+/// instead of once per source. Equals BATCH_MAX_ROWS / the protocol face's
+/// PutVectors 500-per-call cap — a sub-batch is one put except when the 19
+/// MiB byte budget subdivides it (split_batches unchanged inside each
+/// slice). Chunk keys are deterministic `{hash}-{modality}-{i}` and the
+/// commit is a merge_insert upsert, so a crash between sub-batches leaves
+/// rows the retry's same-key upserts overwrite — no pre-clearing needed.
+const EMBED_SUB_BATCH: usize = BATCH_MAX_ROWS;
+
 // ---------------------------------------------------------------------------
 // startup gates (serve calls these BEFORE spawning anything)
 // ---------------------------------------------------------------------------
@@ -832,11 +844,16 @@ fn log_normalize(display: &str, outcome: &NormalizeOutcome) {
 /// and bundling them keeps the two functions at honest argument counts):
 /// the user's child-routing SNAPSHOT (owned: the spawn_blocking segment
 /// cannot borrow the plan), the per-child size gate, and the normalize
-/// charset fallback both normalize call sites share.
+/// charset fallback both normalize call sites share. The InFlight tap
+/// (2026-11-11) rides along as an Option: `None` wherever no register entry
+/// exists (tests driving `run_member` directly) — child ticks are the walk's
+/// ONLY structural addition, the walk itself still produces all parts up
+/// front (the interleave starts downstream, at embed time).
 struct WalkCtx {
     routes: ChildRoutes,
     max_child_bytes: u64,
     charset_fallback: &'static encoding_rs::Encoding,
+    progress: Option<ProgressTap>,
 }
 
 /// Run ONE chain member over ONE document or child (M2.1 step 3): a LEAF
@@ -894,6 +911,13 @@ fn run_member(
         "ingest: {display} -> container({name}) x {} children",
         children.len()
     );
+    // InFlight register (2026-11-11): childrenTotal=1551 shows while the
+    // walk grinds — accumulated over nested containers (the outer walk is
+    // the long one); childrenDone ticks at every child EXIT below so the
+    // pair converges even when children are skipped
+    if let Some(tap) = &ctx.progress {
+        tap.children_total(children.len() as u32);
+    }
     let mut parts: Vec<Part> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     // T13 section ordinal (ADR 0005, the ORCHESTRATION coordinate source):
@@ -918,6 +942,9 @@ fn run_member(
                 child.bytes.len(),
                 max_child_bytes / 1024 / 1024
             ));
+            if let Some(tap) = &ctx.progress {
+                tap.child_done();
+            }
             continue;
         }
         // ---- child normalize (the SAME mechanism the document got) ----
@@ -940,6 +967,9 @@ fn run_member(
                     child.name,
                     inner_message(&e)
                 ));
+                if let Some(tap) = &ctx.progress {
+                    tap.child_done();
+                }
                 continue;
             }
         };
@@ -953,6 +983,9 @@ fn run_member(
                 outcome.bytes.len(),
                 max_child_bytes / 1024 / 1024
             ));
+            if let Some(tap) = &ctx.progress {
+                tap.child_done();
+            }
             continue;
         }
         log_normalize(&child_display, &outcome);
@@ -978,6 +1011,11 @@ fn run_member(
                 }
                 Err(reason) => skipped.push(format!("'{}': {reason}", child.name)),
             },
+        }
+        // every routed child exits here (joined, skipped for no-chain, or
+        // skipped with its walk's reason) — the walk's LAST tick site
+        if let Some(tap) = &ctx.progress {
+            tap.child_done();
         }
     }
     if !has_extracted_content(&parts) {
@@ -1711,6 +1749,21 @@ impl IngestRuntime {
             );
             return;
         }
+        // InFlight register (2026-11-11): the entry is born the moment a
+        // worker owns the job and dies at the BOTTOM of this function — every
+        // exit between is terminal (finish_marker: INDEXED / PARTIALLY /
+        // FAILED / parked) or an abandoned attempt (read failure; the next
+        // scan re-enqueues). Process-memory only: a restart loses the attempt
+        // AND the entry together (a persisted "progress" for a dead attempt
+        // would be a lie).
+        self.shared.job_register(&job.vb, &job.object_key);
+        self.process_job_locked(job, plan).await;
+        self.shared.job_unregister(&job.vb, &job.object_key);
+    }
+
+    /// [`process_job`]'s body after the register wrap: everything from the
+    /// marker load to the final marker write.
+    async fn process_job_locked(&self, job: &Job, plan: &BucketPlan) {
         let storage = &self.state.storage;
 
         // ---- load marker, flip IN_PROGRESS ----
@@ -1918,6 +1971,9 @@ impl IngestRuntime {
         cache: &mut Option<ExtractCache>,
         succeeded: &mut BTreeSet<String>,
     ) -> Result<(), AttemptErr> {
+        // InFlight: a fresh attempt re-stamps the attempt clock and rewinds
+        // the stage (counter fields survive — see job_attempt_begin)
+        self.shared.job_attempt_begin(&job.vb, &job.object_key);
         // ---- extract + chunk (CPU segment) ----
         let chunks: &[Chunk] = match cache {
             Some(c) => &c.chunks,
@@ -1946,6 +2002,15 @@ impl IngestRuntime {
                 // the scan claimed the source under.
                 let mime = mime_for(&job.object_key).to_string();
                 let bytes = bytes.clone();
+                // the InFlight tap the blocking segment reports through
+                // (stage flips at the segment's internal seams + the child
+                // ticks below) — an owned handle because spawn_blocking
+                // cannot borrow the runtime
+                let tap = ProgressTap {
+                    shared: Arc::clone(&self.shared),
+                    vb: job.vb.clone(),
+                    key: job.object_key.clone(),
+                };
                 // container unpacking (M2.1 step 3): the children of any
                 // container member re-enter THIS bucket's extract table —
                 // snapshotted here (plus the per-child size guard) because
@@ -1954,6 +2019,7 @@ impl IngestRuntime {
                     routes: plan.child_routes(),
                     max_child_bytes: plan.max_file_size_bytes,
                     charset_fallback: plan.charset_fallback,
+                    progress: Some(tap.clone()),
                 };
                 let display = job.object_key.clone();
                 let permit = self
@@ -1966,6 +2032,11 @@ impl IngestRuntime {
                     .map_err(|e| AttemptErr::Fail(format!("cpu semaphore closed: {e}")))?;
                 let mut work = tokio::task::spawn_blocking(move || {
                     let _hold = permit;
+                    // InFlight: a fresh (uncached) walk begins — clear the
+                    // children pair so an attempt-2 re-walk cannot
+                    // double-count attempt 1's totals (plain files never
+                    // re-materialize it: no container ever unpacks)
+                    tap.children_reset();
                     // M2.1 step 3 layering, then step 2 — all inside THIS one
                     // CPU segment, no concurrency:
                     //
@@ -2044,6 +2115,10 @@ impl IngestRuntime {
                             run_member(&ctx, &display, name, kind, &bytes, &mime, 0),
                         )
                     });
+                    // InFlight: the member runs (lazy — inside
+                    // pick_from_chain's fold) are where leaf extracts AND
+                    // container child walks happen (children* tick in there)
+                    tap.stage(JobStage::Extracting);
                     pick_from_chain(&short_key, members)
                         .map_err(|e| {
                             // observability: the exhaustion aggregate names
@@ -2072,6 +2147,8 @@ impl IngestRuntime {
                             // embed_prefix; mode none (the default) is the
                             // pre-R2 byte path — chunk_source degrades to
                             // it with a None stem
+                            // (InFlight: chunk_source IS the chunking seam)
+                            tap.stage(JobStage::Chunking);
                             chunker
                                 .chunk_source(&parts, Some(source_stem.as_str()))
                                 .map(|chunks| (winner, furniture, chunks))
@@ -2174,43 +2251,74 @@ impl IngestRuntime {
                 };
             let scoped: &[Chunk] = scoped_storage.as_deref().unwrap_or(chunks);
             let spec = &plan.derived[name];
-            let vectors = self
-                .embed_gated(loaded, scoped)
-                .await
-                .map_err(|e| AttemptErr::Fail(format!("embedder '{name}' failed: {e}")))?;
 
-            let rows = build_rows(plan, job, spec, scoped, &vectors)?;
-            for batch in split_batches(rows, spec.dim) {
-                // domain check + commit under the write lock: the check is
-                // load-then-(maybe)-create, and racing it against another
-                // worker's identical create would surface as Conflict noise.
-                let _guard = self.shared.write_lock().lock().await;
-                // per-batch domain check (§5.10.5): the protocol face can
-                // drop/recreate indexes between scans; ours is recreated
-                // idempotently, a FOREIGN one under the name parks the file.
-                match domain::ensure_domain(
-                    &self.state.storage,
-                    &job.vb,
-                    spec,
-                    &self.state.region,
-                    &self.state.account,
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(domain::DomainError::Mismatch(m)) => return Err(AttemptErr::Parked(m)),
-                    Err(domain::DomainError::Io(m)) => {
-                        return Err(AttemptErr::Fail(format!("domain check: {m}")));
-                    }
-                }
-                self.put_batch(&job.vb, &spec.index_name, batch)
+            // ---- serial sub-batch interleave (2026-11-11 摄取进度可见性) ----
+            // The pre-interleave shape ran embed_documents ONCE over the
+            // whole source before any row was built or committed — a
+            // 50-minute novel showed IN_PROGRESS with zero further signal
+            // until the very end. Chunks now flow in
+            // min(EMBED_SUB_BATCH, remaining) slices — embed → build_rows →
+            // put_batch, then the next slice — so InFlight progress advances
+            // ~500 chunks at a time. Order discipline: slices follow the
+            // global chunk order and stay in order within a slice, so the
+            // commits' row sequence is EXACTLY the old single-call
+            // build_rows → split_batches sequence (split_batches cuts at the
+            // 500-row mark, which coincides with every slice boundary).
+            // Crash-safety: chunk keys are deterministic
+            // `{hash}-{modality}-{i}` and put_batch is a merge_insert
+            // upsert, so residue from a mid-interleave crash is overwritten
+            // by the retry's same-key upserts — no pre-clearing needed.
+            // Throughput: N×500 embed calls on the REUSED ort session
+            // instead of 1×N (per-call overhead only).
+            let total = scoped.len() as u32;
+            self.shared.job_chunks_plan(&job.vb, &job.object_key, total);
+            let mut chunks_done: u32 = 0;
+            for sub in scoped.chunks(EMBED_SUB_BATCH) {
+                self.shared
+                    .job_stage(&job.vb, &job.object_key, JobStage::Embedding);
+                let vectors = self
+                    .embed_gated(loaded, sub)
                     .await
-                    .map_err(|e| {
-                        AttemptErr::Fail(format!(
-                            "put_vectors into {}/{} rejected: {e}",
-                            job.vb, spec.index_name
-                        ))
-                    })?;
+                    .map_err(|e| AttemptErr::Fail(format!("embedder '{name}' failed: {e}")))?;
+                let rows = build_rows(plan, job, spec, sub, &vectors)?;
+                chunks_done += sub.len() as u32;
+                self.shared
+                    .job_chunks_done(&job.vb, &job.object_key, chunks_done);
+                for batch in split_batches(rows, spec.dim) {
+                    self.shared
+                        .job_stage(&job.vb, &job.object_key, JobStage::Writing);
+                    // domain check + commit under the write lock: the check is
+                    // load-then-(maybe)-create, and racing it against another
+                    // worker's identical create would surface as Conflict noise.
+                    let _guard = self.shared.write_lock().lock().await;
+                    // per-batch domain check (§5.10.5): the protocol face can
+                    // drop/recreate indexes between scans; ours is recreated
+                    // idempotently, a FOREIGN one under the name parks the file.
+                    match domain::ensure_domain(
+                        &self.state.storage,
+                        &job.vb,
+                        spec,
+                        &self.state.region,
+                        &self.state.account,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(domain::DomainError::Mismatch(m)) => return Err(AttemptErr::Parked(m)),
+                        Err(domain::DomainError::Io(m)) => {
+                            return Err(AttemptErr::Fail(format!("domain check: {m}")));
+                        }
+                    }
+                    self.put_batch(&job.vb, &spec.index_name, batch)
+                        .await
+                        .map_err(|e| {
+                            AttemptErr::Fail(format!(
+                                "put_vectors into {}/{} rejected: {e}",
+                                job.vb, spec.index_name
+                            ))
+                        })?;
+                    self.shared.job_batch_done(&job.vb, &job.object_key);
+                }
             }
             succeeded.insert(name.clone());
         }
@@ -2634,6 +2742,116 @@ pub struct StatsSnapshot {
     pub failed: u64,
 }
 
+// ---------------------------------------------------------------------------
+// InFlight register (live per-job progress; GetIngestStatus `inFlight`)
+// ---------------------------------------------------------------------------
+
+/// One live job's coarse pipeline stage (closed enum; kebab Display). The
+/// vocabulary covers the whole attempt — a PLAIN file's walk phases pass in
+/// microseconds (the extract segment runs them in one CPU closure), a
+/// CONTAINER's linger (the child walk is where `children*` tick), and
+/// embedding/writing alternate per sub-batch under the 2026-11-11 interleave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStage {
+    /// Object read + normalize + probe + route (the package, pre-extraction).
+    Unpacking,
+    /// Member run: leaf extracts and container child walks (`children*` tick).
+    Extracting,
+    /// `chunker.chunk_source` over the winning parts.
+    Chunking,
+    /// One ~500-chunk sub-batch is at the embedder (2026-11-11 interleave).
+    Embedding,
+    /// One ops-layer PutVectors batch is committing (lock held or pending).
+    Writing,
+}
+
+impl JobStage {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobStage::Unpacking => "unpacking",
+            JobStage::Extracting => "extracting",
+            JobStage::Chunking => "chunking",
+            JobStage::Embedding => "embedding",
+            JobStage::Writing => "writing",
+        }
+    }
+}
+
+impl std::fmt::Display for JobStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One LIVE job's progress entry (the register's value). Every counter is
+/// `Option` — a field exists only once the stage that owns it has begun
+/// (`children*` from the first container unpack, `chunks*`/`batches*` from
+/// the first embedder pass of the current attempt).
+#[derive(Debug, Clone)]
+pub struct InFlightJob {
+    /// The OBJECT key (bucket lives in the register key / the wire entry's
+    /// bucket scope — GetIngestStatus nests `inFlight` under its bucket).
+    pub key: String,
+    pub stage: JobStage,
+    /// RFC3339 of the current stage's start (flips with every transition).
+    pub stage_started_at: String,
+    /// RFC3339 of the CURRENT attempt's start (the retry loop re-stamps it;
+    /// the elapsed the `vf jobs` table shows).
+    pub attempt_started_at: String,
+    /// Container children: total unpacked (accumulated over nested
+    /// containers) / walked so far. `None` until a container unpacks.
+    pub children_total: Option<u32>,
+    pub children_done: Option<u32>,
+    /// Chunks of the CURRENT embedder pass: total scoped / embedded so far
+    /// (advanced per sub-batch; reset when the next embedder's pass starts).
+    pub chunks_total: Option<u32>,
+    pub chunks_done: Option<u32>,
+    /// Ops-layer batches: `total` is the row-cap plan `ceil(chunks / 500)` —
+    /// the 19 MiB byte budget can subdivide a sub-batch's put, letting
+    /// `done` run past `total` on pathological metadata; advisory progress,
+    /// not accounting. `None` until the first embedder pass.
+    pub batches_total: Option<u32>,
+    pub batches_done: Option<u32>,
+}
+
+/// The blocking extract segment's handle into the register (stage flips at
+/// the segment's internal seams + per-child walk ticks). The async
+/// orchestration calls `IngestShared`'s methods directly; only the
+/// `spawn_blocking` closure — which cannot borrow the runtime — carries one.
+#[derive(Clone)]
+pub(crate) struct ProgressTap {
+    shared: Arc<IngestShared>,
+    vb: String,
+    key: String,
+}
+
+impl ProgressTap {
+    /// Flip the stage (re-stamps `stage_started_at`).
+    pub(crate) fn stage(&self, stage: JobStage) {
+        self.shared.job_stage(&self.vb, &self.key, stage);
+    }
+
+    /// Clear the children pair (a fresh walk begins — an uncached attempt
+    /// re-runs it, and accumulation must not survive the retry; the pair
+    /// re-materializes at the first container's unpack, so plain files
+    /// never report children keys).
+    pub(crate) fn children_reset(&self) {
+        self.shared.job_children_reset(&self.vb, &self.key);
+    }
+
+    /// One container unpacked `n` children (accumulates across nested
+    /// containers — the outer walk is the long one).
+    pub(crate) fn children_total(&self, n: u32) {
+        self.shared.job_children_total(&self.vb, &self.key, n);
+    }
+
+    /// One child's walk finished (joined OR skipped — every exit path ticks,
+    /// so `done` converges to `total`).
+    pub(crate) fn child_done(&self) {
+        self.shared.job_child_done(&self.vb, &self.key);
+    }
+}
+
 /// The piece of the ingest runtime the PROTOCOL face (`AppState.ingest` ->
 /// [`IngestHandle`]) holds: the loaded core (one `Arc` shared with the
 /// runtime's workers), the last-scan clock, the reindex job registry, the
@@ -2671,6 +2889,14 @@ pub struct IngestShared {
     /// scan interval must not print the same skip every pass; cleared when
     /// the lock recovers).
     unlocked_warned: std::sync::Mutex<BTreeSet<String>>,
+    /// InFlight register (2026-11-11 摄取进度可见性): `dedup_key ->
+    /// live progress`, one entry per job a worker currently owns — stage,
+    /// per-stage/attempt clocks and the children/chunks/batches counters.
+    /// Process-memory ONLY by design: a restart loses the attempt itself
+    /// (the IN_PROGRESS marker re-enqueues on the next scan), and a
+    /// persisted "progress" for a dead attempt would be a lie. BTreeMap so
+    /// snapshots iterate key-sorted (deterministic-output contract).
+    in_flight: std::sync::Mutex<BTreeMap<String, InFlightJob>>,
 }
 
 impl IngestShared {
@@ -2689,6 +2915,7 @@ impl IngestShared {
             reindex_barrier: std::sync::Mutex::new(BTreeSet::new()),
             write_lock: tokio::sync::Mutex::new(()),
             unlocked_warned: std::sync::Mutex::new(BTreeSet::new()),
+            in_flight: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -2859,6 +3086,138 @@ impl IngestShared {
             .lock()
             .unwrap()
             .insert(bucket.to_string(), marker::now_rfc3339());
+    }
+
+    // ---- InFlight register (2026-11-11; worker -> GetIngestStatus/vf jobs) ----
+
+    /// A worker took the job: the entry is born at `unpacking` with both
+    /// clocks stamped (the read/hash phase and the first attempt share the
+    /// initial stamp until [`IngestShared::job_attempt_begin`] re-stamps).
+    pub(crate) fn job_register(&self, vb: &str, object_key: &str) {
+        let now = marker::now_rfc3339();
+        self.in_flight.lock().unwrap().insert(
+            format!("{}\u{1}{}", vb, object_key),
+            InFlightJob {
+                key: object_key.to_string(),
+                stage: JobStage::Unpacking,
+                stage_started_at: now.clone(),
+                attempt_started_at: now,
+                children_total: None,
+                children_done: None,
+                chunks_total: None,
+                chunks_done: None,
+                batches_total: None,
+                batches_done: None,
+            },
+        );
+    }
+
+    /// A new attempt begins (the retry loop): re-stamp the attempt clock and
+    /// rewind to `unpacking`. Counter fields are left as-is — the extract
+    /// cache may short-circuit the walk (children counters stay converged)
+    /// and each embedder pass resets its own `chunks*`/`batches*`.
+    pub(crate) fn job_attempt_begin(&self, vb: &str, object_key: &str) {
+        let now = marker::now_rfc3339();
+        let key = format!("{}\u{1}{}", vb, object_key);
+        if let Some(job) = self.in_flight.lock().unwrap().get_mut(&key) {
+            job.stage = JobStage::Unpacking;
+            job.stage_started_at = now.clone();
+            job.attempt_started_at = now;
+        }
+    }
+
+    /// A stage transition (re-stamps `stage_started_at` only on a REAL
+    /// change — the interleave flips embedding/writing per sub-batch and
+    /// consecutive same-stage flips must not reset the stage clock mid-run).
+    pub(crate) fn job_stage(&self, vb: &str, object_key: &str, stage: JobStage) {
+        let key = format!("{}\u{1}{}", vb, object_key);
+        if let Some(job) = self.in_flight.lock().unwrap().get_mut(&key)
+            && job.stage != stage
+        {
+            job.stage = stage;
+            job.stage_started_at = marker::now_rfc3339();
+        }
+    }
+
+    /// A fresh walk begins on an uncached attempt: clear the children pair
+    /// (accumulation must not survive a retry) — it re-materializes at the
+    /// first container's unpack, so a PLAIN file's walk never reports
+    /// children keys at all.
+    pub(crate) fn job_children_reset(&self, vb: &str, object_key: &str) {
+        let key = format!("{}\u{1}{}", vb, object_key);
+        if let Some(job) = self.in_flight.lock().unwrap().get_mut(&key) {
+            job.children_total = None;
+            job.children_done = None;
+        }
+    }
+
+    /// `n` more children unpacked (accumulates over nested containers).
+    pub(crate) fn job_children_total(&self, vb: &str, object_key: &str, n: u32) {
+        let key = format!("{}\u{1}{}", vb, object_key);
+        if let Some(job) = self.in_flight.lock().unwrap().get_mut(&key) {
+            *job.children_total.get_or_insert(0) += n;
+        }
+    }
+
+    /// One more child's walk finished (joined or skipped — converges).
+    pub(crate) fn job_child_done(&self, vb: &str, object_key: &str) {
+        let key = format!("{}\u{1}{}", vb, object_key);
+        if let Some(job) = self.in_flight.lock().unwrap().get_mut(&key) {
+            *job.children_done.get_or_insert(0) += 1;
+        }
+    }
+
+    /// An embedder pass begins over `total` scoped chunks: fresh `chunks*`
+    /// counters and the row-cap batch plan (`ceil(total / 500)` — see
+    /// [`InFlightJob::batches_total`] for the advisory caveat).
+    pub(crate) fn job_chunks_plan(&self, vb: &str, object_key: &str, total: u32) {
+        let key = format!("{}\u{1}{}", vb, object_key);
+        if let Some(job) = self.in_flight.lock().unwrap().get_mut(&key) {
+            job.chunks_total = Some(total);
+            job.chunks_done = Some(0);
+            job.batches_total = Some(total.div_ceil(EMBED_SUB_BATCH as u32));
+            job.batches_done = Some(0);
+        }
+    }
+
+    /// Cumulative chunks embedded in this pass (the worker tracks the sum —
+    /// one store per sub-batch, not an add per tick).
+    pub(crate) fn job_chunks_done(&self, vb: &str, object_key: &str, done: u32) {
+        let key = format!("{}\u{1}{}", vb, object_key);
+        if let Some(job) = self.in_flight.lock().unwrap().get_mut(&key) {
+            job.chunks_done = Some(done);
+        }
+    }
+
+    /// One more ops-layer batch committed.
+    pub(crate) fn job_batch_done(&self, vb: &str, object_key: &str) {
+        let key = format!("{}\u{1}{}", vb, object_key);
+        if let Some(job) = self.in_flight.lock().unwrap().get_mut(&key) {
+            *job.batches_done.get_or_insert(0) += 1;
+        }
+    }
+
+    /// The job left the worker: terminal outcome (INDEXED / PARTIALLY_INDEXED
+    /// / FAILED / parked via `finish_marker`) OR an abandoned attempt (read
+    /// failure — the next scan re-enqueues). Either way the entry dies; the
+    /// register never outlives the work it describes.
+    pub(crate) fn job_unregister(&self, vb: &str, object_key: &str) {
+        self.in_flight
+            .lock()
+            .unwrap()
+            .remove(&format!("{}\u{1}{}", vb, object_key));
+    }
+
+    /// One bucket's live jobs, key-sorted (GetIngestStatus `inFlight`).
+    pub fn in_flight_of(&self, bucket: &str) -> Vec<InFlightJob> {
+        let prefix = format!("{bucket}\u{1}");
+        self.in_flight
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(_, j)| j.clone())
+            .collect()
     }
 
     // ---- KB statistics (appendix E.2 numberOf* block; T7) ----
@@ -4060,6 +4419,390 @@ pub(crate) mod tests {
             batches.iter().all(|b| b.len() <= 1),
             "{:?}",
             batches.iter().map(|b| b.len()).collect::<Vec<_>>()
+        );
+    }
+
+    // ---- InFlight register + the 2026-11-11 sub-batch interleave ----------
+
+    /// The interleave's slicing rule: `min(500, remaining)` per sub-batch,
+    /// aligned with the protocol face's PutVectors 500-per-call cap.
+    #[test]
+    fn embed_sub_batches_are_min_500_slices() {
+        assert_eq!(EMBED_SUB_BATCH, BATCH_MAX_ROWS);
+        let lens = |n: usize| {
+            (0..n)
+                .collect::<Vec<_>>()
+                .chunks(EMBED_SUB_BATCH)
+                .map(|c| c.len())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lens(0), Vec::<usize>::new());
+        assert_eq!(lens(1), vec![1]);
+        assert_eq!(lens(499), vec![499]);
+        assert_eq!(lens(500), vec![500]);
+        assert_eq!(lens(501), vec![500, 1]);
+        assert_eq!(lens(1200), vec![500, 500, 200]);
+    }
+
+    /// A minimal valid plan/job/spec for the pure rows tests (the same shape
+    /// `build_rows_stores_original_text_when_prefix_present` builds inline).
+    fn rows_fixture(
+        n: usize,
+    ) -> (
+        BucketPlan,
+        Job,
+        domain::DerivedSpec,
+        Vec<Chunk>,
+        Vec<Vec<f32>>,
+    ) {
+        let plan = BucketPlan {
+            fingerprint: "fp".to_string(),
+            claim: ClaimFilter::default(),
+            extract: BTreeMap::new(),
+            extractors: BTreeMap::new(),
+            chunker: crate::pipeline::chunk::ChunkerKind::from_config(
+                "t",
+                &toml::from_str("kind = \"token-window\"\nsize = 32\noverlap = 8").unwrap(),
+                None,
+            )
+            .unwrap(),
+            embedders: Vec::new(),
+            derived: BTreeMap::new(),
+            merge: Merge::Rrf,
+            merge_weights: BTreeMap::new(),
+            rerank: None,
+            max_file_size_bytes: 1 << 20,
+            retries: 0,
+            extract_timeout: std::time::Duration::from_secs(9),
+            store_chunk_text: true,
+            fts: true,
+            fts_tokenizer: crate::pipeline::config::FtsTokenizer::Icu,
+            fusion_overfetch: 1,
+            anchor_gating: true,
+            charset_fallback: encoding_rs::GBK,
+            scan_interval_secs: 30,
+        };
+        let job = Job {
+            vb: "docs".to_string(),
+            object_key: "novels/double.txt".to_string(),
+            key_hash: marker::object_key_hash("novels/double.txt"),
+        };
+        let spec = domain::DerivedSpec {
+            index_name: "t-abcdefgh".to_string(),
+            key: "0".repeat(64),
+            embedder: "tiny".to_string(),
+            model: "tiny-fixture".to_string(),
+            dim: 8,
+        };
+        let chunks: Vec<Chunk> = (0..n as u32)
+            .map(|i| Chunk {
+                index: i,
+                text: format!("body words number {i} of the fixture text"),
+                image: None,
+                kind: crate::pipeline::ChunkKind::Body,
+                page: None,
+                line: Some((i, i + 3)),
+                section: None,
+                embed_prefix: None,
+            })
+            .collect();
+        let vectors: Vec<Vec<f32>> = chunks
+            .iter()
+            .map(|c| vec![c.index as f32 / 8.0; 8])
+            .collect();
+        (plan, job, spec, chunks, vectors)
+    }
+
+    /// The interleave's ORDER CONTRACT: slicing at min(500, remaining) and
+    /// running build_rows + split_batches per slice produces EXACTLY the row
+    /// sequence and batch boundaries the old single-call
+    /// build_rows(1×N) → split_batches shape produced (split_batches cuts
+    /// at the 500-row mark, which coincides with every slice boundary; the
+    /// byte estimate resets at every cut in both shapes) — merge_insert
+    /// idempotency makes the interleave safe, this pins that it is also a
+    /// NO-OP on ordering.
+    #[test]
+    fn sub_batch_interleave_matches_single_call_rows_and_batches() {
+        let (plan, job, spec, chunks, vectors) = rows_fixture(1200);
+
+        // the pre-interleave shape: one embed call, one build, one split
+        let rows_all = match build_rows(&plan, &job, &spec, &chunks, &vectors) {
+            Ok(r) => r,
+            Err(AttemptErr::Fail(m)) | Err(AttemptErr::Parked(m)) => panic!("rows: {m}"),
+        };
+        let batches_all = split_batches(rows_all, spec.dim);
+
+        // the interleaved shape: per-500 slice build + split, flattened
+        let mut keys_new = Vec::new();
+        let mut batch_lens_new = Vec::new();
+        for (off, sub) in chunks.chunks(EMBED_SUB_BATCH).enumerate() {
+            let vs = &vectors[off * EMBED_SUB_BATCH..off * EMBED_SUB_BATCH + sub.len()];
+            let rows = match build_rows(&plan, &job, &spec, sub, vs) {
+                Ok(r) => r,
+                Err(AttemptErr::Fail(m)) | Err(AttemptErr::Parked(m)) => panic!("rows: {m}"),
+            };
+            for b in split_batches(rows, spec.dim) {
+                batch_lens_new.push(b.len());
+                keys_new.extend(b.into_iter().map(|r| r.key));
+            }
+        }
+
+        let keys_all: Vec<String> = batches_all.into_iter().flatten().map(|r| r.key).collect();
+        assert_eq!(keys_new, keys_all, "identical chunk-key sequence");
+        assert_eq!(
+            batch_lens_new,
+            vec![500, 500, 200],
+            "identical batch boundaries"
+        );
+    }
+
+    /// The register's lifecycle, pinned pure: birth at unpacking with both
+    /// clocks stamped, attempt re-stamps, stage flips re-stamp the stage
+    /// clock (same-stage flips do NOT), counters appear/reset per family,
+    /// and every updater is a no-op once the entry is gone.
+    #[tokio::test]
+    async fn inflight_register_transitions_counters_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _h, _state) = test_runtime(dir.path(), "").await;
+        let shared = &rt.shared;
+
+        shared.job_register("docs", "docs/a.txt");
+        let js = shared.in_flight_of("docs");
+        assert_eq!(js.len(), 1);
+        assert_eq!(js[0].key, "docs/a.txt");
+        assert_eq!(js[0].stage, JobStage::Unpacking);
+        assert_eq!(js[0].stage_started_at, js[0].attempt_started_at);
+        assert!(
+            js[0].children_total.is_none()
+                && js[0].chunks_total.is_none()
+                && js[0].batches_total.is_none(),
+            "counters appear only when their stage begins: {:?}",
+            js[0]
+        );
+
+        // a retry re-stamps the attempt clock and rewinds the stage
+        shared.job_stage("docs", "docs/a.txt", JobStage::Chunking);
+        shared.job_attempt_begin("docs", "docs/a.txt");
+        let j = &shared.in_flight_of("docs")[0];
+        assert_eq!(j.stage, JobStage::Unpacking);
+
+        // stage flips re-stamp; SAME-stage flips must not (the interleave
+        // alternates embedding/writing and would otherwise reset the clock
+        // twice per sub-batch)
+        shared.job_stage("docs", "docs/a.txt", JobStage::Embedding);
+        let stamped = shared.in_flight_of("docs")[0].stage_started_at.clone();
+        shared.job_stage("docs", "docs/a.txt", JobStage::Embedding);
+        assert_eq!(
+            shared.in_flight_of("docs")[0].stage_started_at,
+            stamped,
+            "same-stage flip keeps the clock"
+        );
+        assert_eq!(shared.in_flight_of("docs")[0].stage, JobStage::Embedding);
+
+        // children family: clear → materialize at the first unpack →
+        // accumulate over nested containers → converge
+        shared.job_children_reset("docs", "docs/a.txt");
+        let j = &shared.in_flight_of("docs")[0];
+        assert_eq!(j.children_total, None, "a cleared pair reports nothing");
+        shared.job_children_total("docs", "docs/a.txt", 3);
+        shared.job_child_done("docs", "docs/a.txt");
+        shared.job_child_done("docs", "docs/a.txt");
+        shared.job_children_total("docs", "docs/a.txt", 2); // nested container
+        shared.job_child_done("docs", "docs/a.txt");
+        let j = &shared.in_flight_of("docs")[0];
+        assert_eq!(j.children_total, Some(5));
+        assert_eq!(j.children_done, Some(3));
+
+        // chunks/batches family: a fresh embedder pass RESETS the pair
+        shared.job_chunks_plan("docs", "docs/a.txt", 1200);
+        shared.job_chunks_done("docs", "docs/a.txt", 500);
+        shared.job_batch_done("docs", "docs/a.txt");
+        let j = &shared.in_flight_of("docs")[0];
+        assert_eq!(j.chunks_total, Some(1200));
+        assert_eq!(j.chunks_done, Some(500));
+        assert_eq!(j.batches_total, Some(3), "ceil(1200/500)");
+        assert_eq!(j.batches_done, Some(1));
+        shared.job_chunks_plan("docs", "docs/a.txt", 8); // second embedder
+        let j = &shared.in_flight_of("docs")[0];
+        assert_eq!((j.chunks_total, j.chunks_done), (Some(8), Some(0)));
+        assert_eq!((j.batches_total, j.batches_done), (Some(1), Some(0)));
+
+        // unregister: terminal (or abandoned attempt) — the entry dies and
+        // trailing ticks stay no-ops (never resurrect)
+        shared.job_unregister("docs", "docs/a.txt");
+        assert!(shared.in_flight_of("docs").is_empty());
+        shared.job_stage("docs", "docs/a.txt", JobStage::Writing);
+        shared.job_child_done("docs", "docs/a.txt");
+        assert!(
+            shared.in_flight_of("docs").is_empty(),
+            "updaters never resurrect a cleared entry"
+        );
+    }
+
+    /// Poll the register until the single test job's entry satisfies `pred`
+    /// — pure register reads, no lock involvement: the CALLER holds the
+    /// write lock across the call, which pins the worker at its next put, so
+    /// the matching state is stable by construction (the deterministic
+    /// mid-flight sampling primitive of the interleave tests).
+    async fn poll_inflight(
+        shared: &Arc<IngestShared>,
+        pred: impl Fn(&InFlightJob) -> bool,
+    ) -> InFlightJob {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            if let Some(j) = shared.in_flight_of("docs").into_iter().find(|j| pred(j)) {
+                return j;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "register never satisfied: {:?}",
+                shared.in_flight_of("docs")
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    /// THE interleave e2e: a >1000-chunk source runs a real worker while the
+    /// test owns the write lock, pinning the worker at put #1 and (after a
+    /// release+re-acquire) at a LATER put — chunksDone advances with the
+    /// sub-batches, the batches/chunks plans hold, and the terminal state
+    /// clears the register.
+    #[tokio::test]
+    async fn inflight_progress_advances_per_sub_batch_and_clears_at_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _h, state) = test_runtime(dir.path(), "").await;
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
+        std::fs::create_dir_all(&docs).unwrap();
+        // ~35k chars over the 32-char/8-overlap window ⇒ ~1.4k chunks ⇒
+        // three sub-batches (500 + 500 + remainder)
+        std::fs::write(docs.join("big.txt"), "word ".repeat(7000)).unwrap();
+        rt.scan_once().await; // enqueue only; the drain runs parked below
+
+        // the test owns the commit lock throughout sample 1: the worker
+        // embeds sub-batch 1, flips to writing and parks AT the lock — its
+        // register state cannot move while we hold it
+        let guard = rt.shared.write_lock().lock().await;
+        let drain = tokio::spawn({
+            let rt = Arc::clone(&rt);
+            async move { rt.drain_queue().await }
+        });
+        let s1 = poll_inflight(&rt.shared, |j| {
+            j.stage == JobStage::Writing && j.chunks_done == Some(500)
+        })
+        .await;
+        assert_eq!(s1.batches_done, Some(0), "put #1 cannot run under our lock");
+        assert_eq!(s1.key, "docs/big.txt");
+        let total = s1.chunks_total.expect("plan stamped");
+        assert!(total > 1000, "three sub-batches: {total}");
+        assert_eq!(s1.batches_total, Some(total.div_ceil(500)));
+        assert!(
+            s1.children_total.is_none(),
+            "a plain txt has no container walk"
+        );
+        assert!(!s1.attempt_started_at.is_empty());
+        assert!(!s1.stage_started_at.is_empty());
+
+        // release + re-acquire: put #1 commits, sub-batch 2 embeds, and the
+        // worker parks at a LATER put — chunksDone strictly advanced (which
+        // of the later puts it parks at is scheduling-dependent; the advance
+        // and the committed count are not)
+        drop(guard);
+        let guard = rt.shared.write_lock().lock().await;
+        let s2 = poll_inflight(&rt.shared, |j| {
+            j.stage == JobStage::Writing && j.chunks_done.unwrap_or(0) > 500
+        })
+        .await;
+        assert!(s2.chunks_done.unwrap() > 500);
+        assert!(s2.batches_done.unwrap() >= 1);
+        drop(guard);
+
+        drain.await.unwrap();
+        assert!(
+            rt.shared.in_flight_of("docs").is_empty(),
+            "the terminal state clears the register"
+        );
+        assert_eq!(
+            status_of(&state, "docs", "docs/big.txt").await.status,
+            SourceStatus::Indexed
+        );
+        // and the full corpus actually landed (the interleave re-indexed
+        // nothing wrong): every planned chunk is queryable
+        let spec = rt.shared.core.buckets["docs"].derived["tiny"].clone();
+        assert_eq!(
+            state
+                .storage
+                .count_vectors("docs", &spec.index_name)
+                .await
+                .unwrap(),
+            total as usize
+        );
+    }
+
+    /// Container children progress (InFlight × the container walk): with the
+    /// worker parked at its put, a 3-child container (one child unroutable —
+    /// SKIPPED mid-walk) shows childrenTotal 3 / childrenDone 3: the walk
+    /// finishes before embed time, and the skip path ticks `done` too, so
+    /// the pair converges. Real worker path via the cfg(test) container.
+    #[tokio::test]
+    async fn inflight_container_children_counts_the_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
+        std::fs::create_dir_all(&docs).unwrap();
+        let payload = b"CHILDREN-CONTAINER";
+        std::fs::write(docs.join("book.ctn"), payload).unwrap();
+
+        let cfg = ctn_config("txt = \"plain\", ctn = \"ctn\"", "");
+        let (rt, _h, state) = runtime_patched(dir.path(), &cfg, |plan| {
+            plan.extractors.insert(
+                "ctn".to_string(),
+                ExtractorKind::TestContainer(TestContainerSpec::one(
+                    "application/octet-stream",
+                    payload,
+                    vec![
+                        ChildDoc::new(
+                            "one.txt",
+                            "text/plain",
+                            "first child body alpha beta gamma delta epsilon",
+                        ),
+                        // off-table mime, no chain: SKIPPED mid-walk — must
+                        // still tick childrenDone (convergence)
+                        ChildDoc::new(
+                            "skip.bin",
+                            "application/x-no-chain-for-this",
+                            "unroutable child bytes",
+                        ),
+                        ChildDoc::new(
+                            "two.txt",
+                            "text/plain",
+                            "second child body zeta eta theta iota kappa lambda",
+                        ),
+                    ],
+                )),
+            );
+        })
+        .await;
+
+        rt.scan_once().await;
+        let guard = rt.shared.write_lock().lock().await;
+        let drain = tokio::spawn({
+            let rt = Arc::clone(&rt);
+            async move { rt.drain_queue().await }
+        });
+        let j = poll_inflight(&rt.shared, |j| j.stage == JobStage::Writing).await;
+        assert_eq!(j.key, "docs/book.ctn");
+        assert_eq!(j.children_total, Some(3));
+        assert_eq!(
+            j.children_done,
+            Some(3),
+            "the skipped child ticks done — the pair converges"
+        );
+        assert!(j.chunks_total.unwrap_or(0) > 0);
+        drop(guard);
+        drain.await.unwrap();
+        assert!(rt.shared.in_flight_of("docs").is_empty());
+        assert_eq!(
+            status_of(&state, "docs", "docs/book.ctn").await.status,
+            SourceStatus::Indexed
         );
     }
 

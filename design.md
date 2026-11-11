@@ -617,7 +617,7 @@ ghcr multi-arch（amd64/arm64 对齐发布矩阵）debian-slim non-root，内含
 | DeleteSource | POST /x-vf/DeleteSource | bucket, key → **202** `{status:"DELETING"}` | = 删对象（经 object_store）+ 异步 GC chunk——与 S3 直接删除等价的便捷包装；对齐 KB `DeleteKnowledgeBaseDocuments` 的 202+轮询 |
 | **Search** | POST /x-vf/Search | bucket, query{text\|image\|audio(M4)}, topK(1–1000), filter?（**$ 短名语法**，§4.6 同款）, returnText?, searchMode?(semantic\|keyword\|hybrid, M3-T9) → hits[] | **旗舰超集 op**：fan-out + merge + 回源；hits 形状对齐 KB Retrieve 的 KnowledgeBaseRetrievalResult（下）。`query.image`（M3-T4 定形）：`{bytes: base64(STANDARD), mime}`，服务端按 magic 嗅探与声明 mime 交叉校验（同 `ImagePayload::validate` 纪律）；query 与 image 模态互斥、audio 属 M4。`searchMode`（M3-T9, ADR 0002）：默认 semantic（缺省=旧行为，老客户端零变化）；keyword=纯 BM25（Lance 原生 FTS，内核走薄 trait 隔离）；hybrid=语义 fan-out+BM25 两路共入 bucket 的 merge（rrf/weighted）；keyword/hybrid 需 TEXT query + `[ingest.X] fts = true`（§7 默认关）+ `vectorfs optimize` 建索引（列缺失/未建时前 flat 兜底、无列响亮拒）；协议面 QueryVectors 保持纯语义 |
 | Reindex | POST /x-vf/Reindex | bucket → **202** `{jobId}` | 显式重嵌（指纹变更后），进度经 GetIngestStatus；KB 无对应 op（其 chunking 不可变，换管线=重建 KB） |
-| GetIngestStatus | POST /x-vf/GetIngestStatus | bucket? → 状态计数 + **统计块（字段名对齐 KB IngestionJobStatistics）**：numberOfDocumentsScanned / numberOfNewDocumentsIndexed / numberOfModifiedDocumentsIndexed / numberOfDocumentsDeleted / numberOfDocumentsFailed + pendingCount；最近对账、active 管线指纹、reindex{jobId, status, progress} | `vf status` 底层 |
+| GetIngestStatus | POST /x-vf/GetIngestStatus | bucket? → 状态计数 + **统计块（字段名对齐 KB IngestionJobStatistics）**：numberOfDocumentsScanned / numberOfNewDocumentsIndexed / numberOfModifiedDocumentsIndexed / numberOfDocumentsDeleted / numberOfDocumentsFailed + pendingCount；最近对账、active 管线指纹、reindex{jobId, status, progress}、**inFlight[]**（2026-11-11 摄取进度可见性：逐在飞作业 `{key, stage, stageStartedAt, attemptStartedAt, childrenTotal?/Done?, chunksTotal?/Done?, batchesTotal?/Done?}`——进程内存，重启即空，additive） | `vf status` / `vf jobs` 底层 |
 
 **Search hit 形状**（对齐 KnowledgeBaseRetrievalResult，保留双 index fan-out 所需字段；`content.type` 为 KB 展示枚举，与内部模态映射：page-image/image→IMAGE、video→拆解为帧/音轨后各自映射）：
 
@@ -666,6 +666,7 @@ AWS 面 21 op 不受影响——文件层经它们写入（公理 2 §5.10.0）�
 | `chunk show <b> <chunk-key> [--around N≤20] [--chars B]` | T14 有界邻域读（grep -C 语义）：邻域取自真实枚举序（枚举优先，跨模态邻居如实返回不跳过）；`--chars 0`（全文）须配 `--around 0`（USAGE 互斥）；截断带 `…[truncated, next: <chunk-key>]` 续窗标记；`store_chunk_text = false` 的索引枚举可见但读取响亮拒绝（NO_CHUNK_TEXT） |
 | `rm <bucket>/<key>` 或 `<key> --bucket <b>` | 删对象 + GC（与 S3 直接删除等价的便捷包装） |
 | `reindex [<b>] 或 --bucket <b>` | 触发显式重嵌（daemon 内执行） |
+| `jobs [<b>]` | 在飞摄取进度（GetIngestStatus `inFlight`）：KEY/STAGE/ELAPSED(attempt 起)/DETAIL（children/chunks/batch `d/t`）；无桶位参=全部摄取桶聚合（加 BUCKET 列）；空态一行 `no in-flight jobs`；寄存器进程内存、重启即空 |
 | `status` | `/health` + GetIngestStatus 汇总 |
 
 通用契约（§5.8 agent 一等契约）：`--json` 带 schema_version、结构化错误 `{code, exit, message, hint}`、stdout=结果 / stderr=进度、零交互、幂等、确定性输出。

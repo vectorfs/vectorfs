@@ -89,6 +89,7 @@ Docker instead: `docker compose -f deploy/docker-compose.yml up`.
 | `vf cat <bucket>/<key>` | print original bytes to stdout |
 | `vf rm <bucket>/<key>` | delete (async chunk GC) |
 | `vf reindex <bucket>` | full re-embed after a pipeline change (prints jobId) |
+| `vf jobs [bucket]` | live ingest progress: KEY/STAGE/ELAPSED/DETAIL (children/chunks/batch d/t) |
 | `vf status` | daemon health + per-bucket ingest summary |
 | `vf config init` | write `~/.config/vectorfs/config.toml` |
 

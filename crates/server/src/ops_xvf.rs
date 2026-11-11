@@ -1970,9 +1970,11 @@ pub async fn reindex(State(state): State<AppState>, body: Bytes) -> Result<Respo
 /// (all six states), pendingCount (PENDING+IN_PROGRESS — the work the file
 /// layer still owes), the `numberOf*` statistics block (KB
 /// IngestionJobStatistics field names; process-lifetime cumulative),
-/// lastScanAt, the active pipeline fingerprint, the derived-index table and
-/// the latest reindex job with live progress. Omitted bucket = every
-/// configured bucket.
+/// lastScanAt, the active pipeline fingerprint, the derived-index table,
+/// the latest reindex job with live progress, and `inFlight` — the live
+/// per-job progress register (2026-11-11 摄取进度可见性: stage + per-stage/
+/// attempt clocks + children/chunks/batches counters; process-memory, empty
+/// after restart by design). Omitted bucket = every configured bucket.
 pub async fn get_ingest_status(
     State(state): State<AppState>,
     body: Bytes,
@@ -2057,6 +2059,34 @@ pub async fn get_ingest_status(
         if let Some(at) = shared.last_scan_at(&bucket) {
             entry["lastScanAt"] = json!(at);
         }
+        // InFlight register (additive): live per-job progress — always an
+        // array (empty when nothing runs). Optional counters appear only
+        // once the stage that owns them has begun; RFC3339 rides the same
+        // marker::now_rfc3339 convention as every other timestamp here.
+        let in_flight: Vec<serde_json::Value> = shared
+            .in_flight_of(&bucket)
+            .into_iter()
+            .map(|j| {
+                let mut o = json!({
+                    "key": j.key,
+                    "stage": j.stage.to_string(),
+                    "stageStartedAt": j.stage_started_at,
+                    "attemptStartedAt": j.attempt_started_at,
+                });
+                if j.children_total.is_some() {
+                    o["childrenTotal"] = json!(j.children_total);
+                    o["childrenDone"] = json!(j.children_done);
+                }
+                if j.chunks_total.is_some() {
+                    o["chunksTotal"] = json!(j.chunks_total);
+                    o["chunksDone"] = json!(j.chunks_done);
+                    o["batchesTotal"] = json!(j.batches_total);
+                    o["batchesDone"] = json!(j.batches_done);
+                }
+                o
+            })
+            .collect();
+        entry["inFlight"] = json!(in_flight);
         if shared.reindex_job(&bucket).is_some() {
             // read = checkpoint: advance the cached job state from live markers
             shared.refresh_reindex(&bucket, done);
@@ -3619,6 +3649,72 @@ mod tests {
         let (st, _, b) = call_json(&f, "/x-vf/GetIngestStatus", json!({"bucket":"docs"})).await;
         assert_eq!(st, StatusCode::OK, "{b}");
         assert_eq!(b["buckets"][0]["furnitureLinesRemoved"], json!(4), "{b}");
+    }
+
+    /// InFlight register over the WIRE (2026-11-11 摄取进度可见性): with the
+    /// worker parked at its first put (the fixture holds the commit lock —
+    /// the stage flips just before the acquire, so the state is stable), a
+    /// >1000-chunk source's GetIngestStatus entry carries `inFlight` with
+    /// the additive field set — stage/chunks per sub-batch, RFC3339 clocks,
+    /// children absent for a plain txt — and the array is EMPTY at the
+    /// terminal state.
+    #[tokio::test]
+    async fn get_ingest_status_reports_inflight_progress_and_clears() {
+        let f = fixture().await;
+        put_source_call(&f, "docs", "docs/big.txt", b"word ".repeat(7000)).await;
+
+        f.rt.scan_once().await; // enqueue; the drain runs parked below
+        let guard = f.handle.shared().write_lock().lock().await;
+        let drain = tokio::spawn({
+            let rt = f.rt.clone();
+            async move { rt.drain_queue().await }
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        let entry = loop {
+            let (st, _, b) = call_json(&f, "/x-vf/GetIngestStatus", json!({"bucket":"docs"})).await;
+            assert_eq!(st, StatusCode::OK, "{b}");
+            let j = &b["buckets"][0]["inFlight"];
+            if j.as_array().is_some_and(|a| a.len() == 1)
+                && j[0]["stage"] == json!("writing")
+                && j[0]["chunksDone"] == json!(500)
+            {
+                break j[0].clone();
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the worker never pinned at put #1: {b}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        };
+        assert_eq!(entry["key"], json!("docs/big.txt"));
+        assert_eq!(
+            entry["batchesDone"],
+            json!(0),
+            "put #1 cannot run under our lock"
+        );
+        let total = entry["chunksTotal"].as_u64().unwrap();
+        assert!(total > 1000, "three sub-batches: {total}");
+        assert_eq!(entry["batchesTotal"], json!(total.div_ceil(500)));
+        // RFC3339 clocks (the ops epoch formatter's fixed ...Z shape)
+        for k in ["stageStartedAt", "attemptStartedAt"] {
+            let s = entry[k].as_str().unwrap();
+            assert_eq!(s.len(), 24, "{k}: {s}");
+            assert!(s.ends_with('Z') && s.contains('T'), "{k}: {s}");
+        }
+        assert!(
+            entry.get("childrenTotal").is_none(),
+            "a plain txt carries no children keys"
+        );
+        drop(guard);
+        drain.await.unwrap();
+
+        // terminal: the register is empty on the wire (the array member
+        // itself stays — always-present additive field)
+        let (st, _, b) = call_json(&f, "/x-vf/GetIngestStatus", json!({"bucket":"docs"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["buckets"][0]["inFlight"], json!([]), "{b}");
+        let m = marker_of(&f, "docs/big.txt").await.unwrap();
+        assert_eq!(m.status, SourceStatus::Indexed, "{m:?}");
     }
 
     /// M3-T4 以图搜图 over the wire, in-process: the image FILE extractor +

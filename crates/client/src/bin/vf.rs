@@ -18,7 +18,8 @@
 //! failures, zero interaction, idempotent verbs, deterministic output.
 //!
 //! Verbs (附录E.4): put / search / sources list|status / get / rm / reindex /
-//! status — plus the T14 content-addressing pair `chunks` (a source's chunk
+//! jobs (live ingest progress) / status — plus the T14 content-addressing
+//! pair `chunks` (a source's chunk
 //! address space: ListVectors + client prefix filter + early-exit) and
 //! `chunk show` (bounded neighborhood read, grep -C semantics) — and `mcp`,
 //! the stdio MCP server that exposes the same verbs to
@@ -106,6 +107,14 @@ enum Command {
     /// Trigger an explicit re-embed of a bucket (after pipeline changes).
     /// Bucket as a bare positional (`vf reindex docs`) or via `--bucket`
     Reindex(ReindexArgs),
+    /// Live ingest progress (the daemon's InFlight register, GetIngestStatus
+    /// `inFlight`): what a worker is doing to WHICH file, RIGHT NOW —
+    /// stage (unpacking/extracting/chunking/embedding/writing), elapsed
+    /// since the current attempt, and the counters the stage owns (children
+    /// d/t for container walks, chunks d/t + batch d/t for the embed→write
+    /// interleave). Empty = nothing in flight. Process-memory on the daemon:
+    /// restart clears it (the attempts restart too)
+    Jobs(JobsArgs),
     /// /health + ingest status summary of the daemon
     Status(StatusArgs),
     /// Run the stdio MCP server (agent remote mode: every tool call proxies
@@ -499,6 +508,22 @@ struct ReindexArgs {
     bucket: Option<String>,
 }
 
+/// `vf jobs [BUCKET]` — the in-flight ingest table (`ls`-shaped bare bucket
+/// positional; omit for every ingest bucket aggregated).
+#[derive(Args, Debug)]
+struct JobsArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
+    /// Vector bucket (bare name positional, S3-CLI style) — omit to
+    /// aggregate every ingest bucket
+    bucket_pos: Option<String>,
+
+    /// Structured output (schema_version'd JSON)
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Args, Debug)]
 struct StatusArgs {
     #[command(flatten)]
@@ -603,6 +628,7 @@ async fn main() {
         Command::Rm(args) => rm_cmd(args).await,
         Command::Ls(args) => ls_cmd(args).await,
         Command::Reindex(args) => reindex_cmd(args).await,
+        Command::Jobs(args) => jobs_cmd(args).await,
         Command::Status(args) => status_cmd(args).await,
         Command::Mcp(args) => mcp_cmd(args).await,
         Command::Config(args) => match args.command {
@@ -2084,6 +2110,195 @@ async fn reindex_cmd(args: ReindexArgs) {
     println!("{job}");
 }
 
+// ---------------------------------------------------------------------------
+// jobs (the InFlight register: live per-job ingest progress)
+// ---------------------------------------------------------------------------
+
+/// Parse the daemon's fixed RFC3339 shape (`YYYY-MM-DDTHH:MM:SS.mmmZ`, the
+/// epoch_to_rfc3339 formatter) back to epoch seconds — no chrono on this
+/// side of the wire; days-from-civil is the same arithmetic inverted.
+/// `None` on any shape drift (the ELAPSED column degrades to `-`, never a
+/// wrong number).
+fn rfc3339_to_epoch(s: &str) -> Option<f64> {
+    let bad = || None;
+    let b = s.as_bytes();
+    if b.len() != 24
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'.'
+        || b[23] != b'Z'
+    {
+        return bad();
+    }
+    let num = |range: std::ops::Range<usize>| -> Option<u32> { s.get(range)?.parse().ok() };
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    let millis: f64 = num(20..23)?.into();
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return bad();
+    }
+    // days-from-civil (Howard Hinnant's algorithm, same one the server's
+    // formatter inverts)
+    let y = i64::from(y) - i64::from(mo <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * i64::from(if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days as f64 * 86400.0 + f64::from(h * 3600 + mi * 60 + sec) + millis / 1000.0)
+}
+
+/// Human elapsed for the ELAPSED column: `3.4s` under a minute, `12m03s`
+/// under an hour, `1h02m` above — the wall-clock shapes long ingests read
+/// naturally (a 50-minute novel shows `50m07s`, not `3007.0s`).
+fn fmt_elapsed(secs: f64) -> String {
+    let secs = secs.max(0.0);
+    if secs < 60.0 {
+        return format!("{secs:.1}s");
+    }
+    let total = secs.floor() as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h == 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{h}h{m:02}m")
+    }
+}
+
+/// The DETAIL column: the counters the job's stages own, `d/t` per family —
+/// `children 812/1551` (a container walk mid-grind), `chunks 3400/20168`
+/// (the embed interleave), `batch 12/41` (commits). Families appear only
+/// when the daemon reports them; `-` when none has begun yet.
+fn jobs_detail(j: &Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let pair = |done: &str, total: &str| -> Option<String> {
+        let (d, t) = (j[done].as_u64()?, j[total].as_u64()?);
+        Some(format!("{d}/{t}"))
+    };
+    if let Some(p) = pair("childrenDone", "childrenTotal") {
+        parts.push(format!("children {p}"));
+    }
+    if let Some(p) = pair("chunksDone", "chunksTotal") {
+        parts.push(format!("chunks {p}"));
+    }
+    if let Some(p) = pair("batchesDone", "batchesTotal") {
+        parts.push(format!("batch {p}"));
+    }
+    if parts.is_empty() {
+        "-".into()
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// `vf jobs [BUCKET]` — the live ingest table over GetIngestStatus's
+/// `inFlight` (bucket-scoped when a bare bucket name is given, every
+/// ingest bucket aggregated otherwise).
+async fn jobs_cmd(args: JobsArgs) {
+    let conn = args
+        .common
+        .connect()
+        .unwrap_or_else(|f| f.fail(args.json, 2));
+    let mut body = json!({});
+    if let Some(p) = args.bucket_pos.as_deref() {
+        let bucket = p.trim_end_matches('/');
+        if bucket.is_empty() {
+            Failure::new(
+                "USAGE",
+                "empty bucket name",
+                "use 'vf jobs [<bucket>]' — no argument lists every ingest bucket",
+            )
+            .fail(args.json, 2);
+        }
+        body["bucket"] = json!(bucket);
+    }
+    let v = match conn.call_json("GetIngestStatus", &body).await {
+        Ok(v) => v,
+        Err(e) => die(e, conn.endpoint()),
+    };
+    // flatten to (bucket, job) pairs — aggregate mode keeps each job's
+    // bucket visible (one daemon can run several ingest buckets)
+    let mut rows: Vec<(String, Value)> = Vec::new();
+    for b in v["buckets"].as_array().cloned().unwrap_or_default() {
+        let bucket = b["bucket"].as_str().unwrap_or("?").to_string();
+        for j in b["inFlight"].as_array().cloned().unwrap_or_default() {
+            rows.push((bucket.clone(), j));
+        }
+    }
+    if args.json {
+        let jobs: Vec<Value> = rows
+            .iter()
+            .map(|(bucket, j)| {
+                let mut o = json!({ "bucket": bucket });
+                for (k, v) in j.as_object().cloned().unwrap_or_default() {
+                    o[k] = v;
+                }
+                o
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema_version": SCHEMA_VERSION,
+                "count": jobs.len(),
+                "jobs": jobs,
+            }))
+            .expect("serializes")
+        );
+        return;
+    }
+    if rows.is_empty() {
+        println!("no in-flight jobs");
+        return;
+    }
+    // scoped to ONE bucket: the 4-column table; aggregate mode adds the
+    // BUCKET column after DETAIL (one daemon can run several ingest buckets)
+    let scoped = args.bucket_pos.is_some();
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    if scoped {
+        println!("{:<40} {:<10} {:>10} DETAIL", "KEY", "STAGE", "ELAPSED");
+    } else {
+        println!(
+            "{:<40} {:<10} {:>10} {:<9} BUCKET",
+            "KEY", "STAGE", "ELAPSED", "DETAIL"
+        );
+    }
+    for (bucket, j) in &rows {
+        // elapsed from the CURRENT attempt's clock; clock skew between this
+        // machine and the daemon can only shrink it (clamped at 0s)
+        let elapsed = j["attemptStartedAt"]
+            .as_str()
+            .and_then(rfc3339_to_epoch)
+            .map(|at| fmt_elapsed(now_epoch - at))
+            .unwrap_or_else(|| "-".into());
+        let detail = jobs_detail(j);
+        if scoped {
+            println!(
+                "{:<40} {:<10} {:>10} {}",
+                truncate(j["key"].as_str().unwrap_or(""), 40),
+                j["stage"].as_str().unwrap_or("?"),
+                elapsed,
+                detail,
+            );
+        } else {
+            println!(
+                "{:<40} {:<10} {:>10} {:<9} {}",
+                truncate(j["key"].as_str().unwrap_or(""), 40),
+                j["stage"].as_str().unwrap_or("?"),
+                elapsed,
+                detail,
+                truncate(bucket, 9),
+            );
+        }
+    }
+}
+
 /// Engine versions under the daemon (engine observability, 2026-11-05): one
 /// line per engine from the health body's `engines` object, absent silently
 /// on older daemons that do not report it (the client never assumes the
@@ -2271,6 +2486,78 @@ mod tests {
 
     fn page(keys: &[&str]) -> Vec<(String, Value)> {
         keys.iter().map(|k| (k.to_string(), Value::Null)).collect()
+    }
+
+    /// RFC3339 → epoch inverts the daemon's fixed formatter exactly (known
+    /// instants round-trip; leap-day and year-boundary dates included), and
+    /// shape drift degrades to None (never a wrong ELAPSED).
+    #[test]
+    fn rfc3339_to_epoch_parses_the_daemon_shape() {
+        // 1970-01-01T00:00:00.000Z
+        assert_eq!(rfc3339_to_epoch("1970-01-01T00:00:00.000Z"), Some(0.0));
+        // 2026-11-11T00:00:00.000Z — cross-checked: 20768 days since epoch
+        assert_eq!(
+            rfc3339_to_epoch("2026-11-11T00:00:00.000Z"),
+            Some(20768.0 * 86400.0)
+        );
+        // leap day: 2024-02-29T12:30:45.250Z (2024 is a leap year)
+        let t = rfc3339_to_epoch("2024-02-29T12:30:45.250Z").unwrap();
+        assert!((t - 1709209845.25).abs() < 1e-6, "{t}");
+        // millis ride through
+        assert_eq!(rfc3339_to_epoch("1970-01-01T00:00:01.500Z"), Some(1.5));
+        for bad in [
+            "",                         // empty
+            "2026-11-11T00:00:00Z",     // no millis
+            "2026-11-11 00:00:00.000Z", // space, not T
+            "2026-13-11T00:00:00.000Z", // month out of range
+            "2026-11-32T00:00:00.000Z", // day out of range
+            "2026-11-11T25:00:00.000Z", // hour out of range
+            "not-a-timestamp-at-all!!",
+        ] {
+            assert_eq!(rfc3339_to_epoch(bad), None, "{bad:?}");
+        }
+    }
+
+    /// ELAPSED formatting: the three wall-clock shapes (seconds / m+s / h+m).
+    #[test]
+    fn elapsed_formats_the_three_shapes() {
+        assert_eq!(fmt_elapsed(0.0), "0.0s");
+        assert_eq!(fmt_elapsed(3.45), "3.5s");
+        assert_eq!(fmt_elapsed(59.9), "59.9s");
+        assert_eq!(fmt_elapsed(60.0), "1m00s");
+        assert_eq!(fmt_elapsed(125.0), "2m05s");
+        assert_eq!(fmt_elapsed(3600.0), "1h00m");
+        assert_eq!(fmt_elapsed(50.0 * 60.0 + 7.0), "50m07s");
+        assert_eq!(fmt_elapsed(3661.0), "1h01m");
+        assert_eq!(fmt_elapsed(-5.0), "0.0s", "clock skew clamps at zero");
+    }
+
+    /// DETAIL composes the counter families that exist, `-` when none.
+    #[test]
+    fn jobs_detail_composes_reported_families() {
+        let j = |v: Value| v;
+        assert_eq!(jobs_detail(&j(json!({}))), "-");
+        assert_eq!(
+            jobs_detail(&j(json!({"childrenDone": 812, "childrenTotal": 1551}))),
+            "children 812/1551"
+        );
+        assert_eq!(
+            jobs_detail(&j(json!({
+                "chunksDone": 3400, "chunksTotal": 20168,
+                "batchesDone": 6, "batchesTotal": 41,
+            }))),
+            "chunks 3400/20168 batch 6/41"
+        );
+        assert_eq!(
+            jobs_detail(&j(json!({
+                "childrenDone": 3, "childrenTotal": 3,
+                "chunksDone": 12, "chunksTotal": 12,
+                "batchesDone": 1, "batchesTotal": 1,
+            }))),
+            "children 3/3 chunks 12/12 batch 1/1"
+        );
+        // a family with only one side (older daemon) is skipped, not halved
+        assert_eq!(jobs_detail(&j(json!({"chunksTotal": 100}))), "-");
     }
 
     /// The interval IS the prefix set: `lower <= k < upper` iff k starts
