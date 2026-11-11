@@ -6,7 +6,8 @@
 //! material that lives outside the tree and a real model download, so they
 //! refuse to run unless the env names it (run with `-- --ignored`).
 //!
-//! ## 1. `r1_probe_calibration` — the df ceiling's calibration oracle
+//! ## 1. `r1_probe_calibration` — the argmin-df head anchor's calibration
+//!    oracle (v2)
 //!
 //! Set `VF_R1_CORPUS_DIR` to a vectorfs data dir whose `docs` bucket (or
 //! `VF_R1_CORPUS_BUCKET`) already holds the radar corpus + textbook with the
@@ -17,23 +18,25 @@
 //!   cargo test -p vectorfs-server --test flagship_recall -- --ignored --nocapture
 //! ```
 //!
-//! It drives the EXACT production probe face (`lexical::kernel().probe_df`
-//! — the postings count of the bare term, capped at `PROBE_DF_LIMIT`)
-//! against the live derived table and pins the MEASURED calibration
-//! `ANCHOR_DF_CEILING`'s doc comment records: the df order
-//! (vibe 1 < coding 35 ≤ ThoughtWorks 36 < 雷达 109 < 技术 336), the
-//! ceiling's rare/structure split, the probe cap's saturation, and the
-//! v2 head-gate counterfactuals (must=[vibe] ⇒ exactly the
-//! correct-answer chunk; an AND-of-anchors verdict including ThoughtWorks
-//! ⇒ the needle evicted — the measured basis of the single-rarest-anchor
-//! MUST). History: the v1 probe (top-1 BM25 score) was measured to
-//! INVERT this ordering (tf/length effects), which retired it.
-//! Pure-CJK terms are outside the v1 analyzer's candidate set (the
-//! analyzer never probes them; the raw count is printed for the record
-//! only). NOTE: this reads the table through LanceDB while a daemon MAY
-//! hold the app-level flock — readers are safe (the flock guards
-//! serve/mcp/optimize writers, and Lance reads don't lock); make sure no
-//! ingest is in flight.
+//! It drives the EXACT production faces (`lexical::kernel().probe_df` —
+//! the postings count of the bare term, capped at `PROBE_DF_LIMIT`; and
+//! since T17 `LanceFts::analyze` — the same-pipeline analyzer terms the
+//! candidate extractor feeds those probes) against the live derived
+//! table and pins the MEASURED calibration the lexical docs record: the
+//! df order (vibe 1 < coding 35 ≤ ThoughtWorks 36 < 雷达 109 < 技术
+//! 336), the origin query's T17 verdict (every df≥1 analyzer term, df
+//! ascending, head = vibe — the argmin), the probe cap's saturation,
+//! and the head-gate counterfactuals (must=[vibe] ⇒ exactly the
+//! correct-answer chunk; an AND-of-anchors verdict including
+//! ThoughtWorks ⇒ the needle evicted — the measured basis of the
+//! single-rarest-anchor MUST). History: the v1 probe (top-1 BM25 score)
+//! was measured to INVERT this ordering (tf/length effects), which
+//! retired it; the v2 df-ceiling (rare-band eligibility line) was
+//! retired by T17's argmin ruling (D-8.4) — the measured table stays as
+//! the calibration record. NOTE: this reads the table through LanceDB
+//! while a daemon MAY hold the app-level flock — readers are safe (the
+//! flock guards serve/mcp/optimize writers, and Lance reads don't
+//! lock); make sure no ingest is in flight.
 //!
 //! ## 2. `flagship_origin_query_anchor_gated_top5` — the therapy proof
 //!
@@ -180,15 +183,14 @@ fn r1_probe_calibration() {
         t0.elapsed().as_secs_f64() * 1000.0
     };
 
-    // The v2 calibration table on this corpus (see lexical::
-    // ANCHOR_DF_CEILING's doc): the count probe reads the df order
-    // directly — vibe 1 < coding 35 ≤ ThoughtWorks 36 < 雷达 109 <
-    // 技术 336 — where the v1 top-1-BM25 probe measured the ORDER
-    // INVERTED (ThoughtWorks above vibe: tf/length effects), the
-    // finding that retired the score probe.
-    let ceiling = vectorfs_server::lexical::ANCHOR_DF_CEILING;
+    // The calibration table on this corpus (see lexical::select_anchors'
+    // history doc): the count probe reads the df order directly — vibe
+    // 1 < coding 35 ≤ ThoughtWorks 36 < 雷达 109 < 技术 336 — where the
+    // v1 top-1-BM25 probe measured the ORDER INVERTED (ThoughtWorks
+    // above vibe: tf/length effects), the finding that retired the score
+    // probe.
     let cap = vectorfs_server::lexical::PROBE_DF_LIMIT as u64;
-    eprintln!("ANCHOR_DF_CEILING = {ceiling}  PROBE_DF_LIMIT = {cap}");
+    eprintln!("PROBE_DF_LIMIT = {cap} (stage two exact limit: EXACT_DF_LIMIT)");
     let _ = probe_ms("vibe"); // warm the index readers first
     let mut counts = std::collections::BTreeMap::new();
     let mut probe_total_ms = 0.0f64;
@@ -204,14 +206,14 @@ fn r1_probe_calibration() {
         "probe latency: {probe_total_ms:.0} ms for 6 terms (indexed, warmed — the R1 \
          analysis budget is ≤ lexical::MAX_PROBES such probes per query)"
     );
-    // (1) the df ORDER the v2 judgment rides (compared on the DEEP counts:
-    // the probe's cap saturates high-df terms to the same value): rarest
-    // anchor first, the structure words far above it
+    // (1) the df ORDER the argmin judgment rides (compared on the DEEP
+    // counts: the probe's cap saturates high-df terms to the same value):
+    // rarest anchor first, the structure words far above it
     let (vibe, vibe_df) = counts["vibe"];
     let (coding, coding_df) = counts["coding"];
     let (tw, tw_df) = counts["ThoughtWorks"];
-    let (radar, radar_df) = counts["雷达"];
-    let (tech, tech_df) = counts["技术"];
+    let (_radar, radar_df) = counts["雷达"];
+    let (_tech, tech_df) = counts["技术"];
     assert_eq!(vibe, vibe_df);
     assert_eq!(coding, coding_df);
     assert_eq!(tw, tw_df);
@@ -219,46 +221,80 @@ fn r1_probe_calibration() {
         vibe_df < coding_df && coding_df <= tw_df && tw_df < radar_df && radar_df < tech_df,
         "the measured df order (vibe {vibe_df} < coding {coding_df} ≤ ThoughtWorks \
          {tw_df} < 雷达 {radar_df} < 技术 {tech_df}) changed — re-record \
-         lexical::ANCHOR_DF_CEILING's table"
+         lexical::select_anchors' history table"
     );
-    // (2) the ceiling's split on this corpus: the rare band under it, the
-    // structure words over it (coding at 35 sits OVER the ceiling — the
-    // origin-query verdict is [vibe] alone, which the counterfactual
-    // below proves is exactly the right gate)
-    assert!(
-        vibe <= ceiling,
-        "the rarest term must anchor: {vibe} > {ceiling}"
-    );
-    for (t, c) in [
-        ("coding", coding),
-        ("ThoughtWorks", tw),
-        ("雷达", radar),
-        ("技术", tech),
-    ] {
-        assert!(
-            c > ceiling,
-            "{t} counts {c} ≤ ceiling {ceiling}: a structure word would enter the \
-             verdict — re-calibrate lexical::ANCHOR_DF_CEILING against this table"
-        );
-    }
-    // (3) the cap saturates exactly where it may: the ubiquitous terms'
-    // probes read as the cap (the ceiling decision needs no more)
+    // (2) the cap saturates exactly where it may: the ubiquitous terms'
+    // probes read as the cap (the band decision needs no more; a
+    // cap-tied HEAD is what stage two's exact counts resolve)
     assert_eq!(
         counts["技术"].0, cap,
         "df 336 saturates the probe cap: min(df, cap) = cap"
     );
-    // CJK terms are outside the v1 analyzer's candidate set: the analyzer
-    // emits zero candidates for them, so the gate can never see them —
-    // the raw count is recorded for the ceiling's margin discussion only.
-    // (The sample's only Latin run, "AI", is its sole candidate.)
+    // (3) THE T17 ORIGIN-QUERY VERDICT on the live corpus (v2 form): the
+    // candidates are the analyzer's own terms (thoughtwork/技术/雷达/
+    // vibe/code/变化 — stemmed, lowercased, CJK included), every df≥1
+    // term rides the verdict df-ascending, and the HEAD is vibe — the
+    // argmin the hard regression gate pins (the df-ceiling eligibility
+    // line is retired; the origin query keeps its head because the df
+    // ORDER says so, not because a threshold lets it through)
+    use vectorfs_server::lexical::LexicalKernel;
+    use vectorfs_server::pipeline::config::FtsTokenizer;
+    let fts = vectorfs_server::lexical::LanceFts;
+    let terms = fts.analyze(
+        FtsTokenizer::Icu,
+        "ThoughtWorks 技术雷达中 Vibe Coding 技术有哪些变化",
+    );
     assert_eq!(
-        vectorfs_server::lexical::anchor_candidates("自满于 AI 生成的代码"),
-        vec!["AI".to_string()],
-        "the analyzer's candidate set is Latin/quoted-only by construction"
+        terms,
+        vec![
+            "thoughtwork".to_string(),
+            "技术".to_string(),
+            "雷达".to_string(),
+            "vibe".to_string(),
+            "code".to_string(),
+            "变化".to_string(),
+        ],
+        "the same-pipeline analyzer terms of the origin query (icu: stem + \
+         lowercase + CJK dictionary words)"
+    );
+    let verdict = rt
+        .block_on(vectorfs_server::lexical::analyze_anchors(
+            &fts,
+            &storage,
+            &bucket,
+            &index,
+            FtsTokenizer::Icu,
+            "ThoughtWorks 技术雷达中 Vibe Coding 技术有哪些变化",
+        ))
+        .expect("analyze_anchors on the live corpus");
+    eprintln!("T17 origin-query verdict: {verdict:?}");
+    assert_eq!(
+        verdict.first().map(String::as_str),
+        Some("vibe"),
+        "the origin query's head anchor is unchanged: vibe (df 1, the argmin)"
     );
     assert!(
-        vectorfs_server::lexical::anchor_candidates("自满于生成的代码").is_empty(),
-        "pure CJK analyzes to zero candidates — graceful degradation"
+        verdict.iter().any(|t| t == "雷达"),
+        "the verdict keeps the df≥1 structure words now (ceiling retired): {verdict:?}"
+    );
+    // the analyzer's candidate face on the R1 sample sentence: CJK words
+    // ARE candidates now (the F1 blind spot is fixed); the raw word AI
+    // rides the pipeline as its lowercase token
+    use vectorfs_server::lexical::anchor_candidates;
+    assert_eq!(
+        anchor_candidates(&fts, FtsTokenizer::Icu, "自满于 AI 生成的代码"),
+        vec![
+            "自满".to_string(),
+            "ai".to_string(),
+            "生成".to_string(),
+            "代码".to_string()
+        ],
+        "the candidate set is the analyzer's terms — CJK included"
+    );
+    assert_eq!(
+        anchor_candidates(&fts, FtsTokenizer::Icu, "自满于生成的代码"),
+        vec!["自满".to_string(), "生成".to_string(), "代码".to_string()],
+        "pure CJK analyzes to real candidates (v1's empty set is gone)"
     );
     // THE PRODUCTION GATE SHAPE, verified on the live corpus (this was the
     // v1 counterfactual; under v2 it is what the query face actually runs):
@@ -650,20 +686,22 @@ fn flagship_origin_query_anchor_gated_top5() {
         )
     });
     // THE BAR (both strict, no silent loosening):
-    // 1. the anchor verdict — under the v2 count probe the origin query's
-    //    rarest term Vibe (df 1, the query's own spelling — the index
-    //    tokenizer folds case at MATCH time, the verdict keeps the query's)
-    //    is the verdict head and its ONLY sub-ceiling candidate on this
-    //    corpus shape (coding/ThoughtWorks df in the dozens sit over the
-    //    ceiling; the exact numbers print in the probe diagnostics above —
-    //    a mismatch here means the corpus's df table drifted, re-run
-    //    r1_probe_calibration and re-calibrate lexical::ANCHOR_DF_CEILING
-    //    before touching anything else).
-    assert_eq!(
-        v["anchors"],
-        serde_json::json!(["Vibe"]),
-        "the origin query's anchor verdict — rarest-first, head = the gate (see \
-         the probe diagnostics above and lexical::ANCHOR_DF_CEILING's table)"
+    // 1. the anchor verdict's HEAD — under the T17 count pipeline the
+    //    origin query's rarest term vibe (df 1; the candidate carries the
+    //    analyzer's lowercased spelling — the index tokenizer folds case
+    //    at MATCH time, the verdict keeps the pipeline's) is the verdict
+    //    head = the MUST term, UNCHANGED from R1 (the hard regression
+    //    gate). The verdict's TAIL now lists every other df≥1 candidate
+    //    (ceiling retired, D-8.7: df-ascending probed candidates) — its
+    //    exact membership follows the corpus's df table (printed in the
+    //    probe diagnostics above), so pin the HEAD, not the list.
+    assert!(
+        v["anchors"].as_array().is_some_and(|a| !a.is_empty())
+            && v["anchors"][0] == serde_json::json!("vibe"),
+        "the origin query's head anchor — vibe, the argmin-df gate term \
+         (verdict {:?}; see the probe diagnostics above and \
+         lexical::select_anchors' history table)",
+        v["anchors"]
     );
     // 2. the rank bar — top-5 (experiment I's pre-R1 baseline: rank 27)
     assert!(

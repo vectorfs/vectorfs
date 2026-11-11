@@ -3968,18 +3968,24 @@ mod tests {
         );
     }
 
-    /// The full R1 v2 driver against the real engine: the df ceiling
-    /// ([`crate::lexical::ANCHOR_DF_CEILING`]) is corpus-SCALE-free (a
-    /// count, not a BM25 score), so a 3k-row fixture exercises it directly
-    /// — candidates → count probes → anchors → gated hits end to end: the
-    /// origin-query form's verdict is the df-1 term (vibe), the v2 gate
-    /// (verdict head) leaves exactly the needle chunk on the lexical arm.
+    /// The full R1→T17 driver against the real engine: the anchor
+    /// judgment is corpus-SCALE-free (counts, not BM25 scores), so a
+    /// 3k-row fixture exercises it directly — candidates (the real
+    /// analyzer chain, icu) → two-stage count probes → anchors → gated
+    /// hits end to end. The origin-query form's verdict keeps EVERY df≥1
+    /// candidate (v3: the ceiling is retired), ties first-seen — on this
+    /// tiny fixture every candidate is df=1, so the head is the FIRST-SEEN
+    /// term (技术, the TOC row's word), NOT vibe; the radar-corpus head
+    /// (vibe df=1 vs coding 35) is the acceptance gate's business. The
+    /// needle punchline survives on the Latin-only form whose argmin head
+    /// IS vibe.
     #[tokio::test]
     async fn fts_anchor_driver_count_probe_end_to_end() {
         let dim = 4;
         // 2998 filler rows + 1 TOC-shaped row + 1 needle row (vibe and
         // coding both df=1 — the rare band; filler df=2998 reads as the
-        // probe CAP, far over the ceiling)
+        // probe CAP — exactly the saturation the stage-two escalation
+        // exists for)
         let mut texts: Vec<String> = (0..2998)
             .map(|i| format!("filler text number {i} of the corpus"))
             .collect();
@@ -4009,8 +4015,8 @@ mod tests {
             .unwrap();
 
         let kernel = crate::lexical::kernel();
-        // the needle's df is under the ceiling; the filler's reads as the
-        // probe cap (2998 → 64), far over it
+        // the needle's df is exact; the filler's reads as the probe cap
+        // (2998 → 64) — the stage-one band, undecidable at the head
         let vibe = kernel
             .probe_df(&storage, "vb", "ixdrv", "vibe")
             .await
@@ -4019,40 +4025,37 @@ mod tests {
             .probe_df(&storage, "vb", "ixdrv", "filler")
             .await
             .unwrap();
-        assert_eq!(vibe, 1, "df=1 is the rare band");
-        assert!(
-            vibe <= crate::lexical::ANCHOR_DF_CEILING,
-            "the needle term anchors"
-        );
-        assert!(
-            filler > crate::lexical::ANCHOR_DF_CEILING,
-            "df≥cap stays over the ceiling: {filler}"
-        );
+        assert_eq!(vibe, 1, "df=1 is exact at stage one");
         assert_eq!(
             filler as usize,
             crate::lexical::PROBE_DF_LIMIT,
             "the cap saturates: df 2998 reads as the cap"
         );
 
-        // the origin-query form through the full driver: the verdict is
-        // the rarest-first list, head = the v2 MUST term
+        // the origin-query form through the full driver (T17 candidates:
+        // analyzer terms, stemmed spellings — coding→code): every df≥1
+        // candidate is in the verdict, rarest first with ties first-seen;
+        // the analyzer's CJK terms (技术/雷达, df=1 in the TOC row) lead
         let anchors = crate::lexical::analyze_anchors(
             kernel.as_ref(),
             &storage,
             "vb",
             "ixdrv",
+            crate::pipeline::config::FtsTokenizer::Icu,
             "技术雷达中 vibe coding 技术有哪些变化",
         )
         .await
         .unwrap();
         assert_eq!(
             anchors,
-            vec!["vibe", "coding"],
-            "rarest first (both df=1, tie keeps query order)"
+            vec!["技术", "雷达", "vibe", "code", "变化"],
+            "every df≥1 candidate, df ties keep first-seen order (the \
+             tiny-fixture artifact: all five are df=1)"
         );
 
-        // and the gated arm the query face would run under the v2 ruling
-        // (MUST = the verdict head): the needle chunk is the ONLY hit
+        // the gated arm the query face runs (MUST = the verdict head):
+        // on THIS corpus the head is 技术 (first-seen df=1 tie) and the
+        // gate keeps exactly its carrier — the TOC row
         let hits = kernel
             .search_gated(
                 &storage,
@@ -4067,8 +4070,45 @@ mod tests {
             .unwrap();
         assert_eq!(
             hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+            vec!["k2998"],
+            "the head gate leaves exactly the head-carrying chunk (the \
+             TOC row — the argmin-tie first-seen ruling, normative)"
+        );
+
+        // the NEEDLE punchline on the form whose argmin head IS the
+        // coined term (vibe df=1, first-seen): the gate leaves exactly
+        // the needle chunk — the R1 acceptance counterfactual shape
+        let needle_anchors = crate::lexical::analyze_anchors(
+            kernel.as_ref(),
+            &storage,
+            "vb",
+            "ixdrv",
+            crate::pipeline::config::FtsTokenizer::Icu,
+            "vibe coding 变化",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            needle_anchors,
+            vec!["vibe", "code", "变化"],
+            "the needle form's verdict: vibe heads (first-seen among the df=1 ties)"
+        );
+        let hits = kernel
+            .search_gated(
+                &storage,
+                "vb",
+                "ixdrv",
+                std::slice::from_ref(&needle_anchors[0]),
+                "vibe coding 变化",
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
             vec!["k2999"],
-            "the gate leaves exactly the anchor-carrying chunk"
+            "must=[vibe]: the needle is the only vibe chunk"
         );
     }
 

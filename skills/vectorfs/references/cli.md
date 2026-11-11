@@ -91,39 +91,46 @@ operators on it are refused with a pointer to `x-vf-src-uri`, see
 protocol.md). A zero-hit query whose src-name filter matched no indexed
 source reports it in a `note` (check the key spelling with `vf ls`).
 
-#### Anchor gating (R1, lexical-arm precision, default on for fts buckets)
+#### Anchor gating (R1→T17, lexical-arm precision, default on for fts buckets)
 
 Before the lexical arm of a `keyword`/`hybrid` text query runs, the daemon
-analyzes the query: its Latin identifier runs and quoted spans (≤8 terms) are
-probed against the FTS index by POSTINGS COUNT (df, capped at 64 — one small
-single-term FTS query per term, 5-25 ms/probe measured, ≤8 probes ≈ 40-200 ms
-added latency). Terms whose df is at or under a calibrated ceiling (16) are
-anchors; the RAREST anchor becomes the MUST constraint of a Boolean FTS query
-— chunks missing it leave the **lexical arm only** (fellow anchors and the
-whole query stay the ranking body). Pure-CJK queries analyze to zero
-candidates and ride the ungated behavior.
+analyzes the query: its quoted spans (any script, whole strings — CJK
+included) and its ANALYZER terms — the same tokenization pipeline the FTS
+index was built with (icu default: dictionary CJK words, lowercased +
+stemmed Latin, ascii-folded accents) — are probed against the FTS index by
+POSTINGS COUNT (≤8 terms, df capped at 64, one small single-term FTS query
+per term, 5-25 ms/probe measured; a head-position tie AT the cap escalates
+to exact counts at 8192). The RAREST df≥1 candidate (argmin, ties
+first-seen) becomes the MUST constraint of a Boolean FTS query — chunks
+missing it leave the **lexical arm only** (the whole query stays the
+ranking body). CJK queries gate like any other (the pre-T17 blind spot is
+gone); only a query whose every candidate is corpus-absent (df=0) rides
+the ungated behavior.
 
 - **Misjudgment cost, stated plainly**: the gate only ever TIGHTENS the
   lexical arm — the semantic arm is untouched, so a misjudged anchor costs
   the lexical *enhancement*, never a result. Worst case is the pre-hybrid
   ranking, not a lost answer.
 - **Verdict visibility**: the response carries an `anchors` member beside
-  `hits` exactly when the analysis ran — the verdict list, rarest-first:
-  the FIRST entry is the term the lexical arm was gated on, further
-  entries are anchors riding the ranking body (`["Vibe"]` = gated on
-  Vibe); `[]` = analyzed, nothing is rare enough (the ungated behavior);
-  absent = not applicable (semantic mode, fts off, or the knob off). Human
-  mode: one stderr diagnostics line.
+  `hits` exactly when the analysis ran — the probed candidates that exist
+  in the corpus, df ascending: the FIRST entry is the term the lexical
+  arm was gated on, whatever its df absolute value (structure words
+  included — a query of only structure words gates on its own argmin);
+  further entries ride the ranking body (`["vibe", "code", …]` — the
+  pipeline's lowercase/stemmed spellings); `[]` = every candidate df=0
+  (the ungated behavior); absent = not applicable (semantic mode, fts
+  off, or the knob off). Human mode: one stderr diagnostics line.
 - **Knob**: `[ingest.<bucket>] anchor-gating = false` restores the ungated
   lexical arm (query-face policy, outside the pipeline fingerprint — no
   reindex). Inert on `fts = false` buckets.
-- **Calibration status (measured)**: the ceiling is calibrated against the
-  docs radar corpus (`lexical::ANCHOR_DF_CEILING`'s table in the server
-  source: vibe df 1 anchors; coding 35 / ThoughtWorks 36 / 雷达 109 /
-  技术 336 do not). The v1 score-based probe (top-1 BM25) was measured to
-  invert the df ordering (tf/chunk-length effects) and retired; the count
-  probe reads df directly. Re-tune via the `r1_probe_calibration`
-  acceptance test on your own corpus.
+- **Calibration status (measured)**: the head anchor's df order is
+  calibrated against the docs radar corpus (`lexical::select_anchors`'
+  history table in the server source: vibe df 1 < coding 35 ≤
+  ThoughtWorks 36 < 雷达 109 < 技术 336 — the origin query's head is
+  vibe). The v1 score-based probe (top-1 BM25) was measured to invert the
+  df ordering (tf/chunk-length effects) and retired; the v2 df-ceiling
+  eligibility line was retired by T17's argmin ruling. Re-check via the
+  `r1_probe_calibration` acceptance test on your own corpus.
 
 ### `vf chunks <KEY>`
 

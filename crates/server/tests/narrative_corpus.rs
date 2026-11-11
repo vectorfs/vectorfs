@@ -50,9 +50,11 @@
 //!    their characters occur ONLY inside the term's instances anywhere
 //!    (their df must equal the residue-rule coverage exactly).
 //! 2. **query zero-words** — every non-keyword content word of a fixture
-//!    query has ZERO corpus occurrences (self-checked), so under T17's
-//!    argmin-df head anchor the QUOTED keyword is trivially the rarest
-//!    candidate and the head.
+//!    query has ZERO occurrences in the NOVEL and in the DECOY
+//!    (self-checked both — the decoy half was added after the first T17
+//!    env run caught it leaking a zero-word), so under T17's argmin-df
+//!    head anchor the QUOTED keyword is trivially the rarest candidate
+//!    and the head.
 //!
 //! ## Test gates
 //!
@@ -60,11 +62,12 @@
 //! byte-identical epub/decoy), corpus structure self-checks (entity bands,
 //! event density model, quarantine/zero-word hygienes), the REAL-extractor
 //! round-trip (`EpubExtractor::unpack` → `HtmlExtractor::extract` keeps
-//! titles, refrains and exact keyword counts), and today's F1 candidate
-//! shape (`lexical::anchor_candidates` on the fixture queries).
+//! titles, refrains and exact keyword counts), and the T17 candidate
+//! shape (`lexical::anchor_candidates` on the fixture queries — quoted
+//! keyword first, CJK non-empty, the long-query truncation).
 //!
 //! Env-gated, flagship-suite discipline (`flagship_recall.rs`): the
-//! full-chain INDEXED gate and the T17/T18 assertion skeletons all need a
+//! full-chain INDEXED gate and the T17/T18 behavior pins all need a
 //! REAL embedder model. They are `#[ignore]`d for `cargo test` and REFUSE
 //! to run silently: without `VF_NARRATIVE_MODELS_DIR` set they panic with
 //! the fix (never a quiet skip). Run with:
@@ -475,11 +478,17 @@ const EVENTS: [EventSpec; 10] = [
 // special queries (the T17/T18 behavior pins' material)
 // ---------------------------------------------------------------------------
 
-/// The structure-word flood query: pure furniture (the refrain's own
-/// bigrams), nothing rare — under v1 it analyzes to ZERO candidates (the
-/// blind spot); under T17's 恒门 it MUST gate anyway (D-8.4: the
-/// all-structure escape hatch is retired).
-const FLOOD_QUERY: &str = "夜里城里有人说起他的事,说的是哪一件";
+/// The structure-word flood query: pure furniture (the refrain verbatim
+/// — every character sits in REFRAIN's vocabulary, self-checked), nothing
+/// rare — under v1 it analyzed to ZERO candidates (the blind spot); under
+/// T17's 恒门 it gates anyway (D-8.4: the all-structure escape hatch is
+/// retired). FIXTURE SURGERY (first T17 env run): the v1 form carried the
+/// tail ",说的是哪一件", and 说的 legitimately occurs in the P_FILLERS
+/// padding (要说的话) at a MID-band df — it out-rared the saturated
+/// furniture and stole the head, which is correct argmin behavior on an
+/// impure query, not a mechanism bug. The pure form pins what the case
+/// exists to pin.
+const FLOOD_QUERY: &str = "夜里城里有人说起他的事";
 
 /// The all-saturated-tie query: three QUOTED coined place names whose
 /// chapter coverages are 72/84/96 (every probe saturates the cap 64), so
@@ -761,7 +770,13 @@ fn build_decoy() -> String {
         lines.push(format!("复述练习其{i}:夜里,城里有人说起他的事。"));
     }
     lines.push("备忘:先查夜里,再查城里,再查有人,再查说起。".to_string());
-    lines.push("统计:这句在正文里每一章的末尾都会出现,没有例外。".to_string());
+    // FIXTURE SURGERY (first T17 env run): the v1 line said 末尾都会出现 —
+    // and 出现 is event E9's zero-word, which the T16 zero-word hygiene
+    // checked against the NOVEL ONLY: the decoy leaked it, df(decoy chunks)
+    // < df(雾隐驿亭), and the E9 head anchor went to 出现. The rephrased
+    // line keeps the statistic's meaning without the leak; the self-check
+    // below now scans the decoy too (the gap this exposed).
+    lines.push("统计:这句在正文里每一章的末尾都有,没有例外。".to_string());
     lines.push("结论:夜里与城里同章,有人与说起同句,检索时四者等价。".to_string());
     lines.join("\n")
 }
@@ -1150,13 +1165,22 @@ fn narrative_query_fixture_self_check() {
                 );
             }
         }
-        // zero-words: zero corpus occurrences (each is a stopgap word the
-        // corpus never uses — this keeps the quoted keyword the argmin)
+        // zero-words: zero occurrences in the NOVEL and in the DECOY (each
+        // is a stopgap word the corpus never uses — this keeps the quoted
+        // keyword the argmin; the decoy half of the check was added after
+        // the first T17 env run caught the decoy leaking E9's 出现 at
+        // decoy-chunk df, stealing that event's head anchor)
         for w in e.zero_words {
             assert_eq!(
                 corpus.matches(w).count(),
                 0,
-                "{}: zero-word {w:?} appears in the corpus",
+                "{}: zero-word {w:?} appears in the novel",
+                e.label
+            );
+            assert!(
+                !n.decoy.contains(w),
+                "{}: zero-word {w:?} appears in the decoy (its small df would \
+                 out-rare the keyword and steal the head anchor)",
                 e.label
             );
         }
@@ -1169,10 +1193,16 @@ fn narrative_query_fixture_self_check() {
         }
     }
 
-    // flood query: pure furniture bigrams
+    // flood query: pure furniture — all four bigrams, and EVERY character
+    // sits in the refrain's vocabulary (no stray word can ride along and
+    // out-rare the saturated furniture — the v1 form's 说的 lesson)
     for bg in FURNITURE_BIGRAMS {
         assert!(FLOOD_QUERY.contains(bg), "flood query must ride {bg}");
     }
+    assert!(
+        FLOOD_QUERY.chars().all(|c| REFRAIN.contains(c)),
+        "flood query must be pure furniture vocabulary"
+    );
     // tie query: three quoted terms; the unquoted remainder is exactly the
     // single-char frame (so the probe set is exactly the tie)
     for (t, _, _) in TIE_TERMS.iter() {
@@ -1323,32 +1353,89 @@ fn narrative_decoy_is_structure_dense_but_distinctive_free() {
     }
 }
 
-/// F1 pinned AT HEAD (today, v1): pure-CJK fixture queries analyze to ZERO
-/// anchor candidates (the R1 blind spot this corpus exists to fix), and
-/// the Latin identifier event — v1's one working shape — extracts exactly
-/// [MeridianVow]. T17's analyze() rewrite flips the CJK lines to non-empty
-/// (the ar7 skeleton below asserts it); this test stays as the v1 record.
+/// The candidate shape under T17's analyze()-based extractor (v3): the
+/// QUOTED CJK keyword is candidate #1 of every event query (any script,
+/// priority order — D-8.3), the Latin identifier event leads with its
+/// analyzer-lowercased token, the special queries analyze NON-empty (the
+/// v1 F1 blind spot is gone), and the long query's one-shot name 谢闻笛
+/// never becomes a candidate (icu dictionary-segments the coined name
+/// into single chars, and the pre-name words fill MAX_PROBES first — the
+/// 规范语义 pin). The chapter-level argmin pre-check: every NON-keyword
+/// candidate covers at least as many chapters as the keyword (the quoted
+/// keyword is tied-rarest before any probe runs — the indexed gate below
+/// asserts the real chunk-level head).
 #[test]
-fn narrative_f1_candidate_shape_pinned_today() {
-    // pure CJK (quoted or not): no ASCII letters ⇒ no v1 candidates
-    for e in EVENTS.iter().filter(|e| e.label != "MeridianVow") {
+fn narrative_candidate_shape_under_t17_analyzer() {
+    use vectorfs_server::lexical::{LanceFts, anchor_candidates};
+    use vectorfs_server::pipeline::config::FtsTokenizer;
+
+    let n = generate(SEED);
+    let fts = LanceFts;
+    for e in EVENTS.iter() {
+        let cands = anchor_candidates(&fts, FtsTokenizer::Icu, e.query);
         assert!(
-            vectorfs_server::lexical::anchor_candidates(e.query).is_empty(),
-            "{}: v1 analyzes pure-CJK queries to zero candidates (F1)",
+            !cands.is_empty(),
+            "{}: T17 analyzes the query to candidates (F1 fixed)",
             e.label
         );
+        let head = if e.label == "MeridianVow" {
+            // the Latin identifier rides the analyzer term (lowercased —
+            // the index's own token; the F1 guard property is unchanged:
+            // the event gates on exactly its identifier)
+            "meridianvow"
+        } else {
+            e.keyword
+        };
+        assert_eq!(
+            cands[0], head,
+            "{}: the (quoted) keyword keeps probe priority",
+            e.label
+        );
+        // the argmin pre-check at chapter level: every OTHER candidate is
+        // either ABSENT (0 chapters and not in the decoy ⇒ df=0, never
+        // gates — the zero-words) or covers at least as many chapters as
+        // the keyword (subwords tie — same chapters by quarantine;
+        // 只在-class strays cover 30 chapters, never fewer than the
+        // event's own). A candidate present in the 1..kw_chapters band —
+        // novel OR decoy — would out-rare the keyword and steal the head;
+        // that is the failure this guards.
+        let kw_chapters = chapters_containing(&n, e.keyword).len();
+        for c in cands.iter().skip(1) {
+            let got = chapters_containing(&n, c).len();
+            assert!(
+                (got == 0 && !n.decoy.contains(c.as_str())) || got >= kw_chapters,
+                "{}: candidate {c:?} covers {got} chapters (decoy: {}) vs keyword's \
+                 {kw_chapters} — present-but-rarer would steal the head-anchor argmin",
+                e.label,
+                n.decoy.contains(c.as_str())
+            );
+        }
     }
-    assert_eq!(
-        vectorfs_server::lexical::anchor_candidates(EVENTS[1].query),
-        vec!["MeridianVow".to_string()],
-        "the Latin identifier event is v1's working shape (F1 guard)"
-    );
+
+    // the special queries: non-empty under v3 (v1 pinned them EMPTY — the
+    // record this test replaced)
     for q in [FLOOD_QUERY, TIE_QUERY, LONG_QUERY] {
         assert!(
-            vectorfs_server::lexical::anchor_candidates(q).is_empty(),
-            "v1 blind spot on {q:?}"
+            !anchor_candidates(&fts, FtsTokenizer::Icu, q).is_empty(),
+            "v3 analyzes {q:?} to candidates"
         );
     }
+    // the tie query's probe set: the three quoted terms LEAD (priority
+    // order), ahead of their dictionary subwords
+    let tie = anchor_candidates(&fts, FtsTokenizer::Icu, TIE_QUERY);
+    assert_eq!(&tie[..3], &["百步桥", "乌篷巷", "栖霞圩"]);
+    // the long query: exactly MAX_PROBES candidates, and the one-shot
+    // name 谢闻笛 is never among them (the truncation 规范语义)
+    let long = anchor_candidates(&fts, FtsTokenizer::Icu, LONG_QUERY);
+    assert_eq!(
+        long.len(),
+        vectorfs_server::lexical::MAX_PROBES,
+        "the long query fills the probe set exactly"
+    );
+    assert!(
+        long.iter().all(|c| !c.contains("谢闻笛")),
+        "the 9th+-position name must never be probed: {long:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1831,31 +1918,34 @@ fn narrative_indexed_full_chain_gate() {
          above/beside it in the top-50 — the recap-flooded ranking the corpus encodes",
         e1.label, e1.occurrence, above
     );
-    eprintln!(
-        "anchors at HEAD (v1, pure CJK ⇒ empty): {:?} — T17 flips this",
-        v["anchors"]
+    // T17: the CJK query's anchors member is NON-empty now, head = the
+    // quoted keyword (the ar7 pin asserts it in full)
+    eprintln!("anchors under T17: {:?}", v["anchors"]);
+    assert_eq!(
+        v["anchors"][0],
+        serde_json::json!(e1.keyword),
+        "the T17 head anchor: the quoted event keyword (the argmin)"
     );
 }
 
 // ---------------------------------------------------------------------------
-// T17/T18 assertion skeletons (red at HEAD by construction; the #[ignore]
-// reasons name the activation conditions)
+// the env-gated behavior pins (T17's analyze()-based pipeline landed;
+// T18's orderBy pin still awaits its activation — the #[ignore] reasons
+// name the env conditions)
 // ---------------------------------------------------------------------------
 
 /// A-R7 (design §1 D-11.2): CJK event queries get anchors and the HEAD
-/// anchor is the expected entity.
-///
-/// ACTIVATION (T17): `LexicalKernel::analyze()` + the D-8.3 candidate
-/// rewrite + the D-8.4 two-stage argmin head anchor. Red at HEAD: v1
-/// analyzes pure-CJK queries to zero candidates (`anchors: []`, pinned in
-/// `narrative_f1_candidate_shape_pinned_today`). The fixture is built so
-/// the head is decidable WITHOUT segmentation luck: the keyword is quoted
-/// (priority candidate, probed whole), its characters are quarantined
-/// (probe = the event's own chunk count), and every other query word has
-/// zero corpus occurrences (df=0 never gates) — the quoted keyword is
-/// trivially the argmin.
+/// anchor is the expected entity — the T17 payoff, live at the indexed
+/// corpus (`LexicalKernel::analyze()` + the D-8.3 candidate rewrite +
+/// the D-8.4 two-stage argmin head anchor). The fixture makes the head
+/// decidable WITHOUT segmentation luck: the keyword is quoted (priority
+/// candidate, probed whole), its characters are quarantined (probe = the
+/// event's own chunk count), and every other query word has zero corpus
+/// occurrences (df=0 never gates) — the quoted keyword is trivially the
+/// argmin. (v1 history: these queries analyzed to `anchors: []` — the
+/// record this test replaced.)
 #[test]
-#[ignore = "activates with T17 (narrative-recall design §2): analyze()-based anchor pipeline"]
+#[ignore = "needs the indexed narrative corpus; set VF_NARRATIVE_MODELS_DIR (see module doc)"]
 fn narrative_ar7_cjk_event_head_anchors() {
     let x = stand_indexed_narrative("ar7");
     for e in EVENTS.iter().filter(|e| e.label != "MeridianVow") {
@@ -1882,9 +1972,13 @@ fn narrative_ar7_cjk_event_head_anchors() {
 }
 
 /// The F1 regression guard at the indexed corpus: the Latin identifier
-/// event's head anchor is `MeridianVow` — true at HEAD (v1's Latin-run
-/// candidate + df ≤ ceiling) and REQUIRED to stay true through T17's
-/// rewrite (the one shape that already worked must not regress).
+/// event's head anchor is `MeridianVow`'s analyzer token — under T17 the
+/// candidate carries the index's own spelling (`meridianvow`, lowercased
+/// by the shared pipeline; the raw probe and the token hit the same
+/// postings), and the verdict is exactly that one term (the query's CJK
+/// words are zero-words, df=0). The guard property is unchanged through
+/// the rewrite: the one shape that already worked still gates on exactly
+/// its identifier.
 #[test]
 #[ignore = "needs the indexed narrative corpus; set VF_NARRATIVE_MODELS_DIR (F1 guard, design D-11.1)"]
 fn narrative_ar7_latin_identifier_guard() {
@@ -1893,18 +1987,21 @@ fn narrative_ar7_latin_identifier_guard() {
     let v = search_json(&x, e.query, 20);
     assert_eq!(
         v["anchors"],
-        serde_json::json!([e.keyword]),
-        "the Latin identifier event gates on exactly its identifier"
+        serde_json::json!(["meridianvow"]),
+        "the Latin identifier event gates on exactly its identifier (the \
+         analyzer's token spelling)"
     );
     assert!(has_hits(&v));
 }
 
-/// The structure-word flood pin (T17 恒门): v2 retired the "all-structure ⇒
-/// zero anchors ⇒ ungated" escape hatch — a pure furniture query MUST
-/// still gate (anchors non-empty, head = a furniture bigram, gated result
-/// non-empty). Red at HEAD (v1: empty anchors on pure CJK).
+/// The structure-word flood pin (T17 恒门): the retired "all-structure ⇒
+/// zero anchors ⇒ ungated" escape hatch stays retired — a pure furniture
+/// query MUST gate (anchors non-empty, head = a furniture bigram, gated
+/// result non-empty). The furniture bigrams all live in the refrain's
+/// own chunks (an exact tie ⇒ first-seen wins), so membership, not
+/// which one, is the assertion.
 #[test]
-#[ignore = "activates with T17 (narrative-recall design §2): the constant-gate behavior (D-8.4)"]
+#[ignore = "needs the indexed narrative corpus; set VF_NARRATIVE_MODELS_DIR (see module doc)"]
 fn narrative_ar7_structure_flood_constant_gate() {
     let x = stand_indexed_narrative("flood");
     let v = search_json(&x, FLOOD_QUERY, 50);
@@ -1930,9 +2027,11 @@ fn narrative_ar7_structure_flood_constant_gate() {
 /// The two-stage saturation tie (T17, D-8.4): all three quoted tie terms
 /// cover ≥ 64 chapters, so every stage-one probe reads the cap (a three-way
 /// tie AT the head) and only the stage-two exact counts can pick argmin =
-/// 乌篷巷 (72 chapters < 84 < 96). Red at HEAD (v1: empty anchors).
+/// 乌篷巷 (72 chapters < 84 < 96). The dictionary subwords (百步/乌篷)
+/// ride the same saturation and the same exact counts, tying their
+/// parents — first-seen keeps the quoted whole-span spellings ahead.
 #[test]
-#[ignore = "activates with T17 (narrative-recall design §2): the two-stage df probe (D-8.4)"]
+#[ignore = "needs the indexed narrative corpus; set VF_NARRATIVE_MODELS_DIR (see module doc)"]
 fn narrative_probe_saturation_tie_two_stage() {
     let x = stand_indexed_narrative("tie");
     // the raw material first (true at HEAD too): saturation + deep order
@@ -1967,13 +2066,17 @@ fn narrative_probe_saturation_tie_two_stage() {
     );
 }
 
-/// The MAX_PROBES truncation pin (T17, D-8.4 规范语义): the long query
-/// carries fourteen distinct multi-char words ahead of the one-shot name
-/// 谢闻笛 (df = one chapter), so the name sits past position 8 of the
-/// candidate list, is never probed, and can never anchor — while the query
-/// still gates on its first-eight argmin. Red at HEAD (v1: empty anchors).
+/// The MAX_PROBES truncation pin (T17, D-8.4 规范语义): the long query's
+/// multi-char analyzer terms (连夜/跑遍/南浦/津渡/码头/回生/药房/船夫…)
+/// fill the probe set to exactly MAX_PROBES, and the one-shot name 谢闻笛
+/// — the query's rarest possible anchor (df = one chapter) — never
+/// enters it: the icu dictionary segments the coined name into single
+/// characters (dropped by the candidate filter), and even its would-be
+/// position sits past the truncation. A discriminative entity the probe
+/// set never reaches is 既定行为, not a bug — the query still gates on
+/// its first-eight argmin.
 #[test]
-#[ignore = "activates with T17 (narrative-recall design §2): analyzer candidates + probe truncation"]
+#[ignore = "needs the indexed narrative corpus; set VF_NARRATIVE_MODELS_DIR (see module doc)"]
 fn narrative_long_query_probe_truncation() {
     let x = stand_indexed_narrative("long");
     let v = search_json(&x, LONG_QUERY, 50);

@@ -45,22 +45,28 @@ CLI (bucket as a bare positional, XOR `--bucket`):
 MCP tool (`vf mcp` or `vectorfs mcp`): `search {bucket, text, topK, filter?,
 returnText}` — same semantics, camelCase.
 
-### Anchor gating (R1 — automatic, default on for fts buckets)
+### Anchor gating (R1→T17 — automatic, default on for fts buckets)
 
 On `keyword`/`hybrid` text queries the daemon first probes the query's
-Latin identifier runs and quoted spans by POSTINGS COUNT (≤8 small
-single-term FTS queries, 5-25 ms each measured — ≈ 40-200 ms added per
-query); terms whose df ≤ a calibrated ceiling (16) are anchors, and the
-RAREST gates the **lexical arm** (chunks missing it leave it; the whole
-query stays the ranking body). Pure-CJK queries ride the ungated behavior.
+quoted spans (any script, whole) and analyzer terms — the SAME tokenization
+pipeline the FTS index was built with, so CJK dictionary words, stemmed
+Latin and folded accents are candidates exactly as the index sees them —
+by POSTINGS COUNT (≤8 small single-term FTS queries at the cap, plus exact
+counts when the head ties at the cap); the RAREST df≥1 candidate (argmin,
+ties first-seen) gates the **lexical arm** (chunks missing it leave it; the
+whole query stays the ranking body). CJK queries gate like any other;
+only a query whose every candidate is corpus-absent (df=0) rides the
+ungated behavior.
 
 - **Misjudgment cost**: the gate only tightens the lexical arm — the
   semantic arm is untouched. A misjudged anchor costs the lexical
   *enhancement*, never a result; worst case is the ungated ranking.
 - The response tells you what happened: an `anchors` array beside `hits`
-  — the verdict rarest-first, the FIRST term is what gated (e.g.
-  `["Vibe"]`); `[]` = analyzed, nothing rare enough; absent = analysis
-  not applicable. The human CLI prints one stderr line.
+  — the probed candidates that exist in the corpus, df ascending; the
+  FIRST term is what gated, whatever its df (e.g. `["vibe", "code", …]`
+  — the pipeline's lowercase/stemmed spellings); `[]` = every candidate
+  df=0; absent = analysis not applicable. The human CLI prints one stderr
+  line.
 - Off switch (server config): `[ingest.<bucket>] anchor-gating = false` —
   query-face policy, no reindex.
 

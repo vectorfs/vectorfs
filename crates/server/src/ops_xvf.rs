@@ -1212,22 +1212,25 @@ fn compile_filter(
 /// fusion order; fewer than topK are returned when the quota thins the
 /// set (no backfill — backfilling would defeat the quota). Absent/0 = off.
 ///
-/// Anchor gating (R1, on by DEFAULT for lexical faces of fts buckets —
+/// Anchor gating (R1→T17, on by DEFAULT for lexical faces of fts buckets —
 /// bucket knob `anchor-gating = true|false`): before the lexical arm runs,
-/// the query's Latin identifier/quoted terms are probed against the FTS
-/// index by POSTINGS COUNT (≤8 small single-term FTS queries, 5-25 ms each
-/// each — see `lexical::PROBE_DF_LIMIT`); terms whose df is at or under
-/// the calibrated ceiling (`lexical::ANCHOR_DF_CEILING`) are anchors, and
-/// the RAREST of them becomes the MUST constraint of a Boolean FTS query —
-/// chunks missing it leave the LEXICAL arm only (the semantic arm is
-/// untouched: a misjudged anchor costs the lexical enhancement, never a
-/// result). Pure-CJK and structure-word-only queries analyze to zero
-/// anchors and ride the ungated behavior; a probe failure degrades to the
-/// ungated behavior with a stderr note. The response carries an `anchors`
-/// member beside `hits` exactly when the analysis ran: the verdict list,
-/// rarest-first — the FIRST entry is the term the lexical arm was gated
-/// on, further entries are anchors that ride the ranking body (empty =
-/// no anchors).
+/// the query's quoted spans (any script, whole) and analyzer terms (the
+/// kernel's SAME pipeline as the index — CJK included, the R1 blind spot)
+/// are probed against the FTS index by POSTINGS COUNT (≤8 small
+/// single-term FTS queries at the cap, plus stage-two exact counts when
+/// the head ties at the cap — see `lexical::analyze_anchors`); the
+/// RAREST df≥1 candidate (the argmin, ties first-seen) becomes the MUST
+/// constraint of a Boolean FTS query — chunks missing it leave the LEXICAL
+/// arm only (the semantic arm is untouched: a misjudged anchor costs the
+/// lexical enhancement, never a result). Queries whose every candidate is
+/// corpus-absent (df=0) ride the ungated behavior; all-structure-word
+/// queries GATE anyway (T17 恒门 — the df-ceiling escape hatch is
+/// retired); a probe failure degrades to the ungated behavior with a
+/// stderr note. The response carries an `anchors` member beside `hits`
+/// exactly when the analysis ran: the probed candidates that exist in the
+/// corpus, df ASCENDING — the FIRST entry is the term the lexical arm was
+/// gated on, whatever its df absolute value; further entries ride the
+/// ranking body (empty = every candidate df=0, nothing gates).
 ///
 /// Hit shape, field by field (appendix E.2):
 /// * `content{text?, type: "TEXT"|"IMAGE"}` — `type` follows the CHUNK's
@@ -1503,19 +1506,21 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
         * shared.fusion_overfetch_of(&input.bucket).unwrap_or(1) as usize)
         .min(1000);
     let lexical = crate::lexical::kernel();
-    // R1 anchor gating (recall-quality roadmap, v2 count probe): on
-    // lexical faces of an fts bucket with `anchor-gating` on (the
-    // default), the query is analyzed ONCE — its Latin identifier/quoted
-    // terms are probed against the first route's derived index by
-    // POSTINGS COUNT (≤ lexical::MAX_PROBES small FTS queries); terms
-    // with df ≤ lexical::ANCHOR_DF_CEILING are anchors and the RAREST
-    // (verdict head) becomes the MUST constraint of the gated Boolean FTS
-    // query. `None` = analysis not applicable (semantic mode / fts off /
-    // knob off) or degraded (probe error — current behavior, one stderr
-    // note); `Some(vec![])` = analyzed, no anchors (pure CJK / all
-    // structure words — the ungated behavior IS the answer). The SEMANTIC
-    // arm never sees the gate: a misjudged anchor costs the lexical
-    // ENHANCEMENT, never a result.
+    // R1/T17 anchor gating (recall-quality roadmap, v3 two-stage count
+    // probe): on lexical faces of an fts bucket with `anchor-gating` on
+    // (the default), the query is analyzed ONCE — its quoted spans and
+    // same-pipeline analyzer terms (the bucket's tokenizer, CJK included)
+    // are probed against the first route's derived index by POSTINGS
+    // COUNT (≤ lexical::MAX_PROBES small FTS queries at the cap; a
+    // head-position saturation tie escalates to exact counts, D-8.4);
+    // every df≥1 candidate is an anchor and the RAREST (verdict head, the
+    // argmin) becomes the MUST constraint of the gated Boolean FTS query.
+    // `None` = analysis not applicable (semantic mode / fts off / knob
+    // off) or degraded (probe error — current behavior, one stderr note);
+    // `Some(vec![])` = analyzed, no anchor exists (every candidate df=0 —
+    // the ungated behavior IS the answer). The SEMANTIC arm never sees
+    // the gate: a misjudged anchor costs the lexical ENHANCEMENT, never a
+    // result.
     let anchor_gating_on = mode != SearchMode::Semantic
         && shared.fts_of(&input.bucket) == Some(true)
         && shared.anchor_gating_of(&input.bucket) != Some(false);
@@ -1635,11 +1640,20 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
             if !anchors_settled {
                 anchors_settled = true;
                 if anchor_gating_on {
+                    // T17 (D-8.2/D-8.3): the bucket's CONFIGURED tokenizer
+                    // (F-4: query-time resolvable; the icu default mirrors
+                    // what an unconfigured optimize builds) drives the
+                    // analyze() half of the candidate extraction — the
+                    // same pipeline the index was built with.
+                    let tokenizer = shared
+                        .fts_tokenizer_of(&input.bucket)
+                        .unwrap_or(crate::pipeline::config::FtsTokenizer::Icu);
                     match crate::lexical::analyze_anchors(
                         lexical.as_ref(),
                         &state.storage,
                         &input.bucket,
                         &spec.index_name,
+                        tokenizer,
                         text,
                     )
                     .await
@@ -1906,15 +1920,17 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
             ),
         );
     }
-    // R1 observability, the restrained response-face form: `anchors` appears
-    // BESIDE `hits` exactly when the anchor analysis RAN — the VERDICT list,
-    // rarest-first (v2): the FIRST entry is the MUST term the lexical arm
-    // was gated on, further entries are anchors riding the ranking body; an
-    // empty array = analyzed, nothing is rare enough (pure CJK /
-    // structure-word queries — the ungated behavior). Absent = the analysis
-    // was not applicable (semantic mode, fts off, `anchor-gating = false`)
-    // or degraded (probe failure — see the stderr note); never a hit-level
-    // member.
+    // R1/T17 observability, the restrained response-face form: `anchors`
+    // appears BESIDE `hits` exactly when the anchor analysis RAN — the
+    // VERDICT list, df ASCENDING (v3, D-8.7): the FIRST entry is the MUST
+    // term the lexical arm was gated on (the argmin-df candidate, its df
+    // absolute value no longer a display filter — narrative corpora gate
+    // on df-hundreds entities and the member must say so), further
+    // entries are probed candidates riding the ranking body; an empty
+    // array = analyzed, every candidate is corpus-absent (df=0 — the
+    // ungated behavior). Absent = the analysis was not applicable
+    // (semantic mode, fts off, `anchor-gating = false`) or degraded
+    // (probe failure — see the stderr note); never a hit-level member.
     if let Some(a) = &anchors {
         body.insert("anchors".into(), json!(a));
     }
@@ -4860,12 +4876,12 @@ mod tests {
     }
 
     /// The R1 anchor corpus at wire scale: the needle's anchor terms are
-    /// df-small against [`crate::lexical::ANCHOR_DF_CEILING`] while the
-    /// filler words are df-huge (700 filler lines ≈ 2000 chunks — filler
-    /// counts read as the probe cap). One needle source carries both
-    /// anchors at high tf; one TOC-shaped source is dense with the
-    /// query's structure words and carries NO anchor (the experiment-G
-    /// flooding shape in miniature).
+    /// df-small (the needle's own chunks) while the filler words are
+    /// df-huge (700 filler lines ≈ 2000 chunks — filler counts read as
+    /// the probe cap). One needle source carries both anchors at high tf;
+    /// one TOC-shaped source is dense with the query's structure words
+    /// and carries NO needle anchor (the experiment-G flooding shape in
+    /// miniature).
     async fn anchor_fixture(extra: &str) -> Fixture {
         let f = fixture_with(tiny_fts_extra_config(extra)).await;
         // ~600 chunks of filler (token-window 32/8: ~24-token stride)
@@ -4909,16 +4925,24 @@ mod tests {
         f
     }
 
-    /// R1 wire: the origin-query FORM through `/x-vf/Search` keyword mode —
-    /// the response carries `anchors` beside `hits` exactly when the
-    /// analysis ran, the gate leaves only anchor-carrying chunks on the
-    /// lexical arm, pure-CJK queries analyze to zero anchors (the ungated
-    /// behavior), and semantic mode never runs the analysis.
+    /// R1→T17 wire: the origin-query FORM through `/x-vf/Search` keyword
+    /// mode — the response carries `anchors` beside `hits` exactly when
+    /// the analysis ran (the verdict = every df≥1 candidate, df ascending,
+    /// analyzer spellings: coding stems to `code`), the gate (verdict head
+    /// = argmin-df) leaves only head-carrying chunks on the lexical arm,
+    /// pure-CJK queries analyze to NON-empty anchors now (the analyzer
+    /// terms — the R1 blind spot fixed; the 恒门: structure-word queries
+    /// gate too), and semantic mode never runs the analysis.
     #[tokio::test]
     async fn anchor_gating_wire_gates_lexical_arm_and_reports_anchors() {
         let f = anchor_fixture("").await;
 
-        // the origin form: anchors found, every keyword hit is the needle
+        // the origin form: the T17 verdict — analyzer terms in the index's
+        // own spellings (ThoughtWorks→thoughtwork is df=0 here: the corpus
+        // never spells it, so it drops; coding→code), df ASCENDING:
+        // vibe/code/变化 are df=1 (needle's single vibe-carrying chunk),
+        // 技术/雷达 df=2 (the TOC's two chunks) — the head (vibe) is the
+        // gate, exactly the R1 acceptance shape
         let (st, _, b) = call_json(
             &f,
             "/x-vf/Search",
@@ -4931,19 +4955,23 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "{b}");
         assert_eq!(
             b["anchors"],
-            json!(["vibe", "coding"]),
-            "the analysis verdict rides the response"
+            json!(["vibe", "code", "变化", "技术", "雷达"]),
+            "the analysis verdict rides the response: every df>=1 candidate, \
+             df ascending, analyzer spellings (coding->code)"
         );
         let hits = b["hits"].as_array().unwrap();
         assert!(!hits.is_empty(), "the needle survives the gate: {b}");
         assert!(
             hits.iter()
                 .all(|h| h["location"]["key"] == json!("docs/needle.txt")),
-            "only anchor-carrying chunks return: {b}"
+            "only head-carrying chunks return (the head is vibe): {b}"
         );
 
-        // pure CJK: analyzed, zero anchors — the ungated behavior (the TOC
-        // flooder legitimately matches the structure words)
+        // pure CJK: NON-empty anchors — the T17 fix (v1 analyzed pure-CJK
+        // to zero candidates). The verdict is df-ascending over the
+        // analyzer's CJK terms, the head (技术, first-seen among the TOC's
+        // df ties) gates the lexical arm onto the TOC flooder — the 恒门:
+        // structure words gate on their argmin, no zero-anchor escape
         let (st, _, b) = call_json(
             &f,
             "/x-vf/Search",
@@ -4952,7 +4980,12 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{b}");
-        assert_eq!(b["anchors"], json!([]), "CJK analyzes to zero anchors");
+        assert_eq!(
+            b["anchors"],
+            json!(["平台", "工具", "技术", "雷达"]),
+            "CJK terms analyze to candidates — df ascending: 平台/工具 live in \
+             one TOC chunk (df=1, first-seen order), 技术/雷达 straddle both (df=2)"
+        );
         let hits = b["hits"].as_array().unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0]["location"]["key"], json!("docs/toc.txt"), "{b}");
@@ -4985,7 +5018,7 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "{b}");
         assert_eq!(
             b["anchors"],
-            json!(["vibe", "coding"]),
+            json!(["vibe", "code", "变化", "技术", "雷达"]),
             "hybrid analyzes and gates exactly like keyword mode: {b}"
         );
         let hits = b["hits"].as_array().unwrap();
@@ -5376,12 +5409,16 @@ mod tests {
 
         // ---- hybrid (rrf): BM25 rank-1 contribution fuses it into the head ----
         // (fixture df diagnostics — a calibration input recorded in
-        // lexical::ANCHOR_DF_CEILING's doc: all three terms of the query
-        // are df=1 in THREE DIFFERENT chunks (the coined sentence straddles
-        // the 32-token window), which is exactly the shape that ruled out
-        // AND-of-all-anchors gating — the v2 gate takes the verdict HEAD.
-        // NOTE the scores below are gated-query scores (must+should Boolean
-        // sum) for anchoring terms; the COUNT is unaffected by gating)
+        // lexical::select_anchors' history table: all three terms of the
+        // query are df=1 in THREE DIFFERENT chunks (the coined sentence
+        // straddles the 32-token window), which is exactly the shape that
+        // ruled out AND-of-all-anchors gating — the v2 gate takes the
+        // verdict HEAD. NOTE the probe strings below are the RAW words;
+        // under T17 the candidates carry the analyzer's STEMMED spellings
+        // (zxqwibble→zxqwibbl, migration→migrat) — the raw probe still
+        // counts the same postings (the query-side stemmer maps both
+        // spellings onto the same index token); the COUNT is unaffected by
+        // gating)
         for t in ["zxqwibble", "migration", "gate"] {
             let (_, _, pb) = call_json(
                 &f,
@@ -5404,14 +5441,12 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{b}");
-        // the v2 verdict on this corpus: all three df=1 terms are anchors,
-        // rarest-first with ties in query order — the GATE is the head
-        // (zxqwibble), the fellow anchors ride `should`
-        assert_eq!(
-            b["anchors"],
-            json!(["zxqwibble", "migration", "gate"]),
-            "{b}"
-        );
+        // the T17 verdict on this corpus: all three terms are df=1
+        // (probed in the analyzer's STEMMED spellings — the index's own
+        // tokens), rarest-first with ties in query order — the GATE is the
+        // head (zxqwibbl, first-seen among the ties), the fellow anchors
+        // ride `should`
+        assert_eq!(b["anchors"], json!(["zxqwibbl", "migrat", "gate"]), "{b}");
         let hybrid_keys: Vec<&str> = b["hits"]
             .as_array()
             .unwrap()

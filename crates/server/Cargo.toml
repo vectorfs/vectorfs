@@ -97,6 +97,17 @@ lance-io = { version = "14.0.2", default-features = false }
 # crates compiled. default-features = false for the same red-line reason.
 lance = { version = "14.0.2", default-features = false }
 
+# T17 (narrative-recall design §1 D-8.2): the query-side analyzer must be the
+# SAME six-stage pipeline the FTS index builds (IcuTokenizer[dict] ->
+# RemoveLongFilter(40) -> LowerCaser -> Stemmer(English) ->
+# StopWordFilter[icu: all languages] -> AsciiFoldingFilter; ngram per
+# apply_ngram_defaults). lance-index assembles it from this crate, so the
+# query side depends on it directly and assembles the identical chain —
+# token-level差分断言 (lexical.rs tests) guards the mirror. Same version
+# already in tree via lance-index -> zero new crates. default-features =
+# false: its only defaults are the jieba/lindera model backends we never use.
+lance-tokenizer = { version = "14.0.2", default-features = false }
+
 url = "2"
 async-trait = "0.1"
 

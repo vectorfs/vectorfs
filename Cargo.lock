@@ -6869,6 +6869,7 @@ dependencies = [
  "image",
  "lance",
  "lance-io",
+ "lance-tokenizer",
  "lancedb",
  "mailparse",
  "object_store 0.14.2",
