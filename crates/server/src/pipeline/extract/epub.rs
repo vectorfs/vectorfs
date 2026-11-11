@@ -44,8 +44,11 @@
 //!
 //! # The OCF walk (container.xml → OPF → spine)
 //!
-//! 1. the zip's FIRST entry must be `mimetype` holding exactly
-//!    `application/epub+zip` (the OCF container contract — the one cheap,
+//! 1. the zip's FIRST entry must be `mimetype` holding
+//!    `application/epub+zip` up to ASCII-whitespace padding (strict OCF says
+//!    unpadded, real-world producers ship CRLF/LF and the reader ecosystem
+//!    tolerates it — see the check site for the deliberate-deviation note;
+//!    the OCF container contract otherwise — the one cheap,
 //!    mechanical integrity check the format itself prescribes; anything
 //!    else is not an epub and fails loudly here, not as a weird parse
 //!    error three steps later);
@@ -192,7 +195,14 @@ fn spine_children(bytes: &[u8]) -> Result<Vec<ChildDoc>, PipelineError> {
         .read_to_end(&mut mt)
         .map_err(|e| PipelineError::extract(format!("epub: reading the mimetype entry: {e}")))?;
     budget.charge("mimetype", mt.len() as u64)?;
-    if mt != EPUB_MIME.as_bytes() {
+    // Strict OCF says the mimetype content is UNPADDED (no leading/trailing
+    // whitespace) — but real-world producers (mostly Windows tooling) ship
+    // CRLF/LF padding, and the wider reader ecosystem (calibre et al.)
+    // tolerates it; the mimetype is advisory metadata (container.xml/OPF
+    // drive everything), so refusing a whole book over it is hostile to the
+    // files-in-product-out contract. We trim ASCII whitespace before the
+    // equality check — a DELIBERATE, documented deviation from strict OCF.
+    if mt.trim_ascii() != EPUB_MIME.as_bytes() {
         return Err(PipelineError::extract(format!(
             "epub: the mimetype entry holds '{}', not '{EPUB_MIME}' — the OCF container \
              contract is violated; this is not a valid .epub file",
@@ -688,6 +698,41 @@ pub(crate) mod tests {
         let wrong = zip.finish().unwrap().into_inner();
         let err = unpack(&wrong).unwrap_err();
         assert!(err.to_string().contains("holds 'application/zip'"), "{err}");
+        // (c′) mimetype with CRLF padding — real-world producers ship this
+        // (the deliberate OCF tolerance, see the check site): PASSES, and
+        // yields the same verdict as the clean form
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file(
+            "mimetype",
+            opts.compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+        zip.write_all(b"application/epub+zip\r\n").unwrap();
+        zip.start_file("META-INF/container.xml", opts).unwrap();
+        zip.write_all(
+            b"<container><rootfiles><rootfile full-path=\"content.opf\"/></rootfiles></container>",
+        )
+        .unwrap();
+        zip.start_file("content.opf", opts).unwrap();
+        zip.write_all(
+            b"<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\">\
+             <metadata/><manifest><item id=\"ch1\" href=\"ch1.xhtml\" \
+             media-type=\"application/xhtml+xml\"/></manifest>\
+             <spine><itemref idref=\"ch1\"/></spine></package>",
+        )
+        .unwrap();
+        zip.start_file("ch1.xhtml", opts).unwrap();
+        zip.write_all(b"<html><body><p>tolerated</p></body></html>")
+            .unwrap();
+        let padded = zip.finish().unwrap().into_inner();
+        let children = unpack(&padded)
+            .unwrap()
+            .expect("CRLF-padded mimetype is tolerated");
+        assert_eq!(
+            children.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["ch1.xhtml"],
+            "the padded-mimetype container still walks to its chapters"
+        );
         // (d) mimetype ok, no META-INF/container.xml
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         zip.start_file(
