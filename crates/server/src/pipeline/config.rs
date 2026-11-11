@@ -215,6 +215,20 @@ struct IngestRaw {
     /// `merge`/`merge-weights` precedent).
     #[serde(rename = "fusion-overfetch", default = "default_fusion_overfetch")]
     fusion_overfetch: u32,
+    /// Anchor gating (R1, recall-quality roadmap): `true` (the DEFAULT) =
+    /// the lexical arm of `/x-vf/Search` first probes the query's Latin
+    /// identifier/quoted terms against the FTS index by POSTINGS COUNT
+    /// (≤8 small single-term FTS queries, 5-25 ms each measured); terms whose df
+    /// is at or under the calibrated ceiling become anchors and the
+    /// RAREST is the MUST constraint of a Boolean FTS query (chunks
+    /// missing it leave the LEXICAL arm only — the semantic arm is
+    /// untouched). `false` = the ungated behavior. TOML key kebab-case.
+    /// Pure query-face policy — EXCLUDED from the pipeline fingerprint;
+    /// INERT on an `fts = false` bucket (no refusal: the fts gate already
+    /// refuses the whole lexical face there, and unlike fts-tokenizer
+    /// this knob changes no index artifact).
+    #[serde(rename = "anchor-gating", default = "default_anchor_gating")]
+    anchor_gating: bool,
 }
 
 fn default_scan_interval_secs() -> usize {
@@ -240,6 +254,9 @@ fn default_fts_tokenizer() -> String {
 }
 fn default_fusion_overfetch() -> u32 {
     1
+}
+fn default_anchor_gating() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +645,12 @@ pub struct IngestConfig {
     /// candidate pool behind a ranking is fetched, never chunk identity,
     /// so it stays OUT of the pipeline fingerprint.
     pub fusion_overfetch: u32,
+    /// Anchor gating (R1): default TRUE — the lexical arm of `/x-vf/Search`
+    /// probes high-IDF query terms and Boolean-gates on them (see
+    /// [`crate::lexical`] for the mechanism). Query-face policy like
+    /// `fusion_overfetch` — OUT of the pipeline fingerprint; inert on an
+    /// fts-off bucket.
+    pub anchor_gating: bool,
 }
 
 impl PipelineConfig {
@@ -1054,6 +1077,7 @@ pub fn load_pipeline_config(text: &str) -> Result<PipelineConfig, PipelineError>
                 fts_tokenizer,
                 rerank,
                 fusion_overfetch: rawi.fusion_overfetch,
+                anchor_gating: rawi.anchor_gating,
             },
         );
     }
@@ -1279,11 +1303,12 @@ fn canonical_charset(
 /// itself, since M3-T11 the WHOLE rerank knob — switch AND model
 /// reference: a reranker model is query-side ranking policy, not an index
 /// definition the way an embedder model is, so swapping it must never
-/// demand a reindex — and since R3b `fusion-overfetch`: retrieval depth
-/// policy, same reasoning) and claim-only fields (`include`, `exclude`,
-/// `index-prefix` — v3.1 R5) are deliberately EXCLUDED: they never change
-/// chunk identity, so changing them must not invalidate completion
-/// markers. The same logic puts
+/// demand a reindex — since R3b `fusion-overfetch`: retrieval depth
+/// policy, same reasoning — and since R1 `anchor-gating`: lexical-arm
+/// gating policy, same reasoning) and claim-only fields (`include`,
+/// `exclude`, `index-prefix` — v3.1 R5) are deliberately EXCLUDED: they
+/// never change chunk identity, so changing them must not invalidate
+/// completion markers. The same logic puts
 /// `max_file_size_mb`/`retries`/`scan_interval_secs`/`store_chunk_text`
 /// outside — they gate or observe, never transform. The charset fallback
 /// is the deliberate exception (normalize.rs module docs): it rewrites
@@ -1543,7 +1568,8 @@ index-prefix = "docs"
                 "[ingest.d]: unknown field 'chunkder' (allowed: include, exclude, extract, \
                  chunk, embedders, merge, merge-weights, index-prefix, scan_interval_secs, \
                  max_file_size_mb, retries, extract_timeout_secs, store_chunk_text, \
-                 charset_fallback, fts, fts-tokenizer, rerank, fusion-overfetch)"
+                 charset_fallback, fts, fts-tokenizer, rerank, fusion-overfetch, \
+                 anchor-gating)"
             ),
             "{msg}"
         );

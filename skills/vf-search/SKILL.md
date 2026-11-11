@@ -45,6 +45,25 @@ CLI (bucket as a bare positional, XOR `--bucket`):
 MCP tool (`vf mcp` or `vectorfs mcp`): `search {bucket, text, topK, filter?,
 returnText}` — same semantics, camelCase.
 
+### Anchor gating (R1 — automatic, default on for fts buckets)
+
+On `keyword`/`hybrid` text queries the daemon first probes the query's
+Latin identifier runs and quoted spans by POSTINGS COUNT (≤8 small
+single-term FTS queries, 5-25 ms each measured — ≈ 40-200 ms added per
+query); terms whose df ≤ a calibrated ceiling (16) are anchors, and the
+RAREST gates the **lexical arm** (chunks missing it leave it; the whole
+query stays the ranking body). Pure-CJK queries ride the ungated behavior.
+
+- **Misjudgment cost**: the gate only tightens the lexical arm — the
+  semantic arm is untouched. A misjudged anchor costs the lexical
+  *enhancement*, never a result; worst case is the ungated ranking.
+- The response tells you what happened: an `anchors` array beside `hits`
+  — the verdict rarest-first, the FIRST term is what gated (e.g.
+  `["Vibe"]`); `[]` = analyzed, nothing rare enough; absent = analysis
+  not applicable. The human CLI prints one stderr line.
+- Off switch (server config): `[ingest.<bucket>] anchor-gating = false` —
+  query-face policy, no reindex.
+
 ## Query crafting
 
 - **Prefer `--mode hybrid`** (the recommended everyday mode): exact terms,

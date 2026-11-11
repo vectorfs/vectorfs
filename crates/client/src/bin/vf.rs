@@ -1064,6 +1064,14 @@ async fn search_cmd(args: SearchArgs) {
     // indexed source — the typo signal); --json carries it as a member,
     // the human table reports it on stderr (progress/diagnostics channel)
     let note = v.get("note").and_then(Value::as_str).map(String::from);
+    // R1: the server's anchor analysis (present exactly when it ran — the
+    // verdict list, rarest-first: the FIRST term is what gated the lexical
+    // arm); same channel split as the note: --json member / human-mode
+    // stderr line
+    let anchors = v
+        .get("anchors")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>());
     if args.json {
         let mut out = json!({
             "schema_version": SCHEMA_VERSION,
@@ -1075,6 +1083,9 @@ async fn search_cmd(args: SearchArgs) {
         if let Some(n) = &note {
             out["note"] = json!(n);
         }
+        if let Some(a) = &anchors {
+            out["anchors"] = json!(a);
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&out).expect("serializes")
@@ -1083,6 +1094,18 @@ async fn search_cmd(args: SearchArgs) {
     }
     if let Some(n) = &note {
         eprintln!("note: {n}");
+    }
+    if let Some(a) = &anchors {
+        // the restrained human form: one diagnostics line, present iff the
+        // analysis ran; an empty list says "analyzed, nothing gated"
+        match a.is_empty() {
+            false => eprintln!(
+                "anchors (gated the lexical arm on {}): {}",
+                a[0],
+                a.join(", ")
+            ),
+            true => eprintln!("anchors: none rare enough — lexical arm ungated"),
+        }
     }
     // human table (deterministic: server order is score desc, key asc);
     // image hits have no text channel — the SOURCE column carries the 回源,

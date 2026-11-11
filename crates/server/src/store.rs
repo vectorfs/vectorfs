@@ -138,6 +138,7 @@ use lancedb::arrow::arrow_schema::{ArrowError, DataType, Field, Fields, Schema};
 // GetVectors / ListVectors / DeleteVectors all share this discipline; M1 T5
 // extends it to metadata predicates via crate::filter).
 use lancedb::expr::{col, is_in, lit};
+use lancedb::index::scalar::{BooleanQuery, FtsQuery, MatchQuery, Occur, Operator};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, DistanceType, Table};
 
@@ -1549,6 +1550,92 @@ impl Storage {
         let fts = lancedb::index::scalar::FullTextSearchQuery::new(query.to_string())
             .with_column(TEXT_COLUMN.to_string())
             .map_err(internal)?;
+        let mut q = table
+            .query()
+            .full_text_search(fts)
+            .limit(top_k + if filter.is_some() { TIE_SLACK } else { 0 });
+        if let Some(p) = pred {
+            q = q.only_if_expr(p);
+        }
+        let stream = q.execute().await.map_err(internal)?;
+        let mut hits: Vec<KeywordHit> = Vec::new();
+        let mut stream = stream;
+        use futures_util::StreamExt;
+        while let Some(batch) = stream.next().await {
+            hits.extend(keyword_hits_from_batch(&batch.map_err(internal)?)?);
+        }
+        if let Some(f) = filter {
+            hits.retain(|h| f.eval(h.metadata.as_ref().unwrap_or(&serde_json::Value::Null)));
+        }
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        hits.truncate(top_k);
+        Ok(hits)
+    }
+
+    /// Anchor-gated BM25 search (R1, reached ONLY through the
+    /// [`crate::lexical::LexicalKernel::search_gated`] seam): a Boolean FTS
+    /// query — `must` = one Match over the anchor terms with operator `And`
+    /// (every anchor token present, a CONSTRAINT), `should` = the original
+    /// query string as a plain Match (the ranking body). Lance's Boolean
+    /// semantics are exactly the R1 shape: documents enter through the
+    /// must-conjunction; should-only documents are EXCLUDED once a must
+    /// clause exists, and the should score only adds to docs already in —
+    /// 不含锚词的块（目录扩散块）直接出局词法路, the正解 anchors its rank
+    /// (research/2026-11-recall-quality-optimization.md §3 R1).
+    ///
+    /// Same contract as [`Storage::keyword_search`] otherwise: pre-T9 table
+    /// dies loud with the optimize fix, filter is the same pushdown +
+    /// exact-blob post-filter with the TIE_SLACK over-fetch, output is
+    /// (score desc, key asc) truncated to `top_k`. Scores are the Boolean
+    /// sum (must BM25 + should BM25 when matched) — same
+    /// corpus-statistics-dependent caveat, comparable within one ranking.
+    ///
+    /// `must` empty or `should` empty is a caller bug (the query face gates
+    /// on non-empty anchors and a non-empty query text); an empty must with
+    /// a non-empty should would silently degrade to the ungated behavior,
+    /// so refuse it here rather than at every caller.
+    pub async fn keyword_search_gated(
+        &self,
+        vb: &str,
+        ix: &str,
+        must: &[String],
+        should: &str,
+        top_k: usize,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<KeywordHit>, StoreError> {
+        if must.is_empty() || should.trim().is_empty() {
+            return Err(StoreError::Internal(format!(
+                "gated keyword search needs at least one must term and a non-empty should query \
+                 (got {} must terms, should {should:?})",
+                must.len()
+            )));
+        }
+        let table = self.open_table(vb, ix).await?;
+        let schema = table.schema().await.map_err(internal)?;
+        if schema.field_with_name(TEXT_COLUMN).is_err() {
+            return Err(StoreError::Validation(format!(
+                "index {vb}/{ix} has no '{TEXT_COLUMN}' column — its rows predate the lexical \
+                 layer (M3-T9); run `vectorfs optimize` to migrate the derived table (adds the \
+                 column, backfills chunk texts, builds the FTS index), then retry the keyword \
+                 search"
+            )));
+        }
+        let cols = mirror_columns(schema.as_ref());
+        let pred = filter.and_then(|f| f.pushdown(&cols));
+        let anchors = MatchQuery::new(must.join(" "))
+            .with_operator(Operator::And)
+            .into();
+        let ranking = MatchQuery::new(should.to_string()).into();
+        let boolean = BooleanQuery::new([(Occur::Must, anchors), (Occur::Should, ranking)]);
+        let fts =
+            lancedb::index::scalar::FullTextSearchQuery::new_query(FtsQuery::Boolean(boolean))
+                .with_column(TEXT_COLUMN.to_string())
+                .map_err(internal)?;
         let mut q = table
             .query()
             .full_text_search(fts)
@@ -3692,6 +3779,296 @@ mod tests {
             hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
             vec!["k001"],
             "only the matching row survives the filter"
+        );
+    }
+
+    /// The R1 gated-kernel contract, engine-direct. The corpus carries the
+    /// R1 shapes: anchor-bearing chunks, a one-anchor chunk, and structure-
+    /// word-only chunks. The gate must (a) drop every chunk missing an
+    /// anchor term, (b) demand ALL anchors (operator And), (c) still rank
+    /// survivors by the query's full BM25 signal (should contributes,
+    /// determinism holds), and (d) compose with top_k and the $-filter
+    /// exactly like the ungated face. The toy corpus is NOT where the
+    /// rare-vs-common probe separation lives (idf spans need corpus scale —
+    /// see [`fts_anchor_driver_count_probe_end_to_end`]); here it is
+    /// the SET semantics that are pinned.
+    #[tokio::test]
+    async fn fts_gated_search_filters_on_must_and_ranks_on_should() {
+        let dim = 4;
+        let texts = [
+            // k000: structure words only, no anchor
+            "技术雷达 技术雷达 平台 工具 语言 平台 工具 语言 技术雷达",
+            // k001: the needle — both anchors inside a structure-word frame
+            "自满于 AI 生成的代码 vibe coding 的采用与变化 技术雷达",
+            // k002: ONE anchor only — the And gate must exclude it
+            "vibe 单独出现的一段 技术雷达 平台",
+            // k003: second needle, fewer structure words
+            "vibe coding 相关讨论的变化",
+        ];
+        let storage = setup_metric("ixgate", vec![text_rows(dim, &texts)], dim, "cosine").await;
+        storage
+            .ensure_fts_index("vb", "ixgate", "icu")
+            .await
+            .unwrap();
+
+        // the contrast: ungated, every chunk matching ANY query term is in
+        // (k000 rides the structure words, k002 rides one anchor) — the
+        // flooding the gate exists to cut
+        let ungated = storage
+            .keyword_search("vb", "ixgate", "技术雷达 vibe coding 变化", 10, None)
+            .await
+            .unwrap();
+        let ungated_keys: Vec<&str> = ungated.iter().map(|h| h.key.as_str()).collect();
+        assert_eq!(
+            ungated_keys.len(),
+            4,
+            "ungated: everything matches something"
+        );
+        assert!(ungated_keys.contains(&"k000") && ungated_keys.contains(&"k002"));
+
+        // (a)+(b): gated on BOTH anchors — only chunks carrying vibe AND
+        // coding survive; k000 (neither) and k002 (vibe only) are OUT
+        let must = vec!["vibe".to_string(), "coding".to_string()];
+        let gated = storage
+            .keyword_search_gated("vb", "ixgate", &must, "技术雷达 vibe coding 变化", 10, None)
+            .await
+            .unwrap();
+        let mut keys: Vec<&str> = gated.iter().map(|h| h.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["k001", "k003"],
+            "must filters; And is strict (k002 has vibe only)"
+        );
+        // (c): ranking among survivors follows the full query's BM25 —
+        // k001 matches the structure words too, so it leads k003
+        assert!(gated[0].key == "k001" || gated[0].key == "k003"); // order pinned below by score
+        assert!(gated[0].score >= gated[1].score, "score desc holds");
+        assert!(gated[0].score > 0.0);
+
+        // (d): top_k truncation keeps the best; the $-filter composes
+        let top1 = storage
+            .keyword_search_gated("vb", "ixgate", &must, "vibe coding", 1, None)
+            .await
+            .unwrap();
+        assert_eq!(top1.len(), 1);
+        let filter = Filter::compile(&json!({"i": {"$gte": 3}})).unwrap();
+        let filtered = storage
+            .keyword_search_gated(
+                "vb",
+                "ixgate",
+                &must,
+                "技术雷达 vibe coding 变化",
+                10,
+                Some(&filter),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            filtered.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+            vec!["k003"],
+            "only the filter-matching survivor returns"
+        );
+
+        // a must term absent from the corpus gates EVERYTHING out — that is
+        // why the analyzer never anchors corpus-absent terms
+        let ghost = storage
+            .keyword_search_gated(
+                "vb",
+                "ixgate",
+                &["zxqwibble".to_string()],
+                "技术雷达 变化",
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(ghost.is_empty(), "an absent must term yields zero hits");
+
+        // the caller contract: empty must / empty should is refused, not
+        // silently ungated
+        assert!(matches!(
+            storage
+                .keyword_search_gated("vb", "ixgate", &[], "q", 10, None)
+                .await,
+            Err(StoreError::Internal(_))
+        ));
+        assert!(matches!(
+            storage
+                .keyword_search_gated("vb", "ixgate", &must, "  ", 10, None)
+                .await,
+            Err(StoreError::Internal(_))
+        ));
+    }
+
+    /// The R1 kernel seam, end to end against the real engine: the dyn
+    /// kernel's count probe (default impl = hit count of the plain search
+    /// at the probe cap) reads the corpus's df table, and search_gated
+    /// rides the Boolean path — the exact faces `/x-vf/Search` dispatches
+    /// through.
+    #[tokio::test]
+    async fn fts_kernel_probe_and_gated_seam_against_the_engine() {
+        let dim = 4;
+        let texts = [
+            "技术雷达 平台 工具 语言 技术雷达 平台 工具",
+            "自满于 AI 生成的代码 vibe coding 的采用与变化 技术雷达",
+            "vibe coding 相关讨论",
+        ];
+        let storage = setup_metric("ixseam", vec![text_rows(dim, &texts)], dim, "cosine").await;
+        storage
+            .ensure_fts_index("vb", "ixseam", "icu")
+            .await
+            .unwrap();
+
+        let kernel = crate::lexical::kernel();
+        assert_eq!(kernel.name(), "lance-fts");
+        // the probe CONTRACT (v2, count form): a probe is exactly the hit
+        // count of the plain search capped at lexical::PROBE_DF_LIMIT, and
+        // an absent term probes 0 (the analyzer's never-anchor case)
+        let vibe = kernel
+            .probe_df(&storage, "vb", "ixseam", "vibe")
+            .await
+            .unwrap();
+        let plain = storage
+            .keyword_search("vb", "ixseam", "vibe", crate::lexical::PROBE_DF_LIMIT, None)
+            .await
+            .unwrap();
+        assert_eq!(vibe, plain.len() as u64);
+        assert_eq!(vibe, 2, "df: both vibe-carrying chunks count");
+        let tf2 = kernel
+            .probe_df(&storage, "vb", "ixseam", "平台")
+            .await
+            .unwrap();
+        assert_eq!(tf2, 1, "df counts CHUNKS: 平台 has tf 2 in k000 alone");
+        let ghost = kernel
+            .probe_df(&storage, "vb", "ixseam", "zxqwibble")
+            .await
+            .unwrap();
+        assert_eq!(ghost, 0, "absent terms probe 0");
+
+        // gated through the trait object: only the anchor-carrying chunks
+        // (the MUST list here is a test choice — the query face passes the
+        // verdict head; the Boolean face accepts any list)
+        let hits = kernel
+            .search_gated(
+                &storage,
+                "vb",
+                "ixseam",
+                &["vibe".to_string(), "coding".to_string()],
+                "技术雷达 vibe coding 变化",
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+            vec!["k001", "k002"],
+            "the dyn face gates exactly like the engine-direct call"
+        );
+    }
+
+    /// The full R1 v2 driver against the real engine: the df ceiling
+    /// ([`crate::lexical::ANCHOR_DF_CEILING`]) is corpus-SCALE-free (a
+    /// count, not a BM25 score), so a 3k-row fixture exercises it directly
+    /// — candidates → count probes → anchors → gated hits end to end: the
+    /// origin-query form's verdict is the df-1 term (vibe), the v2 gate
+    /// (verdict head) leaves exactly the needle chunk on the lexical arm.
+    #[tokio::test]
+    async fn fts_anchor_driver_count_probe_end_to_end() {
+        let dim = 4;
+        // 2998 filler rows + 1 TOC-shaped row + 1 needle row (vibe and
+        // coding both df=1 — the rare band; filler df=2998 reads as the
+        // probe CAP, far over the ceiling)
+        let mut texts: Vec<String> = (0..2998)
+            .map(|i| format!("filler text number {i} of the corpus"))
+            .collect();
+        texts.push("技术雷达 平台 工具 语言 技术雷达 平台 工具 语言".to_string());
+        texts.push("AI vibe vibe coding 变化".to_string());
+        let rows: Vec<VectorRow> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let meta = json!({
+                    "i": i,
+                    "x-vf-chunk-text": t,
+                    "x-vf-src-name": format!("docs/{i}.txt"),
+                });
+                row_with_text(
+                    &format!("k{:04}", i),
+                    lcg_vec(i as u64 + 7, dim),
+                    meta,
+                    Some(t),
+                )
+            })
+            .collect();
+        let storage = setup_metric("ixdrv", vec![rows], dim, "cosine").await;
+        storage
+            .ensure_fts_index("vb", "ixdrv", "icu")
+            .await
+            .unwrap();
+
+        let kernel = crate::lexical::kernel();
+        // the needle's df is under the ceiling; the filler's reads as the
+        // probe cap (2998 → 64), far over it
+        let vibe = kernel
+            .probe_df(&storage, "vb", "ixdrv", "vibe")
+            .await
+            .unwrap();
+        let filler = kernel
+            .probe_df(&storage, "vb", "ixdrv", "filler")
+            .await
+            .unwrap();
+        assert_eq!(vibe, 1, "df=1 is the rare band");
+        assert!(
+            vibe <= crate::lexical::ANCHOR_DF_CEILING,
+            "the needle term anchors"
+        );
+        assert!(
+            filler > crate::lexical::ANCHOR_DF_CEILING,
+            "df≥cap stays over the ceiling: {filler}"
+        );
+        assert_eq!(
+            filler as usize,
+            crate::lexical::PROBE_DF_LIMIT,
+            "the cap saturates: df 2998 reads as the cap"
+        );
+
+        // the origin-query form through the full driver: the verdict is
+        // the rarest-first list, head = the v2 MUST term
+        let anchors = crate::lexical::analyze_anchors(
+            kernel.as_ref(),
+            &storage,
+            "vb",
+            "ixdrv",
+            "技术雷达中 vibe coding 技术有哪些变化",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            anchors,
+            vec!["vibe", "coding"],
+            "rarest first (both df=1, tie keeps query order)"
+        );
+
+        // and the gated arm the query face would run under the v2 ruling
+        // (MUST = the verdict head): the needle chunk is the ONLY hit
+        let hits = kernel
+            .search_gated(
+                &storage,
+                "vb",
+                "ixdrv",
+                std::slice::from_ref(&anchors[0]),
+                "技术雷达中 vibe coding 技术有哪些变化",
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+            vec!["k2999"],
+            "the gate leaves exactly the anchor-carrying chunk"
         );
     }
 

@@ -288,6 +288,12 @@ pub(crate) struct BucketPlan {
     /// behavior). Query-side retrieval policy like `merge` — never chunk
     /// identity, outside the pipeline fingerprint.
     pub(crate) fusion_overfetch: u32,
+    /// Anchor gating (R1): whether the lexical arm of `/x-vf/Search`
+    /// probes high-IDF query terms and Boolean-gates on them (default
+    /// true; see [`crate::lexical`]). Query-face policy like
+    /// `fusion_overfetch` — outside the fingerprint, inert when `fts` is
+    /// off.
+    pub(crate) anchor_gating: bool,
     /// The normalize charset entry's fallback (M3-T7), resolved ONCE at
     /// load from the config's canonical name (config.rs validated the
     /// label at parse) and threaded to BOTH normalize call sites — the
@@ -1117,6 +1123,7 @@ impl IngestCore {
                     fts: icfg.fts,
                     fts_tokenizer: icfg.fts_tokenizer,
                     fusion_overfetch: icfg.fusion_overfetch,
+                    anchor_gating: icfg.anchor_gating,
                     charset_fallback: encoding_rs::Encoding::for_label(
                         icfg.charset_fallback.as_bytes(),
                     )
@@ -2759,6 +2766,15 @@ impl IngestShared {
     /// outside the pipeline fingerprint.
     pub fn fusion_overfetch_of(&self, bucket: &str) -> Option<u32> {
         self.core.buckets.get(bucket).map(|p| p.fusion_overfetch)
+    }
+
+    /// The bucket's anchor-gating switch (R1): `true` (the default) = the
+    /// lexical arm of `/x-vf/Search` runs the anchor analysis and gates on
+    /// high-IDF terms. Query-face policy — outside the pipeline
+    /// fingerprint; meaningless on an fts-off bucket (the whole lexical
+    /// face is refused there).
+    pub fn anchor_gating_of(&self, bucket: &str) -> Option<bool> {
+        self.core.buckets.get(bucket).map(|p| p.anchor_gating)
     }
 
     /// Derived-index specs of one bucket, config embedder order.

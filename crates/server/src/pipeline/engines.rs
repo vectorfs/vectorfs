@@ -28,7 +28,6 @@
 //! bump either without this module and CI goes red, not the runtime silent.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 /// The pdfium BINARY pin this build expects (`PDFIUM_RELEASE` in
 /// scripts/runtime_lib_pins.sh — the fetch script and the Dockerfile
@@ -76,14 +75,16 @@ pub fn engine_versions_owned() -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The workspace root for the parity tests below (`crates/server/../..`).
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::path::PathBuf;
+
+    /// The workspace root for the parity tests below (`crates/server/../..`).
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
 
     /// The .so pins must equal the fetch script's single source of truth —
     /// bumping `runtime_lib_pins.sh` without this module (or vice versa)
