@@ -28,10 +28,16 @@ R1–R4 已按雷达语料的病根落地，但在叙事类语料（长篇小说
   TOC 页概念，`Part.sections` 为空、前缀退化为常量文件名 stem（`ChunkCtx` 仅此一字段，
   `windowing.rs:114-132`），整部小说每个 chunk 的嵌入前缀相同，R2 的章节语境红利为零。
 
-伴随（真 BUG 级，非机制）：T15.4 的 skill 文档义务未执行——vf-search skill 仍称
-"only `x-vf-src-uri` is filterable"，且 `--mode/--rerank/--rerank-depth/--per-source/--kind/
---source` 七个已交付旗标无一记载；`anchors` 观测成员（`ops_xvf.rs` 响应契约）CLI `--json`
-未透传。
+> 修订记录（2026-11-11，评审后）：①「分位数自校准」细化为其退化形态 argmin（0 分位）+ v1
+> 降级语义；②icu_segmenter 直接依赖改为 **lance-tokenizer 同版本线**（同上游 ≠ 同分词：
+> lance 索引侧是六段分析管线，分段级一致不保证 token 级一致）；③章题手术补指纹载体
+> （`chapter-titles` knob，T12 `structure=true` 先例）；④`--at` 钉死恰一源语义（section 是
+> 源内序号）。详见设计文档 §6 评审记录。
+
+伴随发现（v1 误判为真 BUG，评审后更正）：skill 文档义务与 anchors CLI 透传**均已在 HEAD
+清偿**（仓库内 `skills/vf-search/SKILL.md` 已记载七旗标与 anchors 面；透传随 R1 提交 50f32d1
+落地）——会话实测失实源于**部署侧过期**（已安装 `vf` 二进制与 `~/.zcode/skills` 副本旧于
+HEAD）。处置降级为 T18 的部署同步项，非仓库欠账。
 
 ## 2. 目标 / 非目标
 
@@ -67,20 +73,24 @@ R1–R4 已按雷达语料的病根落地，但在叙事类语料（长篇小说
 
 1. **稳定性由构造保证**：R7 的锚词与索引词出自同一上游（crate 版本线对齐 + 差分断言），
    取代 v1 的形状启发式；断言扩展挂 T9「分词差分断言」既有先例；
-2. **章题溯源退级链**：epub 优先解析 NCX/nav 目录标签，退级到子文档首个 heading 行，再退级
-   到子文档名——提取层一次性手术，**CCH（索引面）与 `x-vf-section-title`（查询面）共用**；
-3. **迁移语义**：`x-vf-section-title` stamp 与容器 CCH 前缀都是指纹变更 ⇒ reindex
-   （T13 坐标键同批先例措辞）；docs 桶唯一受影响源是 15,428 chunk 的 epub，代价如实入
-   迁移说明；
+2. **章题溯源退级链（评审后收窄）**：epub 优先解析 NCX/nav 目录标签（EPUB3 `properties="nav"`
+   / EPUB2 `spine@toc`），退级到子文档文件名——**heading 行退级删除**（落点跨层且把行为面
+   泄漏到非 epub 容器）；提取层一次性手术，**CCH（索引面）与 `x-vf-section-title`（查询面）
+   共用**；
+3. **迁移语义（评审后补载体）**：章题解析是行为变化，`EpubConfig` 增 `chapter-titles = true`
+   knob（默认开 + 恒序列化，T12 `structure=true` 先例）⇒ 升级即指纹翻转 ⇒ 指纹门拒启 ⇒
+   强制 reindex 波次；docs 桶受影响源 = 15,428 chunk 的 epub，代价如实入迁移说明；
 4. **orderBy 是扫描序视图不是排序语义**：终局命中集内按 (section, line) 排序、分数保留展示、
    与 mode 正交；与 rerank/kind 排除同类——ranking policy 不入指纹（T11/T12 先例）。
 
 ## 5. 依赖与风险
 
-- **真 BUG 清单（实施期直接修）**：①vf-search skill 过滤句与旗标记载义务（T15.4 遗留）；
-  ②`anchors` 成员 CLI `--json` 透传核验（缺则补线）；
-- 依赖：`icu_segmenter` 显式进 server 依赖树（与 lancedb 锁定版本线对齐——依赖对齐是差分
-  断言的前提）；`ChildDoc` 增 title 字段（extract 手术，additive）；
+- 部署侧同步项（T18 随任务执行，非仓库欠账）：重装过期 `vf` 二进制与 skill 安装副本
+  （F-9 教训：观测结论必须锚定二进制版本）；mcp.rs `SearchParams` 的 searchMode 欠账立
+  backlog（本提案只加 orderBy，不默扩）；
+- 依赖：`lance-tokenizer` 同版本线直接进 server 依赖树（锁内 14.0.2 现成，与 lancedb
+  统一移动——token 级对拍断言的前提）；`ChildDoc`/`Part` 增 title 字段（additive，
+  构造点影响面 27+21 处入 T18 工作量）；
 - 风险：①icu 版本漂移致查询侧与 lance 内部分词漂移——差分断言拦截；②`--at` 的客户端枚举
   成本——T14 early-exit 前缀枚举有界（O(源 chunk 数)，15k 级实测可忽略）；③orderBy 被期望成
   语义排序——文档措辞钉死「扫描序视图」；④epub 章题退级链对无 nav 无 heading 的极端 epub
