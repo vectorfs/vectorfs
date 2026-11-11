@@ -52,15 +52,29 @@
 //! Part NAMES: an attachment's filename when present (provenance/logs —
 //! never routing input), else `part-{n}` in walk order.
 //!
-//! # Guards
+//! # Guards (the 2026-11-11 裁决 2 dual criteria, shared constants)
 //!
 //! The document's own bytes are capped upstream by `max_file_size_mb`;
-//! parts are subsets of the parsed message (mailparse is in-memory,
-//! zero-copy over the input), so the per-child size and count gates the
-//! WORKER already owns are the whole story here. A malformed message
-//! fails loudly (mailparse errs on broken framing); an unpack that finds
-//! no body and no attachment yields zero children and the worker's
-//! "none of its 0 children" Err is the loud verdict.
+//! parts are subsets of the parsed message (mailparse is in-memory and
+//! linear over the input), so unlike the zip-based containers there is no
+//! cheap listing to pre-check — both legs enforce AT PRODUCTION time in
+//! [`EmlGuard::push`], the single door every produced child passes
+//! through:
+//!
+//! * the COUNT leg: at most [`super::CONTAINER_MAX_ENTRIES`] = 4096
+//!   produced parts (the worker's MAX_CHILDREN answers at the same
+//!   number, the 裁决 2 lock-step);
+//! * the RATIO leg: each part's decoded bytes charge
+//!   [`super::ExpansionBudget`] against the message's own size — CTE
+//!   decoding shrinks (base64 → 3/4) and charset transcoding inflates
+//!   ~1.5× at worst, so a real message sits orders of magnitude under
+//!   `× 256`; the leg exists so all three container kinds answer to the
+//!   SAME two constants and the same two-branch refusal vocabulary
+//!   ("too many entries OR an expansion ratio past 256:1 — this one: …").
+//!
+//! A malformed message fails loudly (mailparse errs on broken framing);
+//! an unpack that finds no body and no attachment yields zero children
+//! and the worker's "none of its 0 children" Err is the loud verdict.
 //!
 //! # Affinity: deliberately undeclared
 //!
@@ -114,31 +128,92 @@ impl Extractor for EmlExtractor {
                  transfer): {e}"
             ))
         })?;
-        let mut children = Vec::new();
-        walk_parts(&mail, &mut children, &mut 0)?;
-        Ok(Some(children))
+        let mut guard = EmlGuard::new(bytes.len());
+        walk_parts(&mail, &mut guard)?;
+        Ok(Some(guard.children))
+    }
+}
+
+/// The unpack accumulator and its two bomb-guard legs (2026-11-11 裁决 2 —
+/// module docs): every produced child passes through [`EmlGuard::push`],
+/// the single door where the shared count ceiling and the shared
+/// expansion budget are enforced, so the eml kind answers to the SAME
+/// two constants and the same two-branch refusal vocabulary as epub/zip.
+struct EmlGuard {
+    /// walk-order part counter, for `part-{n}` display names.
+    counter: usize,
+    /// produced children, in walk order.
+    children: Vec<ChildDoc>,
+    /// 裁决 2's ratio leg over the message's own bytes.
+    budget: super::ExpansionBudget,
+    /// the message's own byte size (the ratio's denominator, quoted by
+    /// the count refusal's shared vocabulary).
+    message_bytes: u64,
+}
+
+impl EmlGuard {
+    fn new(message_bytes: usize) -> Self {
+        EmlGuard {
+            counter: 0,
+            children: Vec::new(),
+            budget: super::ExpansionBudget::new("eml", message_bytes),
+            message_bytes: message_bytes as u64,
+        }
+    }
+
+    /// Produce one child: the count leg, then the ratio charge, then the
+    /// push — in that order, so a refusal names the leg that tripped.
+    fn push(
+        &mut self,
+        name: String,
+        mime: impl Into<String>,
+        bytes: Vec<u8>,
+    ) -> Result<(), PipelineError> {
+        if self.children.len() >= super::CONTAINER_MAX_ENTRIES {
+            return Err(PipelineError::extract(format!(
+                "eml: the message's MIME tree expands past the {}-part ceiling — refused as the \
+                 parts are produced; the container bomb guard trips on too many entries OR an \
+                 expansion ratio past {}:1 ({} message bytes × {}), and this message trips the \
+                 ENTRY COUNT; a legitimate mail this fragmented is too large for one source",
+                super::CONTAINER_MAX_ENTRIES,
+                super::CONTAINER_EXPANSION_RATIO,
+                self.message_bytes,
+                super::CONTAINER_EXPANSION_RATIO
+            )));
+        }
+        self.budget.charge(&name, bytes.len() as u64)?;
+        self.children.push(ChildDoc::new(name, mime, bytes));
+        Ok(())
+    }
+
+    /// The part's display name: a `name=`/filename param when present,
+    /// else a stable `part-{n}` in walk order. Never a routing input.
+    fn part_name(&mut self, part: &ParsedMail<'_>) -> String {
+        // non-attachment parts rarely carry names; when one does (a
+        // `name=` param), it is still the honest display name
+        if let Some(name) = part.ctype.params.get("name") {
+            return name.clone();
+        }
+        self.counter += 1;
+        format!("part-{}", self.counter - 1)
     }
 }
 
 /// Depth-first walk of the MIME part tree (module docs: the policy).
-fn walk_parts(
-    part: &ParsedMail<'_>,
-    out: &mut Vec<ChildDoc>,
-    counter: &mut usize,
-) -> Result<(), PipelineError> {
+fn walk_parts(part: &ParsedMail<'_>, guard: &mut EmlGuard) -> Result<(), PipelineError> {
     let mimetype = part.ctype.mimetype.to_ascii_lowercase();
     if mimetype.starts_with("multipart/") {
         for sub in &part.subparts {
-            walk_parts(sub, out, counter)?;
+            walk_parts(sub, guard)?;
         }
         return Ok(());
     }
     // an embedded/attached email: ONE message/rfc822 child, re-routed (the
     // mechanism depth gate bounds the recursion — module docs)
     if mimetype == "message/rfc822" {
-        let name = part_name(part, counter);
+        let name = guard.part_name(part);
         let bytes = part.get_body_raw().map_err(|e| body_err(&name, e))?;
-        out.push(ChildDoc::new(name, EML_MIME, bytes));
+        guard.push(name, EML_MIME, bytes)?;
         return Ok(());
     }
     let disposition = part.get_content_disposition();
@@ -146,7 +221,10 @@ fn walk_parts(
     let is_attachment =
         matches!(disposition.disposition, DispositionType::Attachment) || filename.is_some();
     if is_attachment {
-        let name = filename.unwrap_or_else(|| part_name(part, counter));
+        let name = match filename {
+            Some(f) => f,
+            None => guard.part_name(part),
+        };
         // text/* attachments decode like body parts (charset metadata
         // honored); everything else rides through CTE-decoded and raw
         let bytes = if mimetype.starts_with("text/") {
@@ -164,29 +242,17 @@ fn walk_parts(
         } else {
             mimetype
         };
-        out.push(ChildDoc::new(name, mime, bytes));
+        guard.push(name, mime, bytes)?;
         return Ok(());
     }
     // body text parts (module docs): the part's OWN mime, charset-decoded
     if mimetype == "text/plain" || mimetype == "text/html" {
-        let name = part_name(part, counter);
+        let name = guard.part_name(part);
         let body = part.get_body().map_err(|e| body_err(&name, e))?;
-        out.push(ChildDoc::new(name, mimetype, body));
+        guard.push(name, mimetype, body.into_bytes())?;
     }
     // everything else: rendering resources — deliberately not produced
     Ok(())
-}
-
-/// The part's display name: an attachment's filename (the caller supplies
-/// it), else a stable `part-{n}` in walk order. Never a routing input.
-fn part_name(part: &ParsedMail<'_>, counter: &mut usize) -> String {
-    // non-attachment parts rarely carry names; when one does (a `name=`
-    // param), it is still the honest display name
-    if let Some(name) = part.ctype.params.get("name") {
-        return name.clone();
-    }
-    *counter += 1;
-    format!("part-{}", *counter - 1)
 }
 
 fn body_err(name: &str, e: mailparse::MailParseError) -> PipelineError {
@@ -396,6 +462,52 @@ pub(crate) mod tests {
             ["text/plain"]
         );
         assert_eq!(children[0].2, b"just a body");
+    }
+
+    /// 裁决 2's count leg over the walk-shaped container: a synthetic
+    /// message fragmenting past the shared 4096-part ceiling refuses as
+    /// the parts are produced, in the two-branch vocabulary naming the
+    /// ENTRY COUNT branch (the ratio leg is charged on the same door — a
+    /// real message's decoded parts sit orders of magnitude under
+    /// `message bytes × 256`, so the count is the leg that can actually
+    /// trip here).
+    #[test]
+    fn part_count_ceiling_refused_as_parts_are_produced() {
+        let n = super::super::CONTAINER_MAX_ENTRIES + 1;
+        let mut eml = String::from(
+            "From: a@b.c\r\nSubject: many\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"X\"\r\n\r\n",
+        );
+        for _ in 0..n {
+            eml.push_str("--X\r\nContent-Type: text/plain\r\n\r\nx\r\n");
+        }
+        eml.push_str("--X--\r\n");
+        let err = unpack(eml.as_bytes()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!(
+                "past the {}-part ceiling",
+                super::super::CONTAINER_MAX_ENTRIES
+            )),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("too many entries OR an expansion ratio past"),
+            "{msg}"
+        );
+        assert!(msg.contains("trips the ENTRY COUNT"), "{msg}");
+        // the same message one part UNDER the ceiling unpacks whole
+        let n = super::super::CONTAINER_MAX_ENTRIES;
+        let mut eml = String::from(
+            "From: a@b.c\r\nSubject: many\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"X\"\r\n\r\n",
+        );
+        for _ in 0..n {
+            eml.push_str("--X\r\nContent-Type: text/plain\r\n\r\nx\r\n");
+        }
+        eml.push_str("--X--\r\n");
+        let children = unpack(eml.as_bytes()).unwrap().expect("container verdict");
+        assert_eq!(children.len(), n, "exactly at the ceiling passes");
     }
 
     #[test]

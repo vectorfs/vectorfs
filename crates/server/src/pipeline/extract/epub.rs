@@ -56,15 +56,28 @@
 //!    the OPF's own directory (`.`/`..` segments normalized,
 //!    percent-decoding applied — both are ordinary href spellings).
 //!
-//! # Guards (the docx discipline, same constants)
+//! # Guards (the docx discipline, same constants — two legs since the
+//! # 2026-11-11 裁决 2)
 //!
-//! * [`super::CONTAINER_MAX_ENTRIES`] = 256 checked before ANY entry is
-//!   read (the entry-count bomb form); the worker's MAX_CHILDREN=256
-//!   guards the produced-children side.
+//! * [`super::CONTAINER_MAX_ENTRIES`] = 4096 checked before ANY entry is
+//!   read (the entry-count leg; widened from 256 by 裁决 2 — a 1560-chapter
+//!   novel is legal, and the count is only the bomb's weak proxy); the
+//!   worker's MAX_CHILDREN guards the produced-children side at the SAME
+//!   number (the two constants move together or children get dropped).
+//! * [`super::ExpansionBudget`] over
+//!   [`super::CONTAINER_EXPANSION_RATIO`] = 256: the decompressed bytes
+//!   the unpack READS may total at most `container bytes × 256`, charged
+//!   chunk-by-chunk while reading (the ratio leg — the bomb's ESSENCE:
+//!   few entries exploding to gigabytes is the same attack as millions of
+//!   tiny ones, and the count alone never sees it).
 //! * [`super::ENTRY_DECOMPRESSION_CEILING`] = 256 MiB per entry, enforced
 //!   while READING (zip headers lie about sizes; the cap bounds what a
 //!   bomb can make this process materialize before the worker's
-//!   max_file_size_mb gate sees the child).
+//!   max_file_size_mb gate sees the child). Unchanged by 裁决 2: one leg
+//!   bounds a single child, the other the aggregate.
+//! * both guard legs refuse with the shared two-branch vocabulary — "too
+//!   many entries OR an expansion ratio past 256:1 — this one: …" — so a
+//!   rejected book's reason names which leg tripped and both numbers.
 //! * missing/duplicate-broken structure (no mimetype entry, mimetype not
 //!   first, no container.xml, no rootfile, no OPF at the declared path,
 //!   spine referencing an absent manifest id, empty spine, XML that does
@@ -138,7 +151,8 @@ impl Extractor for EpubExtractor {
 
 /// The OCF walk (module docs): mimetype check → container.xml → OPF →
 /// spine-ordered chapter children. Every structural failure is a loud Err
-/// naming the step.
+/// naming the step; the two bomb-guard legs (count, ratio) refuse with
+/// the shared two-branch vocabulary (裁决 2).
 fn spine_children(bytes: &[u8]) -> Result<Vec<ChildDoc>, PipelineError> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| {
         PipelineError::extract(format!(
@@ -148,12 +162,21 @@ fn spine_children(bytes: &[u8]) -> Result<Vec<ChildDoc>, PipelineError> {
     })?;
     if zip.len() > super::CONTAINER_MAX_ENTRIES {
         return Err(PipelineError::extract(format!(
-            "epub: the package lists {} entries (max {}) — refused before reading any entry; if \
-             this is a legitimate book, it is too large for one source",
+            "epub: the package lists {} entries (max {}) — refused before reading any entry; \
+             the container bomb guard trips on too many entries OR an expansion ratio past \
+             {}:1 ({} container bytes × {}), and this package trips the ENTRY COUNT; if this \
+             is a legitimate book, it is too large for one source",
             zip.len(),
-            super::CONTAINER_MAX_ENTRIES
+            super::CONTAINER_MAX_ENTRIES,
+            super::CONTAINER_EXPANSION_RATIO,
+            bytes.len(),
+            super::CONTAINER_EXPANSION_RATIO
         )));
     }
+    // 裁决 2's ratio leg: everything this unpack READS charges the budget
+    // (non-spine resources are never read, so only what the process
+    // actually materializes counts against the container's bytes)
+    let mut budget = super::ExpansionBudget::new("epub", bytes.len());
     // (1) the OCF mimetype contract: FIRST entry, exact content
     let mut first = zip.by_index(0).map_err(zip_err("epub", "mimetype"))?;
     if first.name_raw() != b"mimetype" {
@@ -168,6 +191,7 @@ fn spine_children(bytes: &[u8]) -> Result<Vec<ChildDoc>, PipelineError> {
     first
         .read_to_end(&mut mt)
         .map_err(|e| PipelineError::extract(format!("epub: reading the mimetype entry: {e}")))?;
+    budget.charge("mimetype", mt.len() as u64)?;
     if mt != EPUB_MIME.as_bytes() {
         return Err(PipelineError::extract(format!(
             "epub: the mimetype entry holds '{}', not '{EPUB_MIME}' — the OCF container \
@@ -178,7 +202,7 @@ fn spine_children(bytes: &[u8]) -> Result<Vec<ChildDoc>, PipelineError> {
     drop(first);
     // (2) container.xml -> the primary OPF path
     let opf_path = {
-        let xml = read_entry(&mut zip, CONTAINER_XML)?;
+        let xml = read_entry(&mut zip, CONTAINER_XML, &mut budget)?;
         let xml = utf8(CONTAINER_XML, &xml)?;
         let Some(opf) = parse_container_xml(&xml)? else {
             return Err(PipelineError::extract(format!(
@@ -190,7 +214,7 @@ fn spine_children(bytes: &[u8]) -> Result<Vec<ChildDoc>, PipelineError> {
     };
     // (3) the OPF: manifest map + spine order
     let (manifest, spine) = {
-        let xml = read_entry(&mut zip, &opf_path)?;
+        let xml = read_entry(&mut zip, &opf_path, &mut budget)?;
         let xml = utf8(&opf_path, &xml)?;
         parse_opf(&opf_path, &xml)?
     };
@@ -212,7 +236,7 @@ fn spine_children(bytes: &[u8]) -> Result<Vec<ChildDoc>, PipelineError> {
             continue; // a resource riding the spine (SVG cover, …)
         }
         let entry_path = resolve_href(&opf_path, href);
-        let bytes = read_entry(&mut zip, &entry_path)?;
+        let bytes = read_entry(&mut zip, &entry_path, &mut budget)?;
         children.push(ChildDoc::new(entry_path, "text/html", bytes));
     }
     Ok(children)
@@ -231,16 +255,24 @@ fn zip_err(kind: &'static str, what: &str) -> impl Fn(zip::result::ZipError) -> 
     }
 }
 
-/// Read one whole entry BY NAME with the decompression ceiling enforced
-/// while reading (headers lie; the cap bounds what a bomb can materialize).
+/// Read one whole entry BY NAME with the decompression ceiling and the
+/// cumulative expansion budget enforced while reading (headers lie; the
+/// caps bound what a bomb can materialize, per entry and in aggregate).
 fn read_entry(
     zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
     name: &str,
+    budget: &mut super::ExpansionBudget,
 ) -> Result<Vec<u8>, PipelineError> {
     let mut entry = zip
         .by_name(name)
         .map_err(|_| PipelineError::extract(format!("epub: the package has no '{name}' part")))?;
-    super::read_entry_capped(&mut entry, super::ENTRY_DECOMPRESSION_CEILING, "epub", name)
+    super::read_entry_capped(
+        &mut entry,
+        super::ENTRY_DECOMPRESSION_CEILING,
+        budget,
+        "epub",
+        name,
+    )
 }
 
 /// Entry bytes that must be XML: OOXML/OPF are UTF-8 by specification.
@@ -832,10 +864,152 @@ pub(crate) mod tests {
         let bomb = zip.finish().unwrap().into_inner();
         let err = unpack(&bomb).unwrap_err();
         let msg = err.to_string();
+        // the count leg's numbers + the 裁决 2 two-branch vocabulary naming
+        // WHICH leg tripped (the count, not the ratio)
         assert!(
-            msg.contains(&format!("max {}", super::super::CONTAINER_MAX_ENTRIES)),
+            msg.contains(&format!(
+                "lists {} entries (max {})",
+                super::super::CONTAINER_MAX_ENTRIES + 1,
+                super::super::CONTAINER_MAX_ENTRIES
+            )),
             "{msg}"
         );
+        assert!(
+            msg.contains("too many entries OR an expansion ratio past"),
+            "{msg}"
+        );
+        assert!(msg.contains("trips the ENTRY COUNT"), "{msg}");
+        assert!(msg.contains("refused before reading any entry"), "{msg}");
+    }
+
+    /// Build a REAL N-chapter book (the 2026-11-11 裁决 2 corpus shape: a
+    /// 1560-chapter novel must pass — `build_epub` above is fixed at the
+    /// three-chapter fixture, so the long-book tests roll their own with
+    /// the same zip crate the kind reads).
+    fn build_long_epub(chapters: usize) -> Vec<u8> {
+        use std::io::Write;
+        let manifest = (0..chapters)
+            .map(|i| {
+                format!(
+                    "<item id=\"c{i}\" href=\"c{i}.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                )
+            })
+            .collect::<String>();
+        let spine = (0..chapters)
+            .map(|i| format!("<itemref idref=\"c{i}\"/>"))
+            .collect::<String>();
+        let opf = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\">\
+             <manifest>{manifest}</manifest><spine>{spine}</spine></package>"
+        );
+        let buf = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(buf);
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        zip.start_file(
+            "mimetype",
+            opts.compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+        zip.write_all(EPUB_MIME.as_bytes()).unwrap();
+        zip.start_file("META-INF/container.xml", opts).unwrap();
+        zip.write_all(
+            b"<container><rootfiles><rootfile full-path=\"content.opf\"/></rootfiles></container>",
+        )
+        .unwrap();
+        zip.start_file("content.opf", opts).unwrap();
+        zip.write_all(opf.as_bytes()).unwrap();
+        for i in 0..chapters {
+            zip.start_file(format!("c{i}.xhtml"), opts).unwrap();
+            zip.write_all(
+                format!(
+                    "<html><body><h1>第{}章</h1><p>第{}章的正文内容，一段足够真实的小节文字。</p></body></html>",
+                    i + 1,
+                    i + 1
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// THE 裁决 2 positive: a 1500-chapter book (the corpus that tripped
+    /// the old 256-entry guard is 1560 — same shape, comfortably under
+    /// the widened 4096) unpacks whole, spine-ordered, every chapter a
+    /// text/html child carrying bytes.
+    #[test]
+    fn thousand_plus_chapter_book_passes_the_widened_guard() {
+        let epub = build_long_epub(1500);
+        let children = unpack(&epub).unwrap().expect("container verdict");
+        assert_eq!(children.len(), 1500, "every chapter survives the unpack");
+        // spine order = natural order here: first child c0, last c1499
+        assert_eq!(children[0].name, "c0.xhtml");
+        assert_eq!(children[1499].name, "c1499.xhtml");
+        assert_eq!(children[0].mime, "text/html");
+        assert!(
+            String::from_utf8_lossy(&children[1499].bytes).contains("第1500章"),
+            "the last chapter's bytes arrived intact"
+        );
+    }
+
+    /// THE 裁决 2 ratio leg: FEW entries (nowhere near 4096), each well
+    /// under the 256 MiB per-entry ceiling — but the decompressed total
+    /// blows past `container bytes × 256`, and the unpack refuses WHILE
+    /// READING with the two-branch vocabulary naming the RATIO branch and
+    /// both numbers. (All-zero chapters deflate ~1000:1 — exactly the
+    /// compressible-payload shape the count-only guard could never see.)
+    #[test]
+    fn expansion_ratio_bomb_refused_while_reading() {
+        use std::io::Write;
+        let zeros = vec![0u8; 2 * 1024 * 1024]; // 2 MiB, ~2 KB deflated
+        let opf = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\">\
+            <manifest><item id=\"c0\" href=\"c0.xhtml\" media-type=\"application/xhtml+xml\"/>\
+            <item id=\"c1\" href=\"c1.xhtml\" media-type=\"application/xhtml+xml\"/>\
+            <item id=\"c2\" href=\"c2.xhtml\" media-type=\"application/xhtml+xml\"/></manifest>\
+            <spine><itemref idref=\"c0\"/><itemref idref=\"c1\"/><itemref idref=\"c2\"/>\
+            </spine></package>";
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        zip.start_file(
+            "mimetype",
+            opts.compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+        zip.write_all(EPUB_MIME.as_bytes()).unwrap();
+        zip.start_file("META-INF/container.xml", opts).unwrap();
+        zip.write_all(
+            b"<container><rootfiles><rootfile full-path=\"content.opf\"/></rootfiles></container>",
+        )
+        .unwrap();
+        zip.start_file("content.opf", opts).unwrap();
+        zip.write_all(opf.as_bytes()).unwrap();
+        for i in 0..3 {
+            zip.start_file(format!("c{i}.xhtml"), opts).unwrap();
+            zip.write_all(&zeros).unwrap();
+        }
+        let bomb = zip.finish().unwrap().into_inner();
+        // ~6 MiB decompressed against a ~6 KB container: ~1000×, far past 256×
+        let err = unpack(&bomb).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expansion-ratio bomb guard refuses while reading"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("too many entries OR an expansion ratio past"),
+            "{msg}"
+        );
+        assert!(msg.contains("this one: the ratio"), "{msg}");
+        // the two numbers: the running total and the limit it crossed
+        assert!(msg.contains("past the container limit"), "{msg}");
+        assert!(
+            msg.contains(&format!("× {}", super::super::CONTAINER_EXPANSION_RATIO)),
+            "{msg}"
+        );
+        // and it is NOT the count leg (3 chapters is nowhere near 4096)
+        assert!(!msg.contains("ENTRY COUNT"), "{msg}");
     }
 
     /// extract() is the loud routing-bug refusal (role separation) — pinned

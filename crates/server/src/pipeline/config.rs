@@ -1395,8 +1395,9 @@ pub fn pipeline_fingerprint(
 /// container children ride (a `default = "auto"` resolves to nothing
 /// there, mirroring `child_routes`, because the built-in map is keyed by
 /// family). A family whose chain resolves empty (auto exempting `img`,
-/// `docx`, `html`, the containers — or no entry at all) is NOT a source
-/// of this pipeline and contributes no entry. Instance NAMES are
+/// `docx`, `html` and the arbitrary-archive containers `zip`/`eml` — or
+/// no entry at all; `epub` is claimed since the 2026-11-11 裁决 1) is NOT
+/// a source of this pipeline and contributes no entry. Instance NAMES are
 /// deliberately absent from the product: chunk identity is the configs.
 fn resolved_extract_routes(
     ingest: &IngestConfig,
@@ -2095,8 +2096,9 @@ chunk = { kind = "token-window", size = 32, overlap = 8 }
     /// sentinel string (a digest still carrying the literal `"auto"` — or
     /// the instance name — could not pass this equality). Both spellings:
     /// the family-key form (`pdf = "auto"`) and the catch-all form
-    /// (`default = "auto"`, which resolves per family: pdf/md/txt claimed,
-    /// the exempt families contribute no entry under either spelling).
+    /// (`default = "auto"`, which resolves per family: pdf/md/txt/epub
+    /// claimed since the 2026-11-11 裁决 1, the exempt families contribute
+    /// no entry under either spelling).
     #[test]
     fn fingerprint_auto_route_equals_explicit_equivalent() {
         // family-key spelling: pdf = "auto" ≡ pdf = <default pdf-text>
@@ -2105,15 +2107,29 @@ chunk = { kind = "token-window", size = 32, overlap = 8 }
         let explicit = "[extractor.p]\nkind = \"pdf-text\"\n\n[ingest.ddd]\nchunk = { kind = \
                         \"token-window\", size = 8, overlap = 2 }\nextract = { pdf = \"p\" }\n";
         assert_eq!(fp_of(auto), fp_of(explicit), "auto ≡ equal-value explicit");
-        // catch-all spelling: default = "auto" ≡ the three built-in families
-        // routed explicitly (the img/docx/html/epub/zip/eml exemptions make
-        // them non-sources under both spellings — no entry either side)
+        // 裁决 1: epub = "auto" ≡ epub = <default epub> — the document-format
+        // container is a claimed auto family now, and its builtin resolves
+        // exactly like any explicit default-config instance
+        let auto_epub = "[ingest.ddd]\nchunk = { kind = \"token-window\", size = 8, overlap = \
+                         2 }\nextract = { epub = \"auto\" }\n";
+        let explicit_epub = "[extractor.b]\nkind = \"epub\"\n\n[ingest.ddd]\nchunk = { kind = \
+                             \"token-window\", size = 8, overlap = 2 }\nextract = { epub = \
+                             \"b\" }\n";
+        assert_eq!(
+            fp_of(auto_epub),
+            fp_of(explicit_epub),
+            "epub auto ≡ equal-value explicit (裁决 1)"
+        );
+        // catch-all spelling: default = "auto" ≡ the four built-in families
+        // routed explicitly (the img/docx/html + zip/eml exemptions make them
+        // non-sources under both spellings — no entry either side)
         let auto_default = "[ingest.ddd]\nchunk = { kind = \"token-window\", size = 8, overlap = \
                             2 }\nextract = { default = \"auto\" }\n";
         let explicit_all = "[extractor.p]\nkind = \"pdf-text\"\n\n[extractor.m]\nkind = \
-                            \"md\"\n\n[extractor.t]\nkind = \"txt\"\n\n[ingest.ddd]\nchunk = { \
-                            kind = \"token-window\", size = 8, overlap = 2 }\nextract = { pdf = \
-                            \"p\", md = \"m\", txt = \"t\" }\n";
+                            \"md\"\n\n[extractor.t]\nkind = \"txt\"\n\n[extractor.b]\nkind = \
+                            \"epub\"\n\n[ingest.ddd]\nchunk = { kind = \"token-window\", size = \
+                            8, overlap = 2 }\nextract = { pdf = \"p\", md = \"m\", txt = \"t\", \
+                            epub = \"b\" }\n";
         assert_eq!(
             fp_of(auto_default),
             fp_of(explicit_all),

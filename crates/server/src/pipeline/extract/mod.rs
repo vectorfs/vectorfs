@@ -56,7 +56,7 @@ pub mod zip;
 use super::{ChildDoc, ContentClass, Extractor, Fit, Modality, Part, PipelineError};
 use docx::{DocxConfig, DocxExtractor};
 use eml::{EmlConfig, EmlExtractor};
-use epub::{EpubConfig, EpubExtractor};
+use epub::{EpubConfig, EpubExtractor, EpubTag};
 use html::{HtmlConfig, HtmlExtractor};
 use image::{ImageConfig, ImageExtractor};
 use md::{MdConfig, MdExtractor, MdTag};
@@ -75,10 +75,13 @@ use zip::{ZipConfig, ZipExtractor};
 /// whole family (routing itself is per-object and extension-exact). The
 /// table is the single mapping both directions consult.
 ///
-/// The M3-T7 rows (`epub`/`zip`/`eml`) are CONTAINER families: their kinds
-/// `unpack`, and `auto` deliberately does NOT claim them (the
-/// img/docx/html exemption ruling — an auto arm would make every
-/// `default = "auto"` deployment start expanding archives overnight).
+/// The M3-T7 rows (`epub`/`zip`/`eml`) are CONTAINER families, but the
+/// 2026-11-11 裁决 1 split their auto treatment: **`epub` IS claimed by
+/// `auto`** — an epub is a DOCUMENT format (one book = one document, the
+/// pdf analog), so it belongs with the document defaults; **`zip`/`eml`
+/// stay OUT** — arbitrary archives whose expansion fan-out remains an
+/// operator declaration (the img/docx/html exemption ruling's
+/// behavior-expansion half, see [`builtin_extractor`]).
 pub const MIME_TO_SHORT_KEY: &[(&str, &str)] = &[
     ("application/pdf", "pdf"),
     (
@@ -164,17 +167,32 @@ pub fn mime_for_short_key(key: &str) -> Option<&'static str> {
 /// text-face families (`docx`, `html`) stay OUT for the behavior-expansion
 /// half of the same ruling: an auto arm would make existing `auto`
 /// deployments START claiming .docx/.html files overnight — text modality
-/// or not, what a pipeline ingests is the operator's declaration. The
-/// M3-T7 CONTAINER families (`epub`, `zip`, `eml`) stay OUT for BOTH
-/// halves at once: an auto arm would make every `auto` deployment start
-/// claiming AND EXPANDING archives overnight — containers re-route
-/// children through the user's chains, so silently adding them is a
-/// behavior expansion with a fan-out the operator never declared.
-/// Deployments that want the classify-first, no-.so engine, the page-image
-/// route, image files, the text face or the containers opt in explicitly
-/// (`extract = { pdf = "pdf-inspector-instance" }`, `pdf =
-/// "pages-instance"`, `img = "image-instance"`, `docx = "…"/`html = "…"`,
-/// `epub = "…"/`zip = "…"/`eml = "…"`). `auto` stays a single-member
+/// or not, what a pipeline ingests is the operator's declaration.
+///
+/// # The 2026-11-11 裁决 1 split of the M3-T7 container families
+///
+/// `epub` IS claimed by `auto` (since this adjudication, revoking the M3-T7
+/// blanket exemption FOR EPUB ALONE): an epub is a DOCUMENT format — one
+/// book is one document, exactly the pdf's shape — so it belongs with the
+/// document defaults, not with the archives. The expansion-fan-out half of
+/// the old container ruling yields accordingly: the chapters re-enter USER
+/// routing (the container role is untouched — auto claims the SOURCE, the
+/// operator's chains still decide what each chapter rides), and the bomb
+/// exposure is the GUARD's problem (裁决 2's dual criteria), not a reason
+/// to leave books unclaimed. FINGERPRINT consequence, deliberate: this arm
+/// changed an auto deployment's RESOLVED routes, so every
+/// `extract = { default = "auto" }` bucket's digest moved (尾巴裁决 A
+/// semantics — the gate refuses startup and demands an explicit re-embed;
+/// explicitly-configured deployments are unaffected, their routes were
+/// never expanded through this arm). `zip`/`eml` stay OUT — ARBITRARY
+/// archives, both halves of the old ruling intact: an auto arm would make
+/// every `auto` deployment start claiming AND EXPANDING archives
+/// overnight, a behavior expansion with a fan-out the operator never
+/// declared. Deployments that want the classify-first, no-.so engine, the
+/// page-image route, image files, the text face or the arbitrary archives
+/// opt in explicitly (`extract = { pdf = "pdf-inspector-instance" }`, `pdf
+/// = "pages-instance"`, `img = "image-instance"`, `docx = "…"/`html =
+/// "…"`, `zip = "…"/`eml = "…"`). `auto` stays a single-member
 /// chain: whether it should become a built-in chain (pdf → pdf-inspector →
 /// pdf-text, say) is an unresolved M3+ ruling.
 pub fn builtin_extractor(short_key: &str) -> Option<ExtractorKind> {
@@ -182,6 +200,11 @@ pub fn builtin_extractor(short_key: &str) -> Option<ExtractorKind> {
         "pdf" => Some(ExtractorKind::PdfText(PdfTextConfig::default())),
         "md" => Some(ExtractorKind::Md(MdConfig { kind: MdTag::Md })),
         "txt" => Some(ExtractorKind::Txt(TxtConfig { kind: TxtTag::Txt })),
+        // 裁决 1 (2026-11-11): the DOCUMENT-format container — one book is
+        // one document, the pdf analog. Default-config epub (no knobs exist).
+        "epub" => Some(ExtractorKind::Epub(EpubConfig {
+            kind: EpubTag::Epub,
+        })),
         _ => None,
     }
 }
@@ -199,9 +222,12 @@ pub fn builtin_extractor(short_key: &str) -> Option<ExtractorKind> {
 /// in the scanner, which owns claiming. Since the plugin-axis hardening
 /// the lookup is TABLE-driven (like the normalizer TABLE) instead of a
 /// hand-written match: one const table, and the
-/// `mime_table_extension_and_auto_views_agree` test pins every family row
-/// of [`MIME_TO_SHORT_KEY`] to an alias row here AND to a
-/// [`builtin_extractor`] arm — three views, one anchor, zero drift.
+/// `extension_alias_view_covers_every_family` test pins every family row
+/// of [`MIME_TO_SHORT_KEY`] to an alias row here while
+/// `auto_mapping_serves_every_mime_family` (ingest) pins the AUTO view —
+/// every family either carries a [`builtin_extractor`] arm or is a
+/// documented exemption (img/docx/html/zip/eml; epub carries its arm
+/// since the 2026-11-11 裁决 1) — three views, one anchor, zero drift.
 pub const EXTENSION_ALIASES: &[(&str, &str)] = &[
     ("pdf", "pdf"),
     // the img family (M3-T4): all three spellings route to the one short
@@ -229,32 +255,112 @@ pub const EXTENSION_ALIASES: &[(&str, &str)] = &[
 // shared container plumbing (M3-T7): the constants + capped read loop the
 // zip-based container kinds (epub/zip) share — the docx.rs discipline
 // (entry-count bomb BEFORE any read; decompression ceiling WHILE reading)
-// factored once for its second and third consumers.
+// factored once for its second and third consumers. The 2026-11-11 裁决 2
+// (see docs/adr/0006) made the guard TWO-legged: entry COUNT is only a weak
+// proxy for a bomb — the bomb's essence is the expansion RATIO — so beside
+// the (widened) entry count stands a cumulative decompressed-bytes budget
+// (`ExpansionBudget` below), and both must trip with the shared
+// two-branch error vocabulary ("too many entries OR an expansion ratio
+// past the limit — this one: …").
 // ---------------------------------------------------------------------------
 
 /// Entry-count bomb guard for container kinds: checked against the zip's
-/// entry listing BEFORE any entry is read (the docx MAX_ZIP_ENTRIES form,
-/// which is itself the ingest worker's MAX_CHILDREN=256 form — same
-/// number, same discipline, kind-side because the listing is read here).
-pub(crate) const CONTAINER_MAX_ENTRIES: usize = 256;
+/// entry listing BEFORE any entry is read (the docx MAX_ZIP_ENTRIES form;
+/// kind-side because the listing is read here). 4096 since the 2026-11-11
+/// 裁决 2 (was 256): still bounded — a hostile archive's fan-out stays
+/// capped — while a legitimate 1560-chapter novel (the corpus that tripped
+/// the old 256) passes. MUST stay in lock step with the ingest worker's
+/// MAX_CHILDREN (same number, same move — otherwise the extractor admits
+/// children the ingest walk drops: the two constants are one guard in two
+/// layers).
+pub(crate) const CONTAINER_MAX_ENTRIES: usize = 4096;
+
+/// Cumulative expansion-ratio bomb guard (2026-11-11 裁决 2): the
+/// decompressed bytes a container's unpack READS may total at most
+/// `container bytes × 256` — the RATIO is the bomb's essence (a million
+/// tiny entries and one entry exploding to gigabytes are the same attack,
+/// and the count alone sees only the first form). Enforced by
+/// [`ExpansionBudget`] as bytes stream in, never only after the whole
+/// unpack. Mechanism constant, deliberately not config (§5.10.8's spirit:
+/// a guardrail is not policy — a knob saying how much bomb to tolerate
+/// would be).
+pub(crate) const CONTAINER_EXPANSION_RATIO: u64 = 256;
 
 /// Per-entry decompression ceiling while READING (the docx MAX_XML_BYTES
 /// form: zip headers lie about sizes, so the cap bounds what a bomb can
 /// make the process materialize BEFORE the worker's per-child
 /// max_file_size_mb gate sees the child). 256 MiB is 2x the default cap's
 /// headroom — mechanism constant, not policy (the §5.10.8 spirit).
+/// UNCHANGED by 裁决 2: the per-entry ceiling and the cumulative ratio are
+/// independent legs (one bounds a single child, one bounds the aggregate).
 pub(crate) const ENTRY_DECOMPRESSION_CEILING: u64 = 256 * 1024 * 1024;
 
+/// Running decompressed-bytes total for ONE container unpack, against the
+/// [`CONTAINER_EXPANSION_RATIO`] limit (裁决 2's second leg). Charges
+/// stream in per read chunk ([`read_entry_capped`]) / per decoded part
+/// (eml), so a bomb is refused the MOMENT the running total crosses
+/// `container bytes × ratio` — never only after the whole unpack has
+/// materialized.
+pub(crate) struct ExpansionBudget {
+    /// Registry label, for the loud error.
+    kind: &'static str,
+    /// The container's own byte size — the ratio's denominator.
+    container_bytes: u64,
+    /// Running total of decompressed bytes charged so far.
+    expanded: u64,
+}
+
+impl ExpansionBudget {
+    /// New budget over a `container_bytes`-byte container (the caller has
+    /// already passed the empty-input gate, so the denominator is > 0).
+    pub(crate) fn new(kind: &'static str, container_bytes: usize) -> Self {
+        ExpansionBudget {
+            kind,
+            container_bytes: container_bytes as u64,
+            expanded: 0,
+        }
+    }
+
+    /// Charge `n` more decompressed bytes, refusing past the ratio limit.
+    /// The error carries the two numbers (running total, limit) and the
+    /// reason in the shared two-branch vocabulary — the count branch lives
+    /// at each kind's entry-listing check, this is the RATIO branch.
+    pub(crate) fn charge(&mut self, name: &str, n: u64) -> Result<(), PipelineError> {
+        let limit = self
+            .container_bytes
+            .saturating_mul(CONTAINER_EXPANSION_RATIO);
+        self.expanded += n;
+        if self.expanded > limit {
+            return Err(PipelineError::extract(format!(
+                "{}: unpacking '{}' pushes the decompressed total to {} bytes past the container \
+                 limit {} ({} container bytes × {}) — the expansion-ratio bomb guard refuses \
+                 while reading (too many entries OR an expansion ratio past {}:1 — this one: the \
+                 ratio); if this is a legitimate package, it expands too much for one source",
+                self.kind,
+                name,
+                self.expanded,
+                limit,
+                self.container_bytes,
+                CONTAINER_EXPANSION_RATIO,
+                CONTAINER_EXPANSION_RATIO
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Read one open zip entry to end, refusing past `ceiling` OUTPUT bytes
-/// (the amplification gate at the expansion point, §5.10.3 ruling ③).
-/// `kind` is the registry label and `name` the entry path, for the loud
-/// error. Generic over [`std::io::Read`] (a `ZipFile` is one; the generic
-/// also keeps THIS module's local `pub mod zip` kind module from shadowing
-/// the crate path), chunk-fed so the cap is enforced DURING the read, not
-/// after it.
+/// (the amplification gate at the expansion point, §5.10.3 ruling ③), and
+/// charging every chunk to `budget` (裁决 2's cumulative ratio leg, refused
+/// mid-read). `kind` is the registry label and `name` the entry path, for
+/// the loud errors. Generic over [`std::io::Read`] (a `ZipFile` is one;
+/// the generic also keeps THIS module's local `pub mod zip` kind module
+/// from shadowing the crate path), chunk-fed so both caps are enforced
+/// DURING the read, not after it.
 pub(crate) fn read_entry_capped(
     entry: &mut impl std::io::Read,
     ceiling: u64,
+    budget: &mut ExpansionBudget,
     kind: &str,
     name: &str,
 ) -> Result<Vec<u8>, PipelineError> {
@@ -278,6 +384,7 @@ pub(crate) fn read_entry_capped(
                  too large for one child"
             )));
         }
+        budget.charge(name, n as u64)?;
         out.extend_from_slice(&chunk[..n]);
     }
 }

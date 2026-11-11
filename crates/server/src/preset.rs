@@ -6,14 +6,30 @@
 //! Six tiers ship (§5.10.4): `dev` (pure protocol face, no pipeline
 //! sections — byte-identical to the pre-preset init), `text-rag` (the gte
 //! text pipeline; init PREFETCHES the model, ~1.17 GiB, stderr progress —
-//! see pipeline::models), `air-gapped` (offline `path` embedder, NO
-//! download by construction), the two M3-T4 image tiers: `multimodal`
-//! (gte text + siglip2 image DUAL embedders — one bucket, text and image
-//! queries both served) and `image-search` (siglip2 only, 以图搜图 over
-//! the images you put), and `scanned-docs` (M3-T10: gte + the pdf chain
-//! `[pdf-text, pdf-ocr]` — the probe→affinity router sends text-native
-//! PDFs to the text layer and scan-dominant ones through OCR, mixed
-//! documents fall to the text member; one text index either way).
+//! see pipeline::models; ships epub since the 2026-11-11 裁决 1), `air-gapped`
+//! (offline `path` embedder, NO download by construction), the two M3-T4
+//! image tiers: `multimodal` (gte text + siglip2 image DUAL embedders —
+//! one bucket, text and image queries both served) and `image-search`
+//! (siglip2 only, 以图搜图 over the images you put), and `scanned-docs`
+//! (M3-T10: gte + the pdf chain `[pdf-text, pdf-ocr]` — the probe→affinity
+//! router sends text-native PDFs to the text layer and scan-dominant ones
+//! through OCR, mixed documents fall to the text member; one text index
+//! either way).
+//!
+//! # Migration note (2026-11-11 裁决 1 — epub joins `auto`)
+//!
+//! `builtin_extractor` gained an `epub` arm (an epub is a DOCUMENT format:
+//! one book = one document, the pdf analog; zip/eml stay explicit-claim —
+//! arbitrary archives). Every `extract = { default = "auto" }` (or
+//! `epub = "auto"`) deployment's RESOLVED routes changed with it, so its
+//! pipeline FINGERPRINT drifted: the startup gate refuses and demands an
+//! explicit re-embed (`vectorfs serve --reindex`) — the 尾巴裁决 A
+//! semantics, no silent mixed deployments of old/new claim sets.
+//! Explicitly-configured deployments (every preset template included)
+//! are UNAFFECTED: their routes were never expanded through the builtin
+//! map. The text-rag template itself carries the new `epub = "epub"`
+//! route explicitly, so freshly-initialized and long-standing text-rag
+//! deployments agree by construction.
 //!
 //! # Why text templates instead of typed structs
 //!
@@ -50,12 +66,15 @@ pub enum Preset {
     /// Pure protocol face: NO pipeline sections (the pre-preset init).
     #[default]
     Dev,
-    /// gte text pipeline: pdf/md/txt extractors + token-window + ort
+    /// gte text pipeline: pdf/md/txt/epub extractors + token-window + ort
     /// embedder; init prefetches the model. Ships `fts = true` (R3c:
     /// hybrid is the recommended everyday mode — the §7 CONFIG default
     /// stays off, the preset opts in; existing deployments' files are
     /// never touched, and `fts` itself stays outside the fingerprint so
-    /// this is availability, not migration).
+    /// this is availability, not migration). epub ships since the
+    /// 2026-11-11 裁决 1 (document format, the pdf analog); its chapters
+    /// are text/html children that ride this section's `default` route —
+    /// the migration note in the module docs covers the auto side.
     TextRag,
     /// Offline text pipeline: local `path` embedder, no network, model
     /// supplied by the operator.
@@ -152,9 +171,17 @@ kind = \"md\"
 [extractor.t]
 kind = \"txt\"
 
+# epub (2026-11-11 裁决 1): a book is one document, the pdf analog. The
+# epub kind unpacks spine-ordered chapters as text/html children; they ride
+# this section's default route below (the txt kind's text/* gate carries
+# them verbatim — add an [extractor.web] html instance + html = \"web\" if
+# you want tag-stripped chapters).
+[extractor.epub]
+kind = \"epub\"
+
 [ingest.docs]
 # include/exclude omitted = the whole source bucket (design-v3.md R5)
-extract = {{ pdf = \"pdf\", md = \"md\", default = \"t\" }}
+extract = {{ pdf = \"pdf\", md = \"md\", epub = \"epub\", default = \"t\" }}
 chunk = {{ kind = \"token-window\", size = 512, overlap = 64 }}
 embedders = [\"text\"]
 merge = \"rrf\"
@@ -409,13 +436,19 @@ mod tests {
             cfg.embedders["text"].describe(),
             "ort(model=gte-multilingual-base)"
         );
-        assert_eq!(cfg.extractors.len(), 3);
+        // pdf/md/txt + epub since the 2026-11-11 裁决 1
+        assert_eq!(cfg.extractors.len(), 4);
+        assert_eq!(cfg.extractors["epub"].describe(), "epub");
         let ingest = &cfg.ingest["docs"];
         assert!(
             ingest.include.is_empty() && ingest.exclude.is_empty(),
             "whole bucket"
         );
         assert_eq!(ingest.embedders, ["text"]);
+        // the epub route is explicit (裁决 1): a book claims the epub kind,
+        // its text/html chapters fall to the default txt route
+        assert_eq!(ingest.extract["epub"], ExtractValue::Single("epub".into()));
+        assert_eq!(ingest.extract["default"], ExtractValue::Single("t".into()));
         // R3c: the preset ships the lexical face ON (hybrid is the
         // recommended everyday mode); the §7 CONFIG default stays false —
         // this asserts the template, not the default
@@ -445,7 +478,7 @@ mod tests {
         assert_eq!(f1, f2);
         assert_eq!(f1.len(), crate::pipeline::config::FINGERPRINT_HEX_LEN);
         // and the fingerprinted instances are exactly the referenced ones
-        // (pdf/md/t all named in `extract`, embedder `text`)
+        // (pdf/md/t/epub all named in `extract`, embedder `text`)
         assert!(t1.contains("embedders = [\"text\"]"));
         // R3c non-migration pin: `fts` stays OUTSIDE the fingerprint — the
         // preset's `fts = true` materializes availability, never a reindex

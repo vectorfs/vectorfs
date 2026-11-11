@@ -801,11 +801,16 @@ const MAX_CONTAINER_DEPTH: u32 = 2;
 /// Bomb guard: one container may unpack at most this many children. Exceeding
 /// it Errs the CONTAINER (naming the entry count) — the member yields like
 /// any Err and the chain may still recover; the file fails loudly if nothing
-/// catches it. 256 sits far above every real-world container at hand (epub
-/// spines, docx parts, eml attachments) while capping the fan-out a hostile
-/// archive can demand from one document. Mechanism constant — same ruling
-/// as [`MAX_CONTAINER_DEPTH`].
-const MAX_CHILDREN: usize = 256;
+/// catches it. 4096 since the 2026-11-11 裁决 2 (was 256 — a real 1560-chapter
+/// novel is legal, and the count is only the bomb's weak proxy; the ESSENCE
+/// is the expansion ratio, which the extractor side's
+/// [`CONTAINER_EXPANSION_RATIO`](crate::pipeline::extract::CONTAINER_EXPANSION_RATIO) guard now enforces
+/// while reading). MUST stay in lock step with the extractor side's
+/// [`CONTAINER_MAX_ENTRIES`](crate::pipeline::extract::CONTAINER_MAX_ENTRIES): the same number, moved
+/// in the same diff — otherwise the extractor admits children (4096-entry
+/// archives pass) that this walk then drops, a silent half-indexed source.
+/// Mechanism constant — same ruling as [`MAX_CONTAINER_DEPTH`].
+const MAX_CHILDREN: usize = 4096;
 
 /// One stderr line per normalize HIT (M2.1 step 3 observability):
 /// `ingest: normalize: docs/a.txt.gz -> gunzip (text/plain)`. Pure
@@ -5410,24 +5415,32 @@ pub(crate) mod tests {
     ///   claiming .docx/.html files it never touched — the same silent
     ///   behavior-expansion the image ruling refuses. Operators opt in
     ///   with `extract = { docx = "…", html = "…" }`.
-    /// * `epub`/`zip`/`eml` (M3-T7, the CONTAINER families): BOTH rulings
-    ///   at once — an auto arm would make every `auto` deployment start
-    ///   claiming AND EXPANDING archives overnight (containers fan children
-    ///   out through the user's chains — a behavior expansion with a
-    ///   fan-out the operator never declared). Operators opt in with
-    ///   `extract = { epub = "…", zip = "…", eml = "…" }`.
+    /// * `zip`/`eml` (M3-T7, the ARBITRARY-ARCHIVE containers): BOTH
+    ///   halves of the original container ruling stay intact for them —
+    ///   an auto arm would make every `auto` deployment start claiming
+    ///   AND EXPANDING arbitrary archives overnight (containers fan
+    ///   children out through the user's chains — a behavior expansion
+    ///   with a fan-out the operator never declared). Operators opt in
+    ///   with `extract = { zip = "…", eml = "…" }`.
+    ///
+    /// `epub` is NO LONGER exempt (2026-11-11 裁决 1): an epub is a
+    /// DOCUMENT format — one book = one document, the pdf analog — so
+    /// `auto` claims it (the M3-T7 blanket container exemption was revoked
+    /// for epub alone; the fingerprint consequence for existing auto
+    /// deployments is recorded at `builtin_extractor`).
     ///
     /// (The cfg(test) `ctn` scaffold key is also exempt: it is scanner-side
     /// claiming only, never an `auto` family.)
     #[test]
     fn auto_mapping_serves_every_mime_family() {
         for (_mime, key) in crate::pipeline::extract::MIME_TO_SHORT_KEY {
-            if matches!(*key, "img" | "docx" | "html" | "epub" | "zip" | "eml") {
+            if matches!(*key, "img" | "docx" | "html" | "zip" | "eml") {
                 assert!(
                     crate::pipeline::extract::builtin_extractor(key).is_none(),
                     "{key} must stay OUT of auto (the pdf-pages/image ruling, the docx/html \
-                     behavior-expansion ruling, the container fan-out ruling): an auto arm \
-                     would silently expand what every default = \"auto\" deployment claims"
+                     behavior-expansion ruling, the arbitrary-archive container fan-out ruling): \
+                     an auto arm would silently expand what every default = \"auto\" deployment \
+                     claims"
                 );
                 continue;
             }
@@ -7221,18 +7234,22 @@ pub(crate) mod tests {
         assert!(reason.contains("MAX_CONTAINER_DEPTH = 2"), "{reason}");
     }
 
-    /// Child-count guard: 257 children Err the container BEFORE any child
-    /// work — the reason names the entry count and the constant.
+    /// Child-count guard: children past MAX_CHILDREN Err the container
+    /// BEFORE any child work — the reason names the entry count and the
+    /// constant. (裁决 2 moved the ceiling 256 → 4096 in lock step with the
+    /// extractor side's CONTAINER_MAX_ENTRIES — the two constants are one
+    /// guard in two layers; 4097 is one past the new ceiling, the same
+    /// one-past shape the 257-children form pinned before it.)
     #[tokio::test]
     async fn container_children_limit_errs() {
         let dir = tempfile::tempdir().unwrap();
         let docs = dir.path().join("docs").join("docs"); // v3: inside the source bucket dir (keys keep the docs/… spelling)
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("many.ctn"), b"MANY".as_slice()).unwrap();
-        let children: Vec<ChildDoc> = (0..=256)
+        let children: Vec<ChildDoc> = (0..=MAX_CHILDREN)
             .map(|i| {
                 ChildDoc::new(
-                    format!("e{i:03}.txt"),
+                    format!("e{i:04}.txt"),
                     "text/plain",
                     format!("entry number {i}").into_bytes(),
                 )
@@ -7256,7 +7273,10 @@ pub(crate) mod tests {
         assert_eq!(m.status, SourceStatus::Failed);
         let reason = m.status_reason.expect("reason");
         assert!(
-            reason.contains("unpacked 257 children (MAX_CHILDREN = 256)"),
+            reason.contains(&format!(
+                "unpacked {} children (MAX_CHILDREN = {MAX_CHILDREN})",
+                MAX_CHILDREN + 1
+            )),
             "{reason}"
         );
         // the guard fires BEFORE any child work: not one vector landed

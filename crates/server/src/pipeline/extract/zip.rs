@@ -42,17 +42,31 @@
 //! third refused outright; proven for the mechanism in M2.1 and for real
 //! zips in the ingest e2e).
 //!
-//! # Guards (the docx discipline, same constants)
+//! # Guards (the docx discipline, same constants — two legs since the
+//! # 2026-11-11 裁决 2)
 //!
-//! * [`super::CONTAINER_MAX_ENTRIES`] checked before ANY entry is read
-//!   (the entry-count bomb form); the worker's MAX_CHILDREN=256 guards
-//!   the produced-children side — for THIS kind entries ≈ children, so
-//!   both trip at the same number.
+//! * [`super::CONTAINER_MAX_ENTRIES`] = 4096 checked before ANY entry is
+//!   read (the entry-count leg; widened from 256 by 裁决 2 — the count is
+//!   only the bomb's weak proxy); the worker's MAX_CHILDREN guards the
+//!   produced-children side at the SAME number — for THIS kind entries ≈
+//!   children, so both trip at the same point (the two constants move
+//!   together or children get dropped).
+//! * [`super::ExpansionBudget`] over
+//!   [`super::CONTAINER_EXPANSION_RATIO`] = 256: the decompressed bytes
+//!   this unpack reads may total at most `container bytes × 256`, charged
+//!   chunk-by-chunk while reading (the ratio leg — the bomb's ESSENCE: a
+//!   handful of entries exploding to gigabytes is the same attack as
+//!   millions of tiny ones, and the count alone never sees it).
 //! * [`super::ENTRY_DECOMPRESSION_CEILING`] = 256 MiB per entry, enforced
 //!   while READING (zip headers lie; the cap bounds what a bomb can make
 //!   this process materialize before the worker's max_file_size_mb gate
-//!   sees the child). A corrupt/encrypted entry fails the whole unpack
-//!   loudly — a partially-expanded archive must not index as if whole.
+//!   sees the child). Unchanged by 裁决 2: one leg bounds a single child,
+//!   the other the aggregate. A corrupt/encrypted entry fails the whole
+//!   unpack loudly — a partially-expanded archive must not index as if
+//!   whole.
+//! * both guard legs refuse with the shared two-branch vocabulary — "too
+//!   many entries OR an expansion ratio past 256:1 — this one: …" — so a
+//!   rejected archive's reason names which leg tripped and both numbers.
 //!
 //! # Affinity: deliberately undeclared
 //!
@@ -112,11 +126,19 @@ impl Extractor for ZipExtractor {
         if zip.len() > super::CONTAINER_MAX_ENTRIES {
             return Err(PipelineError::extract(format!(
                 "zip: the archive lists {} entries (max {}) — refused before reading any entry; \
-                 if the archive is legitimate, split it",
+                 the container bomb guard trips on too many entries OR an expansion ratio past \
+                 {}:1 ({} container bytes × {}), and this archive trips the ENTRY COUNT; if the \
+                 archive is legitimate, split it",
                 zip.len(),
-                super::CONTAINER_MAX_ENTRIES
+                super::CONTAINER_MAX_ENTRIES,
+                super::CONTAINER_EXPANSION_RATIO,
+                bytes.len(),
+                super::CONTAINER_EXPANSION_RATIO
             )));
         }
+        // 裁决 2's ratio leg: every entry this unpack reads charges the
+        // budget against the archive's own bytes
+        let mut budget = super::ExpansionBudget::new("zip", bytes.len());
         let mut children = Vec::with_capacity(usize::min(zip.len(), super::CONTAINER_MAX_ENTRIES));
         for i in 0..zip.len() {
             let mut entry = zip
@@ -132,6 +154,7 @@ impl Extractor for ZipExtractor {
             let bytes = super::read_entry_capped(
                 &mut entry,
                 super::ENTRY_DECOMPRESSION_CEILING,
+                &mut budget,
                 "zip",
                 &name,
             )?;
@@ -298,10 +321,64 @@ pub(crate) mod tests {
         let bomb = build_zip(&refs);
         let err = unpack(&bomb).unwrap_err();
         let msg = err.to_string();
+        // the count leg's numbers + the 裁决 2 two-branch vocabulary naming
+        // WHICH leg tripped (the count, not the ratio)
         assert!(
-            msg.contains(&format!("max {}", super::super::CONTAINER_MAX_ENTRIES)),
+            msg.contains(&format!(
+                "lists {} entries (max {})",
+                super::super::CONTAINER_MAX_ENTRIES + 1,
+                super::super::CONTAINER_MAX_ENTRIES
+            )),
             "{msg}"
         );
+        assert!(
+            msg.contains("too many entries OR an expansion ratio past"),
+            "{msg}"
+        );
+        assert!(msg.contains("trips the ENTRY COUNT"), "{msg}");
+        assert!(msg.contains("refused before reading any entry"), "{msg}");
+    }
+
+    /// THE 裁决 2 ratio leg over the zip kind: FEW entries (nowhere near
+    /// 4096), each far under the 256 MiB per-entry ceiling — but a handful
+    /// of highly-compressible payloads blows the `container bytes × 256`
+    /// total while reading, and the refusal names the RATIO branch with
+    /// both numbers (all-zero entries deflate ~1000:1 — the exact shape a
+    /// count-only guard waves through).
+    #[test]
+    fn expansion_ratio_bomb_refused_while_reading() {
+        let zeros = vec![0u8; 1024 * 1024]; // 1 MiB, ~1 KB deflated
+        let entries: Vec<(String, &[u8])> = (0..8)
+            .map(|i| (format!("pad/{i}.bin"), zeros.as_slice()))
+            .collect();
+        let refs: Vec<(&str, &[u8])> = entries.iter().map(|(n, b)| (n.as_str(), *b)).collect();
+        let bomb = build_zip(&refs);
+        // ~8 MiB decompressed against a ~10 KB archive: ~800×, past 256×
+        let err = unpack(&bomb).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expansion-ratio bomb guard refuses while reading"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("too many entries OR an expansion ratio past"),
+            "{msg}"
+        );
+        assert!(msg.contains("this one: the ratio"), "{msg}");
+        assert!(msg.contains("past the container limit"), "{msg}");
+        assert!(
+            msg.contains(&format!("× {}", super::super::CONTAINER_EXPANSION_RATIO)),
+            "{msg}"
+        );
+        // and it is NOT the count leg (8 entries is nowhere near 4096)
+        assert!(!msg.contains("ENTRY COUNT"), "{msg}");
+        // the moderate sibling passes: same entry count, honest 1:1-ish
+        // payloads are nowhere near the ratio
+        let sane = build_zip(&[
+            ("a.txt", b"plain body".as_slice()),
+            ("b.md", b"# heading".as_slice()),
+        ]);
+        assert!(unpack(&sane).is_ok());
     }
 
     #[test]
