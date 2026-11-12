@@ -1,0 +1,8 @@
+# One-shot reindex override (T18 migration wave: chapter-titles knob flips
+# the epub route's pipeline fingerprint — the gate refuses to start until the
+# drifted sources are re-embedded explicitly, per D-9.1's migration ruling).
+# Use: docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.reindex.yml up -d
+# Then recreate WITHOUT this file to return to the default serve command.
+services:
+  vectorfs:
+    command: ["serve", "--reindex", "--data-dir", "/vectorfs/data"]
