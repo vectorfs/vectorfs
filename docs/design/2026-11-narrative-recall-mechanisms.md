@@ -181,6 +181,20 @@ backlog 条目）。
 - **ADR 0006**：knob 落在 epub 的 EpubConfig——epub 现为归文档默认路由，指纹翻转覆盖面即
   默认行为面，迁移说明按此措辞。
 
+### T18 迁移注记（2026-11-12 交付回填）
+
+- **升级 ⇒ reindex 波次**：`chapter-titles` 恒序列化进指纹（默认 true），升级 T18 使每个
+  epub 路由桶（含 `epub = "auto"` 的 auto 桶）指纹翻转，`fingerprint_gate` 拒启并要求
+  `vectorfs serve --reindex`（或 `vf reindex`）。docs 桶受影响面 = epub 源
+  （≈15,428 chunk，本地 embedder 代价可忽略）；`chapter-titles = false` 恢复 pre-T18
+  chunk 形状（无 title、无 `x-vf-section-title`），但恢复不了 pre-T18 指纹值——回旧行为
+  仍需一次 reindex，如实措辞。
+- **MCP 面欠账 backlog**：`SearchParams` 本任务只加 `orderBy`；`searchMode`/`includeKinds`/
+  `anchors`（落后 CLI 三代）另立 backlog，不默扩（D-10.4 评审二处置）。
+- **部署侧同步**（F-9 教训）：交付后重装 `vf` 二进制与 `~/.zcode/skills` 的 skill 副本，
+  观测结论须锚定二进制版本。手动回放清单（8 查询头锚 ×8 + 灰雾 vs 魔药 orderBy 各一条）
+  属运营验收项，不在本仓测试面。
+
 ## 4. 实施序与守门
 
 **序**：T16 → T17 → T18（尺子→疗法→面）；T17 依赖 T16 语料（calibration v2），差分断言

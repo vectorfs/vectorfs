@@ -98,15 +98,23 @@
 ///
 /// 1. the source FILE NAME STEM (always — the non-PDF sources' only
 ///    component; `ChunkerKind::chunk_source` passes it);
-/// 2. the CHAPTER PATH: the NEAREST PRECEDING TOC entry for the window's
-///    START page — the last map entry (appearance order) whose target
-///    page ≤ the window's start page. A v1 declaration: the path is the
-///    FLAT nearest entry, not a reconstructed hierarchy (TOC lines carry
-///    no reliable depth signal; indent analysis is out of scope), and
-///    windows before the first entry's page — the TOC pages themselves,
-///    typically — carry no chapter component at all. The adjudication's
-///    optional document-title component is v1-NOT-IMPLEMENTED (see
-///    `ChunkCtx`'s declaration: no layout signal ⇒ not obtainable).
+/// 2. the CHAPTER COMPONENT, by source shape:
+///    * a CONTAINER LEAF part (T18, D-9.3) — `sections` empty and the
+///      walk stamped a `title` — names its chapter DIRECTLY (the epub
+///      nav/NCX/stem chain's label); the component is the title itself,
+///      page lookup never applies (container children are pageless);
+///    * a flat/PDF part — the NEAREST PRECEDING TOC entry for the
+///      window's START page: the last map entry (appearance order) whose
+///      target page ≤ the window's start page. A v1 declaration: the
+///      path is the FLAT nearest entry, not a reconstructed hierarchy
+///      (TOC lines carry no reliable depth signal; indent analysis is
+///      out of scope), and windows before the first entry's page — the
+///      TOC pages themselves, typically — carry no chapter component at
+///      all. The adjudication's optional document-title component is
+///      v1-NOT-IMPLEMENTED (see `ChunkCtx`'s declaration: no layout
+///      signal ⇒ not obtainable). A paged part inside a titled container
+///      keeps this arm (its `sections` is its own document's TOC map —
+///      the flat-PDF behavior is the zero-change rule).
 ///
 /// `None` when the mode is off (the pre-R2 path — no prefix ever
 /// materializes). The product is the ONLY string the embed axis may
@@ -116,16 +124,24 @@ pub(super) fn context_header(
     ctx: &super::ChunkCtx<'_>,
     sections: &[(u32, String)],
     start_page: Option<u32>,
+    title: Option<&str>,
 ) -> Option<String> {
     if mode == super::ContextHeader::None {
         return None;
     }
     let mut components: Vec<&str> = vec![ctx.source_stem];
-    if let Some(page) = start_page {
+    if sections.is_empty() {
+        // the container-leaf arm (T18): the stamped chapter title IS the
+        // chapter component — an untitled container child degrades to the
+        // stem-only prefix exactly as before
+        if let Some(t) = title {
+            components.push(t);
+        }
+    } else if let Some(page) = start_page {
         // nearest preceding entry: the LAST in-appearance entry whose
         // target page is at/below the window's start page
-        if let Some((_, title)) = sections.iter().rfind(|(tp, _)| *tp <= page) {
-            components.push(title);
+        if let Some((_, toc_title)) = sections.iter().rfind(|(tp, _)| *tp <= page) {
+            components.push(toc_title);
         }
     }
     Some(components.join(" > "))

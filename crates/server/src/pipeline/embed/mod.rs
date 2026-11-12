@@ -419,6 +419,7 @@ mod tests {
             page: None,
             line: None,
             section: None,
+            title: None,
             embed_prefix: None,
         };
         assert_eq!(embed_input(&plain), "正文块");

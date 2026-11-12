@@ -144,6 +144,7 @@ impl Extractor for MdExtractor {
             furniture_removed: 0,
             section: None,
             sections: Vec::new(),
+            title: None,
         }])
     }
 }

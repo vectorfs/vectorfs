@@ -816,6 +816,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            title: None,
             embed_prefix: None,
         };
         let chunks = vec![mk([255, 255, 255]), mk([0, 0, 0])];
@@ -848,6 +849,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            title: None,
             embed_prefix: None,
         };
         let red = e.embed_documents(&[wide]).await.unwrap();
@@ -917,6 +919,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                title: None,
                 embed_prefix: None,
             }])
             .await
@@ -1005,6 +1008,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            title: None,
             embed_prefix: None,
         };
         let batch: Vec<_> = (0..5).map(mk).collect();

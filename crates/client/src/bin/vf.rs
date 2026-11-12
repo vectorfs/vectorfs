@@ -277,9 +277,57 @@ struct SearchArgs {
     #[arg(long = "source")]
     sources: Vec<String>,
 
+    /// Container SECTION axis (T18, R8): `A` or `A:B` (inclusive) over the
+    /// source-internal chapter ordinal `x-vf-section` — compiled to $eq /
+    /// $gte+$lte, combined with --filter/--source/--at via $and. Section
+    /// numbers are per source (`vf chunks --sections` lists them with
+    /// titles)
+    #[arg(long, value_name = "A[:B]")]
+    section: Option<String>,
+
+    /// Section lookup by chapter TITLE substring (T18, R8): requires
+    /// EXACTLY ONE --source (a section number is source-internal — bare
+    /// use would cross-wire sources). Enumerates the source's chunks,
+    /// keeps the sections whose x-vf-section-title contains the substring
+    /// (case-insensitive), and compiles them into the same filter. Zero
+    /// matches reports a note instead of guessing
+    #[arg(long, value_name = "substr")]
+    at: Option<String>,
+
+    /// Terminal view ordering (T18, R8): section-asc / section-desc —
+    /// re-order the final hits by (section, line, score desc, key asc),
+    /// missing sections last; presentation only, scores keep their
+    /// meaning. Absent = retrieval order
+    #[arg(long, value_enum)]
+    order: Option<OrderByArg>,
+
     /// Structured output (schema_version'd JSON)
     #[arg(long)]
     json: bool,
+}
+
+/// The `--order` enum (T18): clap's ValueEnum turns an invalid value into
+/// a USAGE error (exit 2) — the client-side error face of the wire's
+/// orderBy validation (same pairing as --mode / searchMode).
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum OrderByArg {
+    /// Chapters in reading order (section ascending)
+    #[value(name = "section-asc")]
+    SectionAsc,
+    /// Chapters in reverse reading order (section descending)
+    #[value(name = "section-desc")]
+    SectionDesc,
+}
+
+impl OrderByArg {
+    /// The wire's orderBy spelling (kebab-case, the server's closed
+    /// vocabulary).
+    fn wire(self) -> &'static str {
+        match self {
+            OrderByArg::SectionAsc => "section-asc",
+            OrderByArg::SectionDesc => "section-desc",
+        }
+    }
 }
 
 /// The `--mode` enum (M3-T9): clap's ValueEnum turns an invalid value into
@@ -407,6 +455,12 @@ struct ChunksArgs {
     /// positional)
     #[arg(long)]
     bucket: Option<String>,
+
+    /// The folded SECTION map (T18, R8): distinct section → chapter title,
+    /// ascending — the map `--section`/`--at` address, instead of the full
+    /// chunk listing (zero server change; same T14 enumeration)
+    #[arg(long)]
+    sections: bool,
 
     /// Structured output (schema_version'd JSON)
     #[arg(long)]
@@ -1049,13 +1103,52 @@ async fn search_cmd(args: SearchArgs) {
             .fail(args.json, 2),
         },
     };
+    // T18 --at's source fence (D-10.2): a section number is SOURCE-INTERNAL
+    // (F-6), so the title lookup needs exactly ONE source — none or several
+    // would cross-wire sources' ordinals. Fail loud at the CLI (exit 2,
+    // the clap error channel's exit code) before any wire traffic.
+    let at_fenced =
+        at_fence_of(args.at.as_deref(), &args.sources).unwrap_or_else(|f| f.fail(args.json, 2));
+    // T18 --section: pure mechanical compilation (D-10.1, ADR 0004 — the
+    // server's filter compiler stays the single translation truth; this
+    // only spells the grammar sugar)
+    let section_filter = args
+        .section
+        .as_deref()
+        .map(section_filter_of)
+        .transpose()
+        .unwrap_or_else(|f| f.fail(args.json, 2));
+    // T18 --at: enumerate the fenced source's chunks, keep the sections
+    // whose x-vf-section-title contains the substring (case-insensitive),
+    // compile to $in. Zero matching sections compile to an empty $in (the
+    // honest zero-answer) PLUS the note the T15 discipline prescribes.
+    let at_filter_and_note = match at_fenced {
+        Some((source, substr)) => {
+            Some(at_filter_of(&conn, &bucket, source, substr, args.json).await)
+        }
+        None => None,
+    };
+    let (at_filter, at_note) = match at_filter_and_note {
+        None => (None, None),
+        Some((f, n)) => (f, n),
+    };
     // --source: a SHALLOW wrapper (T15) — the translation's single source
     // of truth is the SERVER (ADR 0004); the CLI only spells the filter.
-    // Combined with --filter via $and so both compose without key overlap.
-    let filter = match (filter, source_filter_of(&args.sources)) {
-        (f, None) => f,
-        (None, s) => s,
-        (Some(f), Some(s)) => Some(json!({ "$and": [f, s] })),
+    // T18: --section/--at are the same species of shallow wrapper; every
+    // member composes through $and so none can collide on a key.
+    let members: Vec<Value> = [
+        filter,
+        source_filter_of(&args.sources),
+        section_filter,
+        at_filter,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let filter = match members.len() {
+        0 => None,
+        1 => Some(members.into_iter().next().expect("len checked")),
+        _ => Some(json!({ "$and": members })),
     };
     let mut body = json!({
         "bucket": bucket,
@@ -1074,12 +1167,16 @@ async fn search_cmd(args: SearchArgs) {
         body["includeKinds"] = json!(args.kinds);
     }
     // R3a/R4: emitted only when spelled — absent = the server default
-    // (rerankDepth = topK, perSource off), old invocations byte-unchanged
+    // (rerankDepth = topK, perSource off), old invocations byte-unchanged.
+    // T18 --order: same discipline (absent = retrieval order)
     if let Some(d) = args.rerank_depth {
         body["rerankDepth"] = json!(d);
     }
     if let Some(n) = args.per_source {
         body["perSource"] = json!(n);
+    }
+    if let Some(o) = args.order {
+        body["orderBy"] = json!(o.wire());
     }
     let v = match conn.call_json("Search", &body).await {
         Ok(v) => v,
@@ -1088,8 +1185,16 @@ async fn search_cmd(args: SearchArgs) {
     let hits = v["hits"].as_array().cloned().unwrap_or_default();
     // T15: the server's empty-hit note (a src-name filter that matched no
     // indexed source — the typo signal); --json carries it as a member,
-    // the human table reports it on stderr (progress/diagnostics channel)
-    let note = v.get("note").and_then(Value::as_str).map(String::from);
+    // the human table reports it on stderr (progress/diagnostics channel).
+    // T18: the --at zero-section note rides the same channel (no chapter
+    // title contains the substring — the honest zero, spelled out)
+    let note = match (
+        v.get("note").and_then(Value::as_str).map(String::from),
+        at_note,
+    ) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
+    };
     // R1: the server's anchor analysis (present exactly when it ran — the
     // verdict list, rarest-first: the FIRST term is what gated the lexical
     // arm); same channel split as the note: --json member / human-mode
@@ -1233,6 +1338,129 @@ fn source_filter_of(sources: &[String]) -> Option<Value> {
         [one] => Some(json!({ "x-vf-src-name": one })),
         many => Some(json!({ "x-vf-src-name": { "$in": many } })),
     }
+}
+
+/// The `--section A[:B]` flag as a filter member (T18, D-10.1): a single
+/// value compiles to `$eq`, `A:B` (INCLUSIVE, A ≤ B) to `$gte`+`$lte` over
+/// the container-child ordinal `x-vf-section`. Every malformed shape
+/// (`:B`, `A:`, empty, non-numeric, inverted) is a USAGE failure naming
+/// the grammar — the flag fails loud before any wire traffic.
+fn section_filter_of(spec: &str) -> Result<Value, Failure> {
+    let parse = |s: &str| -> Result<u64, Failure> {
+        s.parse::<u64>().map_err(|_| {
+            Failure::new(
+                "USAGE",
+                format!("--section: '{s}' is not a section number"),
+                "sections are 1-based container ordinals — list them (with titles) with: \
+                 vf chunks <bucket>/<key> --sections",
+            )
+        })
+    };
+    match spec.split_once(':') {
+        None => {
+            let a = parse(spec)?;
+            Ok(json!({ "x-vf-section": { "$eq": a } }))
+        }
+        Some((a, b)) => {
+            let (a, b) = (parse(a)?, parse(b)?);
+            if a > b {
+                return Err(Failure::new(
+                    "USAGE",
+                    format!("--section: inverted range {a}:{b} (start must be <= end)"),
+                    format!("spell the range low-first: --section {b}:{a}"),
+                ));
+            }
+            Ok(json!({ "x-vf-section": { "$gte": a, "$lte": b } }))
+        }
+    }
+}
+
+/// The `--at` source fence (T18, D-10.2): a section number is SOURCE-INTERNAL
+/// (F-6), so the title lookup needs EXACTLY ONE `--source` — none or several
+/// would cross-wire sources' ordinals into one `$in`. `Ok(None)` = no `--at`
+/// spelled (nothing to fence); `Ok(Some((source, substr)))` = the fenced
+/// pair; the Err is the USAGE failure `search_cmd` fails loud with (exit 2,
+/// the clap error channel's exit code, before any wire traffic).
+fn at_fence_of<'a>(
+    at: Option<&'a str>,
+    sources: &'a [String],
+) -> Result<Option<(&'a String, &'a str)>, Failure> {
+    match at {
+        None => Ok(None),
+        Some(substr) => match sources {
+            [one] => Ok(Some((one, substr))),
+            many => Err(Failure::new(
+                "USAGE",
+                format!("--at needs exactly one --source (got {})", many.len()),
+                "section numbers are per source — pass the source first: vf search \"…\" \
+                 <bucket> --source <key> --at <title-substring>",
+            )),
+        },
+    }
+}
+
+/// The `--at <substr>` flag as a filter member (T18, D-10.2): enumerate
+/// the ONE fenced source's chunks (the T14 enumeration, full-metadata
+/// round trip, early-exit), keep the distinct sections whose
+/// `x-vf-section-title` contains `substr` (case-insensitive), and compile
+/// them to an `$in`. Returns the member plus an optional NOTE (zero
+/// matching sections — the honest zero spelled out, the T15 discipline).
+/// The enumeration is bounded by the source's own address space (early
+/// exit at the hash fence), so a 15k-chunk book costs one pass.
+async fn at_filter_of(
+    conn: &Connection,
+    bucket: &str,
+    source: &str,
+    substr: &str,
+    json_out: bool,
+) -> (Option<Value>, Option<String>) {
+    let indexes = match derived_indexes(conn, bucket).await {
+        Ok(ix) => ix,
+        Err(f) => f.fail(json_out, 1),
+    };
+    let hash = chunkkey::object_key_hash(source);
+    let entries = enumerate_source_chunks(conn, bucket, &indexes, &hash, json_out).await;
+    let needle = substr.to_lowercase();
+    let mut sections: Vec<u64> = Vec::new();
+    let mut sample_titles: Vec<String> = Vec::new();
+    for (_, m) in &entries {
+        let title = m["x-vf-section-title"].as_str();
+        if title.is_none_or(|t| !t.to_lowercase().contains(&needle)) {
+            continue;
+        }
+        if let Some(s) = m["x-vf-section"].as_u64()
+            && !sections.contains(&s)
+        {
+            sections.push(s);
+            if let Some(t) = title
+                && sample_titles.len() < 3
+            {
+                sample_titles.push(t.chars().take(40).collect());
+            }
+        }
+    }
+    if sections.is_empty() {
+        let note = format!(
+            "--at: no chapter of '{source}' has a section title containing {substr:?} — \
+             the filter matches nothing; list the source's sections with: vf chunks \
+             {bucket}/{source} --sections"
+        );
+        // an empty $in is the honest zero-answer (matches nothing, no
+        // error) — the note carries the diagnosis
+        return (Some(json!({ "x-vf-section": { "$in": [] } })), Some(note));
+    }
+    sections.sort_unstable();
+    let note = if sections.len() > 3 {
+        Some(format!(
+            "--at: {} sections ({}, …, §{}) of '{source}' match {substr:?}",
+            sections.len(),
+            sample_titles.join("; "),
+            sections[sections.len() - 1]
+        ))
+    } else {
+        None
+    };
+    (Some(json!({ "x-vf-section": { "$in": sections } })), note)
 }
 
 // ---------------------------------------------------------------------------
@@ -1715,6 +1943,13 @@ async fn chunks_cmd(args: ChunksArgs) {
     };
     let hash = chunkkey::object_key_hash(&key);
     let entries = enumerate_source_chunks(&conn, &bucket, &indexes, &hash, args.json).await;
+    // T18 --sections: the folded map (distinct section → title, ascending)
+    // over the SAME enumeration — the map `--section`/`--at` address, zero
+    // server change
+    if args.sections {
+        sections_view(&entries, &bucket, &key, &hash, args.json);
+        return;
+    }
     if entries.is_empty() {
         let status = src["status"].as_str().unwrap_or("?");
         eprintln!(
@@ -1800,6 +2035,59 @@ async fn chunks_cmd(args: ChunksArgs) {
             coord,
             text.chars().take(60).collect::<String>()
         );
+    }
+}
+
+/// The `--sections` folded view (T18, R8): distinct section → chapter
+/// title, ascending — 「地图即元数据」's read face over the same T14
+/// enumeration. A source with no section axis (a flat document) says so
+/// instead of printing an empty table.
+fn sections_view(entries: &[(String, Value)], bucket: &str, key: &str, hash: &str, json_out: bool) {
+    let mut map: Vec<(u64, Option<&str>)> = Vec::new();
+    for (_, m) in entries {
+        if let Some(s) = m["x-vf-section"].as_u64()
+            && !map.iter().any(|(sec, _)| *sec == s)
+        {
+            map.push((s, m["x-vf-section-title"].as_str()));
+        }
+    }
+    map.sort_unstable_by_key(|(s, _)| *s);
+    if json_out {
+        let sections: Vec<Value> = map
+            .iter()
+            .map(|(s, t)| {
+                json!({
+                    "section": s,
+                    "title": t,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema_version": SCHEMA_VERSION,
+                "bucket": bucket,
+                "key": key,
+                "hash": hash,
+                "count": sections.len(),
+                "sections": sections,
+            }))
+            .expect("serializes")
+        );
+        return;
+    }
+    if map.is_empty() {
+        eprintln!(
+            "vf: '{key}' carries no section axis (flat source, or no container children yielded) \
+             — sections address container children (epub chapters)"
+        );
+        return;
+    }
+    println!("{key} · {} sections", map.len());
+    let header = format!("{:<8} {}", "SECTION", "TITLE");
+    println!("{header}");
+    for (s, t) in &map {
+        println!("{:<8} {}", format!("§{s}"), t.unwrap_or("—"));
     }
 }
 
@@ -2762,5 +3050,66 @@ mod tests {
             source_filter_of(&["docs/a.txt".to_string(), "docs/b.txt".to_string()]),
             Some(json!({"x-vf-src-name": {"$in": ["docs/a.txt", "docs/b.txt"]}}))
         );
+    }
+
+    /// `--section A[:B]` ⇒ the x-vf-section filter member (T18, D-10.1):
+    /// a single value compiles to `$eq`, `A:B` (inclusive) to `$gte`+`$lte`,
+    /// and every malformed shape (`:B`, `A:`, empty, non-numeric, inverted)
+    /// is a USAGE failure naming the grammar — the compilation happens
+    /// client-side but the translation truth stays the SERVER's (ADR 0004:
+    /// these are the only two spellings the server's filter compiler would
+    /// accept anyway).
+    #[test]
+    fn section_flag_compiles_and_refuses_malformed_shapes() {
+        assert_eq!(
+            section_filter_of("7").unwrap(),
+            json!({"x-vf-section": {"$eq": 7}})
+        );
+        assert_eq!(
+            section_filter_of("3:9").unwrap(),
+            json!({"x-vf-section": {"$gte": 3, "$lte": 9}})
+        );
+        // degenerate-but-legal: a one-section range is the same predicate
+        assert_eq!(
+            section_filter_of("4:4").unwrap(),
+            json!({"x-vf-section": {"$gte": 4, "$lte": 4}})
+        );
+        // malformed shapes all refuse (fail loud, exit 2 in the command)
+        for bad in ["", ":5", "5:", "x", "1:x", "x:9", "9:3", "-1", "1.5"] {
+            let err = section_filter_of(bad).unwrap_err();
+            assert_eq!(err.code, "USAGE", "{bad}: {err:?}");
+        }
+        // the inverted range's hint spells the fix
+        let inv = section_filter_of("9:3").unwrap_err();
+        assert!(inv.hint.contains("--section 3:9"), "{inv:?}");
+    }
+
+    /// The `--at` source fence (T18, D-10.2): a section number is
+    /// source-internal, so no `--at` without EXACTLY ONE `--source` —
+    /// none or several cross-wire sources' ordinals; the fence refusals
+    /// are USAGE failures whose hint names the fix.
+    #[test]
+    fn at_fence_requires_exactly_one_source() {
+        // no --at: nothing to fence, any --source count is fine
+        assert!(matches!(at_fence_of(None, &[]), Ok(None)));
+        assert!(matches!(
+            at_fence_of(None, &["docs/a.txt".to_string(), "docs/b.txt".to_string()]),
+            Ok(None)
+        ));
+        // --at + exactly one --source: the fenced pair
+        let src = "docs/novel.epub".to_string();
+        let fenced = at_fence_of(Some("灰雾"), std::slice::from_ref(&src)).unwrap();
+        assert_eq!(fenced, Some((&src, "灰雾")));
+        // --at with no source / several sources: USAGE, fail loud
+        let no_source = at_fence_of(Some("灰雾"), &[]).unwrap_err();
+        let two = at_fence_of(
+            Some("灰雾"),
+            &["docs/a.epub".to_string(), "docs/b.epub".to_string()],
+        )
+        .unwrap_err();
+        for f in [no_source, two] {
+            assert_eq!(f.code, "USAGE", "{f:?}");
+            assert!(f.hint.contains("--source"), "{f:?}");
+        }
     }
 }

@@ -180,13 +180,16 @@ impl TokenWindowChunker {
                 // R2 CCH: the window's context header — the chapter
                 // component keys on the window's START page (页区间的起始
                 // 页), so a straddling window names the chapter its first
-                // char lives in
+                // char lives in; T18: a container LEAF (no TOC map) names
+                // its stamped chapter title instead (the shared seam's
+                // two arms — windowing::context_header)
                 let embed_prefix = ctx.and_then(|ctx| {
                     super::windowing::context_header(
                         self.context_header,
                         ctx,
                         &part.sections,
                         page.map(|(start, _)| start),
+                        part.title.as_deref(),
                     )
                 });
                 out.push(Chunk {
@@ -199,8 +202,10 @@ impl TokenWindowChunker {
                     page,
                     line,
                     // the orchestration channel passes through untouched
-                    // (container-child ordinal, stamped by the ingest walk)
+                    // (container-child ordinal + T18 chapter title, both
+                    // stamped by the ingest walk)
                     section: part.section,
+                    title: part.title.clone(),
                     embed_prefix,
                 });
                 index += 1;
@@ -232,6 +237,7 @@ mod tests {
             furniture_removed: 0,
             section: None,
             sections: Vec::new(),
+            title: None,
         }])
         .unwrap()
         .into_iter()
@@ -452,6 +458,7 @@ mod tests {
             furniture_removed: 0,
             section: None,
             sections: Vec::new(),
+            title: None,
         };
         let out = c.chunk(&[part]).unwrap();
         // the invariant battery still holds (forced endpoints never bend it)
@@ -549,6 +556,7 @@ mod tests {
             furniture_removed: 0,
             section: None,
             sections: Vec::new(),
+            title: None,
         };
         let out = c.chunk(&[part]).unwrap();
         assert!(out.len() >= 3, "fixture must span windows: {out:?}");
@@ -618,6 +626,7 @@ mod tests {
             real_lines: false,
             furniture_removed: 0,
             section: None,
+            title: None,
             sections: vec![(1, "一章".to_string()), (2, "二章".to_string())],
         };
         part.pages = vec![(1, 0), (2, 18)];
@@ -706,6 +715,7 @@ mod tests {
             furniture_removed: 0,
             section: Some(4),
             sections: Vec::new(),
+            title: None,
         };
         let out = c.chunk(&[part]).unwrap();
         assert!(out.len() >= 2, "{out:?}");

@@ -713,6 +713,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                title: None,
                 embed_prefix: None,
             },
             Chunk {
@@ -723,6 +724,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                title: None,
                 embed_prefix: None,
             },
         ];
@@ -933,6 +935,7 @@ pub(crate) mod tests {
                     page: None,
                     line: None,
                     section: None,
+                    title: None,
                     embed_prefix: None,
                 },
                 Chunk {
@@ -943,6 +946,7 @@ pub(crate) mod tests {
                     page: None,
                     line: None,
                     section: None,
+                    title: None,
                     embed_prefix: None,
                 },
             ])

@@ -85,7 +85,12 @@ Index-side chunk-table knob: `context-header = "toc-path" | "none"`
 `文件名（去扩展）> 章节路径` — where the chapter comes from the PDF's
 TOC-derived section map (the nearest preceding TOC entry for the chunk's
 start page; non-PDF sources and TOC-less documents degrade to
-filename-only). Two rules are load-bearing:
+filename-only). T18 adds the container arm: a container LEAF part (an
+epub chapter) names its stamped chapter title directly — `文件名 >
+章题` — from the epub `chapter-titles` knob's two-level chain (nav/NCX
+label > child file-name stem; that knob lives on `[extractor.<name>]
+kind = "epub"`, defaults true, and DOES trip the fingerprint gate — see
+below). Two rules are load-bearing:
 
 - **改嵌入输入 = 改块身份 = reindex**: enabling the knob changes every
   vector, so it ENTERS the pipeline fingerprint and the gate demands an

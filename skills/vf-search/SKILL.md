@@ -35,6 +35,9 @@ CLI (bucket as a bare positional, XOR `--bucket`):
 | `--rerank` | cross-encoder re-scoring of the merged top-K (needs `[ingest] rerank = true`; semantic/hybrid only — keyword refuses) |
 | `--rerank-depth N` | rerank candidate depth: re-score the first N merged candidates, still return `--top-k` (1..=200, ≥ top-k, needs `--rerank`, default = top-k). CPU budget: ~148 ms/pair on CPU — depth 20 ≈ 3 s, depth 50 ≈ 7.4 s |
 | `--per-source N` | per-source quota: at most N hits per source file in the merged order, before top-K truncation (1..=100, default off). Fewer than top-k hits come back when the quota thins the set — no backfill |
+| `--section A[:B]` | container chapter range (T18): `7` = chapter 7, `3:9` = chapters 3–9 inclusive — compiles to an `x-vf-section` filter; sections are per source, so scope with `--source` for cross-file queries |
+| `--at SUBSTR` | chapter lookup by TITLE substring (T18): needs exactly one `--source`; enumerates that source's chapter titles and filters to the sections whose title contains the substring (case-insensitive). List titles first with `vf chunks <key> --sections` |
+| `--order O` | terminal view ordering (T18): `section-asc` \| `section-desc` — re-orders the final hits by (section, line, score desc, key asc), section-less hits last. Presentation only: membership and scores keep their meaning. Absent = retrieval order |
 | `--top-k K` | hits to request, 1..=1000 (default 10) |
 | `--source KEY` | restrict to one source file by its key (repeatable = several files) — the server translates names to the `x-vf-src-uri` hash, no digging |
 | `--kind K` | admit an excluded structure kind (repeatable): `toc` and `legend` chunks are out of the default result set; `--kind toc` brings them back (allowed: body, toc, caption, legend) |
@@ -43,7 +46,8 @@ CLI (bucket as a bare positional, XOR `--bucket`):
 | `--json` | schema-versioned structured output |
 
 MCP tool (`vf mcp` or `vectorfs mcp`): `search {bucket, text, topK, filter?,
-returnText}` — same semantics, camelCase.
+returnText, orderBy?}` — same semantics, camelCase (`orderBy:
+"section-asc"|"section-desc"` mirrors `--order`).
 
 ### Anchor gating (R1→T17 — automatic, default on for fts buckets)
 
@@ -114,6 +118,28 @@ pathologically short) — `--kind` (or `includeKinds` on the wire) admits
 them. A zero-hit search whose src-name filter matched no indexed source
 says so in a `note` — check the key spelling (`vf ls`) before concluding
 the corpus lacks the answer.
+
+### Section axis (T18 — books and other container documents)
+
+A container document (epub book, one file = one document) carries a
+per-source chapter ordinal on every chunk: `x-vf-section` (1 = first
+chapter; filterable like any number key) and, when the epub's TOC
+declares chapter titles, their prose form `x-vf-section-title`
+(filterable `$eq`/`$startsWith`). The CLI sugar over them:
+
+```bash
+vf search "潮汐灯" docs --source docs/novel.epub --section 7      # one chapter
+vf search "灰雾" docs --source docs/novel.epub --section 3:9      # a range, inclusive
+vf search "魔药" docs --source docs/novel.epub --at 魔药铺        # by title substring
+vf search "…" docs --order section-asc                            # read hits in book order
+vf chunks docs/novel.epub --sections    # the section → title map of one source
+```
+
+`--section`/`--at` compose with `--filter`/`--source` into one `$and`.
+The natural recall recipe for narrative questions ("when does X first
+happen"): `--per-source` + `--order section-asc`, then read the first
+hit's chapter — recap chapters outrank the occurrence in raw score, but
+cannot claim the earliest narrative slot.
 
 ## From hit to full document
 

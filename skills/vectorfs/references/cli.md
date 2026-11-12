@@ -65,6 +65,9 @@ cross-checks the real container).
 | `--rerank` | cross-encoder re-scoring of the merged top-K (needs `[ingest] rerank = true`; semantic/hybrid only — keyword refuses: BM25 order IS that mode's contract) |
 | `--rerank-depth N` | rerank candidate depth (R3a): re-score the first N merged candidates, still return `--top-k`. 1..=200 and ≥ top-k, needs `--rerank`; default = top-k (no change). CPU budget: the cross-encoder scores ~148 ms/pair on CPU — depth 20 ≈ 3 s, depth 50 ≈ 7.4 s (linear in depth) |
 | `--per-source N` | per-source quota (R4): at most N hits per source file, applied to the merged ranking before top-K truncation (rank order kept). 1..=100, 0/absent = off. If the quota thins the set below top-k, fewer hits come back — skipped same-source hits are NOT backfilled (backfill would defeat the quota) |
+| `--section A[:B]` | container chapter range (T18): `7` compiles to `x-vf-section $eq`, `3:9` (inclusive, low-first) to `$gte`+`$lte`; composes with `--filter`/`--source`/`--at` via `$and`. Sections are per source (1 = first chapter) — list them with `vf chunks <key> --sections`; malformed shapes are usage errors |
+| `--at SUBSTR` | chapter lookup by TITLE substring (T18): requires EXACTLY ONE `--source` (section numbers are source-internal; none/multiple = usage error). Enumerates that source's chunks, keeps the sections whose `x-vf-section-title` contains the substring (case-insensitive), compiles them to `$in`. Zero matches = empty `$in` + a note naming the fix (list titles with `--sections`) |
+| `--order O` | terminal view ordering (T18): `section-asc` \| `section-desc` — the FINAL hit set re-ordered by (section, line-start, score desc, key asc), hits without a section LAST (both directions). Presentation only (after quota/truncation/rerank): membership and every `score` keep their meaning. Absent = retrieval order |
 | `--bucket B` | explicit form (XOR the bare-name positional) |
 | `--top-k K` | 1..=1000, default 10 |
 | `--source KEY` | restrict to one source file by key, repeatable for several (T15) — the server translates names to `x-vf-src-uri` hashes, no hash digging |
@@ -84,7 +87,11 @@ are pathologically short BM25 docs) — `--kind toc` (repeatable; the wire's
 Filter operators (bare value = implicit `$eq`): `$eq $ne $gt $gte $lt $lte
 $startsWith $in $nin $exists $and $or`. Example:
 `--filter '{"kind": {"$eq": "doc"}, "len": {"$gte": 5}}'`. Filterable
-file-layer keys: `x-vf-src-uri` (everywhere) and `x-vf-chunk-kind`; on this
+file-layer keys: `x-vf-src-uri` (everywhere), `x-vf-chunk-kind`, and the
+T13/T18 coordinate keys `x-vf-page-start`/`x-vf-line-start`/`x-vf-section`
+(numbers) plus `x-vf-section-title` (string, `$eq`/`$startsWith` — the
+epub chapter-title stamp, present only when the source's TOC declared
+titles); on this
 Search face `x-vf-src-name` also filters with `$eq`/`$in` (server-side
 translated to the src-uri hash — QueryVectors rejects that key; other
 operators on it are refused with a pointer to `x-vf-src-uri`, see
@@ -144,6 +151,12 @@ Table: `I  KIND  COORD  TEXT` — I is `{modality}-{i}` (compose the full key
 with the hash prefix printed above the table), KIND the `x-vf-chunk-kind`,
 COORD the T13 summary (`p18-19` / `L405-420` / `§3`), TEXT a 60-char
 preview. `--json`. The read verb for the bodies is `vf chunk show`.
+
+`--sections` (T18): the folded SECTION map instead of the chunk listing —
+distinct section → chapter title, ascending, over the same enumeration
+(zero server change; `--json`). The map `vf search --section`/`--at`
+address; a source with no section axis (flat document) says so instead of
+printing an empty table.
 
 ### `vf chunk show <BUCKET> <CHUNK-KEY>`
 

@@ -290,11 +290,13 @@ pub enum Fit {
 /// spans), [`Part::pages`] (the page-offset table T13 shares), and
 /// [`Part::furniture_removed`]. R2 (recall roadmap CCH) adds a third
 /// annotation channel of the same additive shape: [`Part::sections`] (the
-/// TOC-derived chapter map the context-header axis consumes). They are
-/// PLAIN Vecs/ints, not Options, for the same reason `image` is
-/// additive-but-explicit: an absent annotation and an empty annotation
-/// mean the same thing here, and one-line `Vec::new()`/`0` literals keep
-/// every existing construction site honest about the new channels.
+/// TOC-derived chapter map the context-header axis consumes); T18 (R8
+/// chapter-title propagation) adds the Option-shaped [`Part::title`]
+/// beside the ordinal. They are PLAIN Vecs/ints, not Options, for the
+/// same reason `image` is additive-but-explicit: an absent annotation and
+/// an empty annotation mean the same thing here, and one-line
+/// `Vec::new()`/`0` literals keep every existing construction site honest
+/// about the new channels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Part {
     pub modality: Modality,
@@ -366,6 +368,20 @@ pub struct Part {
     /// chunker axis only when `context-header = "toc-path"`; like the
     /// other annotation channels it never changes the text channel.
     pub sections: Vec<(u32, String)>,
+    /// Container CHAPTER TITLE (T18, R8 structure axis): the prose title of
+    /// the container child this part came from (an epub chapter's nav/NCX
+    /// label, or its file-name stem when the package declares no TOC — the
+    /// `chapter-titles` knob's two-level chain, design D-9.2). Like
+    /// [`Part::section`] this is an ORCHESTRATION stamp: extractors never
+    /// set it; the ingest container walk copies it from the
+    /// [`ChildDoc::title`] the container kind produced. `None` is the
+    /// ordinary value — leaf documents, and children of container kinds
+    /// that declare no titles (zip/eml), never carry one. Consumed beside
+    /// the section ordinal: the CCH context header's chapter component for
+    /// a container LEAF (D-9.3) and the `x-vf-section-title` metadata key
+    /// (D-9.4). An outer walk's stamp lands beside (never erases) an inner
+    /// walk's — see the stamping site's title-preservation note.
+    pub title: Option<String>,
 }
 
 /// One structural label over a [`Part`]'s text (T12): a BYTE range plus its
@@ -417,15 +433,25 @@ pub struct ImagePayload {
 /// * `name` — the chapter/entry path (e.g. `OEBPS/ch1.xhtml`): provenance
 ///   and logs only, never routing input (a child has no filename to guess
 ///   from — the mime IS its identity).
+/// * `title` — the child's CHAPTER TITLE (T18, R8 structure axis):
+///   `None` for every kind except the epub kind under its `chapter-titles`
+///   knob (whose nav/NCX > filename-stem chain is the point of the
+///   field). The ingest container walk copies it onto every part of the
+///   child's walk ([`Part::title`]) beside the section ordinal.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChildDoc {
     pub bytes: bytes::Bytes,
     pub mime: String,
     pub name: String,
+    /// Chapter title, when the container kind declares one (T18 — see the
+    /// struct docs). `None` for every pre-T18 call site, which is why
+    /// [`ChildDoc::new`] keeps its signature and opens the channel empty.
+    pub title: Option<String>,
 }
 
 impl ChildDoc {
-    /// Convenience constructor (tests and future M3 kinds).
+    /// Convenience constructor (tests and future M3 kinds): an UNTITLED
+    /// child (the pre-T18 shape — the title channel opens `None`).
     pub fn new(
         name: impl Into<String>,
         mime: impl Into<String>,
@@ -435,6 +461,22 @@ impl ChildDoc {
             bytes: bytes.into(),
             mime: mime.into(),
             name: name.into(),
+            title: None,
+        }
+    }
+
+    /// Convenience constructor for TITLED children (T18): the epub kind's
+    /// chapter arm (nav/NCX label or filename stem under the
+    /// `chapter-titles` knob) and its tests.
+    pub fn new_titled(
+        name: impl Into<String>,
+        mime: impl Into<String>,
+        bytes: impl Into<bytes::Bytes>,
+        title: impl Into<String>,
+    ) -> Self {
+        ChildDoc {
+            title: Some(title.into()),
+            ..ChildDoc::new(name, mime, bytes)
         }
     }
 }
@@ -456,6 +498,7 @@ impl Part {
             furniture_removed: 0,
             section: None,
             sections: Vec::new(),
+            title: None,
         }
     }
 
@@ -479,6 +522,7 @@ impl Part {
             furniture_removed: 0,
             section: None,
             sections: Vec::new(),
+            title: None,
         }
     }
 }
@@ -568,6 +612,14 @@ pub struct Chunk {
     /// passed through untouched from [`Part::section`] (the orchestration
     /// source — extractors never set it). `None` for every leaf source.
     pub section: Option<u32>,
+    /// Content-addressing CHAPTER TITLE (T18, R8): the container child's
+    /// prose title, passed through untouched from [`Part::title`] (the
+    /// same orchestration channel as `section` — extractors never set
+    /// it). `None` for every leaf source and every untitled container
+    /// child; the ingest row stamper writes it as the `x-vf-section-title`
+    /// metadata key (string; filterable `$eq`/`$startsWith` by the mirror
+    /// column's automatic evolution) only when present.
+    pub title: Option<String>,
     /// Embedding-input heading-path prefix (R2 CCH, recall roadmap):
     /// `文件名（去扩展）> 文档标题（可得则用）> 章节路径（按窗起始页查
     /// TOC 章节地图）` — the structured-context prefix the chunker stamps
@@ -1331,6 +1383,7 @@ mod tests {
             page: None,
             line: None,
             section: None,
+            title: None,
             embed_prefix: None,
         };
         let atomic = Chunk {
@@ -1344,6 +1397,7 @@ mod tests {
             page: None,
             line: None,
             section: None,
+            title: None,
             embed_prefix: None,
         };
         assert_eq!(text_window.modality(), Modality::Text);

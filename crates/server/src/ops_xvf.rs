@@ -173,6 +173,15 @@ struct SearchInput {
     /// vocabulary (`body|toc|caption|legend`) — unknown kinds are
     /// ValidationExceptions, never silent no-matches.
     include_kinds: Option<Vec<String>>,
+    /// Terminal view ordering (T18, R8 structure axis, D-10.4):
+    /// `section-asc` / `section-desc` re-order the FINAL hit set by
+    /// (section, line-start, score desc, key asc), missing keys
+    /// nulls-last — applied AFTER quota/truncation/rerank (presentation
+    /// only, membership untouched; the `score` column keeps its meaning).
+    /// Absent = the retrieval order (the pre-T18 behavior). Unknown
+    /// values are ValidationExceptions at `path=orderBy` (the searchMode
+    /// precedent).
+    order_by: Option<String>,
 }
 
 /// The parsed `searchMode` (see [`SearchInput::search_mode`]).
@@ -181,6 +190,13 @@ enum SearchMode {
     Semantic,
     Keyword,
     Hybrid,
+}
+
+/// The parsed `orderBy` (T18, D-10.4): the section axis's two directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderBy {
+    SectionAsc,
+    SectionDesc,
 }
 
 #[derive(Deserialize)]
@@ -1212,6 +1228,16 @@ fn compile_filter(
 /// fusion order; fewer than topK are returned when the quota thins the
 /// set (no backfill — backfilling would defeat the quota). Absent/0 = off.
 ///
+/// `orderBy` (T18, R8 structure axis): terminal view ordering of the FINAL
+/// hit set — `"section-asc"`/`"section-desc"` sort by the chapter ordinal
+/// `x-vf-section` (key sequence section, `x-vf-line-start`, score desc,
+/// key asc; a MISSING section sorts NULLS-LAST in both directions).
+/// Applied after quota → truncation → rerank: presentation only, the
+/// membership and every hit's `score` keep their meaning (composed with
+/// rerank, the score column still carries the rerank logit). Absent = the
+/// retrieval order; unknown values are refused at `path=orderBy` (the
+/// searchMode discipline). A ranking policy, NOT in the fingerprint.
+///
 /// Anchor gating (R1→T17, on by DEFAULT for lexical faces of fts buckets —
 /// bucket knob `anchor-gating = true|false`): before the lexical arm runs,
 /// the query's quoted spans (any script, whole) and analyzer terms (the
@@ -1283,6 +1309,24 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
                 format!(
                     "unknown searchMode {other:?} (allowed: semantic, keyword, hybrid) — \
                      semantic is the default"
+                ),
+            ));
+        }
+    };
+
+    // T18 orderBy (D-10.4): closed vocabulary, 400 at the field (the
+    // searchMode discipline — an unknown value dies at the field that
+    // carries it, never a silent no-op ordering)
+    let order_by = match input.order_by.as_deref() {
+        None => None,
+        Some("section-asc") => Some(OrderBy::SectionAsc),
+        Some("section-desc") => Some(OrderBy::SectionDesc),
+        Some(other) => {
+            return Err(ApiError::validation_field(
+                "orderBy",
+                format!(
+                    "unknown orderBy {other:?} (allowed: section-asc, section-desc) — absent \
+                     keeps the retrieval order"
                 ),
             ));
         }
@@ -1824,6 +1868,64 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> Result<Respon
         // rerankDepth candidates, still RETURN topK (a no-op at the
         // default depth == topK).
         merged.truncate(top_k);
+    }
+
+    // ---- T18 orderBy (R8 structure axis, D-10.4): the terminal view
+    // ordering — 配额 → 截断 → rerank → 排序 (§3's order of record; only
+    // the PRESENTATION moves, never the membership). Key sequence:
+    // (section, line-start, score desc, key asc), with a MISSING key
+    // sorting NULLS-LAST in both directions (a hit without a section is
+    // not "chapter zero" — it is a differently-shaped source, and pinning
+    // it last keeps container-only orderings readable in mixed buckets).
+    // `section-desc` flips ONLY the section key; the tie sequence
+    // (line-start asc, score desc, key asc) is stable in both directions
+    // — determinism over symmetry. Composes with rerank: applied AFTER
+    // it, the presented order is the section order even though each
+    // hit's `score` stays the RERANK LOGIT (the score column is what
+    // produced the membership; the orderBy column is how you read it).
+    // Ranking policy, deliberately NOT in the fingerprint (the T11/T12
+    // rerank precedent — §3).
+    if let Some(direction) = order_by {
+        let descending = matches!(direction, OrderBy::SectionDesc);
+        // per-key extraction, once per comparison arm: the stored
+        // metadata is the single source (the coord summary below reads
+        // the same keys)
+        let section_of = |h: &crate::pipeline::Hit| -> Option<u64> {
+            attribution
+                .get(&h.key)
+                .and_then(|(_, _, m)| m.as_ref())
+                .and_then(|m| m.get("x-vf-section"))
+                .and_then(serde_json::Value::as_u64)
+        };
+        let line_of = |h: &crate::pipeline::Hit| -> Option<u64> {
+            attribution
+                .get(&h.key)
+                .and_then(|(_, _, m)| m.as_ref())
+                .and_then(|m| m.get("x-vf-line-start"))
+                .and_then(serde_json::Value::as_u64)
+        };
+        // nulls-last comparator for one Option<u64> key: None ranks
+        // after EVERY Some, in both directions
+        let opt_cmp = |x: Option<u64>, y: Option<u64>, flip: bool| -> std::cmp::Ordering {
+            use std::cmp::Ordering;
+            match (x, y) {
+                (Some(x), Some(y)) if flip => y.cmp(&x),
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+        };
+        merged.sort_by(|a, b| {
+            opt_cmp(section_of(a), section_of(b), descending)
+                .then_with(|| opt_cmp(line_of(a), line_of(b), false))
+                .then_with(|| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.key.cmp(&b.key))
+        });
     }
 
     let hits: Vec<serde_json::Value> = merged
@@ -3207,6 +3309,232 @@ mod tests {
             ls <= 3 && 3 <= le,
             "({ls},{le}) must contain line 3: {holder}"
         );
+    }
+
+    /// The T18 container pipeline: a cfg(test) scripted container (the
+    /// ingest suite's discipline) whose children CARRY TITLES, beside a
+    /// flat txt source — the section axis and its title companion, end to
+    /// end through the real worker.
+    async fn titled_container_fixture() -> Fixture {
+        let text = format!(
+            "[extractor.plain]\nkind = \"txt\"\n\n\
+             [extractor.ctn]\nkind = \"txt\"\n\n\
+             [embedder.tiny]\nkind = \"ort\"\nmodel = \"tiny-fixture\"\npath = {:?}\noffline = true\n\n\
+             [ingest.docs]\ninclude = [\"docs/**\"]\nextract = {{ txt = \"plain\", ctn = \"ctn\" }}\n\
+             chunk = {{ kind = \"token-window\", size = 32, overlap = 8 }}\n\
+             embedders = [\"tiny\"]\nscan_interval_secs = 1\n",
+            fixture_dir().display().to_string()
+        );
+        let cfg = crate::pipeline::config::load_pipeline_config(&text).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut core = IngestCore::load(&cfg, std::path::Path::new("/nonexistent-models"))
+            .await
+            .expect("fixture embedder loads");
+        // the placeholder extractor becomes the scripted container (the
+        // ingest suite's runtime_patched shape, through BucketPlan's
+        // cfg(test) injection hook — the plan's own fields stay private)
+        use crate::pipeline::ChildDoc;
+        use crate::pipeline::extract::ExtractorKind;
+        const PAYLOAD: &[u8] = b"TITLED-BOOK";
+        core.buckets
+            .get_mut("docs")
+            .expect("docs bucket")
+            .set_extractor(
+                "ctn",
+                ExtractorKind::TestContainer(crate::pipeline::extract::TestContainerSpec::one(
+                    "application/octet-stream",
+                    PAYLOAD,
+                    vec![
+                        ChildDoc::new_titled(
+                            "ch1.xhtml",
+                            "text/plain",
+                            "first chapter body words alpha beta gamma",
+                            "第一章　灰雾渡口",
+                        ),
+                        ChildDoc::new_titled(
+                            "ch2.xhtml",
+                            "text/plain",
+                            "second chapter body words delta epsilon zeta",
+                            "第二章　魔药铺",
+                        ),
+                        ChildDoc::new(
+                            "ch3.xhtml",
+                            "text/plain",
+                            "third chapter body words eta theta iota",
+                        ),
+                    ],
+                )),
+            );
+        let handle = Arc::new(IngestHandle::new(IngestShared::new(core)));
+        let state = Arc::new(AppState::new(
+            Arc::new(crate::store::Storage::file(dir.path())),
+            Some(creds()),
+            "us-east-1".into(),
+            "000000000000".into(),
+            false,
+            Some(handle.clone()),
+        ));
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let rt = IngestRuntime::new(
+            Arc::clone(handle.shared()),
+            state.clone(),
+            Arc::new(Notify::new()),
+            rx,
+        );
+        Fixture {
+            router: crate::build_router(state.as_ref().clone()),
+            rt,
+            handle,
+            state,
+            dir,
+        }
+    }
+
+    /// T18 R8 structure axis, end to end (D-9.4 + D-10.4): a titled
+    /// container + a flat txt share one index —
+    /// * `x-vf-section-title` is FILTERABLE ($eq/$startsWith, the mirror
+    ///   column's automatic evolution — F-7, no registration);
+    /// * `orderBy: section-asc|section-desc` re-orders the final view by
+    ///   (section, line, score desc, key asc) with MISSING sections
+    ///   NULLS-LAST (the flat source's hits), scores retained;
+    /// * an unknown orderBy is a 400 at path=orderBy (the searchMode
+    ///   discipline).
+    #[tokio::test]
+    async fn search_section_axis_title_filters_and_order_by() {
+        let f = titled_container_fixture().await;
+        const PAYLOAD: &[u8] = b"TITLED-BOOK";
+        put_source_call(&f, "docs", "docs/book.ctn", PAYLOAD.to_vec()).await;
+        put_source_call(
+            &f,
+            "docs",
+            "docs/flat.txt",
+            b"flat source body words kappa lambda mu".to_vec(),
+        )
+        .await;
+        drive(&f).await;
+
+        // ---- D-9.4: the title companion is filterable ----
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"words"},"topK":50,
+                   "filter":{"x-vf-section-title":{"$eq":"第二章　魔药铺"}}}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let hits = b["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "the titled section matches: {b}");
+        for h in hits {
+            assert_eq!(
+                h["metadata"]["x-vf-section"],
+                json!(2),
+                "$eq on the title narrows to section 2: {h}"
+            );
+        }
+        let (st, _, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"words"},"topK":50,
+                   "filter":{"x-vf-section-title":{"$startsWith":"第"}}}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        {
+            let hits = b["hits"].as_array().unwrap();
+            assert!(
+                !hits.is_empty(),
+                "$startsWith 第 matches the titled sections: {b}"
+            );
+            for h in hits {
+                // the two titled sections (1, 2) — never the untitled 3,
+                // never the flat source's key-absent rows
+                let sec = h["metadata"]["x-vf-section"].as_u64();
+                assert!(
+                    sec == Some(1) || sec == Some(2),
+                    "$startsWith keeps only the titled rows: {h}"
+                );
+            }
+        }
+
+        // ---- D-10.4: orderBy section-asc — container sections ascending,
+        // the flat (section-less) source NULLS-LAST, scores retained ----
+        let sections_of = |b: &serde_json::Value| -> Vec<Option<u64>> {
+            b["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["metadata"]["x-vf-section"].as_u64())
+                .collect()
+        };
+        let (st, _, asc) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"words"},"topK":50,"orderBy":"section-asc"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{asc}");
+        let secs = sections_of(&asc);
+        assert!(secs.len() >= 4, "container + flat hits: {secs:?}");
+        {
+            // nulls last: every None trails every Some
+            let first_none = secs.iter().position(|s| s.is_none());
+            let last_some = secs.iter().rposition(|s| s.is_some());
+            assert!(
+                first_none.is_some_and(|n| last_some.is_some_and(|s| n > s)),
+                "nulls-last: {secs:?}"
+            );
+            // and the Some prefix is ascending
+            let somes: Vec<u64> = secs.iter().flatten().copied().collect();
+            let mut sorted = somes.clone();
+            sorted.sort_unstable();
+            assert_eq!(somes, sorted, "section-asc: {secs:?}");
+            // scores retained
+            for h in asc["hits"].as_array().unwrap() {
+                assert!(h["score"].as_f64().is_some(), "{h}");
+            }
+        }
+        let (st, _, desc) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"words"},"topK":50,"orderBy":"section-desc"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{desc}");
+        let secs = sections_of(&desc);
+        {
+            let somes: Vec<u64> = secs.iter().flatten().copied().collect();
+            let mut sorted = somes.clone();
+            sorted.sort_unstable();
+            sorted.reverse();
+            assert_eq!(
+                somes, sorted,
+                "section-desc flips the section leg: {secs:?}"
+            );
+            let first_none = secs.iter().position(|s| s.is_none());
+            let last_some = secs.iter().rposition(|s| s.is_some());
+            assert!(
+                first_none.is_some_and(|n| last_some.is_some_and(|s| n > s)),
+                "nulls-last holds under desc too: {secs:?}"
+            );
+        }
+
+        // ---- the closed vocabulary: unknown value dies at path=orderBy ----
+        let (st, h, b) = call_json(
+            &f,
+            "/x-vf/Search",
+            json!({"bucket":"docs","query":{"text":"words"},"topK":5,"orderBy":"chapter-asc"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["fieldList"][0]["path"], json!("orderBy"), "{b}");
+        assert!(
+            b["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown orderBy"),
+            "{b}"
+        );
+        let _ = h;
     }
 
     /// The pdf+txt pipeline for the PAGE-coordinate e2e (the real pdfium

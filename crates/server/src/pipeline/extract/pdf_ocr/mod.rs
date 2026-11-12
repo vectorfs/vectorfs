@@ -554,6 +554,7 @@ impl Extractor for PdfOcrExtractor {
                 furniture_removed: 0,
                 section: None,
                 sections: Vec::new(),
+                title: None,
             });
         }
         if parts.is_empty() {

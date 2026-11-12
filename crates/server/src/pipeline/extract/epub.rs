@@ -31,7 +31,11 @@
 //! * **Produced**: one ChildDoc per spine itemref whose manifest
 //!   media-type is an XHTML form (`application/xhtml+xml` or `text/html`),
 //!   in SPINE order; `name` is the zip entry path (provenance/logs only),
-//!   `mime` is `text/html` (the routing identity).
+//!   `mime` is `text/html` (the routing identity), and — since T18, under
+//!   the `chapter-titles` knob — `title` is the chapter's title by the
+//!   two-level chain: the nav/NCX label for its entry, else the FILE NAME
+//!   STEM (an epub with no readable TOC degrades to filename chapter
+//!   titles — 有界退化, not an error; D-9.2).
 //! * **NOT produced**: everything else. Images, stylesheets, fonts and the
 //!   EPUB3 nav document are RESOURCES of the book, not independently
 //!   routable user documents — an operator's html chain expresses no
@@ -125,11 +129,36 @@ pub(crate) const EPUB_MIME: &str = "application/epub+zip";
 /// rides the spine but is a resource — module docs).
 const XHTML_MEDIA_TYPES: &[&str] = &["application/xhtml+xml", "text/html"];
 
-/// Runtime instance (configless — the reading order is a format fact, not
-/// a user decision; which chain consumes the chapters is the USER's
-/// config, which is the whole point of the container role).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct EpubExtractor;
+/// Runtime instance: the reading order stays a format fact (not a user
+/// decision), but T18's `chapter-titles` knob rides along as the one
+/// config bit — titles are chunk-identity-relevant, hence the knob, hence
+/// the runtime carries it (the `PdfTextExtractor::with_structure` shape).
+#[derive(Debug, Clone, Copy)]
+pub struct EpubExtractor {
+    chapter_titles: bool,
+}
+
+impl Default for EpubExtractor {
+    /// `new()`'s twin — the adjudicated default (titles ON, T18).
+    fn default() -> Self {
+        EpubExtractor {
+            chapter_titles: default_chapter_titles(),
+        }
+    }
+}
+
+impl EpubExtractor {
+    /// The default-config runtime (chapter-titles ON, the T18 default).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// T18 `chapter-titles` knob (config arm of the builder).
+    pub fn with_chapter_titles(mut self, chapter_titles: bool) -> Self {
+        self.chapter_titles = chapter_titles;
+        self
+    }
+}
 
 impl Extractor for EpubExtractor {
     fn extract(&self, _bytes: &[u8], _mime: &str) -> Result<Vec<super::Part>, PipelineError> {
@@ -148,15 +177,16 @@ impl Extractor for EpubExtractor {
         // see pipeline/gate.rs)
         gate::refuse_empty_input("epub", bytes)?;
         gate::refuse_foreign_mime("epub", mime, gate::Accept::Exact(EPUB_MIME))?;
-        Ok(Some(spine_children(bytes)?))
+        Ok(Some(spine_children(bytes, self.chapter_titles)?))
     }
 }
 
 /// The OCF walk (module docs): mimetype check → container.xml → OPF →
 /// spine-ordered chapter children. Every structural failure is a loud Err
 /// naming the step; the two bomb-guard legs (count, ratio) refuse with
-/// the shared two-branch vocabulary (裁决 2).
-fn spine_children(bytes: &[u8]) -> Result<Vec<ChildDoc>, PipelineError> {
+/// the shared two-branch vocabulary (裁决 2). `chapter_titles` (T18)
+/// stamps each child's title by the D-9.2 two-level chain.
+fn spine_children(bytes: &[u8], chapter_titles: bool) -> Result<Vec<ChildDoc>, PipelineError> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| {
         PipelineError::extract(format!(
             "epub: cannot open as a zip archive (corrupt upload, truncated transfer, or not a \
@@ -222,8 +252,9 @@ fn spine_children(bytes: &[u8]) -> Result<Vec<ChildDoc>, PipelineError> {
         };
         opf
     };
-    // (3) the OPF: manifest map + spine order
-    let (manifest, spine) = {
+    // (3) the OPF: manifest map + spine order + (T18) the TOC pointer —
+    // EPUB3 `properties="nav"` or EPUB2 `spine@toc`
+    let (manifest, spine, toc) = {
         let xml = read_entry(&mut zip, &opf_path, &mut budget)?;
         let xml = utf8(&opf_path, &xml)?;
         parse_opf(&opf_path, &xml)?
@@ -233,10 +264,20 @@ fn spine_children(bytes: &[u8]) -> Result<Vec<ChildDoc>, PipelineError> {
             "epub: the OPF '{opf_path}' has an empty spine — no reading order, no chapters"
         )));
     }
+    // T18 chapter titles (D-9.2, knob-gated): resolved entry-path -> label
+    // from the nav/NCX document, when the package declares one; `None` =
+    // no map (and knob off), the per-child filename-stem fallback decides
+    let titles = if chapter_titles {
+        toc.and_then(|toc| chapter_title_map(&mut zip, &opf_path, &toc, &mut budget))
+    } else {
+        None
+    };
     // children in SPINE order: XHTML manifest items only (module docs)
     let mut children = Vec::with_capacity(spine.len());
     for idref in spine {
-        let Some((_id, href, media_type)) = manifest.iter().find(|(id, _, _)| id == &idref) else {
+        let Some((_id, href, media_type, _props)) =
+            manifest.iter().find(|(id, _, _, _)| id == &idref)
+        else {
             return Err(PipelineError::extract(format!(
                 "epub: the OPF spine references idref '{idref}' but the manifest declares no \
                  such item — a broken package document is refused, not guessed around"
@@ -247,9 +288,187 @@ fn spine_children(bytes: &[u8]) -> Result<Vec<ChildDoc>, PipelineError> {
         }
         let entry_path = resolve_href(&opf_path, href);
         let bytes = read_entry(&mut zip, &entry_path, &mut budget)?;
-        children.push(ChildDoc::new(entry_path, "text/html", bytes));
+        if !chapter_titles {
+            children.push(ChildDoc::new(entry_path, "text/html", bytes));
+            continue;
+        }
+        // the two-level chain: nav/NCX label for this entry, else the
+        // child FILE NAME stem (the last path segment minus extension —
+        // `OEBPS/ch1.xhtml` degrades to `ch1`; bounded, documented)
+        let title = titles
+            .as_ref()
+            .and_then(|m| m.get(&entry_path))
+            .cloned()
+            .unwrap_or_else(|| file_stem(&entry_path));
+        children.push(ChildDoc::new_titled(entry_path, "text/html", bytes, title));
     }
     Ok(children)
+}
+
+/// The child file-name STEM (the D-9.2 fallback rung): the last path
+/// segment of the entry path minus its extension — a chapter without a
+// TOC label still names itself something stable and human-guessable.
+fn file_stem(entry_path: &str) -> String {
+    let file = entry_path.rsplit('/').next().unwrap_or(entry_path);
+    match file.rsplit_once('.') {
+        // a dotless name (rare, legal in a zip) keeps itself as the stem
+        Some((stem, _)) => stem.to_string(),
+        None => file.to_string(),
+    }
+}
+
+/// The TOC document the OPF points at (T18, D-9.2): the EPUB3 nav (a
+/// manifest item whose `properties` list carries the `nav` token) or the
+/// EPUB2 NCX (the manifest item `spine@toc` names). `href` is OPF-relative
+/// (resolved by the caller); `ncx` picks the label grammar.
+#[derive(Debug)]
+struct TocDoc {
+    href: String,
+    ncx: bool,
+}
+
+/// Resolve the package's TOC document into an entry-path -> label map
+/// (`None` when the named part is missing — the fallback rung's call, an
+/// epub whose declared TOC is absent degrades to filename stems, 有界退
+/// 化; unparseable XML is the same refusal-not-guess call). The map is
+/// keyed by the RESOLVED entry path so the spine loop's `resolve_href`
+/// spellings join regardless of `.`/`..`/percent-encoding variance
+/// between the OPF and the TOC's own hrefs.
+fn chapter_title_map(
+    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    opf_path: &str,
+    toc: &TocDoc,
+    budget: &mut super::ExpansionBudget,
+) -> Option<std::collections::HashMap<String, String>> {
+    let toc_path = resolve_href(opf_path, &toc.href);
+    let xml = read_entry(zip, &toc_path, budget).ok()?;
+    let xml = utf8(&toc_path, &xml).ok()?;
+    let anchors = if toc.ncx {
+        parse_ncx(&xml)
+    } else {
+        parse_nav(&xml)
+    };
+    let map = anchors
+        .into_iter()
+        .filter_map(|(href, label)| {
+            let label = label.trim();
+            if label.is_empty() {
+                None
+            } else {
+                Some((resolve_href(&toc_path, &href), label.to_string()))
+            }
+        })
+        .collect();
+    Some(map)
+}
+
+/// EPUB3 nav document -> `[(href, label)]`: the text of every `<a href>`
+/// inside a `<nav epub:type="toc">`. Other navs (landmarks, page-list)
+/// carry different hrefs for different purposes — only the TOC nav's
+/// anchors are chapter titles, so a nav document without one contributes
+/// nothing (the fallback rung's call again).
+fn parse_nav(xml: &str) -> Vec<(String, String)> {
+    let mut reader = Reader::from_str(xml);
+    let mut out = Vec::new();
+    let mut in_toc_nav = 0usize; // nesting depth inside the toc <nav>
+    let mut in_anchor = false;
+    let mut href = String::new();
+    let mut label = String::new();
+    let mut buf = Vec::new();
+    loop {
+        let Ok(event) = reader.read_event_into(&mut buf) else {
+            return out; // malformed tail: keep the anchors that parsed
+        };
+        match event {
+            Event::Start(e) => {
+                let name = e.name().into_inner();
+                if is(name, b"nav") {
+                    // local-name `type` matches `epub:type` (attr()'s
+                    // prefix-stripping rule) — the EPUB3 spelling
+                    if attr(&e, b"type").as_deref() == Some("toc") {
+                        in_toc_nav += 1;
+                    }
+                } else if in_toc_nav > 0 && is(name, b"a") {
+                    in_anchor = true;
+                    href = attr(&e, b"href").unwrap_or_default();
+                    label.clear();
+                }
+            }
+            Event::Text(t) => {
+                if in_anchor && let Ok(txt) = t.xml_content(quick_xml::XmlVersion::Implicit1_0) {
+                    label.push_str(&txt);
+                }
+            }
+            Event::End(e) => {
+                let name = e.name().into_inner();
+                if is(name, b"a") && in_anchor {
+                    in_anchor = false;
+                    out.push((std::mem::take(&mut href), std::mem::take(&mut label)));
+                } else if is(name, b"nav") && in_toc_nav > 0 {
+                    in_toc_nav -= 1;
+                }
+            }
+            Event::Eof => return out,
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
+/// EPUB2 NCX -> `[(href, label)]`: each `<navPoint>`'s `<navLabel><text>`
+/// applies to its own `<content src>` (label-before-content is the NCX's
+/// own element order, so the pending-label state machine is exact for
+/// nested navPoints too).
+fn parse_ncx(xml: &str) -> Vec<(String, String)> {
+    let mut reader = Reader::from_str(xml);
+    let mut out = Vec::new();
+    let mut in_nav_label = false;
+    let mut label = String::new();
+    let mut pending: Option<String> = None;
+    let mut buf = Vec::new();
+    loop {
+        let Ok(event) = reader.read_event_into(&mut buf) else {
+            return out;
+        };
+        match event {
+            Event::Start(e) => {
+                let name = e.name().into_inner();
+                if is(name, b"navLabel") {
+                    in_nav_label = true;
+                    label.clear();
+                }
+            }
+            // `<content src=…/>` is self-closing in every real NCX — the
+            // Empty arm is the one that fires, Start kept away since a
+            // paired `<content>` spelling carries no text either way
+            Event::Empty(e) => {
+                if is(e.name().into_inner(), b"content")
+                    && let Some(src) = attr(&e, b"src")
+                    && let Some(l) = pending.take()
+                {
+                    out.push((src, l));
+                }
+            }
+            Event::Text(t) => {
+                if in_nav_label && let Ok(txt) = t.xml_content(quick_xml::XmlVersion::Implicit1_0) {
+                    label.push_str(&txt);
+                }
+            }
+            Event::End(e) => {
+                let name = e.name().into_inner();
+                if is(name, b"navLabel") {
+                    in_nav_label = false;
+                    let l = label.trim();
+                    if !l.is_empty() {
+                        pending = Some(l.to_string());
+                    }
+                }
+            }
+            Event::Eof => return out,
+            _ => {}
+        }
+        buf.clear();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -347,16 +566,26 @@ fn parse_container_xml(xml: &str) -> Result<Option<String>, PipelineError> {
     }
 }
 
-/// One `<item id=… href=… media-type=…>` row of the OPF manifest.
-type OpfItem = (String, String, String); // (id, href, media-type)
+/// One `<item id=… href=… media-type=… [properties=…]>` row of the OPF
+/// manifest (the T18 properties column rides along for the EPUB3 nav
+/// lookup).
+type OpfItem = (String, String, String, Option<String>); // (id, href, media-type, properties)
 
-/// OPF → `(manifest items, spine idrefs)`. The manifest is collected in
-/// document order; the spine is collected in document order — WHICH IS THE
-/// READING ORDER and therefore the children order (module docs).
-fn parse_opf(opf_path: &str, xml: &str) -> Result<(Vec<OpfItem>, Vec<String>), PipelineError> {
+/// [`parse_opf`]'s product: (manifest items, spine idrefs, TOC document).
+type Opf = (Vec<OpfItem>, Vec<String>, Option<TocDoc>);
+
+/// OPF → `(manifest items, spine idrefs, TOC document)`. The manifest is
+/// collected in document order; the spine is collected in document order —
+/// WHICH IS THE READING ORDER and therefore the children order (module
+/// docs). The TOC pointer (T18, D-9.2) is the EPUB3 nav — the manifest
+/// item whose `properties` token list carries `nav` — or, failing that,
+/// the EPUB2 `spine@toc` idref resolved through the manifest (an NCX);
+/// `None` when the package declares neither (the filename-stem rung).
+fn parse_opf(opf_path: &str, xml: &str) -> Result<Opf, PipelineError> {
     let mut reader = Reader::from_str(xml);
-    let mut manifest: Vec<OpfItem> = Vec::new(); // (id, href, media-type)
+    let mut manifest: Vec<OpfItem> = Vec::new(); // (id, href, media-type, properties)
     let mut spine: Vec<String> = Vec::new();
+    let mut spine_toc_id: Option<String> = None;
     let mut in_manifest = false;
     let mut in_spine = false;
     let mut buf = Vec::new();
@@ -371,6 +600,8 @@ fn parse_opf(opf_path: &str, xml: &str) -> Result<(Vec<OpfItem>, Vec<String>), P
                     in_manifest = true;
                 } else if is(name, b"spine") {
                     in_spine = true;
+                    // EPUB2's TOC pointer: the manifest id of the NCX
+                    spine_toc_id = attr(&e, b"toc");
                 } else if in_manifest && is(name, b"item") {
                     manifest_item(&e, &mut manifest);
                 } else if in_spine
@@ -405,20 +636,45 @@ fn parse_opf(opf_path: &str, xml: &str) -> Result<(Vec<OpfItem>, Vec<String>), P
         }
         buf.clear();
     }
-    Ok((manifest, spine))
+    // EPUB3 first (a 3.0 package may carry both a nav and a legacy NCX —
+    // the spec's own reading order for TOC precedence), EPUB2 second
+    let toc = manifest
+        .iter()
+        .find(|(_, _, _, props)| {
+            props
+                .as_deref()
+                .is_some_and(|p| p.split_whitespace().any(|t| t == "nav"))
+        })
+        .map(|(_, href, _, _)| TocDoc {
+            href: href.clone(),
+            ncx: false,
+        })
+        .or_else(|| {
+            spine_toc_id.as_deref().and_then(|id| {
+                manifest
+                    .iter()
+                    .find(|(mid, _, _, _)| mid == id)
+                    .map(|(_, href, _, _)| TocDoc {
+                        href: href.clone(),
+                        ncx: true,
+                    })
+            })
+        });
+    Ok((manifest, spine, toc))
 }
 
 /// One `<item id=… href=… media-type=…>` into the manifest (items without
-/// all three attributes cannot serve a spine reference and are skipped —
-/// they may legitimately be metadata-only).
+/// the first three attributes cannot serve a spine reference and are
+/// skipped — they may legitimately be metadata-only; `properties` is
+/// optional and absent for every pre-EPUB3 package).
 fn manifest_item(
     e: &quick_xml::events::BytesStart<'_>,
-    manifest: &mut Vec<(String, String, String)>,
+    manifest: &mut Vec<(String, String, String, Option<String>)>,
 ) {
     if let (Some(id), Some(href), Some(mt)) =
         (attr(e, b"id"), attr(e, b"href"), attr(e, b"media-type"))
     {
-        manifest.push((id, href, mt));
+        manifest.push((id, href, mt, attr(e, b"properties")));
     }
 }
 
@@ -454,17 +710,44 @@ fn resolve_href(opf_path: &str, href: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// config (no knobs — the tag is the whole section)
+// config (one knob since T18 — chapter-titles, the migration carrier)
 // ---------------------------------------------------------------------------
+
+/// The T18 `chapter-titles` knob's default: ON. A NAMED function (not
+/// `#[serde(default)]`, which for `bool` can only mean `false`): the
+/// builtin-path construction and the deserialization path share this one
+/// definition (the `default_structure` anti-drift note — a default that
+/// lives in two places eventually disagrees).
+fn default_chapter_titles() -> bool {
+    true
+}
 
 /// Per-kind config struct (`deny_unknown_fields`): the typed `kind` tag
 /// doubles as the allowed-field list in unknown-key errors and as the
-/// fingerprint payload (canonical form `kind = "epub"`, knob-free — the
-/// reading order is a format fact, the chapter chain is the user's).
+/// fingerprint payload (canonical form `kind = "epub"` + the knob below).
+///
+/// The T18 `chapter-titles` knob (default ON) gates the chapter-title
+/// chain (design D-9.2): nav/NCX label > child file-name stem. Titles
+/// change the stamped `x-vf-section-title` metadata and the CCH embedding
+/// input, so they are chunk-identity-relevant — the knob serializes into
+/// the fingerprint ALWAYS (value-as-canonical, the T12 `structure`
+/// precedent and the pdf-inspector `markdown` one: no elide at the
+/// default, an elided default would punch a hole in "the fingerprint
+/// owns chunk-set identity"). Upgrading to T18 flips every epub-route
+/// bucket's fingerprint — the gate refuses startup and demands the
+/// explicit reindex wave (D-9.1; the reading order itself stays a format
+/// fact, not a knob).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EpubConfig {
     pub kind: EpubTag,
+    /// T18 chapter-title propagation (R8 structure axis): stamp each spine
+    /// child's chapter title (the two-level chain above). `false` = the
+    /// pre-T18 byte-exact shape (no titles, no `x-vf-section-title`).
+    /// Config form is kebab-case like every knob (`chapter-titles`, the
+    /// `context-header` spelling discipline).
+    #[serde(rename = "chapter-titles", default = "default_chapter_titles")]
+    pub chapter_titles: bool,
 }
 
 /// Literal tag: only deserializes from `"epub"`.
@@ -472,6 +755,19 @@ pub struct EpubConfig {
 pub enum EpubTag {
     #[serde(rename = "epub")]
     Epub,
+}
+
+impl Default for EpubConfig {
+    /// The one construction path for the adjudicated default (the
+    /// `PdfTextConfig::default` discipline): serde's
+    /// `default = "default_chapter_titles"` and the ingest builtin's
+    /// literal read the SAME definition.
+    fn default() -> Self {
+        EpubConfig {
+            kind: EpubTag::Epub,
+            chapter_titles: default_chapter_titles(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -588,7 +884,7 @@ pub(crate) mod tests {
     /// Unpack helper (the mime gate is part of the contract — always the
     /// canonical mime).
     fn unpack(epub: &[u8]) -> Result<Option<Vec<ChildDoc>>, PipelineError> {
-        EpubExtractor.unpack(epub, EPUB_MIME)
+        EpubExtractor::new().unpack(epub, EPUB_MIME)
     }
 
     /// THE format-intelligence test: the spine — not the zip entry order —
@@ -857,11 +1153,13 @@ pub(crate) mod tests {
         let err = unpack(b"").unwrap_err();
         assert!(err.to_string().contains("empty input"), "{err}");
         let epub = build_epub(&["ch1"], &[]);
-        let err = EpubExtractor.unpack(&epub, "application/zip").unwrap_err();
+        let err = EpubExtractor::new()
+            .unpack(&epub, "application/zip")
+            .unwrap_err();
         assert!(err.to_string().contains("cannot handle mime"), "{err}");
         assert!(unpack(&epub).is_ok(), "canonical mime passes");
         assert!(
-            EpubExtractor.unpack(&epub, "").is_ok(),
+            EpubExtractor::new().unpack(&epub, "").is_ok(),
             "empty mime tolerated"
         );
     }
@@ -1061,7 +1359,9 @@ pub(crate) mod tests {
     /// here so the dispatch arm cannot silently change meaning.
     #[test]
     fn extract_refuses_loudly_never_guesses() {
-        let err = EpubExtractor.extract(b"whatever", EPUB_MIME).unwrap_err();
+        let err = EpubExtractor::new()
+            .extract(b"whatever", EPUB_MIME)
+            .unwrap_err();
         assert!(
             err.to_string().contains("container kind: it unpacks"),
             "{err}"
@@ -1080,7 +1380,10 @@ pub(crate) mod tests {
             ContentClass::MixedTextScan,
             ContentClass::NoText,
         ] {
-            assert_eq!(Extractor::affinity(&EpubExtractor, class), Fit::Capable);
+            assert_eq!(
+                Extractor::affinity(&EpubExtractor::new(), class),
+                Fit::Capable
+            );
         }
     }
 
@@ -1088,10 +1391,242 @@ pub(crate) mod tests {
     fn config_roundtrip() {
         let cfg: EpubConfig = toml::from_str("kind = \"epub\"").unwrap();
         assert_eq!(cfg.kind, EpubTag::Epub);
-        assert_eq!(toml::to_string(&cfg).unwrap().trim(), "kind = \"epub\"");
+        // 恒序列化 (the T12 `structure` discipline): the knob serializes at
+        // the DEFAULT too — an elided default would punch a hole in "the
+        // fingerprint owns chunk-set identity"
+        assert!(cfg.chapter_titles);
+        assert_eq!(
+            toml::to_string(&cfg).unwrap().trim(),
+            "kind = \"epub\"\nchapter-titles = true"
+        );
+        // the spelled-off form roundtrips; Default agrees with the
+        // deserialization default (one construction path)
+        let off: EpubConfig = toml::from_str("kind = \"epub\"\nchapter-titles = false").unwrap();
+        assert!(!off.chapter_titles);
+        assert_eq!(
+            toml::to_string(&off).unwrap().trim(),
+            "kind = \"epub\"\nchapter-titles = false"
+        );
+        assert_eq!(EpubConfig::default(), cfg);
         // wrong literal rejected (stage-2 tag guards stage-1 dispatch);
-        // unknown field rejected (no knobs)
+        // unknown field still rejected (one knob, not an open struct)
         assert!(toml::from_str::<EpubConfig>("kind = \"zip\"").is_err());
         assert!(toml::from_str::<EpubConfig>("kind = \"epub\"\ndpi = 300").is_err());
+    }
+
+    // ---- T18 chapter titles (D-9.2): the two-level chain ----
+
+    /// EPUB3 nav labels win: the properties="nav" document names each
+    /// spine chapter, and the children carry its toc-nav anchor texts
+    /// verbatim (spine order, not nav order — the scramble must hold; and
+    /// the landmarks nav's anchors must NOT leak — only epub:type="toc").
+    #[test]
+    fn chapter_titles_nav_labels_take_priority() {
+        use std::io::Write;
+        let manifest = CHAPTERS
+            .iter()
+            .map(|(id, _)| {
+                format!(
+                    "<item id=\"{id}\" href=\"{id}.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                )
+            })
+            .collect::<String>()
+            + "<item id=\"nv\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" \
+                properties=\"nav\"/>";
+        let opf = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\">\
+             <metadata/><manifest>{manifest}</manifest>\
+             <spine><itemref idref=\"ch2\"/><itemref idref=\"ch3\"/><itemref idref=\"ch1\"/>\
+             </spine></package>"
+        );
+        let nav = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <html xmlns=\"http://www.w3.org/1999/xhtml\" \
+             xmlns:epub=\"http://www.idpf.org/2007/ops\">\
+             <body><nav epub:type=\"toc\"><ol>\
+             <li><a href=\"ch1.xhtml\">第一章　起航</a></li>\
+             <li><a href=\"ch2.xhtml\">第二章　转折</a></li>\
+             <li><a href=\"ch3.xhtml\">第三章　归宿</a></li>\
+             </ol></nav>\
+             <nav epub:type=\"landmarks\"><ol><li><a href=\"ch1.xhtml\">正文开头</a></li></ol>\
+             </nav></body></html>";
+        let container_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <container version=\"1.0\" \
+             xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\">\
+             <rootfiles><rootfile full-path=\"OEBPS/content.opf\" \
+             media-type=\"application/oebps-package+xml\"/></rootfiles></container>";
+        let buf = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(buf);
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        zip.start_file(
+            "mimetype",
+            opts.compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+        zip.write_all(EPUB_MIME.as_bytes()).unwrap();
+        for (name, bytes) in [
+            ("META-INF/container.xml", container_xml.as_bytes()),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/nav.xhtml", nav.as_bytes()),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        for (id, _) in CHAPTERS {
+            zip.start_file(format!("OEBPS/{id}.xhtml"), opts).unwrap();
+            zip.write_all(b"<html><body><p>chapter body</p></body></html>")
+                .unwrap();
+        }
+        let epub = zip.finish().unwrap().into_inner();
+        let children = EpubExtractor::new()
+            .unpack(&epub, EPUB_MIME)
+            .unwrap()
+            .expect("container verdict");
+        let got: Vec<(&str, &str)> = children
+            .iter()
+            .map(|c| (c.name.as_str(), c.title.as_deref().unwrap_or("")))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("OEBPS/ch2.xhtml", "第二章　转折"),
+                ("OEBPS/ch3.xhtml", "第三章　归宿"),
+                ("OEBPS/ch1.xhtml", "第一章　起航"),
+            ],
+            "nav labels follow the spine order; landmarks never leak"
+        );
+    }
+
+    /// EPUB2 NCX labels: spine@toc names the NCX manifest item, its
+    /// navMap labels apply (nested navPoints keep their own), and the
+    /// NCX's own directory anchors the src resolution.
+    #[test]
+    fn chapter_titles_ncx_labels_via_spine_toc() {
+        use std::io::Write;
+        let opf = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <package xmlns=\"http://www.idpf.org/2007/opf\" version=\"2.0\">\
+            <metadata/><manifest>\
+            <item id=\"ncx\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/>\
+            <item id=\"c1\" href=\"text/c1.xhtml\" media-type=\"application/xhtml+xml\"/>\
+            <item id=\"c2\" href=\"text/c2.xhtml\" media-type=\"application/xhtml+xml\"/>\
+            </manifest><spine toc=\"ncx\">\
+            <itemref idref=\"c1\"/><itemref idref=\"c2\"/></spine></package>";
+        let ncx = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <ncx xmlns=\"http://www.daisy.org/z3986/2005/ncx/\" version=\"2005-1\">\
+            <navMap>\
+            <navPoint><navLabel><text>上篇　灯起</text></navLabel>\
+            <content src=\"text/c1.xhtml\"/>\
+            <navPoint><navLabel><text>第一节</text></navLabel>\
+            <content src=\"text/c2.xhtml\"/></navPoint></navPoint>\
+            </navMap></ncx>";
+        let buf = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(buf);
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        zip.start_file(
+            "mimetype",
+            opts.compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+        zip.write_all(EPUB_MIME.as_bytes()).unwrap();
+        zip.start_file("META-INF/container.xml", opts).unwrap();
+        zip.write_all(
+            b"<container><rootfiles><rootfile full-path=\"content.opf\"/></rootfiles></container>",
+        )
+        .unwrap();
+        zip.start_file("content.opf", opts).unwrap();
+        zip.write_all(opf.as_bytes()).unwrap();
+        zip.start_file("toc.ncx", opts).unwrap();
+        zip.write_all(ncx.as_bytes()).unwrap();
+        for name in ["text/c1.xhtml", "text/c2.xhtml"] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(b"<html><body><p>body</p></body></html>")
+                .unwrap();
+        }
+        let epub = zip.finish().unwrap().into_inner();
+        let children = EpubExtractor::new()
+            .unpack(&epub, EPUB_MIME)
+            .unwrap()
+            .expect("container verdict");
+        let got: Vec<(&str, &str)> = children
+            .iter()
+            .map(|c| (c.name.as_str(), c.title.as_deref().unwrap_or("")))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("text/c1.xhtml", "上篇　灯起"), ("text/c2.xhtml", "第一节")],
+            "NCX labels apply, nested navPoints keep their own"
+        );
+    }
+
+    /// The fallback rung: no nav property and no spine@toc (the shared
+    /// builder's shape) ⇒ every child names itself by FILE NAME STEM; and
+    /// the knob OFF ⇒ the pre-T18 shape (title None everywhere).
+    #[test]
+    fn chapter_titles_fall_back_to_file_stems_and_knob_off_is_none() {
+        let epub = build_epub(&["ch2", "ch1"], &[]);
+        let children = EpubExtractor::new()
+            .unpack(&epub, EPUB_MIME)
+            .unwrap()
+            .expect("container verdict");
+        assert_eq!(
+            children
+                .iter()
+                .map(|c| c.title.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("ch2"), Some("ch1")],
+            "no nav/NCX ⇒ file-name stems (bounded degradation)"
+        );
+        let off = EpubExtractor::new()
+            .with_chapter_titles(false)
+            .unpack(&epub, EPUB_MIME)
+            .unwrap()
+            .expect("container verdict");
+        assert!(
+            off.iter().all(|c| c.title.is_none()),
+            "knob off ⇒ the pre-T18 untitled shape"
+        );
+    }
+
+    /// A declared nav the package does not actually carry is a DEGRADED
+    /// book, not an error: the stem rung answers (有界退化 — design §5.6).
+    #[test]
+    fn chapter_titles_missing_nav_part_degrades_to_stems() {
+        use std::io::Write;
+        let opf = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\">\
+            <metadata/><manifest>\
+            <item id=\"nv\" href=\"ghost.xhtml\" media-type=\"application/xhtml+xml\" \
+            properties=\"nav\"/>\
+            <item id=\"c1\" href=\"c1.xhtml\" media-type=\"application/xhtml+xml\"/>\
+            </manifest><spine><itemref idref=\"c1\"/></spine></package>";
+        let buf = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(buf);
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        zip.start_file(
+            "mimetype",
+            opts.compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+        zip.write_all(EPUB_MIME.as_bytes()).unwrap();
+        zip.start_file("META-INF/container.xml", opts).unwrap();
+        zip.write_all(
+            b"<container><rootfiles><rootfile full-path=\"content.opf\"/></rootfiles></container>",
+        )
+        .unwrap();
+        zip.start_file("content.opf", opts).unwrap();
+        zip.write_all(opf.as_bytes()).unwrap();
+        zip.start_file("c1.xhtml", opts).unwrap();
+        zip.write_all(b"<html><body><p>body</p></body></html>")
+            .unwrap();
+        let epub = zip.finish().unwrap().into_inner();
+        let children = EpubExtractor::new()
+            .unpack(&epub, EPUB_MIME)
+            .unwrap()
+            .expect("container verdict");
+        assert_eq!(
+            children[0].title.as_deref(),
+            Some("c1"),
+            "a declared-but-missing nav degrades to the stem rung"
+        );
     }
 }

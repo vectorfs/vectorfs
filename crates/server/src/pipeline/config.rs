@@ -2182,6 +2182,49 @@ chunk = { kind = "token-window", size = 32, overlap = 8 }
         );
     }
 
+    /// T18 `chapter-titles` fingerprint pin (the T12 `structure` discipline,
+    /// D-9.1): the epub knob serializes at the DEFAULT too (an elided
+    /// default would punch a hole in "the fingerprint owns chunk-set
+    /// identity" — titles change the stamped metadata and the CCH embedding
+    /// input, they are chunk-identity-relevant), so absent ≡ explicit-true
+    /// (one construction path), true ≠ false, and the AUTO epub route moves
+    /// with the builtin value exactly like an explicit bucket. This is the
+    /// migration's own arrow: upgrading to T18 flips every epub-route
+    /// bucket's digest (canonical gains the `chapter-titles` line) and the
+    /// gate demands the explicit reindex wave; `false` restores the pre-T18
+    /// chunk SHAPE (the extractor test pins that half — no titles, no
+    /// `x-vf-section-title`), never the pre-T18 digest.
+    #[test]
+    fn fingerprint_epub_chapter_titles_moves_with_the_knob() {
+        let auto = "[ingest.ddd]\nchunk = { kind = \"token-window\", size = 8, overlap = 2 }\n\
+                    extract = { epub = \"auto\" }\n";
+        let explicit_at = |knob_line: &str| {
+            format!(
+                "[extractor.b]\nkind = \"epub\"\n{knob_line}[ingest.ddd]\nchunk = {{ \
+                 kind = \"token-window\", size = 8, overlap = 2 }}\nextract = {{ epub = \"b\" }}\n"
+            )
+        };
+        let at_default = explicit_at("");
+        let on = explicit_at("chapter-titles = true\n");
+        let off = explicit_at("chapter-titles = false\n");
+        assert_eq!(fp_of(auto), fp_of(&at_default), "auto ≡ the builtin value");
+        assert_eq!(
+            fp_of(&at_default),
+            fp_of(&on),
+            "explicit default ≡ explicit true (值即规范)"
+        );
+        assert_ne!(
+            fp_of(auto),
+            fp_of(&off),
+            "the RESOLVED chapter-titles value participates — auto ≠ flipped"
+        );
+        assert_ne!(
+            fp_of(&on),
+            fp_of(&off),
+            "chapter-titles flips the explicit form too"
+        );
+    }
+
     #[test]
     fn fingerprint_chunker_kind_and_knobs_enter_naturally() {
         // M3-T6 (the chunker axis's second kind): the fingerprint serializes

@@ -297,6 +297,10 @@ impl ChunkerKind {
                             .map(|(f, l)| (f.0, l.0)),
                         line: None,
                         section: part.section,
+                        // the T18 chapter title rides the orchestration
+                        // channel beside the ordinal (a container's image
+                        // child is still a child)
+                        title: part.title.clone(),
                         // an image atom has no text to prefix (R2 CCH)
                         embed_prefix: None,
                     });
@@ -802,5 +806,80 @@ mod tests {
                 "{c:?}"
             );
         }
+    }
+
+    /// T18 (R8, D-9.3): the CONTAINER-LEAF arm — a sectioned, pageless
+    /// part whose walk stamped a chapter title carries `stem > title` as
+    /// its prefix (the epub chapter shape); the same-shaped part WITHOUT a
+    /// title stays filename-only (the pre-T18 shape), and the FLAT PDF
+    /// path (sections present, no title) keeps the TOC-page lookup
+    /// byte-for-byte — the zero-change rule for the R2 corpus.
+    #[test]
+    fn container_leaf_titles_stamp_the_chapter_component() {
+        let on = cch_kind("token-window", "toc-path");
+        // the container leaf: pageless, mapless, titled
+        let mut leaf = Part::text("chapter body prose long enough to window across");
+        leaf.section = Some(3);
+        leaf.title = Some("第七章　灰雾渡口".to_string());
+        let chunks = on
+            .chunk_source(std::slice::from_ref(&leaf), Some("novel"))
+            .unwrap();
+        assert!(
+            chunks.iter().all(|c| c.embed_prefix.is_some()),
+            "{chunks:?}"
+        );
+        for c in &chunks {
+            assert_eq!(
+                c.embed_prefix.as_deref(),
+                Some("novel > 第七章　灰雾渡口"),
+                "{c:?}"
+            );
+            // the title rides the chunk's orchestration channel too (the
+            // x-vf-section-title stamper's input)
+            assert_eq!(c.title.as_deref(), Some("第七章　灰雾渡口"), "{c:?}");
+        }
+        // the UNTITLED sibling: same shape, no title — filename-only (the
+        // zip/eml container shape, and every pre-T18 container)
+        let mut untitled = Part::text("chapter body prose long enough to window across");
+        untitled.section = Some(4);
+        let chunks = on
+            .chunk_source(std::slice::from_ref(&untitled), Some("novel"))
+            .unwrap();
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.embed_prefix.as_deref() == Some("novel") && c.title.is_none()),
+            "{chunks:?}"
+        );
+        // the flat PDF path: sections present, title absent — the TOC-page
+        // lookup answers EXACTLY as before (pinned against the same map:
+        // page-1 windows carry 序章)
+        let flat = paged_part_with_map();
+        let pinned = on
+            .chunk_source(std::slice::from_ref(&flat), Some("golden-radar"))
+            .unwrap();
+        for c in &pinned {
+            let page = c.page.unwrap().0;
+            let chapter = if page == 1 {
+                "序章"
+            } else {
+                "第二章 方法"
+            };
+            assert_eq!(
+                c.embed_prefix.as_deref(),
+                Some(format!("golden-radar > {chapter}").as_str()),
+                "{c:?}"
+            );
+        }
+        // mode none: the title arm composes with the mode gate — off is
+        // still off (no prefix ever, whatever the title)
+        let off = cch_kind("token-window", "none");
+        let chunks = off
+            .chunk_source(std::slice::from_ref(&leaf), Some("novel"))
+            .unwrap();
+        assert!(
+            chunks.iter().all(|c| c.embed_prefix.is_none()),
+            "{chunks:?}"
+        );
     }
 }

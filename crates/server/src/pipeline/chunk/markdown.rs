@@ -180,13 +180,15 @@ impl MarkdownChunker {
                 let (page, line) = coords.window(s, e);
                 // R2 CCH — identical wiring to token-window (the shared
                 // seam; the chapter component keys on the window's start
-                // page)
+                // page, and T18's container-leaf arm names the stamped
+                // title instead — same two arms, same seam)
                 let embed_prefix = ctx.and_then(|ctx| {
                     windowing::context_header(
                         self.context_header,
                         ctx,
                         &part.sections,
                         page.map(|(start, _)| start),
+                        part.title.as_deref(),
                     )
                 });
                 out.push(Chunk {
@@ -197,6 +199,7 @@ impl MarkdownChunker {
                     page,
                     line,
                     section: part.section,
+                    title: part.title.clone(),
                     embed_prefix,
                 });
                 index += 1;
@@ -228,6 +231,7 @@ mod tests {
             furniture_removed: 0,
             section: None,
             sections: Vec::new(),
+            title: None,
         }])
         .unwrap()
         .into_iter()
@@ -372,6 +376,7 @@ mod tests {
             furniture_removed: 0,
             section: Some(2),
             sections: Vec::new(),
+            title: None,
         };
         let out = c.chunk(&[part]).unwrap();
         assert!(out.len() >= 2, "{out:?}");

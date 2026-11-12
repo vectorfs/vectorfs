@@ -939,6 +939,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                title: None,
                 embed_prefix: None,
             })
             .collect();
@@ -1001,6 +1002,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                title: None,
                 embed_prefix: None,
             }])
             .await
@@ -1024,6 +1026,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                title: None,
                 embed_prefix: None,
             })
             .collect();
@@ -1055,6 +1058,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                title: None,
                 embed_prefix: None,
             }])
             .await
@@ -1083,6 +1087,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                title: None,
                 embed_prefix: None,
             }])
             .await
@@ -1108,6 +1113,7 @@ pub(crate) mod tests {
                 page: None,
                 line: None,
                 section: None,
+                title: None,
                 embed_prefix: None,
             }])
             .await
@@ -1238,6 +1244,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            title: None,
             embed_prefix: None,
         }
     }
@@ -1251,6 +1258,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            title: None,
             embed_prefix: None,
         }
     }
@@ -1307,6 +1315,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            title: None,
             embed_prefix: Some(prefix.to_string()),
         };
         // legacy batch: input = ["vol32 > 试验\n正文一", "notes\n正文二"]

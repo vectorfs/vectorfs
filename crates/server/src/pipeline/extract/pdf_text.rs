@@ -279,6 +279,7 @@ impl Extractor for PdfTextExtractor {
             furniture_removed,
             section: None,
             sections,
+            title: None,
         }])
     }
 }

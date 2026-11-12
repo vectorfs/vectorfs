@@ -56,7 +56,7 @@ pub mod zip;
 use super::{ChildDoc, ContentClass, Extractor, Fit, Modality, Part, PipelineError};
 use docx::{DocxConfig, DocxExtractor};
 use eml::{EmlConfig, EmlExtractor};
-use epub::{EpubConfig, EpubExtractor, EpubTag};
+use epub::{EpubConfig, EpubExtractor};
 use html::{HtmlConfig, HtmlExtractor};
 use image::{ImageConfig, ImageExtractor};
 use md::{MdConfig, MdExtractor, MdTag};
@@ -201,10 +201,9 @@ pub fn builtin_extractor(short_key: &str) -> Option<ExtractorKind> {
         "md" => Some(ExtractorKind::Md(MdConfig { kind: MdTag::Md })),
         "txt" => Some(ExtractorKind::Txt(TxtConfig { kind: TxtTag::Txt })),
         // 裁决 1 (2026-11-11): the DOCUMENT-format container — one book is
-        // one document, the pdf analog. Default-config epub (no knobs exist).
-        "epub" => Some(ExtractorKind::Epub(EpubConfig {
-            kind: EpubTag::Epub,
-        })),
+        // one document, the pdf analog. Default-config epub (the T18
+        // `chapter-titles` knob's default rides via `EpubConfig::default`).
+        "epub" => Some(ExtractorKind::Epub(EpubConfig::default())),
         _ => None,
     }
 }
@@ -759,9 +758,15 @@ impl ExtractorKind {
             // knob-free kinds (M3-T6): the label is the whole summary
             ExtractorKind::Docx(_) => "docx".to_string(),
             ExtractorKind::Html(_) => "html".to_string(),
-            // knob-free kinds (M3-T7), same discipline: the label is the
-            // whole summary
-            ExtractorKind::Epub(_) => "epub".to_string(),
+            // the T18 knob shows only when it departs from the default
+            // (chapter-titles on), keeping summary lines short
+            ExtractorKind::Epub(cfg) => {
+                if cfg.chapter_titles {
+                    "epub".to_string()
+                } else {
+                    "epub(chapter-titles=false)".to_string()
+                }
+            }
             ExtractorKind::Zip(_) => "zip".to_string(),
             ExtractorKind::Eml(_) => "eml".to_string(),
             // the knob shows only when it departs from the pdf-text-aligned
@@ -846,7 +851,7 @@ impl Extractor for ExtractorKind {
             // the worker short-circuits extract for kinds whose unpack
             // yields children, so reaching extract is a routing bug, and
             // it must fail visibly instead of guessing)
-            ExtractorKind::Epub(_) => EpubExtractor.extract(bytes, mime),
+            ExtractorKind::Epub(_) => EpubExtractor::new().extract(bytes, mime),
             ExtractorKind::Zip(_) => ZipExtractor.extract(bytes, mime),
             ExtractorKind::Eml(_) => EmlExtractor.extract(bytes, mime),
             // role separation made loud: a container NEVER extracts — the
@@ -929,8 +934,12 @@ impl Extractor for ExtractorKind {
             | ExtractorKind::Docx(_)
             | ExtractorKind::Html(_) => Ok(None),
             // the production containers: expansion is their one product
-            // path (each module's docs carry its ruling)
-            ExtractorKind::Epub(_) => EpubExtractor.unpack(_bytes, _mime),
+            // path (each module's docs carry its ruling); epub carries the
+            // T18 `chapter-titles` knob into its unpack (titles are
+            // chunk-identity-relevant — the knob's whole point)
+            ExtractorKind::Epub(cfg) => EpubExtractor::new()
+                .with_chapter_titles(cfg.chapter_titles)
+                .unpack(_bytes, _mime),
             ExtractorKind::Zip(_) => ZipExtractor.unpack(_bytes, _mime),
             ExtractorKind::Eml(_) => EmlExtractor.unpack(_bytes, _mime),
             #[cfg(test)]

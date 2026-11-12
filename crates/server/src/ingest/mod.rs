@@ -315,6 +315,16 @@ pub(crate) struct BucketPlan {
 }
 
 impl BucketPlan {
+    /// cfg(test) injection hook (the TestContainer discipline): swap one
+    /// declared extractor instance's kind for a scripted one, so test
+    /// suites OUTSIDE this module (ops_xvf's titled-container e2e) can
+    /// patch a loaded plan without reaching into the private extractors
+    /// map. Production builds never see this method.
+    #[cfg(test)]
+    pub(crate) fn set_extractor(&mut self, name: &str, kind: ExtractorKind) {
+        self.extractors.insert(name.to_string(), kind);
+    }
+
     /// The ordered extractor CHAIN this bucket routes `object_key` through
     /// (M2.1 linear fallback), as (member name, kind) pairs — the name is
     /// what the aggregated statusReason quotes ("auto" names the sentinel's
@@ -1006,6 +1016,18 @@ fn run_member(
                     section += 1;
                     for p in child_parts.iter_mut() {
                         p.section = Some(section);
+                        // T18 chapter title (R8, D-9.3): the container
+                        // kind's declared title rides the same loop. The
+                        // stamp is TITLE-PRESERVING: an outer container
+                        // without titles (zip/eml) never ERASES a title an
+                        // inner walk legitimately stamped (a zip holding
+                        // an epub keeps the epub's chapter titles) — unlike
+                        // the section ordinal above, whose outer-wins rule
+                        // exists because two ordinals would collide; a
+                        // carried title and a missing one cannot.
+                        if let Some(t) = &child.title {
+                            p.title = Some(t.clone());
+                        }
                     }
                     parts.append(&mut child_parts);
                 }
@@ -2563,8 +2585,14 @@ struct BatchRow {
 /// so page-key presence no longer uniquely identifies multi-page-PDF rows
 /// — format discrimination belongs to modality semantics
 /// (`x-vf-modality`/the source mime), see `chunk::windowing::Coords`).
-/// Key-count accounting: 5 base + text + kind + at most 4 coordinates
-/// = 11 ≤ 50 (AWS per-vector metadata cap). Per-chunk modality (M3-T1):
+/// T18 adds the section's chapter-title companion `x-vf-section-title`
+/// (string; written ONLY when the walk stamped a title — the epub
+/// `chapter-titles` knob's product; filterable `$eq`/`$startsWith` via
+/// the mirror column's automatic evolution, F-7 — no registration
+/// anywhere).
+/// Key-count accounting: 5 base + text + kind + at most 4 coordinates +
+/// the title = 12 ≤ 50 (AWS per-vector metadata cap). Per-chunk modality
+/// (M3-T1):
 /// both the metadata value and the chunk-key namespace come from the CHUNK,
 /// so image atoms land in the `image` namespace (`{hash}-image-{i}`) with
 /// `x-vf-modality = image` — text chunks keep the `text` namespace.
@@ -2605,6 +2633,13 @@ fn build_rows(
         if let Some(section) = chunk.section {
             let m = metadata.as_object_mut().expect("object literal");
             m.insert("x-vf-section".into(), serde_json::json!(section));
+        }
+        // T18: the section's chapter title, only when the walk stamped one
+        // (leaf sources and untitled container children carry none — key
+        // absence is the ordinary story, never a stale empty string)
+        if let Some(title) = &chunk.title {
+            let m = metadata.as_object_mut().expect("object literal");
+            m.insert("x-vf-section-title".into(), serde_json::json!(title));
         }
         if plan.store_chunk_text {
             metadata
@@ -4503,6 +4538,7 @@ pub(crate) mod tests {
                 page: None,
                 line: Some((i, i + 3)),
                 section: None,
+                title: None,
                 embed_prefix: None,
             })
             .collect();
@@ -5507,6 +5543,7 @@ pub(crate) mod tests {
             page: Some((18, 19)),
             line: None,
             section: None,
+            title: None,
             embed_prefix: Some("vol32 > 试验".to_string()),
         }];
         let vectors = vec![vec![0.5f32; 8]];
@@ -5537,6 +5574,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            title: None,
             embed_prefix: None,
         };
         let image = |i: u32| Chunk {
@@ -5550,6 +5588,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            title: None,
             embed_prefix: None,
         };
         // the pre-image marker shape, byte-stable: text-only file
@@ -5590,6 +5629,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            title: None,
             embed_prefix: None,
         };
         let image = |i: u32| Chunk {
@@ -5603,6 +5643,7 @@ pub(crate) mod tests {
             page: None,
             line: None,
             section: None,
+            title: None,
             embed_prefix: None,
         };
 
@@ -6636,6 +6677,86 @@ pub(crate) mod tests {
             joined(&2).contains("second child body") && !joined(&2).contains("first child"),
             "section 2 = child two (skip.bin held no number): {sections:?}"
         );
+    }
+
+    /// T18 chapter-title propagation (R8, D-9.3/D-9.4): the container
+    /// kind's declared child titles ride the walk's stamp loop beside the
+    /// section ordinal, and the row stamper writes them as
+    /// `x-vf-section-title` — ONLY when present (an untitled child of the
+    /// same walk carries no key, key absence is the ordinary story).
+    #[tokio::test]
+    async fn container_children_carry_their_chapter_titles() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        let payload = b"TITLED-CONTAINER";
+        std::fs::write(docs.join("book.ctn"), payload).unwrap();
+
+        let cfg = ctn_config("txt = \"plain\", ctn = \"ctn\"", "");
+        let (rt, _h, state) = runtime_patched(dir.path(), &cfg, |plan| {
+            plan.extractors.insert(
+                "ctn".to_string(),
+                ExtractorKind::TestContainer(TestContainerSpec::one(
+                    "application/octet-stream",
+                    payload,
+                    vec![
+                        ChildDoc::new_titled(
+                            "ch1/one.txt",
+                            "text/plain",
+                            "first child body alpha beta gamma delta epsilon zeta",
+                            "第一章　灯起",
+                        ),
+                        // the UNTITLED sibling: same walk, no key written
+                        ChildDoc::new(
+                            "ch2/two.txt",
+                            "text/plain",
+                            "second child body eta theta iota kappa lambda mu",
+                        ),
+                    ],
+                )),
+            );
+        })
+        .await;
+
+        rt.scan_once().await;
+        rt.drain_queue().await;
+        assert_eq!(
+            status_of(&state, "docs", "docs/book.ctn").await.status,
+            SourceStatus::Indexed
+        );
+
+        let plan = &rt.shared.core.buckets["docs"];
+        let rows = state
+            .storage
+            .scan_vectors("docs", &plan.derived["tiny"].index_name, None)
+            .await
+            .unwrap();
+        assert!(!rows.is_empty());
+        let mut titled: BTreeMap<u64, String> = BTreeMap::new();
+        let mut untitled_sections = Vec::new();
+        for r in &rows {
+            let meta = r.metadata.as_ref().expect("row metadata");
+            let section = meta["x-vf-section"].as_u64().expect("sectioned");
+            match meta.get("x-vf-section-title") {
+                Some(t) => {
+                    titled.insert(section, t.as_str().unwrap_or_default().to_string());
+                }
+                None => untitled_sections.push(section),
+            }
+        }
+        // section 1 = the titled child: its title landed verbatim
+        assert_eq!(
+            titled.get(&1).map(String::as_str),
+            Some("第一章　灯起"),
+            "the titled child's chapter title is stamped: {titled:?}"
+        );
+        // section 2 = the untitled sibling: NO key (absence, never an
+        // empty string)
+        assert!(
+            untitled_sections.iter().all(|s| *s == 2),
+            "the untitled child carries no x-vf-section-title: {untitled_sections:?}"
+        );
+        assert_eq!(titled.len(), 1, "exactly one titled section: {titled:?}");
     }
 
     /// Child-level normalize: a container child that is ITSELF gzipped

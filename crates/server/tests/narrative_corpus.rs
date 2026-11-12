@@ -682,7 +682,12 @@ fn build_epub(chapters: &[String]) -> Vec<u8> {
             )
         })
         .collect::<String>()
-        + "<item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\"/>";
+        // T18 activation surgery: the nav item carries properties="nav"
+        // (EPUB3's TOC pointer) so the chapter-titles chain resolves the
+        // nav document — before T18 the fixture built the nav CONTENT but
+        // never declared it, exercising only the stem fallback
+        + "<item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" \
+        properties=\"nav\"/>";
     let spine = (0..chapters.len())
         .map(|i| format!("<itemref idref=\"ch{i:03}\"/>"))
         .collect::<String>();
@@ -1247,7 +1252,7 @@ fn narrative_epub_round_trips_real_extractors() {
     let n = generate(SEED);
     // EPUB_MIME is pub(crate) in the kind; the canonical mime is the OCF
     // constant this builder wrote into the mimetype entry
-    let children = EpubExtractor
+    let children = EpubExtractor::new()
         .unpack(&n.epub, "application/epub+zip")
         .expect("generated epub must unpack")
         .expect("container verdict");
@@ -1263,6 +1268,15 @@ fn narrative_epub_round_trips_real_extractors() {
             "spine == natural order"
         );
         assert_eq!(child.mime, "text/html", "the html routing mime");
+        // T18 (D-9.2): the declared nav (properties="nav") resolved — each
+        // child's title is its nav anchor label, the chapter's own title
+        // line verbatim (not the ch000 filename stem)
+        assert_eq!(
+            child.title.as_deref(),
+            n.chapters[i].lines().next(),
+            "chapter {} carries its nav label",
+            i + 1
+        );
         let parts = HtmlExtractor
             .extract(&child.bytes, "text/html")
             .unwrap_or_else(|e| panic!("chapter {} must extract: {e}", i + 1));
@@ -1319,7 +1333,7 @@ fn narrative_epub_round_trips_real_extractors() {
         }
     }
     // determinism against the real faces
-    let again = EpubExtractor
+    let again = EpubExtractor::new()
         .unpack(&n.epub, "application/epub+zip")
         .unwrap()
         .unwrap();
@@ -1733,22 +1747,35 @@ fn stand_indexed_narrative(tag: &str) -> IndexedNarrative {
 /// keyword-mode search through the CLI --json face (the same face the
 /// flagship acceptance drives).
 fn search_json(x: &IndexedNarrative, query: &str, top_k: u32) -> serde_json::Value {
-    let o = vf(
-        x.port,
-        &[
-            "search",
-            query,
-            "docs",
-            "--mode",
-            "keyword",
-            "--top-k",
-            &top_k.to_string(),
-            "--json",
-        ],
-    );
+    search_json_ordered(x, query, top_k, None)
+}
+
+/// [`search_json`] with an explicit `--order` (T18): None keeps the
+/// retrieval order, Some spells the wire's orderBy.
+fn search_json_ordered(
+    x: &IndexedNarrative,
+    query: &str,
+    top_k: u32,
+    order: Option<&str>,
+) -> serde_json::Value {
+    let mut args: Vec<String> = vec![
+        "search".into(),
+        query.into(),
+        "docs".into(),
+        "--mode".into(),
+        "keyword".into(),
+        "--top-k".into(),
+        top_k.to_string(),
+    ];
+    if let Some(o) = order {
+        args.push("--order".into());
+        args.push(o.into());
+    }
+    args.push("--json".into());
+    let o = vf(x.port, &args.iter().map(String::as_str).collect::<Vec<_>>());
     assert!(
         o.status.success(),
-        "search {query:?} failed: {}{}",
+        "search {query:?} (order {order:?}) failed: {}{}",
         out(&o),
         err(&o)
     );
@@ -1929,9 +1956,9 @@ fn narrative_indexed_full_chain_gate() {
 }
 
 // ---------------------------------------------------------------------------
-// the env-gated behavior pins (T17's analyze()-based pipeline landed;
-// T18's orderBy pin still awaits its activation — the #[ignore] reasons
-// name the env conditions)
+// the env-gated behavior pins (T17's analyze()-based pipeline and T18's
+// orderBy position half are both live — the #[ignore] reasons name the
+// env conditions)
 // ---------------------------------------------------------------------------
 
 /// A-R7 (design §1 D-11.2): CJK event queries get anchors and the HEAD
@@ -2095,24 +2122,37 @@ fn narrative_long_query_probe_truncation() {
     );
 }
 
-/// A-R8 position half (T18, D-11.2): with the section axis applied to the
-/// event query's hit set, the FIRST event-chapter hit in (section,
-/// line-start) order is the occurrence chapter — no recap may claim the
-/// earliest narrative slot despite its higher BM25 (复述不冒名).
-///
-/// ACTIVATION (T18): `/x-vf Search` `orderBy: "section-asc"` (D-10.4)
-/// replaces the client-side sort below — assert the RESPONSE order
-/// directly then. Today this pins the metadata ingredients (every novel
-/// hit carries coord.section) plus the ordering semantics pre-implemented
-/// client-side; it is green on an indexed corpus by construction, and the
-/// #[ignore] belongs to T18's activation set.
+/// A-R8 position half (T18 activated, D-11.2 + D-10.4): the server-side
+/// `orderBy: "section-asc"` view answers the FM2 question directly — the
+/// FIRST event-chapter hit of the ordered response IS the occurrence
+/// chapter (复述不冒名: the recap flood may fill the ranking behind it,
+/// never claim the earliest narrative slot). The T16-era client-side sort
+/// is retired; the assertion now reads the RESPONSE order verbatim, and
+/// the pre-checks pin the ingredients the order keys on (every novel hit
+/// carries coord.section; the ordered view's sections are ascending).
 #[test]
-#[ignore = "activates with T18 (narrative-recall design §2): orderBy section-asc (D-10.4)"]
+#[ignore = "needs the indexed narrative corpus; set VF_NARRATIVE_MODELS_DIR (see module doc)"]
 fn narrative_ar8_position_half_section_order() {
     let x = stand_indexed_narrative("ar8");
     let e = &EVENTS[0]; // 潮汐灯, occurrence 7
-    let v = search_json(&x, e.query, 50);
-    let mut event_hits: Vec<(u64, u64)> = v["hits"]
+    // ingredient pin (the ordered view is only meaningful when the hits
+    // carry the section axis at all)
+    let plain = search_json(&x, e.query, 50);
+    let sections: Vec<u64> = plain["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .filter(|h| h["location"]["key"].as_str() == Some(NOVEL_KEY))
+        .filter_map(|h| h["location"]["coord"]["section"].as_u64())
+        .collect();
+    assert!(
+        sections.contains(&(e.occurrence as u64)),
+        "the event query must surface its chapters: {sections:?}"
+    );
+    // THE T18 assertion: the server's orderBy view, response order read
+    // verbatim — the first event-chapter hit is the occurrence chapter
+    let v = search_json_ordered(&x, e.query, 50, Some("section-asc"));
+    let ordered: Vec<(u64, u64)> = v["hits"]
         .as_array()
         .expect("hits")
         .iter()
@@ -2124,19 +2164,28 @@ fn narrative_ar8_position_half_section_order() {
                 .unwrap_or(0);
             Some((section, line))
         })
-        .filter(|(s, _)| *s == e.occurrence as u64 || e.recaps.iter().any(|(r, _)| *r as u64 == *s))
+        .collect();
+    let event_secs: Vec<u64> = ordered
+        .iter()
+        .map(|(s, _)| *s)
+        .filter(|s| *s == e.occurrence as u64 || e.recaps.iter().any(|(r, _)| *r as u64 == *s))
         .collect();
     assert!(
-        !event_hits.is_empty(),
-        "the event query must surface its chapters"
+        !event_secs.is_empty(),
+        "the ordered view keeps the event chapters: {ordered:?}"
     );
-    event_hits.sort_unstable();
+    // the ordered view's own sections are ascending (the key's first leg)
+    let mut sorted = ordered.clone();
+    sorted.sort_unstable();
     assert_eq!(
-        event_hits[0].0, e.occurrence as u64,
-        "the occurrence chapter leads the section-ordered view — recaps do not claim the slot"
+        ordered, sorted,
+        "orderBy section-asc returns sections ascending (ties by line)"
     );
-    // TODO(T18): switch to server-side orderBy:"section-asc" and assert
-    // the response's first event hit IS the occurrence chunk verbatim.
+    // 复述不冒名: the FIRST event hit is the occurrence chapter itself
+    assert_eq!(
+        event_secs[0], e.occurrence as u64,
+        "the occurrence chapter leads the section-ordered response — recaps do not claim the slot"
+    );
 }
 
 /// The FM4 cross-source observation (design §1 D-11.2, 降级为观测): the

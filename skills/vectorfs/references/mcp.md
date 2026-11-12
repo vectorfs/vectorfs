@@ -25,7 +25,7 @@ them with anything that prints to stdout.
 
 | Tool | Params | Notes |
 |---|---|---|
-| `search` | `bucket`*, `text`*, `topK` (1..=1000, default 10), `filter`?, (`returnText`, default true) | the RAG entry: merged, source-attributed hits with `content.text` and `location.key` |
+| `search` | `bucket`*, `text`*, `topK` (1..=1000, default 10), `filter`?, `orderBy`? (`section-asc`/`section-desc`, T18 — re-order the final hits by chapter ordinal, section-less hits last; absent = retrieval order), (`returnText`, default true) | the RAG entry: merged, source-attributed hits with `content.text` and `location.key` |
 | `put_source` | `bucket`*, `path` XOR `content`, `key`?, `waitSeconds` (default 0) | `path` = local file (key defaults to its name); `content` = inline text, then `key` REQUIRED. Returns on acceptance (202-style); `waitSeconds > 0` polls GetSource to a terminal state, timeout returns with a note |
 | `delete_source` | `bucket`*, `key` | async chunk GC |
 | `reindex` | `bucket` | returns the jobId |

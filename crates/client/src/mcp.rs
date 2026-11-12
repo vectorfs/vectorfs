@@ -92,6 +92,15 @@ pub struct SearchParams {
     /// Include each hit's stored chunk text (default true).
     #[serde(default = "default_true")]
     pub return_text: bool,
+    /// Terminal view ordering (T18): "section-asc" / "section-desc" —
+    /// re-order the final hits by (section, line, score desc, key asc),
+    /// missing sections last; presentation only (scores keep their
+    /// meaning, membership untouched). Absent = retrieval order.
+    /// BACKLOG NOTE: this face deliberately gains ONLY orderBy — its
+    /// searchMode/includeKinds/anchors arrears stay open (design D-10.4,
+    /// the MCP 面欠账 backlog).
+    #[serde(default)]
+    pub order_by: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -471,6 +480,11 @@ impl VfMcp {
         if let Some(f) = p.filter.as_ref().filter(|f| !f.is_null()) {
             body["filter"] = f.clone();
         }
+        // T18: orderBy passes through spelled-only (absent = the server's
+        // retrieval order; the server validates the closed vocabulary)
+        if let Some(o) = &p.order_by {
+            body["orderBy"] = json!(o);
+        }
         let v = self
             .conn
             .call_json("Search", &body)
@@ -723,8 +737,12 @@ mod tests {
     struct FakeState {
         /// (bucket, key, bytes) of every PutSource the gate accepted.
         uploads: Vec<(String, String, Vec<u8>)>,
+        /// Every Search request body the daemon saw (T18: the orderBy
+        /// passthrough pin reads the WIRE, not the envelope — the tool's
+        /// response deliberately carries only hits/note).
+        searches: Vec<Value>,
         /// wait/* keys already polled once — the waitSeconds loop's
-        /// PENDING-then-INDEXED two-step.
+        /// PENDING→INDEXED two-step.
         polled: std::collections::HashSet<String>,
     }
     type Shared = Arc<std::sync::Mutex<FakeState>>;
@@ -760,27 +778,33 @@ mod tests {
             )
             .route(
                 "/x-vf/Search",
-                post(|body: bytes::Bytes| async move {
-                    let v: serde_json::Value =
-                        serde_json::from_slice(&body).unwrap_or(Value::Null);
-                    if v["bucket"] == "nope" {
-                        return (
-                            StatusCode::NOT_FOUND,
-                            Json(json!({"__type": "NotFoundException",
-                                        "message": "bucket nope has no [ingest.*] section"})),
-                        )
-                            .into_response();
-                    }
-                    Json(json!({"hits": [{
-                        "key": "docs/fox.txt#0",
-                        "score": 0.9,
-                        "index": "docs#tiny",
-                        "location": {"type": "source", "key": "docs/fox.txt"},
-                        "content": {"text": "the quick brown fox", "type": "text"},
-                        "metadata": {"x-vf-src-name": "docs/fox.txt"},
-                    }]}))
-                    .into_response()
-                }),
+                post(
+                    |AxState(st): AxState<Shared>, body: bytes::Bytes| async move {
+                        let v: serde_json::Value =
+                            serde_json::from_slice(&body).unwrap_or(Value::Null);
+                        // record the request body (T18's orderBy passthrough
+                        // pin reads the wire — the envelope carries only
+                        // hits/note)
+                        st.lock().unwrap().searches.push(v.clone());
+                        if v["bucket"] == "nope" {
+                            return (
+                                StatusCode::NOT_FOUND,
+                                Json(json!({"__type": "NotFoundException",
+                                            "message": "bucket nope has no [ingest.*] section"})),
+                            )
+                                .into_response();
+                        }
+                        Json(json!({"hits": [{
+                            "key": "docs/fox.txt#0",
+                            "score": 0.9,
+                            "index": "docs#tiny",
+                            "location": {"type": "source", "key": "docs/fox.txt"},
+                            "content": {"text": "the quick brown fox", "type": "text"},
+                            "metadata": {"x-vf-src-name": "docs/fox.txt"},
+                        }]}))
+                        .into_response()
+                    },
+                ),
             )
             .route(
                 "/x-vf/ListSources",
@@ -1006,7 +1030,10 @@ mod tests {
             "{v}"
         );
 
-        // search: hit shape carries the source location (回源 join)
+        // search: hit shape carries the source location (回源 join); T18:
+        // the face's ONE new member (orderBy) passes through spelled-only
+        // (the server owns the closed vocabulary — the MCP face's other
+        // arrears stay open, the D-10.4 backlog note)
         let (is_err, v) = text_of(
             vf.search(Parameters(SearchParams {
                 bucket: "docs".into(),
@@ -1014,6 +1041,7 @@ mod tests {
                 top_k: 5,
                 filter: None,
                 return_text: true,
+                order_by: Some("section-asc".into()),
             }))
             .await,
         );
@@ -1022,6 +1050,12 @@ mod tests {
         assert_eq!(hits.len(), 1, "{v}");
         assert_eq!(hits[0]["location"]["key"], "docs/fox.txt", "{v}");
         assert_eq!(hits[0]["content"]["text"], "the quick brown fox", "{v}");
+        // the WIRE body carried orderBy (FakeState records every Search);
+        // the later None-spelled call leaves it ABSENT (spelled-only)
+        {
+            let bodies = _state.lock().unwrap().searches.clone();
+            assert_eq!(bodies[0]["orderBy"], "section-asc", "{bodies:?}");
+        }
 
         // search a bucket with no ingest section -> structured guidance
         let (is_err, v) = text_of(
@@ -1031,11 +1065,17 @@ mod tests {
                 top_k: 1,
                 filter: None,
                 return_text: false,
+                order_by: None,
             }))
             .await,
         );
         assert!(is_err, "{v}");
         assert_eq!(v["code"], "NotFound", "{v}");
+        {
+            let bodies = _state.lock().unwrap().searches.clone();
+            let last = bodies.last().expect("the nope search was recorded");
+            assert!(last.get("orderBy").is_none(), "absent stays absent: {last}");
+        }
 
         // delete_source + reindex
         let (is_err, v) = text_of(
