@@ -1228,14 +1228,15 @@ async fn search_cmd(args: SearchArgs) {
     }
     if let Some(a) = &anchors {
         // the restrained human form: one diagnostics line, present iff the
-        // analysis ran; an empty list says "analyzed, nothing gated"
+        // analysis ran; an empty list says "analyzed, every candidate
+        // probed df=0 (absent from the corpus) — nothing to gate on"
         match a.is_empty() {
             false => eprintln!(
                 "anchors (gated the lexical arm on {}): {}",
                 a[0],
                 a.join(", ")
             ),
-            true => eprintln!("anchors: none rare enough — lexical arm ungated"),
+            true => eprintln!("anchors: none with postings in the corpus — lexical arm ungated"),
         }
     }
     // human table (deterministic: server order is score desc, key asc);
